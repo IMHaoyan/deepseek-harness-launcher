@@ -1,6 +1,6 @@
 # DeepSeek Harness Launcher（DSHL）—— Windows 托盘启动器 / 看护工具
 
-（本项目完全由DeepSeek Harness搭载Deepseek模型Vibe coding得到）
+（本项目完全由DeepSeek Harness搭载Deepseek模型通过Vibe coding得到）
 
 DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DSH）的 Windows 托盘启动器：系统托盘常驻、一键启动/停止/接管 DSH Web 服务、消息通知（托盘闪烁）、开机自启、运行环境自动检测与一键安装、自动更新。
 
