@@ -64,7 +64,7 @@ npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--pu
 npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub Release 并上传三件套
 ```
 
-**发布**（`tools/release.mjs`）：前置 = 工作区干净、已 `git push origin main`、安装并登录 GitHub CLI（`winget install GitHub.cli && gh auth login`）。脚本会校验 tag 不存在、产物齐全后 `gh release create v<版本> dshl-<版本>.exe .blockmap latest.yml`；客户端 `electron-updater` 依据 `latest.yml` 自动更新。
+**发布**（`tools/release.mjs`）：前置 = 工作区干净、已 `git push origin main`、安装并登录 GitHub CLI（`winget install GitHub.cli && gh auth login`）。脚本会校验 tag 不存在、产物齐全后 `gh release create v<版本> dshl-<版本>.exe .blockmap latest.yml`；客户端 `electron-updater` 依据 `latest.yml` 自动更新。用法：`npm run release`（说明自动取上一 tag 以来的提交列表），或 `npm run release "v1.0.7 更新内容：\n- 第一条\n- 第二条"`（换行用字面 `\n`，真实换行会被 npm/cmd 批处理截断）。
 
 ## 运行环境（自动检测 + 一键安装）
 

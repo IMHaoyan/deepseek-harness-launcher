@@ -6,7 +6,9 @@
 //   1. git 工作区干净，且已 git push origin main（tag 要指向已推送的提交）
 //   2. 安装并登录 GitHub CLI：winget install GitHub.cli && gh auth login
 //
-// 用法：npm run release ["版本说明…"]（不传说明则用 v<version>）
+// 用法：
+//   npm run release                                  —— 说明自动取"上一 tag 以来的提交列表"
+//   npm run release "v1.0.7 更新内容：\n- 第一条\n- 第二条"  —— 字面 \n 表示换行（真实换行会被批处理截断）
 import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -21,7 +23,16 @@ const exe = `dshl-${version}.exe`
 const exePath = join(root, 'dist', exe)
 const blockmapPath = exePath + '.blockmap'
 const latestYml = join(root, 'dist', 'latest.yml')
-const notes = process.argv.slice(2).join(' ').trim() || tag
+
+// 说明：命令行参数里请用字面 \n 表示换行（真实换行会被 npm/cmd 批处理在传递时截断，导致 Release 说明只剩第一行）
+function defaultNotes() {
+  try {
+    const prev = execFileSync('git', ['describe', '--tags', '--abbrev=0'], { cwd: root, encoding: 'utf8' }).trim()
+    const log = execFileSync('git', ['log', `${prev}..HEAD`, '--pretty=format:- %s'], { cwd: root, encoding: 'utf8' }).trim()
+    return log ? `${tag} 更新内容：\n${log}` : tag
+  } catch { return tag }
+}
+const notes = process.argv.slice(2).join(' ').trim().replace(/\\n/g, '\n') || defaultNotes()
 
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
