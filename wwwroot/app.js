@@ -422,64 +422,76 @@ $('btnEnvOpenInstallLog').addEventListener('click', () => void cmd('openInstallL
 // ---------- 自动更新（electron-updater → GitHub Releases） ----------
 function renderUpdater(u) {
   if (!u) return;
+  window._updater = u;
   const statusEl = $('updaterStatus');
   const checkBtn = $('btnUpdaterCheck');
-  const installBtn = $('btnUpdaterInstall');
   const detailRow = $('updaterDetailRow');
   const detail = $('updaterDetail');
+  const badge = $('btnUpdateBadge');
   const current = u.current || '-';
+  const hasUpdate = (u.status === 'downloading' || u.status === 'downloaded') && !!u.latest;
+
+  // 主页面底端指示：有更新时"更新日志"右侧显示绿色 ↑ 圆圈
+  badge.classList.toggle('hidden', !hasUpdate);
+
+  // 有更新时"检查更新"按钮变形为绿色"更新到 vX"
+  checkBtn.textContent = hasUpdate ? `更新到 v${u.latest}` : '检查更新';
+  checkBtn.classList.toggle('update-ready', hasUpdate);
+
   switch (u.status) {
     case 'dev':
       statusEl.textContent = `v${current}`;
       detail.textContent = '开发模式（npm start）不支持在线更新';
       detailRow.classList.remove('hidden');
       checkBtn.disabled = true;
-      installBtn.classList.add('hidden');
       break;
     case 'checking':
       statusEl.textContent = `v${current}`;
       detail.textContent = '正在检查更新…';
       detailRow.classList.remove('hidden');
       checkBtn.disabled = true;
-      installBtn.classList.add('hidden');
       break;
     case 'downloading':
       statusEl.textContent = `v${current}`;
-      detail.textContent = `发现新版本 v${u.latest}，正在下载 ${u.percent || 0}%…`;
+      detail.textContent = `发现新版本 v${u.latest}，正在下载 ${u.percent || 0}%…（下载完成后点"更新到 v${u.latest}"立即安装，退出重启也会自动安装）`;
       detailRow.classList.remove('hidden');
       checkBtn.disabled = true;
-      installBtn.classList.add('hidden');
       break;
     case 'downloaded':
       statusEl.textContent = `v${current}`;
-      detail.textContent = `新版本 v${u.latest} 已就绪：点"重启并安装"立即更新（退出重启也会自动安装）`;
+      detail.textContent = `新版本 v${u.latest} 已就绪：点"更新到 v${u.latest}"立即安装（退出重启也会自动安装）`;
       detailRow.classList.remove('hidden');
       checkBtn.disabled = false;
-      installBtn.classList.remove('hidden');
       break;
     case 'up-to-date':
       statusEl.textContent = `v${current}（已是最新）`;
       detailRow.classList.add('hidden');
       checkBtn.disabled = false;
-      installBtn.classList.add('hidden');
       break;
     case 'error':
       statusEl.textContent = `v${current}`;
       detail.textContent = '检查更新失败：' + (u.error || '网络错误');
       detailRow.classList.remove('hidden');
       checkBtn.disabled = false;
-      installBtn.classList.add('hidden');
       break;
     default:
       statusEl.textContent = `v${current}`;
       detailRow.classList.add('hidden');
       checkBtn.disabled = false;
-      installBtn.classList.add('hidden');
   }
 }
 
-$('btnUpdaterCheck').addEventListener('click', () => void cmd('updaterCheck'));
-$('btnUpdaterInstall').addEventListener('click', () => void cmd('updaterInstall'));
+// 主页面底端链接
+$('btnGithub').addEventListener('click', () => void cmd('openGithub'));
+$('btnChangelog').addEventListener('click', () => void cmd('openChangelog'));
+// 绿色 ↑ 更新指示：点击切换到设置页（那里有"更新到 vX"按钮）
+$('btnUpdateBadge').addEventListener('click', () => showPage('settings'));
+// 版本与更新按钮：已就绪 → 立即安装；否则 → 检查更新
+$('btnUpdaterCheck').addEventListener('click', () => {
+  const u = window._updater;
+  if (u && u.status === 'downloaded') void cmd('updaterInstall');
+  else void cmd('updaterCheck');
+});
 // 状态卡上的单项安装按钮（事件委托：卡片由 render 重建）
 $('envCards').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-env-item]');

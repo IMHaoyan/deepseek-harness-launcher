@@ -49,6 +49,13 @@
         <button class="btn" id="btnEnvOpen">查看环境详情</button>
       </div>
     </section>
+
+    <!-- 底端：项目链接 + 更新入口（有新版时"更新日志"右侧显示绿色 ↑ 指示，点击进入设置页） -->
+    <section class="card actions main-footer">
+      <button class="btn" id="btnGithub">Github地址</button>
+      <button class="btn" id="btnChangelog">更新日志</button>
+      <button class="btn update-badge hidden" id="btnUpdateBadge" title="发现新版本，点击进入设置页查看">↑</button>
+    </section>
   </div>
 
   <!-- 运行环境页面（检测 + 一键安装向导） -->
@@ -160,7 +167,6 @@
         <div class="chips">
           <span class="value" id="updaterStatus">v-</span>
           <button class="btn sm" id="btnUpdaterCheck">检查更新</button>
-          <button class="btn sm primary hidden" id="btnUpdaterInstall">重启并安装</button>
         </div>
       </div>
       <div class="row" id="updaterDetailRow">

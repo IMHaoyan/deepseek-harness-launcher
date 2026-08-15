@@ -269,6 +269,35 @@ body {
 .btn.danger { color: var(--danger); }
 .btn.danger:hover { background: var(--danger-hover); }
 
+/* 更新就绪：绿色按钮（设置页"更新到 vX"） */
+.btn.update-ready {
+  background: var(--success);
+  color: #FFFFFF;
+}
+.btn.update-ready:hover { background: #16A34A; }
+.btn.update-ready:active { background: #15803D; }
+.btn.update-ready:disabled,
+.btn.update-ready:disabled:hover,
+.btn.update-ready:disabled:active {
+  background: var(--success);
+  opacity: 0.5;
+}
+
+/* 主页面底端更新指示：绿色圆圈 + 向上箭头 */
+.btn.update-badge {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--success);
+  color: #FFFFFF;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+}
+.btn.update-badge:hover { background: #16A34A; }
+.btn.update-badge:active { background: #15803D; }
+
 .actions {
   display: flex;
   flex-wrap: wrap;

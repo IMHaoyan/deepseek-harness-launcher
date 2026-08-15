@@ -71,7 +71,7 @@ function initUpdater(opts = {}) {
     setStatus('downloaded', { latest: info.version, percent: 100, error: '' })
     if (onFlash) { try { onFlash() } catch { /* noop */ } }
     if (onNotify) {
-      onNotify('DeepSeek Harness Launcher', `新版本 v${info.version} 已下载完成，退出重启后自动安装（也可在设置页点"重启并安装"立即更新）`)
+      onNotify('DeepSeek Harness Launcher', `新版本 v${info.version} 已下载完成：点设置页"更新到 v${info.version}"立即安装（退出重启也会自动安装）`)
     }
   })
   autoUpdater.on('error', (err) => {
@@ -83,6 +83,7 @@ function initUpdater(opts = {}) {
 
 function getState() {
   state.current = app.getVersion()
+  if (!isPackaged() && state.status === 'idle') state.status = 'dev'
   return snapshot()
 }
 

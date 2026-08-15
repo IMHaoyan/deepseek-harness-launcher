@@ -1242,6 +1242,8 @@ function registerIpc() {
         case 'openWeb': openWebUi(); return '{}'
         case 'openUrlExternal': try { shell.openExternal(WEB_URL) } catch { /* noop */ } return '{}'
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
+        case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
+        case 'openChangelog': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher/releases') } catch { /* noop */ } return '{}'
         case 'toggleAutostart': setAutostart(!autostartEnabled()); broadcastState(); return '{}'
         case 'testNotify': notify('DeepSeek Harness', '测试通知：链路正常，点击本通知打开 DeepSeek Harness', WEB_URL); return '{}'
         case 'setZoom': {
