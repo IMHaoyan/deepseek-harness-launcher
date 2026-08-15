@@ -5,6 +5,14 @@ DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DS
 - **支持平台：Windows 10/11（64 位）**。macOS / Linux 的代码保留在仓库中，但未经过测试，暂不承诺可用。
 - 逻辑与行为移植自早期 C# 原型（托盘、QQ/微信式闪烁、接管/启动/停止、通知 dropbox、开机自启、自检）。
 
+## 软件界面
+
+![软件界面 1](docs/screenshots/ui-1.png)
+
+![软件界面 2](docs/screenshots/ui-2.png)
+
+![软件界面 3](docs/screenshots/ui-3.png)
+
 ## 用户安装与使用
 
 1. 到 [Releases](https://github.com/IMHaoyan/deepseek-harness-launcher/releases) 下载最新 `dshl-<版本>.exe`（NSIS 安装包）。
