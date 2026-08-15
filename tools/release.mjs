@@ -27,7 +27,8 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 function run(cmd, args) {
   console.log('> ' + cmd + ' ' + args.join(' '))
-  execFileSync(cmd, args, { stdio: 'inherit', cwd: root })
+  // Windows：.cmd 批处理无法被 CreateProcess 直接 spawn（spawnSync EINVAL），经 shell 执行
+  execFileSync(cmd, args, { stdio: 'inherit', cwd: root, shell: process.platform === 'win32' })
 }
 
 // 捕获 stdout 的命令；非零退出/不存在 → null（注意 stdio 不可用 ignore，成功也返回 null）
