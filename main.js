@@ -38,10 +38,21 @@ const args = parseArgs(process.argv)
 
 const SELF_TEST = !!args.selftest
 const HOST = args.host || '127.0.0.1'
-// 自检必须默认用独立端口 3999，绝不触碰真实服务端口
-const PORT = args.port || (SELF_TEST ? 3999 : 3080)
-const WEB_URL = `http://${HOST}:${PORT}`
+// 运行端口：命令行 --port 优先；其次配置项（默认 3080）；自检固定 3999。
+// 运行时可变（设置页"服务端口"），启动时按配置重算，切换后由 setPort 重启服务。
+let PORT = args.port || (SELF_TEST ? 3999 : 3080)
+let WEB_URL = `http://${HOST}:${PORT}`
 const READY_TIMEOUT_SEC = 60
+
+// 按当前配置重算运行端口（配置缺失/非法一律回退默认 3080）
+function applyRuntimePort() {
+  const p = args.port || (SELF_TEST ? 3999 : (Number.isInteger(Config.port) && Config.port >= 1024 && Config.port <= 65535 && Config.port !== 0 ? Config.port : 3080))
+  if (p !== PORT) {
+    PORT = p
+    WEB_URL = `http://${HOST}:${PORT}`
+    log('runtime port applied: ' + PORT)
+  }
+}
 
 // ---------- 路径（DSH_HOME 缺省回退 ~/.dsh，与 DSH 自身一致） ----------
 const realHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
@@ -63,7 +74,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, windowWidth: 0, windowHeight: 0, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '' }
 let firstRun = false
 let harnessRoot = ''
 
@@ -178,8 +189,14 @@ function loadConfig() {
       if (typeof cfg.useSystemBrowser === 'boolean') Config.useSystemBrowser = cfg.useSystemBrowser
       if (typeof cfg.autoRestart === 'boolean') Config.autoRestart = cfg.autoRestart
       if (typeof cfg.tabsEnabled === 'boolean') Config.tabsEnabled = cfg.tabsEnabled
+      if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
       if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= 480) Config.windowWidth = cfg.windowWidth
       if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= 600) Config.windowHeight = cfg.windowHeight
+      // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
+      if (Number.isInteger(cfg.webWindowWidth) && cfg.webWindowWidth >= 640) Config.webWindowWidth = cfg.webWindowWidth
+      if (Number.isInteger(cfg.webWindowHeight) && cfg.webWindowHeight >= 480) Config.webWindowHeight = cfg.webWindowHeight
+      if (typeof cfg.webWindowMaximized === 'boolean') Config.webWindowMaximized = cfg.webWindowMaximized
+      if (Number.isInteger(cfg.webWindowX) && Number.isInteger(cfg.webWindowY)) { Config.webWindowX = cfg.webWindowX; Config.webWindowY = cfg.webWindowY }
       if (typeof cfg.harnessRoot === 'string' && cfg.harnessRoot) Config.harnessRoot = cfg.harnessRoot
       if (typeof cfg.nodePath === 'string' && cfg.nodePath) Config.nodePath = cfg.nodePath
       if (typeof cfg.dshVersion === 'string' && cfg.dshVersion) Config.dshVersion = cfg.dshVersion
@@ -248,20 +265,36 @@ const server = {
   adoptedPid: 0,
   adoptedAlive: false,
   stopping: false,
+  blockedReason: '',
+  suggestedPort: 0,
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
   running() { return this.owned() || (this.adoptedPid !== 0 && this.adoptedAlive) },
   displayPid() { return this.owned() ? this.child.pid : this.adoptedPid },
 }
 
-function portOpen() {
+function portOpenAt(port) {
   return new Promise((resolve) => {
     let done = false
     const finish = (ok) => { if (done) return; done = true; try { sock.destroy() } catch { /* noop */ } resolve(ok) }
-    const sock = net.connect({ host: HOST, port: PORT })
+    const sock = net.connect({ host: HOST, port })
     sock.setTimeout(400, () => finish(false))
     sock.once('connect', () => finish(true))
     sock.once('error', () => finish(false))
   })
+}
+
+function portOpen() {
+  return portOpenAt(PORT)
+}
+
+// 从 start 起向上找第一个空闲端口（最多试 30 个，越界返回 0）：给"端口被占用"场景提供可直接切换的建议
+async function findFreePort(start) {
+  for (let i = 0; i < 30; i++) {
+    const p = start + i
+    if (p < 1024 || p > 65535) break
+    if (!(await portOpenAt(p))) return p
+  }
+  return 0
 }
 
 function findListenPid() {
@@ -328,13 +361,57 @@ async function findNode() {
   return 'node'
 }
 
+// HTTP 指纹探测：确认端口后面确实是 DeepSeek Harness Web 服务，而不是其他恰好占用该端口的程序。
+// 根页面 HTML 含 "DeepSeek Harness" 标题字样（自检同款判定）；非 DSH → { ok: false }，绝不接管/误杀。
+function probeDsh() {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: HOST, port: PORT })
+    const buf = []
+    let settled = false
+    const done = (ok, reason) => {
+      if (settled) return
+      settled = true
+      try { sock.destroy() } catch { /* noop */ }
+      resolve({ ok, reason })
+    }
+    sock.setTimeout(1500, () => done(false, 'timeout')) // 本地服务毫秒级响应；仅"占端口但不回 HTTP"的程序会等到超时
+    sock.once('connect', () => {
+      sock.write(`GET / HTTP/1.1\r\nHost: ${HOST}:${PORT}\r\nUser-Agent: dshl-probe\r\nAccept: text/html\r\nConnection: close\r\n\r\n`)
+    })
+    sock.once('error', () => done(false, 'connect'))
+    sock.on('data', (d) => buf.push(d))
+    sock.once('close', () => {
+      if (settled) return
+      const text = Buffer.concat(buf).toString('utf8')
+      done(/DeepSeek Harness/i.test(text), 'fingerprint')
+    })
+  })
+}
+
 async function startServer() {
   if (server.owned()) return true
+  server.blockedReason = ''
+  server.suggestedPort = 0
   if (await portOpen()) {
-    server.adoptedPid = await findListenPid()
-    server.adoptedAlive = server.adoptedPid !== 0
-    log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
-    return true
+    // 端口被占用：先验证对方身份，是 DSH 才接管
+    const probe = await probeDsh()
+    if (probe.ok) {
+      server.adoptedPid = await findListenPid()
+      server.adoptedAlive = server.adoptedPid !== 0
+      log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
+      return true
+    }
+    const pid = await findListenPid()
+    server.adoptedPid = 0
+    server.adoptedAlive = false
+    // 自动找下一个空闲端口作为建议，面板提供"换到该端口并启动"一键入口
+    const suggested = await findFreePort(PORT + 1)
+    server.suggestedPort = suggested
+    server.blockedReason = suggested
+      ? `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；建议切换到空闲端口 ${suggested}（启动器面板可一键切换），或关闭占用程序`
+      : `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；附近端口均被占用，请关闭占用程序后重试`
+    log(server.blockedReason + '；probe=' + (probe.reason || 'fingerprint-mismatch'))
+    return false
   }
   server.adoptedPid = 0
   server.adoptedAlive = false
@@ -446,6 +523,20 @@ async function stopServer() {
   }
 }
 
+// 端口切换：重启自己拉起的服务到新端口（WEB_URL 已更新），并把所有打开的标签页重载到新地址
+async function restartServerOnNewPort() {
+  if (!server.owned()) return false
+  await stopServer()
+  const ok = await startServer()
+  if (ok) {
+    for (const t of webTabs) {
+      const wc = t.view && t.view.webContents
+      if (wc && !wc.isDestroyed()) { try { wc.loadURL(WEB_URL) } catch { /* noop */ } }
+    }
+  }
+  return ok
+}
+
 // 自动重启看护：服务意外退出后自动拉起（设置页开关，默认开；10s 冷却 + 最多连续 5 次，防崩溃死循环）
 let restartAttempts = 0
 let lastRestartAt = 0
@@ -485,7 +576,7 @@ function notify(title, message, url) {
         body: message,
         icon: IconNormal && !IconNormal.isEmpty() ? IconNormal : undefined,
       })
-      n.on('click', () => openWebUi())
+      n.on('click', () => openDshOrPanel())
       n.show()
     } else {
       log(`[notify] ${title}: ${message}`)
@@ -496,6 +587,7 @@ function notify(title, message, url) {
 function notifyStartResult(ok) {
   if (ok && server.owned()) notify('DeepSeek Harness', `服务已就绪：${WEB_URL}`)
   else if (ok) notify('DeepSeek Harness', `检测到已在运行的服务（PID ${server.displayPid()}），已接管`)
+  else if (server.blockedReason) notify('DeepSeek Harness', server.blockedReason)
   else if (envReady()) notify('DeepSeek Harness', '服务启动失败，请打开启动器面板查看日志')
   else notify('DeepSeek Harness', '运行环境未就绪，请打开启动器面板一键安装')
 }
@@ -518,6 +610,12 @@ async function handleStart() {
   broadcastState()
 }
 
+// 统一"打开"入口：环境未就绪或端口被占用 → 打开启动器面板（一键安装/一键换端口入口）；否则 → 独立窗口
+function openDshOrPanel() {
+  if (envReady() && !server.blockedReason) openWebUi()
+  else showPanel()
+}
+
 // ---------- 托盘 ----------
 let tray = null
 
@@ -525,10 +623,10 @@ function buildTray() {
   if (!IconNormal || IconNormal.isEmpty()) { log('tray icon missing, tray disabled'); return }
   tray = new Tray(IconNormal)
   tray.setToolTip('DeepSeek Harness Launcher')
-  tray.on('click', () => { if (envReady()) openWebUi(); else showPanel() }) // 环境未就绪时单击打开面板（一键安装入口）
+  tray.on('click', () => openDshOrPanel()) // 环境未就绪时单击打开面板（一键安装入口）
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示启动器面板', click: () => showPanel() },
-    { label: '打开 DeepSeek Harness', click: () => openWebUi() },
+    { label: '打开 DeepSeek Harness', click: () => openDshOrPanel() },
     { type: 'separator' },
     { label: '退出', click: () => { void requestExit() } },
   ]))
@@ -925,6 +1023,8 @@ function webCloseTab(id) {
   if (webRightId === id) webRightId = null
   if (webActiveId === id) webActiveId = webTabs.length ? (webTabs[idx - 1] || webTabs[0]).id : null
   if (webTabs.length < 2) { webSplitOn = false; webRightId = null }
+  // 关闭最后一个标签 → 立即补一个全新标签（窗口永远至少有 1 个标签，避免内容区整片空白）
+  if (webTabs.length === 0) webCreateTab()
   webLayout()
 }
 
@@ -1002,6 +1102,33 @@ function webCloseFocused() {
   webLayout()
 }
 
+// ---------- 独立窗口几何持久化（尺寸/位置/最大化，重启后恢复） ----------
+function saveWebWindowState() {
+  if (!webWin || webWin.isDestroyed()) return
+  try {
+    // 最大化/最小化时 getSize 返回的不是"常规尺寸"，只记最大化标志，不覆盖已存的正常尺寸
+    if (webWin.isMaximized() || webWin.isMinimized()) {
+      Config.webWindowMaximized = webWin.isMaximized()
+      return
+    }
+    const [w, h] = webWin.getSize()
+    const [x, y] = webWin.getPosition()
+    if (w >= 640 && h >= 480) {
+      Config.webWindowWidth = w
+      Config.webWindowHeight = h
+      Config.webWindowX = x
+      Config.webWindowY = y
+      Config.webWindowMaximized = false
+    }
+  } catch { /* noop */ }
+}
+
+let webStateSaveTimer = null
+function scheduleSaveWebWindowState() {
+  clearTimeout(webStateSaveTimer)
+  webStateSaveTimer = setTimeout(saveWebWindowState, 500) // resize/move 事件密集，防抖后落盘
+}
+
 function openWebUi(opts = {}) {
   log('open DeepSeek Harness window (systemBrowser=' + Config.useSystemBrowser + ')')
   stopFlash() // 任何"打开"动作都视为已读提醒
@@ -1016,7 +1143,10 @@ function openWebUi(opts = {}) {
     webWin.focus()
     return
   }
-  const [webW, webH] = defaultWebSize()
+  // 独立窗口尺寸：上次手动调整过的尺寸（≥最小）优先，否则默认 0.8×物理高、3:2
+  const [defW, defH] = defaultWebSize()
+  const webW = (Config.webWindowWidth >= 640 && Config.webWindowHeight >= 480) ? Config.webWindowWidth : defW
+  const webH = (Config.webWindowWidth >= 640 && Config.webWindowHeight >= 480) ? Config.webWindowHeight : defH
   webWin = new BrowserWindow({
     width: webW,
     height: webH,
@@ -1036,11 +1166,30 @@ function openWebUi(opts = {}) {
       backgroundThrottling: false,
     },
   })
-  // 显式居中：基于主显示器工作区计算坐标（不依赖 center 选项，虚拟显示器环境下更可靠）
-  try {
-    const wa = screen.getPrimaryDisplay().workArea
-    webWin.setPosition(Math.round(wa.x + (wa.width - webW) / 2), Math.round(wa.y + (wa.height - webH) / 2))
-  } catch { /* noop */ }
+  // 定位：上次位置仍在某个显示器工作区内 → 原位恢复；否则居中（防拔掉副屏后窗口落在屏幕外）
+  let posApplied = false
+  if (Number.isInteger(Config.webWindowX) && Number.isInteger(Config.webWindowY)) {
+    const px = Config.webWindowX
+    const py = Config.webWindowY
+    const onScreen = screen.getAllDisplays().some((d) => {
+      const wa = d.workArea
+      return px + webW > wa.x + 80 && px < wa.x + wa.width - 80 && py >= wa.y - 8 && py + 80 < wa.y + wa.height
+    })
+    if (onScreen) {
+      try { webWin.setPosition(px, py) } catch { /* noop */ }
+      posApplied = true
+    }
+  }
+  if (!posApplied) {
+    // 显式居中：基于主显示器工作区计算坐标（不依赖 center 选项，虚拟显示器环境下更可靠）
+    try {
+      const wa = screen.getPrimaryDisplay().workArea
+      webWin.setPosition(Math.round(wa.x + (wa.width - webW) / 2), Math.round(wa.y + (wa.height - webH) / 2))
+    } catch { /* noop */ }
+  }
+  if (Config.webWindowMaximized) {
+    try { webWin.maximize() } catch { /* noop */ }
+  }
   // 抢前台：确保窗口可见并置顶于当前层（远程串流场景防被遮挡）
   try { webWin.show(); webWin.focus(); webWin.moveTop() } catch { /* noop */ }
   log(`web win created: size=${webW}x${webH} bounds=${JSON.stringify(webWin.getBounds())}`)
@@ -1049,13 +1198,14 @@ function openWebUi(opts = {}) {
     try { webWin.webContents.setZoomLevel(0) } catch { /* noop */ }
   })
   attachContextMenu(webWin.webContents)
-  webWin.on('resize', () => webLayout())
+  webWin.on('resize', () => { webLayout(); scheduleSaveWebWindowState() })
+  webWin.on('move', () => scheduleSaveWebWindowState())
   // 最小化→恢复 / 隐藏→显示 不一定触发 resize：显式重排，防止页面区残留零尺寸（整片灰）
   webWin.on('show', () => webLayout())
   webWin.on('restore', () => webLayout())
-  // 最大化状态变化 → 重排 + 壳按钮图标/提示实时切换（□ ↔ ❐）
-  webWin.on('maximize', () => { webLayout(); webPushState() })
-  webWin.on('unmaximize', () => { webLayout(); webPushState() })
+  // 最大化状态变化 → 重排 + 壳按钮图标/提示实时切换（□ ↔ ❐）+ 持久化
+  webWin.on('maximize', () => { webLayout(); webPushState(); saveWebWindowState() })
+  webWin.on('unmaximize', () => { webLayout(); webPushState(); saveWebWindowState() })
   webWin.loadFile(path.join(WWWROOT, 'browser.html')).catch(() => { /* noop */ })
   webCreateTab() // 首个标签页：后台加载，挂载即显示
   // 点 ✕ 只隐藏到后台继续运行（页面与会话保持存活），托盘退出时才真正关闭
@@ -1098,6 +1248,9 @@ function stateJson() {
     owned: server.owned(),
     pid: server.displayPid(),
     url: WEB_URL,
+    port: PORT,
+    blocked: server.blockedReason || '',
+    suggestedPort: server.suggestedPort || 0,
     version: app.getVersion(),
     autostart: autostartEnabled(),
     notify: Config.notify,
@@ -1249,14 +1402,24 @@ function registerIpc() {
           Config.useSystemBrowser = false
           Config.autoRestart = true
           Config.tabsEnabled = false
+          const portBefore = PORT
+          Config.port = 0
           Config.windowWidth = 0
           Config.windowHeight = 0
+          Config.webWindowWidth = 0
+          Config.webWindowHeight = 0
+          Config.webWindowMaximized = false
+          Config.webWindowX = null
+          Config.webWindowY = null
           Config.harnessRoot = ''
           Config.nodePath = ''
           Config.dshVersion = '0.1.0-rc.6'
           Config.nodeMajor = 22
           Config.nodeMirror = ''
           Config.npmRegistry = ''
+          applyRuntimePort()
+          // 端口复位到默认 3080：若自己拉起的服务跑在自定义端口，重启到默认端口并重载页面
+          if (PORT !== portBefore && server.owned()) await restartServerOnNewPort()
           if (!autostartEnabled()) setAutostart(true)
           if (win && !win.isDestroyed()) {
             const [dw, dh] = defaultPanelSize()
@@ -1265,6 +1428,7 @@ function registerIpc() {
           }
           if (webWin && !webWin.isDestroyed()) {
             try {
+              if (webWin.isMaximized()) webWin.unmaximize()
               const [ww2, wh2] = defaultWebSize()
               webWin.setSize(ww2, wh2)
               webWin.center()
@@ -1281,6 +1445,39 @@ function registerIpc() {
         }
         case 'setUseSystemBrowser': Config.useSystemBrowser = !!value; saveConfig(); broadcastState(); return '{}'
         case 'setAutoRestart': Config.autoRestart = !!value; saveConfig(); broadcastState(); return '{}'
+        case 'setPort': {
+          // 服务端口（1024–65535）：保存后立即生效——自己拉起的服务重启到新端口并重载页面；
+          // 接管的外部实例不受控制，仅提示"下次由启动器启动时生效"
+          const p = Number(value)
+          if (!Number.isInteger(p) || p < 1024 || p > 65535) return '{}'
+          Config.port = p
+          saveConfig()
+          const before = PORT
+          applyRuntimePort()
+          if (PORT !== before) {
+            if (server.owned()) {
+              const ok = await restartServerOnNewPort()
+              notify('DeepSeek Harness', ok ? `服务已切换到端口 ${PORT}` : '新端口启动失败，请打开启动器面板查看日志')
+            } else if (server.adoptedPid) {
+              notify('DeepSeek Harness', `端口已保存为 ${PORT}；当前接管的外部实例不受控制，下次由启动器启动服务时生效`)
+            }
+          }
+          broadcastState()
+          return '{}'
+        }
+        case 'portSwitchStart': {
+          // "端口被占用"场景的一键换端口：保存建议端口并立即尝试启动
+          const p = Number(value && value.port)
+          if (!Number.isInteger(p) || p < 1024 || p > 65535) return '{}'
+          Config.port = p
+          saveConfig()
+          applyRuntimePort()
+          server.blockedReason = ''
+          server.suggestedPort = 0
+          await handleStart()
+          broadcastState()
+          return '{}'
+        }
         case 'setTabsEnabled': {
           // 关闭时：退出分屏并只保留当前标签，标题栏回到"标题 + 最小化/最大化/关闭"精简形态
           Config.tabsEnabled = !!value
@@ -1365,6 +1562,7 @@ async function requestExit() {
   if (reallyExit) return
   reallyExit = true
   stopFlash()
+  saveWebWindowState() // 退出前落盘独立窗口几何（防抖定时器可能尚未触发）
   if (server.owned()) await stopServerFast()
   log('tray exiting')
   try { saveConfig() } catch { /* noop */ }
@@ -1440,7 +1638,7 @@ async function runSelfTest() {
     if (!win || win.isDestroyed()) { selftestPrint('FAILED: window not created'); app.exit(2); return }
     const title = await win.webContents.executeJavaScript('document.title')
     const panel = await win.webContents.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用
@@ -1514,6 +1712,7 @@ function cssZoomPct() {
 // ---------- 初始化 ----------
 function init() {
   loadConfig()
+  applyRuntimePort() // 端口配置生效（命令行 --port / 设置页"服务端口"）
   initEnvRuntime()
   Config.zoom = systemZoom() // 启动器缩放默认跟随系统（不持久化，每次启动重读）
   Config.webZoom = cssZoomPct() // 对话界面缩放默认 = 独立窗口当前缩放（校正后）
@@ -1569,9 +1768,9 @@ function init() {
 
 // ---------- 应用生命周期 ----------
 if (IS_WIN) { try { app.setAppUserModelId('com.dshl.launcher') } catch { /* noop */ } }
-app.on('before-quit', () => { reallyExit = true })
+app.on('before-quit', () => { reallyExit = true; saveWebWindowState() }) // 覆盖更新安装等非托盘路径的退出
 app.on('window-all-closed', () => { /* 托盘常驻，不退出 */ })
-app.on('activate', () => openWebUi()) // macOS Dock 点击
+app.on('activate', () => openDshOrPanel()) // macOS Dock 点击
 process.on('uncaughtException', (err) => { try { log('uncaught: ' + ((err && err.stack) || err)) } catch { /* noop */ } })
 
 try { fs.unlinkSync(SELFTEST_RESULT) } catch { /* noop */ }
@@ -1583,7 +1782,7 @@ if (!SELF_TEST) {
     app.on('second-instance', () => {
       // 已有一个实例在跑：提示用户（避免"双击了新包但好像没反应"的困惑），并打开窗口
       notify('DeepSeek Harness', '启动器已在运行（托盘图标），本次双击未启动新实例')
-      openWebUi()
+      openDshOrPanel()
     })
     app.whenReady().then(init)
   }

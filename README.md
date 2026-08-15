@@ -61,7 +61,10 @@ npm start              # 开发模式运行（或双击 dshl.vbs 隐藏启动）
 npm run selftest       # 自检：临时 DSH_HOME + 端口 3999，不影响正在运行的服务
 npm run envcheck       # 独立环境探测（退出码 0 就绪 / 1 缺失 / 2 错误）
 npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--publish never，不自动上传）
+npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub Release 并上传三件套
 ```
+
+**发布**（`tools/release.mjs`）：前置 = 工作区干净、已 `git push origin main`、安装并登录 GitHub CLI（`winget install GitHub.cli && gh auth login`）。脚本会校验 tag 不存在、产物齐全后 `gh release create v<版本> dshl-<版本>.exe .blockmap latest.yml`；客户端 `electron-updater` 依据 `latest.yml` 自动更新。
 
 ## 运行环境（自动检测 + 一键安装）
 
@@ -99,6 +102,12 @@ npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--pu
   "useSystemBrowser": false,
   "autoRestart": true,
   "tabsEnabled": false,
+  "port": 0,
+  "webWindowWidth": 0,
+  "webWindowHeight": 0,
+  "webWindowMaximized": false,
+  "webWindowX": null,
+  "webWindowY": null,
   "harnessRoot": "",
   "nodePath": "",
   "dshVersion": "0.1.0-rc.6",
@@ -113,6 +122,8 @@ npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--pu
 - 启动器面板默认尺寸：**窗口可调整的最小尺寸（480×600）**；手动调整后会记住，设置页"恢复默认设置"可一键清回默认并复位窗口。
 - DeepSeek Harness 独立窗口默认尺寸：**高 = 0.8 × 物理分辨率高**（物理 = 逻辑 × 系统缩放），**宽:高 = 3:2**，屏幕居中。
 - 窗口定位：DeepSeek Harness 独立窗口**屏幕居中**；启动器面板**右下角紧贴任务栏**（右缘贴屏幕、下缘贴任务栏上沿）。
+- **独立窗口几何持久化**：手动调整后的尺寸/位置/最大化状态自动记住（resize/move 防抖落盘），重启后原位恢复；位置不在任何显示器工作区内时自动回退居中（防拔副屏后窗口失踪）；"恢复默认设置"清回默认。
+- **服务端口**（设置页，默认 3080）：双击输入新端口（1024–65535）。自己拉起的服务会**立即重启到新端口**并重载所有打开的页面；接管的外部实例不受控制（仅保存，下次由启动器启动时生效）；恢复默认回 3080。
 - 设置页"恢复默认设置"按钮：所有选项（缩放/主题/提醒/浏览器方式/自动重启/窗口尺寸/自启）一次恢复默认值。
 - **自动重启看护**（设置页开关，默认开）：服务意外退出后自动拉起（10 秒冷却、连续 5 次上限防崩溃死循环），成功后弹"服务已自动重启"通知；接管的外部实例死亡同样触发。
 - **日志轮转**：`dshl.log` 与 `server.{out,err}.log` 超过 1MB 自动转存 `.1/.2/.3`，保留最近 3 份。
@@ -132,9 +143,9 @@ npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--pu
 
 ## 与 DSH 的协作
 
-- 服务启动：按环境探测结果 spawn（源码版 = `<harnessRoot>/apps/cli/lib/bin.js`；全局/npx/托管 = 各自包内 `lib/bin.js`），统一参数 `web --host 127.0.0.1 --port 3080`（隐藏窗口，日志写入 `~/.dsh/dshl-logs/server.{out,err}.log`）。
+- 服务启动：按环境探测结果 spawn（源码版 = `<harnessRoot>/apps/cli/lib/bin.js`；全局/npx/托管 = 各自包内 `lib/bin.js`），统一参数 `web --host 127.0.0.1 --port <服务端口（默认 3080，设置页可改）>`（隐藏窗口，日志写入 `~/.dsh/dshl-logs/server.{out,err}.log`）。
 - 环境未就绪时：不盲 spawn，托盘单击打开面板引导一键安装；自动重启看护同样跳过（重测缓存 30s，用户外部装好后自动就绪）。
-- 端口探测 + 接管：端口被占时接管外部实例（退出时不停止它）。
+- 端口探测 + 接管：端口被占时**先做 HTTP 指纹验证**（根页面含 "DeepSeek Harness" 标题字样）确认是 DSH 才接管（退出时不停止它）；被其他程序占用则**拒绝接管与启动**：自动探测出下一个空闲端口，面板弹"⚠ 服务端口被占用"警示卡，**一键"换到端口 X 并启动"**（也可去设置页手动改端口），绝不误杀。
 - 会话通知：复用 `dsh-notify` 插件的 dropbox（`~/.dsh/dshl-logs/notify/*.json`，插件已同步使用 dshl-logs）。
 - 托盘自身日志：`~/.dsh/dshl-logs/dshl.log`。
 

@@ -102,6 +102,51 @@ const zoomWidgets = {
   web: makeZoomWidget('btnWebZoom', 50, 300, 'setWebZoom'),
 };
 
+// ---------- 服务端口控件：双击变输入框（1024–65535），保存后服务自动切换端口 ----------
+function initPortWidget() {
+  const el = $('btnPort');
+  const ui = { value: 3080, editing: false };
+  const setText = () => { el.textContent = String(ui.value); };
+  el.addEventListener('dblclick', () => {
+    if (ui.editing) return;
+    ui.editing = true;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = 1024;
+    input.max = 65535;
+    input.step = 1;
+    input.value = ui.value;
+    input.className = 'zoom-input';
+    el.textContent = '';
+    el.appendChild(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = () => { if (done) return; done = true; ui.editing = false; input.remove(); setText(); };
+    const commit = () => {
+      const v = parseInt(input.value, 10);
+      if (Number.isInteger(v) && v >= 1024 && v <= 65535) {
+        ui.value = v;
+        cmd('setPort', v);
+      }
+      finish();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') finish();
+    });
+    input.addEventListener('blur', commit);
+  });
+  return {
+    setFromState(v) {
+      if (ui.editing || !Number.isInteger(v)) return;
+      ui.value = v;
+      setText();
+    },
+  };
+}
+const portCtl = initPortWidget();
+
 function buildChips(containerId, items, checkedKey, onPick) {
   const container = $(containerId);
   container.textContent = '';
@@ -155,15 +200,32 @@ function render(state) {
   const running = window._running;
   const rowDot = $('statusRowDot');
   const rowWrap = $('statusText');
+  $('portWarnCard').classList.add('hidden');
   if (running) {
     rowWrap.className = 'value strong status-value running';
     rowDot.className = 'dot running';
     const origin = state.owned ? '由本工具启动' : '接管外部服务';
     $('statusRowText').textContent = `运行中（${origin}）`;
+    $('statusRowText').title = '';
+  } else if (state.blocked) {
+    // 端口被非 DSH 程序占用：拒绝接管，也不允许启动
+    rowWrap.className = 'value strong status-value stopped';
+    rowDot.className = 'dot stopped';
+    $('statusRowText').textContent = '已停止（端口被占用）';
+    $('statusRowText').title = state.blocked;
+    // 警示卡：完整原因 + 一键换到建议的空闲端口
+    $('portWarnCard').classList.remove('hidden');
+    $('portWarnDetail').textContent = state.blocked;
+    const suggested = Number.isInteger(state.suggestedPort) && state.suggestedPort > 0 ? state.suggestedPort : 0;
+    window._suggestedPort = suggested;
+    const sw = $('btnPortSwitch');
+    sw.classList.toggle('hidden', !suggested);
+    if (suggested) sw.textContent = `换到端口 ${suggested} 并启动`;
   } else {
     rowWrap.className = 'value strong status-value stopped';
     rowDot.className = 'dot stopped';
     $('statusRowText').textContent = '已停止';
+    $('statusRowText').title = '';
   }
   $('urlText').textContent = state.url || '-';
   window._currentUrl = state.url || '';
@@ -191,6 +253,7 @@ function render(state) {
     applyZoom(state.cssZoom ?? state.zoom);
   }
   zoomWidgets.web.setFromState(state.webZoom ?? 100);
+  portCtl.setFromState(state.port || 3080);
 
   // 主题 chips（仅值变化时重建，避免打断点击）
   if (window._lastTheme !== state.theme) {
@@ -406,6 +469,10 @@ $('btnReset').addEventListener('click', () => cmd('resetDefaults'));
 $('btnEnvBack').addEventListener('click', () => showPage('main'));
 $('btnEnvFix').addEventListener('click', () => showPage('env'));
 $('btnEnvOpen').addEventListener('click', () => showPage('env'));
+$('btnPortSwitch').addEventListener('click', () => {
+  if (window._suggestedPort) cmd('portSwitchStart', { port: window._suggestedPort });
+});
+$('btnPortOpenSettings').addEventListener('click', () => showPage('settings'));
 $('btnEnvRecheck').addEventListener('click', () => { void cmd('envDetect'); });
 $('btnEnvCopyDiag').addEventListener('click', () => { void cmd('envCopyDiagnostics'); });
 $('btnEnvInstallAll').addEventListener('click', () => {

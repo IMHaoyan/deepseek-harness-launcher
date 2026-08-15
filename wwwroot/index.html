@@ -50,6 +50,16 @@
       </div>
     </section>
 
+    <!-- 端口被其他程序占用警示（HTTP 指纹验证未通过，拒绝接管） -->
+    <section class="card env-warning hidden" id="portWarnCard">
+      <div class="env-warn-title">⚠ 服务端口被占用</div>
+      <div class="env-warn-detail" id="portWarnDetail"></div>
+      <div class="actions">
+        <button class="btn primary hidden" id="btnPortSwitch">换到端口并启动</button>
+        <button class="btn" id="btnPortOpenSettings">打开设置改端口</button>
+      </div>
+    </section>
+
     <!-- 底端：项目链接 + 更新入口（有新版时"更新日志"右侧显示绿色 ↑ 指示，点击进入设置页） -->
     <section class="card actions main-footer">
       <button class="btn" id="btnGithub">Github地址</button>
@@ -148,6 +158,12 @@
         <span class="label">自动重启</span>
         <div class="chips">
           <button class="chip" id="btnAutoRestart">开启</button>
+        </div>
+      </div>
+      <div class="row long-label">
+        <span class="label">服务端口</span>
+        <div class="chips">
+          <button class="chip" id="btnPort" title="双击输入新端口（1024–65535），保存后服务自动切换到新端口">3080</button>
         </div>
       </div>
       <div class="row long-label">

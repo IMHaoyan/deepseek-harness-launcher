@@ -12,7 +12,8 @@
     "selftest": "electron . --selftest",
     "envcheck": "node tools/envcheck.cjs",
     "dist:win": "electron-builder --win --publish never",
-    "dist:mac": "electron-builder --mac"
+    "dist:mac": "electron-builder --mac",
+    "release": "node tools/release.mjs"
   },
   "dependencies": {
     "semver": "^7.7.1",
