@@ -1,0 +1,210 @@
+/* DSHL 浏览器壳样式（Edge 式：壳仅绘制 tab 条与分隔条，页面视图由主进程原生挂载） */
+:root {
+  --bg: #F9FAFB;
+  --card: #FFFFFF;
+  --border: rgba(0, 0, 0, 0.1);
+  --border-soft: rgba(0, 0, 0, 0.04);
+  --text-primary: #0F1115;
+  --text-secondary: #61666B;
+  --brand: #4D6BFE;
+  --brand-hover: #5686FE;
+  --ghost-hover: rgba(38, 49, 72, 0.06);
+  --ghost-active: rgba(38, 49, 72, 0.1);
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --ratio: 0.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #353536;
+    --card: #2B2B2C;
+    --border: rgba(255, 255, 255, 0.12);
+    --border-soft: rgba(255, 255, 255, 0.06);
+    --text-primary: #F9FAFB;
+    --text-secondary: #D3D5D6;
+    --brand: #5686FE;
+    --brand-hover: #679EFE;
+    --ghost-hover: rgba(255, 255, 255, 0.08);
+    --ghost-active: rgba(255, 255, 255, 0.14);
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; overflow: hidden; }
+
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ---------- Tab 栏（无边框窗口的标题栏，可拖动窗口） ---------- */
+
+/* 首次状态推送前隐藏标题栏，避免"标签/精简形态"闪变 */
+body:not(.ready) #tabbar { visibility: hidden; }
+
+#tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  height: 42px; /* 38px × 130% ≈ 49px，再 × 85% ≈ 41.65 → 取整 42px；与 main.js WEB_TAB_H 保持一致 */
+  padding: 0 0 0 8px; /* 右侧窗口按钮组贴窗缘（Edge 式） */
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-soft);
+  -webkit-app-region: drag;
+}
+
+.drag-space {
+  flex: 1;
+  min-width: 8px;
+  height: 100%;
+}
+
+/* 精简形态（"启用标签和内部分屏功能"关闭时）：仅显示窗口标题 */
+.title-only {
+  display: flex;
+  align-items: center;
+  flex: none;
+  max-width: 60%;
+  height: 100%;
+  padding: 0 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  -webkit-app-region: drag;
+}
+
+.title-only.hidden { display: none; }
+
+#tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: none;
+  max-width: 70%;
+  min-width: 0;
+  -webkit-app-region: drag;
+}
+
+#tabs::-webkit-scrollbar { display: none; }
+
+.tab {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 243px; /* tab 横向长度上限：270px 的 90% */
+  height: 100%;
+  padding: 0 13.5px; /* 15px 的 90% */
+  border: none;
+  border-radius: 8px 8px 0 0; /* Edge 式：直角矩形，仅顶部小圆角 */
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font);
+  font-size: 12.6px; /* 标签标题字体：18px 的 70% */
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+.tab:hover { background: var(--ghost-hover); }
+.tab.active { background: var(--card); color: var(--text-primary); box-shadow: 0 0 0 1px var(--border-soft); }
+
+.tab .t-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 175.5px; /* 195px 的 90% */
+}
+
+.tab .t-close {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.tab .t-close:hover { background: var(--ghost-active); color: var(--text-primary); }
+
+.bar-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 14px;
+  border: none;
+  border-radius: 0; /* Edge 式直角 */
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.bar-btn:hover { background: var(--ghost-hover); }
+.bar-btn.on { background: var(--brand); color: #FFFFFF; }
+.bar-btn.on:hover { background: var(--brand-hover); }
+
+/* 窗口按钮组：贴右缘、彼此无间距、全高直角（Edge 式） */
+.win-group {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.win-btn {
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-app-region: no-drag;
+}
+
+.win-btn:hover { background: var(--ghost-hover); }
+.win-btn.close:hover { background: #EC1313; color: #FFFFFF; }
+
+/* ---------- 分隔条（位于两个原生视图之间的缝隙，壳在此接收拖拽） ---------- */
+
+#divider {
+  position: fixed;
+  top: 42px; /* 与 #tabbar 高度一致 */
+  bottom: 0;
+  width: 5px;
+  left: calc(var(--ratio) * 100% - 2.5px);
+  cursor: col-resize;
+  background: var(--border-soft);
+  z-index: 10;
+}
+
+#divider:hover, #divider.dragging { background: var(--brand); }
+
+#divider.hidden { display: none; }

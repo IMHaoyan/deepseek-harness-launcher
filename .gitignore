@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+dshl-selftest-*
+.DS_Store
+Thumbs.db
+# 本地命名讨论存档（内部文档，不随公开仓库发布）
+NAMES.md

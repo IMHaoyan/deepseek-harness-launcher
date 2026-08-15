@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
+  <title>DeepSeek Harness · 离线</title>
+  <style>
+    html, body { height: 100%; }
+    body {
+      margin: 0; display: flex; align-items: center; justify-content: center;
+      background: #F9FAFB;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      color: #0F1115;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #353536; color: #F9FAFB; }
+      .card { background: #2B2B2C !important; border-color: rgba(255, 255, 255, 0.12) !important; }
+      .sub { color: #D3D5D6 !important; }
+    }
+    .card {
+      background: #FFFFFF;
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      border-radius: 12px;
+      padding: 32px 40px;
+      text-align: center;
+      max-width: 440px;
+    }
+    h1 { font-size: 16px; font-weight: 500; margin: 0 0 8px; }
+    .sub { font-size: 13px; color: #61666B; line-height: 20px; margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>DeepSeek Harness 服务未启动</h1>
+    <p class="sub">请先在启动器面板点击「启动服务」，<br>服务就绪后本窗口会自动进入 DeepSeek Harness。</p>
+  </div>
+</body>
+</html>

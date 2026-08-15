@@ -1,0 +1,621 @@
+/* DeepSeek Harness 设计令牌（取自 design-platform.css）
+   亮色默认（data-theme="light"）；[data-theme="dark"] 与 system+系统暗色共用暗色令牌。 */
+:root {
+  --bg: #F9FAFB;                 /* neutral-bluish-60 / module-platform */
+  --card: #FFFFFF;               /* layer-1 */
+  --border: rgba(0, 0, 0, 0.1); /* border-l2 */
+  --border-soft: rgba(0, 0, 0, 0.04);
+  --text-primary: #0F1115;       /* bluish-1000 */
+  --text-secondary: #61666B;     /* bluish-700 */
+  --text-tertiary: #818589;      /* bluish-600 */
+  --brand: #4D6BFE;              /* DeepSeek 品牌蓝 */
+  --brand-hover: #5686FE;        /* deepseek-450 */
+  --brand-active: #4176E6;       /* deepseek-500 */
+  --primary-fill: #4D6BFE;
+  --primary-hover: #5686FE;
+  --primary-active: #4176E6;
+  --primary-fore: #FFFFFF;
+  --ghost-hover: rgba(38, 49, 72, 0.06);
+  --ghost-active: rgba(38, 49, 72, 0.1);
+  --danger: #EC1313;
+  --danger-hover: rgba(236, 19, 19, 0.05);
+  --success: #22C55E;
+  --error: #EC1313;
+  --log-bg: #F9FAFB;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+[data-theme="dark"] {
+  --bg: #353536;
+  --card: #2B2B2C;
+  --border: rgba(255, 255, 255, 0.12);
+  --border-soft: rgba(255, 255, 255, 0.06);
+  --text-primary: #F9FAFB;
+  --text-secondary: #D3D5D6;
+  --text-tertiary: #ADB2B8;
+  --brand: #5686FE;
+  --brand-hover: #679EFE;
+  --brand-active: #4176E6;
+  --primary-fill: #5686FE;
+  --primary-hover: #679EFE;
+  --primary-active: #4D6BFE;
+  --primary-fore: #FFFFFF;
+  --ghost-hover: rgba(255, 255, 255, 0.08);
+  --ghost-active: rgba(255, 255, 255, 0.14);
+  --danger: #F25A5A;
+  --danger-hover: rgba(242, 90, 90, 0.15);
+  --success: #22C55E;
+  --error: #F25A5A;
+  --log-bg: #1B1B1C;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --bg: #353536;
+    --card: #2B2B2C;
+    --border: rgba(255, 255, 255, 0.12);
+    --border-soft: rgba(255, 255, 255, 0.06);
+    --text-primary: #F9FAFB;
+    --text-secondary: #D3D5D6;
+    --text-tertiary: #ADB2B8;
+    --brand: #5686FE;
+    --brand-hover: #679EFE;
+    --brand-active: #4176E6;
+    --primary-fill: #5686FE;
+    --primary-hover: #679EFE;
+    --primary-active: #4D6BFE;
+    --primary-fore: #FFFFFF;
+    --ghost-hover: rgba(255, 255, 255, 0.08);
+    --ghost-active: rgba(255, 255, 255, 0.14);
+    --danger: #F25A5A;
+    --danger-hover: rgba(242, 90, 90, 0.15);
+    --success: #22C55E;
+    --error: #F25A5A;
+    --log-bg: #1B1B1C;
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 22px;
+  padding: 16px;
+  overflow-y: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ---------- 头部 ---------- */
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 4px 14px;
+}
+
+.whale {
+  flex: none;
+  color: var(--text-primary);
+}
+
+.titles h1 {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 24px;
+}
+
+.titles p {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 18px;
+}
+
+.status-pill {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--card);
+  border: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+
+.header-btn { margin-left: auto; }
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  flex: none;
+}
+
+.dot.running { background: var(--success); }
+.dot.stopped { background: var(--error); }
+.status-pill.running { color: var(--success); }
+.status-pill.stopped { color: var(--error); }
+
+/* 状态行：运行中的指示点与文字均为绿色（对齐 StateDot 语义） */
+.status-value { display: inline-flex; align-items: center; gap: 8px; }
+.status-value.running { color: var(--success); }
+.status-value.stopped { color: var(--error); }
+
+/* ---------- 卡片 ---------- */
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  gap: 12px;
+}
+
+.row + .row { margin-top: 2px; }
+
+/* 设置行标题：14px/22 主色（对齐 AppearanceRow 规格） */
+.label {
+  flex: none;
+  width: 88px;
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 22px;
+}
+
+/* 长标题行：标题在上、控件在下，控件左缘与其他行严格对齐（88px 标签列 + 12px 间距） */
+.row.stack {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.row.stack .label {
+  width: auto;
+}
+
+.row.stack .chips {
+  margin-left: 100px;
+}
+
+/* 设置页：选项控件靠右对齐（label 靠左，chips/按钮贴右缘；主页状态行不受影响） */
+#pageSettings .row {
+  justify-content: space-between;
+}
+
+#pageSettings .row.stack .chips {
+  margin-left: auto;
+}
+
+/* 长标题行：标题与按钮同在一行，label 占自适应宽度（按钮已靠右对齐） */
+#pageSettings .row.long-label .label {
+  width: auto;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.value {
+  color: var(--text-primary);
+  font-size: 14px;
+  line-height: 22px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.value.strong { font-weight: 500; }
+.value.mono { font-family: var(--font-mono); font-size: 13px; color: var(--text-tertiary); }
+
+/* 地址行：可点击，默认浏览器打开 */
+.value.link { cursor: pointer; }
+.value.link:hover { color: var(--brand); text-decoration: underline; }
+
+/* ---------- 按钮（胶囊，h36/r18，对齐 Button.module.css） ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 18px;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--text-primary);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 100ms ease;
+  white-space: nowrap;
+}
+
+.btn:hover { background: var(--ghost-hover); }
+.btn:active { background: var(--ghost-active); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn:disabled:hover, .btn:disabled:active { background: transparent; }
+
+/* 主按钮：DeepSeek 品牌蓝 */
+.btn.primary {
+  background: var(--primary-fill);
+  color: var(--primary-fore);
+}
+.btn.primary:hover { background: var(--primary-hover); }
+.btn.primary:active { background: var(--primary-active); }
+.btn.primary:disabled:hover, .btn.primary:disabled:active { background: var(--primary-fill); }
+
+.btn.danger { color: var(--danger); }
+.btn.danger:hover { background: var(--danger-hover); }
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 14px;
+}
+
+/* ---------- 胶囊选择器（chips，h28/r14） ---------- */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 14px;
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-primary);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 100ms ease;
+  white-space: nowrap;
+}
+
+.chip:hover { background: var(--ghost-hover); }
+.chip.checked {
+  background: var(--primary-fill);
+  color: var(--primary-fore);
+}
+.chip.checked:hover { background: var(--primary-hover); }
+
+/* ---------- 缩放微调按钮（拖动 + 双击输入） ---------- */
+
+.zoom-widget {
+  min-width: 72px;
+  cursor: ew-resize;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background-color 100ms ease;
+}
+
+.zoom-widget.dragging {
+  background: var(--primary-active);
+  color: var(--primary-fore);
+}
+
+.zoom-input {
+  width: 76px;
+  height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+  outline: none;
+  padding: 0 6px;
+}
+
+.zoom-input:focus { border-color: var(--brand); }
+
+/* ---------- 页面切换 ---------- */
+
+/* 通用隐藏：任何带 hidden 类的元素都不显示。
+   此前只有 .page.hidden，导致 envWarnCard（card env-warning hidden）与 envProgressWrap 等非 .page 元素
+   的 hidden 类完全无效——警示卡永远显示，无论环境是否就绪。 */
+.hidden { display: none !important; }
+
+.page.hidden { display: none !important; }
+
+#pageMain,
+#pageSettings {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- 子页面（设置 / 日志） ---------- */
+
+#pageLog {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 0 12px;
+  flex: none;
+}
+
+.page-title {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 24px;
+  color: var(--text-primary);
+}
+
+#btnOpenLogsDir { margin-left: auto; }
+
+/* 小号按钮（设置行内的"测试通知"） */
+.btn.sm {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+#log {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-secondary);
+  background: var(--log-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 12px;
+  min-height: 0;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* ---------- 运行环境页（检测 + 一键安装向导） ---------- */
+
+/* 主页面环境警示卡 */
+.env-warning { border-color: rgba(236, 19, 19, 0.35); }
+
+.env-warn-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--error);
+  margin-bottom: 4px;
+}
+
+.env-warn-detail {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* 环境状态卡 */
+.env-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.env-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.env-badge {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: #FFFFFF;
+}
+
+.env-badge-ok { background: var(--success); }
+.env-badge-warn { background: #F59E0B; }
+.env-badge-bad { background: var(--error); }
+
+.env-card-name {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+}
+
+.env-card-version {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-left: auto;
+}
+
+.env-card-detail {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  user-select: text;
+  -webkit-user-select: text;
+  word-break: break-all;
+}
+
+.env-card-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+
+/* 安装向导 */
+.env-install-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.env-install-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  flex: 1;
+  min-width: 0;
+}
+
+.env-stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.env-stage {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+
+.env-stage.active {
+  color: var(--primary-fore);
+  background: var(--primary-fill);
+  border-color: transparent;
+}
+
+.env-stage.done { color: var(--success); }
+.env-stage.error { color: var(--error); border-color: rgba(236, 19, 19, 0.4); }
+
+.progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border-soft);
+  overflow: hidden;
+  margin-top: 10px;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--primary-fill);
+  transition: width 120ms ease;
+}
+
+.env-stage-text {
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-primary);
+  margin-top: 8px;
+}
+
+.env-install-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  align-items: center;
+}
+
+.env-log-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+#envLog {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-secondary);
+  background: var(--log-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 10px;
+  margin-top: 8px;
+  height: 180px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* 手动安装指引 */
+.env-manual-title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  margin-bottom: 6px;
+}
+
+.env-manual-body {
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--text-secondary);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.env-manual-body p { margin-bottom: 4px; }
+
+.env-code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--log-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 1px 6px;
+  user-select: text;
+  -webkit-user-select: text;
+}

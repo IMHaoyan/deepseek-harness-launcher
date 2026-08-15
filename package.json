@@ -1,0 +1,66 @@
+{
+  "name": "deepseek-harness-launcher",
+  "productName": "DeepSeek Harness Launcher",
+  "version": "1.0.4",
+  "description": "DeepSeek Harness Launcher（DSHL）—— Windows 托盘启动器/看护工具",
+  "main": "main.js",
+  "private": true,
+  "author": "dshl",
+  "scripts": {
+    "build:assets": "node tools/build-assets.mjs",
+    "start": "electron .",
+    "selftest": "electron . --selftest",
+    "envcheck": "node tools/envcheck.cjs",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac"
+  },
+  "dependencies": {
+    "semver": "^7.7.1",
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^34.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.dshl.launcher",
+    "productName": "DeepSeek Harness Launcher",
+    "files": [
+      "main.js",
+      "preload.js",
+      "browser-preload.js",
+      "env-detect.js",
+      "env-install.js",
+      "updater.js",
+      "wwwroot/**/*",
+      "assets/**/*"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/ds.ico",
+      "artifactName": "dshl-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DeepSeek Harness Launcher",
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.utilities"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "IMHaoyan",
+      "repo": "deepseek-harness-launcher"
+    }
+  }
+}

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <title>DeepSeek Harness Launcher 启动器面板</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- 主页面 -->
+  <div id="pageMain" class="page">
+    <header class="header">
+      <svg class="whale" viewBox="0 0 23.16 17.04" width="24" aria-hidden="true">
+        <path fill="currentColor" d="__WHALE_PATH__"/>
+      </svg>
+      <div class="titles">
+        <h1>DeepSeek Harness Launcher</h1>
+        <p id="panelVersion">启动器面板</p>
+      </div>
+      <button class="btn header-btn" id="btnSettings" title="设置">⚙ 设置</button>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <span class="label">状态</span>
+        <span class="value strong status-value" id="statusText">
+          <span class="dot" id="statusRowDot"></span><span id="statusRowText">检测中…</span>
+        </span>
+      </div>
+      <div class="row">
+        <span class="label">地址</span>
+        <span class="value mono link" id="urlText" title="在默认浏览器中打开">-</span>
+      </div>
+    </section>
+
+    <section class="card actions">
+      <button class="btn primary" id="btnOpen">打开 DeepSeek Harness</button>
+      <button class="btn primary" id="btnToggle">启动服务</button>
+      <button class="btn" id="btnLogs">查看日志</button>
+    </section>
+
+    <!-- 环境未就绪警示（检测到缺失/版本过低时显示） -->
+    <section class="card env-warning hidden" id="envWarnCard">
+      <div class="env-warn-title">⚠ 运行环境未就绪</div>
+      <div class="env-warn-detail" id="envWarnDetail"></div>
+      <div class="actions">
+        <button class="btn primary" id="btnEnvFix">一键安装环境</button>
+        <button class="btn" id="btnEnvOpen">查看环境详情</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- 运行环境页面（检测 + 一键安装向导） -->
+  <div id="pageEnv" class="page hidden">
+    <div class="page-header">
+      <button class="btn" id="btnEnvBack">← 返回</button>
+      <span class="page-title">运行环境</span>
+      <button class="btn" id="btnEnvCopyDiag">复制诊断信息</button>
+      <button class="btn" id="btnEnvRecheck">重新检测</button>
+    </div>
+
+    <div id="envCards"></div>
+
+    <section class="card">
+      <div class="env-install-head">
+        <button class="btn primary" id="btnEnvInstallAll">一键安装缺失环境</button>
+        <span class="env-install-hint" id="envInstallHint">检测中…</span>
+      </div>
+      <div id="envProgressWrap" class="hidden">
+        <div class="env-stages" id="envStages"></div>
+        <div class="progress"><div class="progress-bar" id="envProgressBar"></div></div>
+        <div class="env-stage-text" id="envStageText"></div>
+        <div class="env-install-actions">
+          <button class="btn sm" id="btnEnvCancel">取消</button>
+          <button class="btn sm" id="btnEnvRetry" style="display:none">重试</button>
+          <button class="btn sm" id="btnEnvOpenInstallLog">打开安装日志文件</button>
+        </div>
+        <label class="env-log-opt"><input type="checkbox" id="envLogAuto" checked>自动滚动</label>
+        <pre id="envLog"></pre>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="env-manual">
+        <div class="env-manual-title">手动安装指引（官方方式）</div>
+        <div class="env-manual-body">
+          <p><b>Node.js</b>：到 nodejs.org 下载 LTS 安装包（需 22.19+ 或 24+）。</p>
+          <p><b>DeepSeek Harness</b>：安装 Node.js 后执行 <span class="env-code">npx @deepseek-ai/dsh web</span>；或克隆仓库 <span class="env-code">git clone https://github.com/deepseek-ai/deepseek-harness.git</span> 后 <span class="env-code">pnpm install &amp;&amp; pnpm run build</span>。</p>
+          <p>安装完成后回到本页点击"重新检测"。</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 设置页面 -->
+  <div id="pageSettings" class="page hidden">
+    <div class="page-header">
+      <button class="btn" id="btnSettingsBack">← 返回</button>
+      <span class="page-title">设置</span>
+    </div>
+
+    <section class="card">
+      <!-- 启动器缩放已隐藏（面板固定跟随系统缩放）；元素保留以免自检断言失效 -->
+      <div class="row hidden">
+        <span class="label">启动器缩放</span>
+        <div class="chips">
+          <button class="chip checked zoom-widget" id="btnZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="label">对话界面缩放</span>
+        <div class="chips">
+          <button class="chip checked zoom-widget" id="btnWebZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="label">主题</span>
+        <div class="chips" id="themeChips"></div>
+      </div>
+      <div class="row">
+        <span class="label">消息提醒</span>
+        <div class="chips">
+          <button class="chip" id="btnNotify">开启</button>
+          <button class="btn sm" id="btnTest">测试通知</button>
+        </div>
+      </div>
+      <div class="row long-label">
+        <span class="label">使用系统浏览器打开DSH</span>
+        <div class="chips">
+          <button class="chip" id="btnSystemBrowser">关闭</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="label">开机自启</span>
+        <div class="chips">
+          <button class="chip" id="btnAuto">开启</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="label">自动重启</span>
+        <div class="chips">
+          <button class="chip" id="btnAutoRestart">开启</button>
+        </div>
+      </div>
+      <div class="row long-label">
+        <span class="label">启用标签和内部分屏功能</span>
+        <div class="chips">
+          <button class="chip" id="btnTabsEnabled">关闭</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="label">运行环境</span>
+        <div class="chips">
+          <button class="btn sm" id="btnOpenEnv">环境详情 / 诊断</button>
+        </div>
+      </div>
+      <div class="row long-label">
+        <span class="label">版本与更新</span>
+        <div class="chips">
+          <span class="value" id="updaterStatus">v-</span>
+          <button class="btn sm" id="btnUpdaterCheck">检查更新</button>
+          <button class="btn sm primary hidden" id="btnUpdaterInstall">重启并安装</button>
+        </div>
+      </div>
+      <div class="row" id="updaterDetailRow">
+        <span class="label" id="updaterDetail"></span>
+      </div>
+      <div class="row">
+        <span class="label">恢复默认</span>
+        <div class="chips">
+          <button class="btn sm danger" id="btnReset">恢复默认设置</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 日志页面 -->
+  <div id="pageLog" class="page hidden">
+    <div class="page-header">
+      <button class="btn" id="btnBack">← 返回</button>
+      <span class="page-title">运行日志</span>
+      <button class="btn" id="btnOpenLogsDir">打开日志文件夹</button>
+    </div>
+    <pre id="log"></pre>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

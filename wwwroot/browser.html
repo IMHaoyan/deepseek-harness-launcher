@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <title>DeepSeek Harness</title>
+  <link rel="stylesheet" href="browser.css">
+</head>
+<body>
+  <div id="tabbar">
+    <div id="titleOnly" class="title-only hidden" title="DeepSeek Harness">DeepSeek Harness</div>
+    <div id="tabs"></div>
+    <button id="btnNew" class="bar-btn" title="新建标签页">＋</button>
+    <div class="drag-space"></div>
+    <div class="win-group">
+      <button id="btnSplit" class="bar-btn" title="左右分屏 (Ctrl+\)">分屏</button>
+      <button id="btnMin" class="bar-btn win-btn" title="最小化">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1"><line x1="1.5" y1="6" x2="10.5" y2="6"/></svg>
+      </button>
+      <button id="btnMax" class="bar-btn win-btn" title="最大化">
+        <svg id="iconMax" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.75" y="1.75" width="8.5" height="8.5"/></svg>
+        <svg id="iconRestore" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" hidden><rect x="1.75" y="3.75" width="6.5" height="6.5"/><path d="M4.25 3.75V1.75h6v6h-2"/></svg>
+      </button>
+      <button id="btnClose" class="bar-btn win-btn close" title="关闭到托盘">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1"><line x1="2" y1="2" x2="10" y2="10"/><line x1="10" y1="2" x2="2" y2="10"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="divider" class="hidden" title="拖动调整分屏比例"></div>
+  <script src="browser.js"></script>
+</body>
+</html>
