@@ -301,6 +301,7 @@ body {
 .actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center; /* 让 28px 的更新徽标与 36px 按钮文字垂直居中对齐（默认 stretch 会顶对齐） */
   gap: 8px;
   padding: 14px;
 }
@@ -648,3 +649,66 @@ body {
   user-select: text;
   -webkit-user-select: text;
 }
+
+/* ---------- 反馈问题对话框 ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal {
+  width: 460px;
+  max-width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+}
+
+.modal-title {
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#feedbackText {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.6;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+#feedbackText:focus { outline: none; border-color: var(--brand); }
+
+.modal-status {
+  min-height: 18px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.modal-status.ok { color: #16A34A; }
+.modal-status.error { color: var(--danger); }
+
+.modal .actions { padding: 0; }

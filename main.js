@@ -74,7 +74,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackToken: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '' }
 let firstRun = false
 let harnessRoot = ''
 
@@ -190,6 +190,7 @@ function loadConfig() {
       if (typeof cfg.autoRestart === 'boolean') Config.autoRestart = cfg.autoRestart
       if (typeof cfg.tabsEnabled === 'boolean') Config.tabsEnabled = cfg.tabsEnabled
       if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
+      if (typeof cfg.feedbackToken === 'string') Config.feedbackToken = cfg.feedbackToken
       if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= 480) Config.windowWidth = cfg.windowWidth
       if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= 600) Config.windowHeight = cfg.windowHeight
       // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
@@ -1251,6 +1252,7 @@ function stateJson() {
     port: PORT,
     blocked: server.blockedReason || '',
     suggestedPort: server.suggestedPort || 0,
+    feedbackConfigured: !!(Config.feedbackToken || embeddedFeedbackToken()),
     version: app.getVersion(),
     autostart: autostartEnabled(),
     notify: Config.notify,
@@ -1326,6 +1328,81 @@ function onTick() {
   scanNotify()
 }
 
+// ---------- 问题反馈（GitHub Issues 通道：用户无需邮件客户端，提交即建 Issue，作者按仓库通知收到） ----------
+const FEEDBACK_REPO = 'IMHaoyan/deepseek-harness-launcher'
+const FEEDBACK_BODY_MAX = 60000 // GitHub issue body 上限 65536 字符，留余量
+
+// 内置反馈令牌：assets/feedback-token.txt（.gitignore 排除，不进仓库；打包时随安装包分发）
+// 仅需 Issues 写权限的 fine-grained token，泄露风险面极小且可随时吊销
+function embeddedFeedbackToken() {
+  try {
+    const t = fs.readFileSync(path.join(ASSETS_DIR, 'feedback-token.txt'), 'utf8').trim()
+    return t || ''
+  } catch { return '' }
+}
+
+// 生效令牌 = 设置页自定义（覆盖）|| 内置
+function effectiveFeedbackToken() {
+  return Config.feedbackToken || embeddedFeedbackToken()
+}
+
+function tailOf(file, lines) {
+  try {
+    const txt = fs.readFileSync(file, 'utf8')
+    return txt.split(/\r?\n/).slice(-lines).join('\n')
+  } catch { return '(无日志文件：' + path.basename(file) + ')' }
+}
+
+function buildFeedbackPack(text, includeLogs) {
+  const version = app.getVersion()
+  const subject = `[DSHL 反馈] v${version} - ${String(text).slice(0, 40).replace(/\r?\n/g, ' ')}`
+  const env = envDetect.envSummary(envReport)
+  const parts = [
+    '# DeepSeek Harness Launcher 问题反馈',
+    '',
+    '## 问题描述',
+    text,
+    '',
+    '## 环境信息',
+    `- 版本：v${version}`,
+    `- 平台：${process.platform} ${os.release()}`,
+    `- 服务地址：${WEB_URL}（端口 ${PORT}）`,
+    `- 服务状态：${server.running() ? '运行中' : '已停止'}${server.blockedReason ? '（' + server.blockedReason + '）' : ''}`,
+    `- 环境就绪：${envReady() ? '是' : '否'}`,
+    `- 环境报告：${JSON.stringify(env)}`,
+  ]
+  if (includeLogs) {
+    parts.push('', '## 日志 dshl.log（末尾 200 行）', '```', tailOf(TRAY_LOG, 200), '```')
+    parts.push('', '## 日志 server.out.log（末尾 100 行）', '```', tailOf(OUT_LOG, 100), '```')
+    parts.push('', '## 日志 server.err.log（末尾 100 行）', '```', tailOf(ERR_LOG, 100), '```')
+  }
+  let body = parts.join('\n')
+  if (body.length > FEEDBACK_BODY_MAX) body = body.slice(0, FEEDBACK_BODY_MAX) + '\n\n…（超出长度限制，已截断）'
+  const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  const dir = path.join(LOG_DIR, 'feedback')
+  try { fs.mkdirSync(dir, { recursive: true }) } catch { /* noop */ }
+  const filePath = path.join(dir, `feedback-${ts}.md`)
+  try { fs.writeFileSync(filePath, body, 'utf8') } catch { /* noop */ }
+  return { subject, body, filePath }
+}
+
+async function createGithubIssue(title, body) {
+  const token = effectiveFeedbackToken()
+  const res = await fetch(`https://api.github.com/repos/${FEEDBACK_REPO}/issues`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'dshl-feedback',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ title, body }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error((data && data.message) || ('HTTP ' + res.status))
+  return data.html_url || ''
+}
+
 // ---------- IPC 命令桥（Bridge.cs 移植） ----------
 function registerIpc() {
   ipcMain.handle('dsh:cmd', async (_event, name, value) => {
@@ -1351,7 +1428,7 @@ function registerIpc() {
         case 'browser:winClose': if (webWin && !webWin.isDestroyed()) { try { webWin.hide() } catch { /* noop */ } } return '{}'
         case 'start': await handleStart(); return '{}'
         case 'stop': await stopServer(); notify('DeepSeek Harness', '服务已停止'); broadcastState(); return '{}'
-        case 'openWeb': openWebUi(); return '{}'
+        case 'openWeb': openDshOrPanel(); return '{}' // 环境未就绪/端口被占用时自动改打开启动器面板
         case 'openUrlExternal': try { shell.openExternal(WEB_URL) } catch { /* noop */ } return '{}'
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
         case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
@@ -1404,6 +1481,7 @@ function registerIpc() {
           Config.tabsEnabled = false
           const portBefore = PORT
           Config.port = 0
+          Config.feedbackToken = ''
           Config.windowWidth = 0
           Config.windowHeight = 0
           Config.webWindowWidth = 0
@@ -1445,6 +1523,34 @@ function registerIpc() {
         }
         case 'setUseSystemBrowser': Config.useSystemBrowser = !!value; saveConfig(); broadcastState(); return '{}'
         case 'setAutoRestart': Config.autoRestart = !!value; saveConfig(); broadcastState(); return '{}'
+        case 'setFeedbackToken': {
+          Config.feedbackToken = String(value || '').trim()
+          saveConfig()
+          broadcastState()
+          return '{}'
+        }
+        case 'feedbackBuild': {
+          const text = String(value && value.text || '').trim()
+          if (!text) return '{}'
+          return JSON.stringify(buildFeedbackPack(text, value && value.includeLogs !== false))
+        }
+        case 'feedbackSend': {
+          const text = String(value && value.text || '').trim()
+          if (!text) return JSON.stringify({ ok: false, error: '请先填写问题描述' })
+          const pack = buildFeedbackPack(text, value && value.includeLogs !== false)
+          if (!effectiveFeedbackToken()) {
+            return JSON.stringify({ ok: false, needToken: true, filePath: pack.filePath })
+          }
+          try {
+            const issueUrl = await createGithubIssue(pack.subject, pack.body)
+            log('feedback submitted: ' + issueUrl)
+            return JSON.stringify({ ok: true, issueUrl, filePath: pack.filePath })
+          } catch (err) {
+            log('feedback submit failed: ' + err.message)
+            return JSON.stringify({ ok: false, error: '提交失败：' + err.message + '（可改用"复制全部"手动提交）', filePath: pack.filePath })
+          }
+        }
+        case 'clipboardWrite': try { clipboard.writeText(String(value)) } catch { /* noop */ } return '{}'
         case 'setPort': {
           // 服务端口（1024–65535）：保存后立即生效——自己拉起的服务重启到新端口并重载页面；
           // 接管的外部实例不受控制，仅提示"下次由启动器启动时生效"
@@ -1638,7 +1744,7 @@ async function runSelfTest() {
     if (!win || win.isDestroyed()) { selftestPrint('FAILED: window not created'); app.exit(2); return }
     const title = await win.webContents.executeJavaScript('document.title')
     const panel = await win.webContents.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('btnFeedbackCode') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用

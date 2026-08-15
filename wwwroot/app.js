@@ -147,6 +147,46 @@ function initPortWidget() {
 }
 const portCtl = initPortWidget();
 
+// ---------- 反馈令牌控件：双击输入 GitHub 反馈令牌（留空 = 未设置，只能用"复制全部"手动提交） ----------
+function initFeedbackCodeWidget() {
+  const el = $('btnFeedbackCode');
+  const ui = { configured: false, editing: false };
+  const setText = () => { el.textContent = ui.configured ? '已设置' : '未设置'; };
+  el.addEventListener('dblclick', () => {
+    if (ui.editing) return;
+    ui.editing = true;
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.placeholder = '输入 GitHub 反馈令牌';
+    input.className = 'zoom-input';
+    input.style.width = '190px';
+    el.textContent = '';
+    el.appendChild(input);
+    input.focus();
+    let done = false;
+    const finish = () => { if (done) return; done = true; ui.editing = false; input.remove(); setText(); };
+    const commit = () => {
+      const v = input.value.trim();
+      ui.configured = !!v;
+      cmd('setFeedbackToken', v);
+      finish();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') finish();
+    });
+    input.addEventListener('blur', commit);
+  });
+  return {
+    setFromState(configured) {
+      if (ui.editing) return;
+      ui.configured = !!configured;
+      setText();
+    },
+  };
+}
+const feedbackCodeCtl = initFeedbackCodeWidget();
+
 function buildChips(containerId, items, checkedKey, onPick) {
   const container = $(containerId);
   container.textContent = '';
@@ -254,6 +294,7 @@ function render(state) {
   }
   zoomWidgets.web.setFromState(state.webZoom ?? 100);
   portCtl.setFromState(state.port || 3080);
+  feedbackCodeCtl.setFromState(!!state.feedbackConfigured);
 
   // 主题 chips（仅值变化时重建，避免打断点击）
   if (window._lastTheme !== state.theme) {
@@ -434,7 +475,12 @@ function refreshEnvLog() {
 
 // ---------- 事件绑定 ----------
 
-$('btnOpen').addEventListener('click', () => cmd('openWeb'));
+$('btnOpen').addEventListener('click', () => {
+  // 环境缺失时"打开 DeepSeek Harness"→ 直接跳转运行环境页（一键安装向导），不尝试打开独立窗口
+  const env = window._envSummary;
+  if (env && !env.ready) { showPage('env'); return; }
+  cmd('openWeb');
+});
 $('urlText').addEventListener('click', () => {
   if (window._currentUrl) cmd('openUrlExternal');
 });
@@ -494,12 +540,14 @@ function renderUpdater(u) {
   const checkBtn = $('btnUpdaterCheck');
   const detailRow = $('updaterDetailRow');
   const detail = $('updaterDetail');
-  const badge = $('btnUpdateBadge');
   const current = u.current || '-';
   const hasUpdate = (u.status === 'downloading' || u.status === 'downloaded') && !!u.latest;
 
-  // 主页面底端指示：有更新时"更新日志"右侧显示绿色 ↑ 圆圈
-  badge.classList.toggle('hidden', !hasUpdate);
+  // 主页面更新卡：检测到更新时独立一行显示完整"更新到 vX"按钮（替代原圆圈箭头徽标）
+  const updateCard = $('updateCard');
+  const updateBtn = $('btnUpdateNow');
+  updateCard.classList.toggle('hidden', !hasUpdate);
+  if (hasUpdate) updateBtn.textContent = `更新到 v${u.latest}`;
 
   // 有更新时"检查更新"按钮变形为绿色"更新到 vX"
   checkBtn.textContent = hasUpdate ? `更新到 v${u.latest}` : '检查更新';
@@ -551,9 +599,13 @@ function renderUpdater(u) {
 // 主页面底端链接
 $('btnGithub').addEventListener('click', () => void cmd('openGithub'));
 $('btnChangelog').addEventListener('click', () => void cmd('openChangelog'));
-// 绿色 ↑ 更新指示：点击切换到设置页（那里有"更新到 vX"按钮）
-$('btnUpdateBadge').addEventListener('click', () => showPage('settings'));
-// 版本与更新按钮：已就绪 → 立即安装；否则 → 检查更新
+// 主页面更新卡：已就绪 → 立即安装；否则 → 检查更新
+$('btnUpdateNow').addEventListener('click', () => {
+  const u = window._updater;
+  if (u && u.status === 'downloaded') void cmd('updaterInstall');
+  else void cmd('updaterCheck');
+});
+// 版本与更新按钮（设置页）：已就绪 → 立即安装；否则 → 检查更新
 $('btnUpdaterCheck').addEventListener('click', () => {
   const u = window._updater;
   if (u && u.status === 'downloaded') void cmd('updaterInstall');
@@ -566,6 +618,54 @@ $('envCards').addEventListener('click', (e) => {
   const item = btn.getAttribute('data-env-item');
   const items = item === 'dsh' ? ['dsh'] : item === 'node' ? ['node'] : ['plugin'];
   void cmd('envInstall', { items });
+});
+
+// ---------- 反馈问题对话框 ----------
+function showFeedbackStatus(text, kind) {
+  const el = $('feedbackStatus');
+  el.textContent = text;
+  el.className = 'modal-status' + (kind ? ' ' + kind : '');
+}
+function openFeedback() {
+  showFeedbackStatus('', '');
+  $('feedbackOverlay').classList.remove('hidden');
+  $('feedbackText').focus();
+}
+function closeFeedback() { $('feedbackOverlay').classList.add('hidden'); }
+$('btnFeedback').addEventListener('click', openFeedback);
+$('btnFeedbackCancel').addEventListener('click', closeFeedback);
+$('feedbackOverlay').addEventListener('mousedown', (e) => {
+  if (e.target === $('feedbackOverlay')) closeFeedback();
+});
+$('btnFeedbackCopy').addEventListener('click', async () => {
+  const text = $('feedbackText').value.trim();
+  if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
+  const pack = await cmd('feedbackBuild', { text, includeLogs: $('feedbackLogs').checked });
+  if (pack && pack.body) {
+    await cmd('clipboardWrite', pack.body);
+    showFeedbackStatus('已复制完整反馈内容（含版本/环境/日志），粘贴到任意地方发送即可', 'ok');
+  } else {
+    showFeedbackStatus('生成失败', 'error');
+  }
+});
+$('btnFeedbackSend').addEventListener('click', async () => {
+  const text = $('feedbackText').value.trim();
+  if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
+  showFeedbackStatus('正在提交…');
+  const r = await cmd('feedbackSend', { text, includeLogs: $('feedbackLogs').checked });
+  if (!r) { showFeedbackStatus('提交失败：无响应', 'error'); return; }
+  if (r.ok) {
+    showFeedbackStatus('已提交到 GitHub（作者会收到通知），感谢反馈！' + (r.issueUrl ? ' ' + r.issueUrl : ''), 'ok');
+    return;
+  }
+  if (r.needToken) {
+    showFeedbackStatus('未配置反馈令牌：请用"复制全部"手动提交，或联系作者配置令牌', 'error');
+    return;
+  }
+  showFeedbackStatus(r.error || '提交失败', 'error');
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('feedbackOverlay').classList.contains('hidden')) closeFeedback();
 });
 
 // 主进程 → JS 状态推送

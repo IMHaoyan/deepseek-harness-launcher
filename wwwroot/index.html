@@ -60,11 +60,16 @@
       </div>
     </section>
 
-    <!-- 底端：项目链接 + 更新入口（有新版时"更新日志"右侧显示绿色 ↑ 指示，点击进入设置页） -->
+    <!-- 底端：项目链接 + 反馈入口 -->
     <section class="card actions main-footer">
       <button class="btn" id="btnGithub">Github地址</button>
       <button class="btn" id="btnChangelog">更新日志</button>
-      <button class="btn update-badge hidden" id="btnUpdateBadge" title="发现新版本，点击进入设置页查看">↑</button>
+      <button class="btn" id="btnFeedback">反馈问题</button>
+    </section>
+
+    <!-- 检测到新版本时独立一行显示完整更新按钮（替代原圆圈箭头徽标） -->
+    <section class="card hidden" id="updateCard">
+      <button class="btn primary update-ready" id="btnUpdateNow">更新到 v-</button>
     </section>
   </div>
 
@@ -167,6 +172,12 @@
         </div>
       </div>
       <div class="row long-label">
+        <span class="label">反馈令牌</span>
+        <div class="chips">
+          <button class="chip" id="btnFeedbackCode" title="可选：双击输入自定义 GitHub 反馈令牌（覆盖内置令牌）。内置令牌随安装包分发（assets/feedback-token.txt，不进仓库）；用户提交的反馈会成为仓库 Issue，作者绑定邮箱会收到通知">未设置</button>
+        </div>
+      </div>
+      <div class="row long-label">
         <span class="label">启用标签和内部分屏功能</span>
         <div class="chips">
           <button class="chip" id="btnTabsEnabled">关闭</button>
@@ -205,6 +216,21 @@
       <button class="btn" id="btnOpenLogsDir">打开日志文件夹</button>
     </div>
     <pre id="log"></pre>
+  </div>
+
+  <!-- 反馈问题对话框 -->
+  <div id="feedbackOverlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-title">反馈问题</div>
+      <textarea id="feedbackText" rows="5" placeholder="描述你遇到的问题、复现步骤、期望行为…（提交时会自动附带版本、环境与日志信息）"></textarea>
+      <label class="env-log-opt"><input type="checkbox" id="feedbackLogs" checked>附带诊断信息与日志</label>
+      <div class="modal-status" id="feedbackStatus"></div>
+      <div class="actions">
+        <button class="btn primary" id="btnFeedbackSend">提交反馈</button>
+        <button class="btn" id="btnFeedbackCopy">复制全部</button>
+        <button class="btn" id="btnFeedbackCancel">取消</button>
+      </div>
+    </div>
   </div>
 
   <script src="app.js"></script>
