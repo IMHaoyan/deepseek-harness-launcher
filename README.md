@@ -115,7 +115,9 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
   "dshVersion": "0.1.0-rc.6",
   "nodeMajor": 22,
   "nodeMirror": "",
-  "npmRegistry": ""
+  "npmRegistry": "",
+  "dshUpdateCheckedAt": 0,
+  "panelHideNotified": false
 }
 ```
 
@@ -139,10 +141,25 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - 独立窗口是 **Edge 式原生分屏**：顶部 tab 栏（高度 42px：38px × 130% × 85% 取整；标签标题字体 12.6px、tab 横向长度最长 243px、直角矩形 Edge 外观；＋ 新建、× 关闭、点击切换、可拖动窗口），**"分屏"按钮位于最右侧（最小化按钮左侧）**，开启左右双视图（分隔条可拖拽，20%–80%；**单标签分屏自动复制当前页为右分屏，关闭任一侧即退出分屏并铺满**）；页面视图用 **WebContentsView 原生挂载**（与 Edge 同源的合成器方案，切换/分屏零闪烁，新标签后台预热无白屏）；快捷键 **Ctrl+\\** 分屏、**Ctrl+Del** 关闭聚焦侧、**Shift+Alt+S** 交换左右；**聚焦单个分屏时该侧右上角浮出 Edge 式控件**：✕ 关闭此分屏、⋯ 菜单（切换左右分屏 / 在新标签页中打开此网页——复制当前 URL 到新标签后关闭原分屏）；Ctrl+滚轮缩放对所有视图同步生效并显示中央浮层。
 - `harnessRoot`：DSH 仓库根目录（源码版）。缺省 Windows 用 `E:\deepseek-harness`。
 - `nodePath`：Node 可执行文件绝对路径（自动探测失败时手动指定）。
-- `dshVersion`：一键安装锁定的 DSH 版本（默认 `0.1.0-rc.6`；改 `latest` 可装最新）。
+- `dshVersion`：一键安装锁定的 DSH 版本（默认 `0.1.0-rc.6`；改 `latest` 可装最新）。DSH 自动更新成功后会自动置为 `latest`。
 - `nodeMajor`：托管 Node 的主版本号（默认 22，即自动装 22.x LTS 最新版）。
 - `nodeMirror`：Node 发行包下载源覆盖（默认空 = nodejs.org 官方源，失败自动回退 npmmirror；可填镜像地址）。
 - `npmRegistry`：npm 源覆盖（默认空 = npm 官方源，失败自动回退 npmmirror；可填镜像地址）。
+- `dshUpdateCheckedAt`：DSH 自动更新上次检查的时间戳（内部记账，自动维护）。
+- `panelHideNotified`：关闭启动器面板时"已最小化到托盘"的引导通知是否已提示过（**只弹一次**，之后静默缩到托盘；"恢复默认设置"会复位重新提示）。
+
+## DSH 自动更新
+
+启动器**静默保持 DeepSeek Harness 为最新版**，全程无需用户确认（与启动器自身的"检查更新"相互独立）：
+
+- 启动 20 秒后首次检查，此后每 6 小时尝试一次（**24 小时节流**，`dshUpdateCheckedAt` 落盘防频繁请求 npm）；
+- 用 `npm view @deepseek-ai/dsh version` 对比已安装版本（registry 失败自动回退 npmmirror），有新版本则按安装形态自动升级：
+  - **托管安装**：复用一键安装引擎重装到最新（`npm install --prefix` 覆盖旧版，进度/日志进安装日志），完成后自动重启服务；
+  - **全局安装**：系统 npm 执行 `npm update -g @deepseek-ai/dsh`（registry 回退同上），完成后自动重启服务；
+  - **npx 缓存**：`npm exec` 预热新版本进缓存（检测按最高版本选中），完成后自动重启服务；
+  - **源码版**：不动开发者仓库，仅记日志；
+- 更新成功弹托盘通知"已自动更新到 vX"；更新前会先停掉自己拉起的服务（更新失败自动用旧版拉起，不停摆）；**接管中的外部实例不受控制**，通知中会提示需手动重启；
+- 手动安装任务进行中时自动跳过；手动"检查更新"按钮查的仍是启动器自身，与 DSH 无关。
 
 ## 与 DSH 的协作
 

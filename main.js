@@ -13,6 +13,7 @@ const { spawn, execFile, execFileSync } = require('child_process')
 const envDetect = require('./env-detect')
 const envInstall = require('./env-install')
 const updater = require('./updater')
+const dshUpdater = require('./dsh-update')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -74,7 +75,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackToken: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackToken: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, panelHideNotified: false }
 let firstRun = false
 let harnessRoot = ''
 
@@ -204,6 +205,8 @@ function loadConfig() {
       if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
       if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
       if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
+      if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
+      if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
     }
   } catch { log('config parse failed, using defaults') }
 }
@@ -760,7 +763,12 @@ function createWindow() {
     if (!reallyExit) {
       e.preventDefault()
       win.hide()
-      notify('DeepSeek Harness', '已最小化到托盘，单击图标打开 DeepSeek Harness，右键可打开启动器面板')
+      // 托盘引导提示只弹一次：首次关闭面板时告知"未退出、缩到托盘"，之后静默隐藏
+      if (!Config.panelHideNotified) {
+        Config.panelHideNotified = true
+        saveConfig()
+        notify('DeepSeek Harness', '已最小化到托盘，单击图标打开 DeepSeek Harness，右键可打开启动器面板')
+      }
     }
   })
   win.on('resized', debounce(() => {
@@ -1495,6 +1503,8 @@ function registerIpc() {
           Config.nodeMajor = 22
           Config.nodeMirror = ''
           Config.npmRegistry = ''
+          Config.dshUpdateCheckedAt = 0
+          Config.panelHideNotified = false
           applyRuntimePort()
           // 端口复位到默认 3080：若自己拉起的服务跑在自定义端口，重启到默认端口并重载页面
           if (PORT !== portBefore && server.owned()) await restartServerOnNewPort()
@@ -1846,6 +1856,19 @@ function init() {
     sendToPanel: (json) => { if (win && !win.isDestroyed()) { try { win.webContents.send('dsh:updater', json) } catch { /* noop */ } } },
     beforeInstall: async () => { if (server.owned()) await stopServerFast() },
   })
+  // DSH 自动更新（dsh-update.js）：静默检查最新版，托管/全局/npx 形态自动升级，无需用户确认
+  dshUpdater.initDshUpdater({
+    Config,
+    saveConfig,
+    log,
+    notify,
+    refreshEnv,
+    envInstall,
+    envDetect,
+    getServerState: () => ({ running: server.running(), owned: server.owned() }),
+    stopService: () => stopServer(),
+    startService: () => handleStart(),
+  })
   if (firstRun) {
     if (!autostartEnabled()) setAutostart(true) // 默认开启开机自启与消息提醒
     saveConfig()
@@ -1870,6 +1893,9 @@ function init() {
   setInterval(onTick, 2000)
   // 启动后 20 秒静默检查一次更新（仅打包版；开发模式跳过）
   setTimeout(() => updater.autoCheck(), 20000)
+  // DSH 自动更新：启动后 20 秒首次检查，此后每 6 小时尝试一次（模块内部 24 小时节流）
+  setTimeout(() => { void dshUpdater.checkOnce('startup') }, 20000)
+  setInterval(() => { void dshUpdater.checkOnce('timer') }, 6 * 60 * 60 * 1000)
 }
 
 // ---------- 应用生命周期 ----------

@@ -8,3 +8,5 @@ Thumbs.db
 NAMES.md
 # 反馈通道令牌：仅本地存在、随安装包分发，绝不进仓库（泄露面 = 只读该仓库 Issues 的细粒度 token）
 assets/feedback-token.txt
+# 本地 npm 镜像配置（registry/electron_mirror），随网络环境而异，不进仓库
+.npmrc
