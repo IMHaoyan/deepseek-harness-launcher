@@ -9,9 +9,12 @@ DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DS
 
 ![软件界面 1](docs/screenshots/ui-1.png)
 
-![软件界面 2](docs/screenshots/ui-2.png)
-
-![软件界面 3](docs/screenshots/ui-3.png)
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/ui-2.png" alt="软件界面 2" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/ui-3.png" alt="软件界面 3" width="100%"></td>
+  </tr>
+</table>
 
 ## 用户安装与使用
 
