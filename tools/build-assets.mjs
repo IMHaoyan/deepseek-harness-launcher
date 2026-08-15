@@ -1,8 +1,12 @@
-// build-assets.mjs — 从官方 FishLogo.tsx 提取鲸鱼路径，生成跨平台托盘图标并组装面板
+// build-assets.mjs — 生成跨平台图标并组装面板
+//
+// 图标来源：assets/deepseek-color.svg（彩色 DeepSeek 鲸鱼，官方品牌蓝 #4D6BFE），
+// 托盘 / 窗口任务栏 / 打包 exe 统一使用彩色版，深浅色主题下都清晰，无需黑白切换逻辑。
+// 面板标题栏内联鲸鱼仍从官方 FishLogo.tsx 提取路径（fill=currentColor，跟随面板主题）。
 //
 // 输出：
-//   assets/ds.ico / blank.ico            —— Windows 托盘（16/24/32 PNG 内嵌）
-//   assets/dsTemplate.png / @2x          —— macOS 模板托盘图标（代码中 setTemplateImage(true)）
+//   assets/ds.ico / blank.ico            —— Windows 托盘 + 窗口/打包图标（16/24/32/48/256 PNG 内嵌）
+//   assets/dsTemplate.png / @2x          —— macOS 彩色托盘图标
 //   assets/blankTemplate.png / @2x       —— macOS 闪烁空白图标
 //   assets/ds.png / @2x / blank.png /@2x —— Linux 回退
 //   assets/icon.png (512)                —— 打包用应用图标（mac dmg）
@@ -80,13 +84,11 @@ function buildIco(entries) {
   return Buffer.concat([header, ...dirs, ...entries.map((e) => e.data)])
 }
 
-const whaleSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 23.16 17.04"><path d="${whalePath}" fill="#0F1115"/></svg>`
-const whaleSvgWhite = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 23.16 17.04"><path d="${whalePath}" fill="#FFFFFF"/></svg>`
+const whaleSvgColor = readFileSync(join(assets, 'deepseek-color.svg'), 'utf8')
 
 // 禁止拉伸：输出正方形画布（边长 = 最长边），图片按原始宽高比居中（contain），四周透明
-async function whalePng(size, fill = '#0F1115') {
-  const svg = fill === '#FFFFFF' ? whaleSvgWhite : whaleSvg
-  return sharp(Buffer.from(svg), { density: 300 })
+async function whalePng(size) {
+  return sharp(Buffer.from(whaleSvgColor), { density: 300 })
     .resize(size, size, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
     .png()
     .toBuffer()
@@ -102,29 +104,22 @@ async function blankPng(size) {
 const sizes = [16, 24, 32, 48, 256] // 256 档供打包 exe 图标使用（electron-builder 要求 ≥256）
 const whaleEntries = []
 for (const s of sizes) whaleEntries.push({ size: s, data: await whalePng(s) })
-const whiteEntries = []
-for (const s of sizes) whiteEntries.push({ size: s, data: await whalePng(s, '#FFFFFF') })
 const blankEntries = []
 for (const s of sizes) blankEntries.push({ size: s, data: await blankPng(s) })
 writeFileSync(join(assets, 'ds.ico'), buildIco(whaleEntries))
-writeFileSync(join(assets, 'ds-white.ico'), buildIco(whiteEntries))
 writeFileSync(join(assets, 'blank.ico'), buildIco(blankEntries))
-console.log('ds.ico / ds-white.ico / blank.ico written (16/24/32/48/256)')
+console.log('ds.ico / blank.ico written (16/24/32/48/256, colored whale)')
 
-// ---------- macOS 模板 PNG（黑色鲸鱼 = 理想模板图，菜单栏自动适配深浅色） ----------
+// ---------- macOS 彩色托盘 PNG ----------
 const w16 = await whalePng(16)
 const w32 = await whalePng(32)
-const ww16 = await whalePng(16, '#FFFFFF')
-const ww32 = await whalePng(32, '#FFFFFF')
 const b16 = await blankPng(16)
 const b32 = await blankPng(32)
 writeFileSync(join(assets, 'dsTemplate.png'), w16)
 writeFileSync(join(assets, 'dsTemplate@2x.png'), w32)
-writeFileSync(join(assets, 'dsWhiteTemplate.png'), ww16)
-writeFileSync(join(assets, 'dsWhiteTemplate@2x.png'), ww32)
 writeFileSync(join(assets, 'blankTemplate.png'), b16)
 writeFileSync(join(assets, 'blankTemplate@2x.png'), b32)
-console.log('macOS template icons written (16 + @2x)')
+console.log('macOS tray icons written (16 + @2x, colored)')
 
 // ---------- Linux 回退 ----------
 writeFileSync(join(assets, 'ds.png'), w16)
@@ -134,7 +129,7 @@ writeFileSync(join(assets, 'blank@2x.png'), b32)
 console.log('linux fallback icons written')
 
 // ---------- 应用图标 512（打包用；同样正方形画布 + contain 居中，不拉伸） ----------
-const icon512 = await sharp(Buffer.from(whaleSvg), { density: 300 })
+const icon512 = await sharp(Buffer.from(whaleSvgColor), { density: 300 })
   .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
   .png()
   .toBuffer()

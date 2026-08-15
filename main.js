@@ -4,7 +4,7 @@
 //                          DshServer.cs（服务生命周期） TcpPid.cs（端口→PID） Bridge.cs（命令桥）
 'use strict'
 
-const { app, BrowserWindow, WebContentsView, Tray, Menu, Notification, shell, ipcMain, nativeImage, nativeTheme, systemPreferences, clipboard, screen } = require('electron')
+const { app, BrowserWindow, WebContentsView, Tray, Menu, Notification, shell, ipcMain, nativeImage, nativeTheme, clipboard, screen } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
@@ -214,58 +214,20 @@ function resolveHarnessRoot() {
   return defaultHarnessRoot()
 }
 
-// ---------- 图标（深色系统主题自动切换为白色鲸鱼） ----------
-let IconNormal = null // 当前主题对应的正常图标
-let IconBlack = null
-let IconWhite = null
+// ---------- 图标（彩色 DeepSeek 鲸鱼，托盘/任务栏/打包图标统一，不再做深浅色切换） ----------
+let IconNormal = null
 let IconBlank = null
 
 function loadIcons() {
   if (IS_WIN) {
-    IconBlack = nativeImage.createFromPath(path.join(ASSETS_DIR, 'ds.ico'))
-    IconWhite = nativeImage.createFromPath(path.join(ASSETS_DIR, 'ds-white.ico'))
+    IconNormal = nativeImage.createFromPath(path.join(ASSETS_DIR, 'ds.ico'))
     IconBlank = nativeImage.createFromPath(path.join(ASSETS_DIR, 'blank.ico'))
   } else {
-    // macOS：模板图（黑色鲸鱼 + alpha），菜单栏自动适配深浅色，无需切换；Linux：按主题切换黑白 PNG
-    IconBlack = nativeImage.createFromPath(path.join(ASSETS_DIR, 'dsTemplate.png'))
-    IconWhite = nativeImage.createFromPath(path.join(ASSETS_DIR, 'dsWhiteTemplate.png'))
+    // macOS / Linux：彩色鲸鱼 PNG（不再用模板图，颜色以图为准）
+    IconNormal = nativeImage.createFromPath(path.join(ASSETS_DIR, 'dsTemplate.png'))
     IconBlank = nativeImage.createFromPath(path.join(ASSETS_DIR, 'blankTemplate.png'))
-    if (IS_MAC) {
-      if (IconBlack && !IconBlack.isEmpty()) IconBlack.setTemplateImage(true)
-      if (IconBlank && !IconBlank.isEmpty()) IconBlank.setTemplateImage(true)
-    }
   }
-  applyThemeIcon()
   if (!IconNormal || IconNormal.isEmpty()) log('tray icon missing: run `npm run build:assets` first')
-}
-
-// 系统真实深色主题（与"设置页主题"无关）：
-// 1) nativeTheme.shouldUseDarkColors 会受 themeSource（= 设置主题）影响，托盘 logo 必须跟随系统任务栏，不能用；
-// 2) systemPreferences.isDarkMode 在 Windows 上不可用（本机 Electron 34 实测为 undefined）且跟随"应用模式"而非任务栏；
-// 因此 Windows 直接读注册表 SystemUsesLightTheme（任务栏深浅的权威来源），macOS 用 isDarkMode，Linux 回退 shouldUseDarkColors。
-function isSystemDark() {
-  if (IS_WIN) {
-    try {
-      const out = execFileSync('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize', '/v', 'SystemUsesLightTheme'], { windowsHide: true, timeout: 5000, encoding: 'utf8' })
-      const m = /SystemUsesLightTheme\s+REG_DWORD\s+0x([0-9a-fA-F]+)/.exec(String(out))
-      if (m) return parseInt(m[1], 16) === 0
-    } catch { /* 读不到时回退 */ }
-  }
-  if (IS_MAC) {
-    try { return systemPreferences.isDarkMode() } catch { /* noop */ }
-  }
-  return nativeTheme.shouldUseDarkColors
-}
-
-let lastSystemDark = null
-
-// 深色系统主题 → 白色鲸鱼；浅色 → 黑色鲸鱼（mac 模板图自动反色，保持原样）
-function applyThemeIcon() {
-  if (IS_MAC) { IconNormal = IconBlack; return }
-  const dark = isSystemDark()
-  lastSystemDark = dark
-  IconNormal = (dark && IconWhite && !IconWhite.isEmpty()) ? IconWhite : IconBlack
-  if (!flashOn) setTrayImage(IconNormal)
 }
 
 function setTrayImage(img) {
@@ -1191,9 +1153,6 @@ function onTick() {
   // 环境未就绪时周期性重测（缓存 30s 节流），用户在外部装好 Node/DSH 后自动就绪
   if (!envReady()) void refreshEnv(false)
   maybeStartDeferred() // 安装完成/启动请求时环境未就绪 → 就绪后自动补启动
-  // 系统任务栏主题轮询：Windows 切换系统深浅色不一定触发 nativeTheme 'updated'（它跟随应用模式），
-  // 2 秒一次轻量检测（读注册表），变化时实时换托盘 logo 颜色
-  if (isSystemDark() !== lastSystemDark) applyThemeIcon()
   // 接管的外部实例存活性探测
   if (server.adoptedPid) {
     portOpen().then((open) => {
@@ -1441,7 +1400,7 @@ async function runSelfTest() {
     }
     selftestPrint('READY ' + WEB_URL)
     selftestPrint('SYSTEM ZOOM ' + Config.zoom + ' (detected from OS)')
-    selftestPrint(`ICONS OK: black=${!IconBlack.isEmpty()} white=${!IconWhite.isEmpty()} blank=${!IconBlank.isEmpty()} darkTheme=${isSystemDark()}`)
+    selftestPrint(`ICONS OK: colored=${!IconNormal.isEmpty()} blank=${!IconBlank.isEmpty()}`)
     const [dw, dh] = defaultPanelSize()
     const [ww2, wh2] = defaultWebSize()
     const prim = screen.getPrimaryDisplay()
@@ -1562,7 +1521,6 @@ function init() {
   try { nativeTheme.themeSource = Config.theme } catch { /* noop */ }
   harnessRoot = resolveHarnessRoot()
   loadIcons()
-  nativeTheme.on('updated', applyThemeIcon) // 系统主题切换时实时换色（深色→白鲸鱼）
   fs.mkdirSync(LOG_DIR, { recursive: true })
   registerIpc()
   createWindow()
