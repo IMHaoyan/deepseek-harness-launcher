@@ -29,9 +29,17 @@ DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DS
 ### 自动更新
 
 - 启动 20 秒后自动静默检查 GitHub Releases 上的新版本，发现即后台下载；
-- 发现新版本时：主页面底端"更新日志"右侧出现**绿色 ↑ 圆圈按钮**，点击直达设置页；设置页"检查更新"按钮变为绿色的"更新到 vX"，点击立即安装（下载中显示进度、就绪后可点；退出重启也会自动安装）；
+- 发现新版本时：主页面出现独立的绿色 **"更新到 vX"** 卡片；设置页"检查更新"按钮同时变为绿色的"更新到 vX"，点击立即安装（下载中显示进度、就绪后可点；退出重启也会自动安装）；
 - 下载完成弹托盘通知；设置页可手动"检查更新"并查看当前版本；
-- 主页面底端另有"Github地址"（打开仓库主页）与"更新日志"（打开 Releases 页面）按钮。
+- 主页面底端另有"Github地址"（打开仓库主页）、"更新日志"（打开 Releases 页面）与"反馈问题"按钮。
+
+### 余额查询
+
+主页面"余额"卡片**只显示余额金额**（绿=可用/红=不可用；悬停显示明细），右侧 **↻ 立即刷新**、**⚙ 进入设置页**（cc-switch 风格，实现参照 [cc-switch](https://github.com/farion1231/cc-switch)：`GET {接口}/user/balance` + Bearer 鉴权）：
+
+- **默认零配置**：自动读取 DSH 的 `~/.dsh/.credentials.yaml`（`DEEPSEEK_API_KEY`）与 `~/.dsh/settings.yaml`（`llm-deepseek.baseURL`），面板加载即查询一次，此后**每 3 分钟自动刷新**；
+- **设置页**（⚙）：API Key **明文显示**、查询接口可自定义（留空 = 自动：DSH 配置 → 官方 `api.deepseek.com`）；点 **"测试并保存"**——连通（正确获取到余额）即自动保存并立即生效；"清除已保存"回到自动读取 DSH 配置；左上角 ← 返回主页；
+- 401/403 提示密钥无效，非 2xx/解析失败给出具体错误；跟随重定向（与 cc-switch 的 HTTP 客户端一致，最多 5 跳，跨域重定向明确报错）。
 
 ## 目录结构
 
@@ -117,7 +125,9 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
   "nodeMirror": "",
   "npmRegistry": "",
   "dshUpdateCheckedAt": 0,
-  "panelHideNotified": false
+  "panelHideNotified": false,
+  "balanceApiKey": "",
+  "balanceBaseUrl": ""
 }
 ```
 
@@ -128,7 +138,7 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - 窗口定位：DeepSeek Harness 独立窗口**屏幕居中**；启动器面板**右下角紧贴任务栏**（右缘贴屏幕、下缘贴任务栏上沿）。
 - **独立窗口几何持久化**：手动调整后的尺寸/位置/最大化状态自动记住（resize/move 防抖落盘），重启后原位恢复；位置不在任何显示器工作区内时自动回退居中（防拔副屏后窗口失踪）；"恢复默认设置"清回默认。
 - **服务端口**（设置页，默认 3080）：双击输入新端口（1024–65535）。自己拉起的服务会**立即重启到新端口**并重载所有打开的页面；接管的外部实例不受控制（仅保存，下次由启动器启动时生效）；恢复默认回 3080。
-- **问题反馈**（主页"反馈问题"按钮）：弹窗填写问题后一键发送到作者的飞书反馈群（飞书群机器人 webhook，作者即时收到；自动附带版本/环境信息与 dshl/server 日志，同时落盘 `~/.dsh/dshl-logs/feedback/`）。通道地址**随安装包内置**（`assets/feishu-webhook.txt`，.gitignore 排除不进仓库；webhook 仅能向指定群发文本消息，泄露可随时在群设置重置），设置页"反馈通道"可填自定义地址覆盖内置；用户侧无需任何配置与邮箱客户端。
+- **问题反馈**（主页"反馈问题"按钮）：弹窗填写问题（可选填联系方式，方便作者回访）后一键发送到作者的飞书反馈群（飞书群机器人 webhook，作者即时收到；自动附带版本/环境信息与 dshl/server 日志，同时落盘 `~/.dsh/dshl-logs/feedback/`）。通道地址**随安装包内置**（`assets/feishu-webhook.txt`，.gitignore 排除不进仓库；webhook 仅能向指定群发文本消息，泄露可随时在群设置重置）；**界面不提供改地址入口**，作者换群时改 `~/.dsh/dshl/config.json` 的 `feedbackWebhook` 字段或重新打包即可；用户侧无需任何配置与邮箱客户端。
 - 设置页"恢复默认设置"按钮：所有选项（缩放/主题/提醒/浏览器方式/自动重启/窗口尺寸/自启）一次恢复默认值。
 - **自动重启看护**（设置页开关，默认开）：服务意外退出后自动拉起（10 秒冷却、连续 5 次上限防崩溃死循环），成功后弹"服务已自动重启"通知；接管的外部实例死亡同样触发。
 - **日志轮转**：`dshl.log` 与 `server.{out,err}.log` 超过 1MB 自动转存 `.1/.2/.3`，保留最近 3 份。
@@ -145,6 +155,8 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - `nodeMajor`：托管 Node 的主版本号（默认 22，即自动装 22.x LTS 最新版）。
 - `nodeMirror`：Node 发行包下载源覆盖（默认空 = nodejs.org 官方源，失败自动回退 npmmirror；可填镜像地址）。
 - `npmRegistry`：npm 源覆盖（默认空 = npm 官方源，失败自动回退 npmmirror；可填镜像地址）。
+- `balanceApiKey`：余额查询自定义 API Key（默认空 = 自动读 DSH 的 `DEEPSEEK_API_KEY`）。
+- `balanceBaseUrl`：余额查询自定义接口地址（默认空 = 自动读 DSH 的 `llm-deepseek.baseURL`，其次官方 `api.deepseek.com`）。
 - `dshUpdateCheckedAt`：DSH 自动更新上次检查的时间戳（内部记账，自动维护）。
 - `panelHideNotified`：关闭启动器面板时"已最小化到托盘"的引导通知是否已提示过（**只弹一次**，之后静默缩到托盘；"恢复默认设置"会复位重新提示）。
 

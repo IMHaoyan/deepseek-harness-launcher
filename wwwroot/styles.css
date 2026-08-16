@@ -197,6 +197,38 @@ body {
   margin-left: 100px;
 }
 
+/* 文本输入框（余额查询接口设置等） */
+.text-input {
+  flex: 1;
+  min-width: 220px;
+  width: 100%;
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 26px;
+  color: var(--text-primary);
+  background: var(--card);
+  outline: none;
+  transition: border-color 100ms ease;
+}
+.text-input:focus { border-color: var(--brand); }
+.text-input::placeholder { color: var(--text-tertiary); }
+
+/* 余额设置页：测试连接结果状态行 */
+.balance-test-status {
+  min-height: 22px;
+  padding: 4px 2px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-secondary);
+}
+.balance-test-status.ok { color: var(--success); }
+.balance-test-status.error { color: var(--danger); }
+
 /* 设置页：选项控件靠右对齐（label 靠左，chips/按钮贴右缘；主页状态行不受影响） */
 #pageSettings .row {
   justify-content: space-between;
@@ -699,6 +731,22 @@ body {
 }
 
 #feedbackText:focus { outline: none; border-color: var(--brand); }
+
+#feedbackContact {
+  width: 100%;
+  height: 34px;
+  background: var(--bg);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 12px;
+  font-family: var(--font);
+  font-size: 13px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+#feedbackContact:focus { outline: none; border-color: var(--brand); }
 
 .modal-status {
   min-height: 18px;

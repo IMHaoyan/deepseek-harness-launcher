@@ -60,6 +60,18 @@
       </div>
     </section>
 
+    <!-- 余额（cc-switch 风格：只显示金额，↻ 手动刷新，自动每 3 分钟查询；⚙ 进入设置页） -->
+    <section class="card" id="balanceCard">
+      <div class="row">
+        <span class="label">余额</span>
+        <div class="chips">
+          <span class="value strong status-value" id="balanceValue">--</span>
+          <button class="btn sm" id="btnBalanceRefresh" title="立即查询余额（自动每 3 分钟查询一次）">↻</button>
+          <button class="btn sm" id="btnBalanceSettings" title="余额接口设置">⚙</button>
+        </div>
+      </div>
+    </section>
+
     <!-- 底端：项目链接 + 反馈入口 -->
     <section class="card actions main-footer">
       <button class="btn" id="btnGithub">Github地址</button>
@@ -172,12 +184,6 @@
         </div>
       </div>
       <div class="row long-label">
-        <span class="label">反馈通道</span>
-        <div class="chips">
-          <button class="chip" id="btnFeedbackCode" title="可选：双击输入飞书群机器人 webhook 地址（覆盖内置通道）。内置地址随安装包分发（assets/feishu-webhook.txt，不进仓库）；提交的反馈会以文本消息发到作者的飞书反馈群，即时收到通知">未设置</button>
-        </div>
-      </div>
-      <div class="row long-label">
         <span class="label">启用标签和内部分屏功能</span>
         <div class="chips">
           <button class="chip" id="btnTabsEnabled">关闭</button>
@@ -208,6 +214,42 @@
     </section>
   </div>
 
+  <!-- 余额设置页面（主页面余额卡片 ⚙ 进入；测试连通成功后自动保存） -->
+  <div id="pageBalance" class="page hidden">
+    <div class="page-header">
+      <button class="btn" id="btnBalanceBack">← 返回</button>
+      <span class="page-title">余额设置</span>
+    </div>
+    <section class="card">
+      <div class="row stack">
+        <span class="label">API Key（明文显示；留空 = 自动读取 DSH 配置）</span>
+        <input class="text-input" type="text" id="balanceKey" placeholder="sk-...">
+      </div>
+      <div class="row stack">
+        <span class="label">查询接口（留空 = 自动：DSH 配置 → 官方 api.deepseek.com）</span>
+        <input class="text-input" type="text" id="balanceBaseUrl" placeholder="https://api.deepseek.com">
+      </div>
+      <div class="row">
+        <span class="label" id="balanceCurrentHint">-</span>
+      </div>
+      <div class="balance-test-status" id="balanceTestStatus"></div>
+      <div class="actions">
+        <button class="btn primary" id="btnBalanceTest">测试并保存</button>
+        <button class="btn sm danger" id="btnBalanceClear">清除已保存</button>
+      </div>
+    </section>
+    <section class="card">
+      <div class="env-manual">
+        <div class="env-manual-title">说明</div>
+        <div class="env-manual-body">
+          <p><b>默认无需配置</b>：自动读取 DSH 配置（`~/.dsh/.credentials.yaml` 的 `DEEPSEEK_API_KEY` 与 `~/.dsh/settings.yaml` 的 `llm-deepseek.baseURL`），打开面板即自动查询余额（每 3 分钟自动刷新）。</p>
+          <p><b>自定义</b>：在此页填写 API Key / 查询接口后点"测试并保存"——连通（正确获取到余额）即自动保存并立即生效；查询接口需实现 DeepSeek 余额 API（`GET {接口}/user/balance`）。</p>
+          <p><b>清除</b>：清空已保存的自定义设置，回到自动读取 DSH 配置。</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <!-- 日志页面 -->
   <div id="pageLog" class="page hidden">
     <div class="page-header">
@@ -223,6 +265,7 @@
     <div class="modal">
       <div class="modal-title">反馈问题</div>
       <textarea id="feedbackText" rows="5" placeholder="描述你遇到的问题、复现步骤、期望行为…（提交时会自动附带版本、环境与日志信息）"></textarea>
+      <input id="feedbackContact" type="text" maxlength="200" placeholder="联系方式（可选）：邮箱 / 飞书号 / QQ 等，方便作者回访你" />
       <label class="env-log-opt"><input type="checkbox" id="feedbackLogs" checked>附带诊断信息与日志</label>
       <div class="modal-status" id="feedbackStatus"></div>
       <div class="actions">

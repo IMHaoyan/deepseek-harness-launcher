@@ -13,6 +13,7 @@ const { spawn, execFile, execFileSync } = require('child_process')
 const envDetect = require('./env-detect')
 const envInstall = require('./env-install')
 const updater = require('./updater')
+const balance = require('./balance')
 const dshUpdater = require('./dsh-update')
 
 const IS_WIN = process.platform === 'win32'
@@ -75,7 +76,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, panelHideNotified: false }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
 let firstRun = false
 let harnessRoot = ''
 
@@ -207,6 +208,8 @@ function loadConfig() {
       if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
       if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
       if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
+      if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
+      if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
     }
   } catch { log('config parse failed, using defaults') }
 }
@@ -1260,7 +1263,6 @@ function stateJson() {
     port: PORT,
     blocked: server.blockedReason || '',
     suggestedPort: server.suggestedPort || 0,
-    feedbackConfigured: !!(Config.feedbackWebhook || embeddedFeishuWebhook()),
     version: app.getVersion(),
     autostart: autostartEnabled(),
     notify: Config.notify,
@@ -1350,7 +1352,7 @@ function embeddedFeishuWebhook() {
   } catch { return '' }
 }
 
-// 生效通道 = 设置页自定义（覆盖）|| 内置
+// 生效通道 = config.json 手动覆盖（作者换群用，界面无入口）|| 内置
 function effectiveFeishuWebhook() {
   const custom = String(Config.feedbackWebhook || '').trim()
   return FEISHU_WEBHOOK_RE.test(custom) ? custom : embeddedFeishuWebhook()
@@ -1372,9 +1374,9 @@ function trimUtf8(text, maxBytes) {
 }
 
 // 发送文本消息到飞书群机器人：成功返回 true，失败抛出可读错误（含飞书错误码）
-async function sendToFeishu(text) {
-  const hook = effectiveFeishuWebhook()
-  const res = await fetch(hook, {
+async function sendToFeishu(text, hook) {
+  const url = hook || effectiveFeishuWebhook()
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ msg_type: 'text', content: { text } }),
@@ -1394,7 +1396,7 @@ function tailOf(file, lines) {
   } catch { return '(无日志文件：' + path.basename(file) + ')' }
 }
 
-function buildFeedbackPack(text, includeLogs) {
+function buildFeedbackPack(text, contact, includeLogs) {
   const version = app.getVersion()
   const subject = `[DSHL 反馈] v${version} - ${String(text).slice(0, 40).replace(/\r?\n/g, ' ')}`
   const env = envDetect.envSummary(envReport)
@@ -1403,15 +1405,16 @@ function buildFeedbackPack(text, includeLogs) {
     '',
     '## 问题描述',
     text,
-    '',
-    '## 环境信息',
+  ]
+  if (contact) parts.push('', '## 联系方式', contact)
+  parts.push('', '## 环境信息',
     `- 版本：v${version}`,
     `- 平台：${process.platform} ${os.release()}`,
     `- 服务地址：${WEB_URL}（端口 ${PORT}）`,
     `- 服务状态：${server.running() ? '运行中' : '已停止'}${server.blockedReason ? '（' + server.blockedReason + '）' : ''}`,
     `- 环境就绪：${envReady() ? '是' : '否'}`,
     `- 环境报告：${JSON.stringify(env)}`,
-  ]
+  )
   if (includeLogs) {
     parts.push('', '## 日志 dshl.log（末尾 200 行）', '```', tailOf(TRAY_LOG, 200), '```')
     parts.push('', '## 日志 server.out.log（末尾 100 行）', '```', tailOf(OUT_LOG, 100), '```')
@@ -1521,6 +1524,8 @@ function registerIpc() {
           Config.npmRegistry = ''
           Config.dshUpdateCheckedAt = 0
           Config.panelHideNotified = false
+          Config.balanceApiKey = ''
+          Config.balanceBaseUrl = ''
           applyRuntimePort()
           // 端口复位到默认 3080：若自己拉起的服务跑在自定义端口，重启到默认端口并重载页面
           if (PORT !== portBefore && server.owned()) await restartServerOnNewPort()
@@ -1549,21 +1554,17 @@ function registerIpc() {
         }
         case 'setUseSystemBrowser': Config.useSystemBrowser = !!value; saveConfig(); broadcastState(); return '{}'
         case 'setAutoRestart': Config.autoRestart = !!value; saveConfig(); broadcastState(); return '{}'
-        case 'setFeedbackWebhook': {
-          Config.feedbackWebhook = String(value || '').trim()
-          saveConfig()
-          broadcastState()
-          return '{}'
-        }
         case 'feedbackBuild': {
           const text = String(value && value.text || '').trim()
           if (!text) return '{}'
-          return JSON.stringify(buildFeedbackPack(text, value && value.includeLogs !== false))
+          const contact = String(value && value.contact || '').trim().slice(0, 200)
+          return JSON.stringify(buildFeedbackPack(text, contact, value && value.includeLogs !== false))
         }
         case 'feedbackSend': {
           const text = String(value && value.text || '').trim()
           if (!text) return JSON.stringify({ ok: false, error: '请先填写问题描述' })
-          const pack = buildFeedbackPack(text, value && value.includeLogs !== false)
+          const contact = String(value && value.contact || '').trim().slice(0, 200)
+          const pack = buildFeedbackPack(text, contact, value && value.includeLogs !== false)
           if (!effectiveFeishuWebhook()) {
             return JSON.stringify({ ok: false, needWebhook: true, filePath: pack.filePath })
           }
@@ -1663,6 +1664,46 @@ function registerIpc() {
           try { clipboard.writeText(JSON.stringify(diag, null, 2)) } catch { /* noop */ }
           notify('DeepSeek Harness', '诊断信息已复制到剪贴板，请粘贴给开发者')
           return '{}'
+        }
+        case 'balanceGet': {
+          const dshInfo = balance.readDshKeyInfo(realHome)
+          const hasSaved = !!Config.balanceApiKey
+          return JSON.stringify({
+            key: Config.balanceApiKey || dshInfo.key, // 明文回传（本地面板"接口设置"中显示）
+            hasKey: hasSaved || !!dshInfo.key,
+            keySource: hasSaved ? 'saved' : (dshInfo.key ? 'dsh' : 'none'),
+            baseUrl: Config.balanceBaseUrl,
+            dshBaseUrl: dshInfo.baseUrl || '',
+          })
+        }
+        case 'balanceSave': {
+          if (value && typeof value === 'object') {
+            if (typeof value.key === 'string' && value.key.trim()) Config.balanceApiKey = value.key.trim()
+            if (typeof value.baseUrl === 'string' && value.baseUrl.trim()) Config.balanceBaseUrl = value.baseUrl.trim()
+            saveConfig()
+          }
+          return '{}'
+        }
+        case 'balanceClear': {
+          Config.balanceApiKey = ''
+          Config.balanceBaseUrl = ''
+          saveConfig()
+          return '{}'
+        }
+        case 'balanceQuery': {
+          const v = value && typeof value === 'object' ? value : {}
+          const dshInfo = balance.readDshKeyInfo(realHome)
+          const typedKey = (typeof v.key === 'string' && v.key.trim()) ? v.key.trim() : ''
+          const typedBase = (typeof v.baseUrl === 'string' && v.baseUrl.trim()) ? v.baseUrl.trim() : ''
+          const key = typedKey || Config.balanceApiKey || dshInfo.key
+          const base = typedBase || Config.balanceBaseUrl || dshInfo.baseUrl || balance.OFFICIAL_BASE
+          const result = await balance.queryBalance(base, key)
+          if (result.ok) {
+            log('balance query ok: ' + result.data.balance_infos.map((i) => `${i.currency} ${i.total}`).join(', ') + ' via ' + result.data.endpoint)
+          } else {
+            log('balance query failed: ' + result.error)
+          }
+          return JSON.stringify(result)
         }
         case 'updaterGetState': return updater.getState()
         case 'updaterCheck': void updater.check(); return updater.getState()
@@ -1770,7 +1811,7 @@ async function runSelfTest() {
     if (!win || win.isDestroyed()) { selftestPrint('FAILED: window not created'); app.exit(2); return }
     const title = await win.webContents.executeJavaScript('document.title')
     const panel = await win.webContents.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('btnFeedbackCode') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnBalanceSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用

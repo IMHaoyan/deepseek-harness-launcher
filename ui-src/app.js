@@ -147,46 +147,6 @@ function initPortWidget() {
 }
 const portCtl = initPortWidget();
 
-// ---------- 反馈通道控件：双击输入飞书群机器人 webhook 地址（留空 = 未设置，只能用"复制全部"手动提交） ----------
-function initFeedbackHookWidget() {
-  const el = $('btnFeedbackCode');
-  const ui = { configured: false, editing: false };
-  const setText = () => { el.textContent = ui.configured ? '已设置' : '未设置'; };
-  el.addEventListener('dblclick', () => {
-    if (ui.editing) return;
-    ui.editing = true;
-    const input = document.createElement('input');
-    input.type = 'password';
-    input.placeholder = '输入飞书机器人 webhook';
-    input.className = 'zoom-input';
-    input.style.width = '190px';
-    el.textContent = '';
-    el.appendChild(input);
-    input.focus();
-    let done = false;
-    const finish = () => { if (done) return; done = true; ui.editing = false; input.remove(); setText(); };
-    const commit = () => {
-      const v = input.value.trim();
-      ui.configured = !!v;
-      cmd('setFeedbackWebhook', v);
-      finish();
-    };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      else if (e.key === 'Escape') finish();
-    });
-    input.addEventListener('blur', commit);
-  });
-  return {
-    setFromState(configured) {
-      if (ui.editing) return;
-      ui.configured = !!configured;
-      setText();
-    },
-  };
-}
-const feedbackCodeCtl = initFeedbackHookWidget();
-
 function buildChips(containerId, items, checkedKey, onPick) {
   const container = $(containerId);
   container.textContent = '';
@@ -222,6 +182,7 @@ function showPage(name) {
   $('pageSettings').classList.toggle('hidden', name !== 'settings');
   $('pageLog').classList.toggle('hidden', name !== 'log');
   $('pageEnv').classList.toggle('hidden', name !== 'env');
+  $('pageBalance').classList.toggle('hidden', name !== 'balance');
   if (name === 'env') {
     // 打开环境页：拉取安装任务快照 + 强制重新检测
     void cmd('envGetState').then((s) => { if (s) renderEnvSnapshot(s); });
@@ -294,7 +255,6 @@ function render(state) {
   }
   zoomWidgets.web.setFromState(state.webZoom ?? 100);
   portCtl.setFromState(state.port || 3080);
-  feedbackCodeCtl.setFromState(!!state.feedbackConfigured);
 
   // 主题 chips（仅值变化时重建，避免打断点击）
   if (window._lastTheme !== state.theme) {
@@ -611,6 +571,102 @@ $('btnUpdaterCheck').addEventListener('click', () => {
   if (u && u.status === 'downloaded') void cmd('updaterInstall');
   else void cmd('updaterCheck');
 });
+
+// ---------- 余额（cc-switch 风格：主页只显示金额 + ↻ + ⚙；⚙ 进入设置页测试并保存） ----------
+const BALANCE_INTERVAL_MS = 3 * 60 * 1000
+let balanceTimer = null
+
+async function refreshBalanceConfig() {
+  const s = await cmd('balanceGet')
+  if (!s) return
+  window._balanceCfg = s
+  const keyEl = $('balanceKey')
+  keyEl.value = s.key || '' // 明文显示当前生效的密钥（已保存或 DSH 配置）
+  keyEl.placeholder = s.key ? '' : 'sk-...（未找到密钥：请填入，或配置 DSH 的 DEEPSEEK_API_KEY）'
+  const urlEl = $('balanceBaseUrl')
+  if (!s.baseUrl) {
+    urlEl.value = ''
+    urlEl.placeholder = s.dshBaseUrl ? `自动：DSH 配置（${s.dshBaseUrl}）` : '自动：官方 api.deepseek.com'
+  } else {
+    urlEl.value = s.baseUrl
+  }
+  const hint = $('balanceCurrentHint')
+  if (s.keySource === 'saved') hint.textContent = '当前：已保存的自定义设置' + (s.baseUrl ? ` · ${s.baseUrl}` : ' · 官方接口')
+  else if (s.keySource === 'dsh') hint.textContent = `当前：自动读取 DSH 配置${s.dshBaseUrl ? ' · ' + s.dshBaseUrl : ''}`
+  else hint.textContent = '当前：未找到密钥（请填写，或配置 DSH 的 DEEPSEEK_API_KEY）'
+}
+
+function renderBalanceResult(r) {
+  const valueEl = $('balanceValue')
+  if (!r || !r.ok) {
+    valueEl.className = 'value strong status-value stopped'
+    valueEl.textContent = '查询失败'
+    valueEl.title = (r && r.error) || '未知错误'
+    return
+  }
+  const d = r.data
+  const fmt = (n) => (n == null ? '-' : Number(n).toFixed(2))
+  const first = d.balance_infos[0]
+  const total = first && first.total != null ? fmt(first.total) : null
+  const avail = d.is_available
+  valueEl.className = 'value strong status-value ' + (avail ? 'running' : 'stopped')
+  valueEl.textContent = total != null ? `¥${total}` : '--'
+  valueEl.title = `${avail ? '可用' : '不可用（余额不足）'} · ${d.balance_infos.map((i) => `${i.currency} 总额 ${fmt(i.total)}（充值 ${fmt(i.toppedUp)} / 赠送 ${fmt(i.granted)}）`).join('；')} · 接口 ${d.endpoint}`
+}
+
+async function queryBalance() {
+  const valueEl = $('balanceValue')
+  valueEl.className = 'value strong status-value'
+  valueEl.textContent = '…'
+  const r = await cmd('balanceQuery', {
+    key: $('balanceKey').value.trim(),
+    baseUrl: $('balanceBaseUrl').value.trim(),
+  })
+  renderBalanceResult(r)
+}
+
+function startBalanceTimer() {
+  if (balanceTimer) clearInterval(balanceTimer)
+  balanceTimer = setInterval(() => void queryBalance(), BALANCE_INTERVAL_MS)
+}
+
+$('btnBalanceRefresh').addEventListener('click', () => void queryBalance())
+$('btnBalanceSettings').addEventListener('click', () => {
+  $('balanceTestStatus').className = 'balance-test-status'
+  $('balanceTestStatus').textContent = ''
+  void refreshBalanceConfig()
+  showPage('balance')
+})
+$('btnBalanceBack').addEventListener('click', () => showPage('main'))
+$('btnBalanceTest').addEventListener('click', async () => {
+  const st = $('balanceTestStatus')
+  st.className = 'balance-test-status'
+  st.textContent = '测试中…'
+  const key = $('balanceKey').value.trim()
+  const baseUrl = $('balanceBaseUrl').value.trim()
+  const r = await cmd('balanceQuery', { key, baseUrl })
+  if (r && r.ok) {
+    await cmd('balanceSave', { key, baseUrl }) // 连通（正确获取到余额）→ 自动保存
+    const fmt = (n) => (n == null ? '-' : Number(n).toFixed(2))
+    const first = r.data.balance_infos[0]
+    const total = first && first.total != null ? fmt(first.total) : '-'
+    st.className = 'balance-test-status ok'
+    st.textContent = `✓ 连接成功，已自动保存：余额 ¥${total}（${r.data.is_available ? '可用' : '不可用'}）`
+    void refreshBalanceConfig()
+  } else {
+    st.className = 'balance-test-status error'
+    st.textContent = '✕ ' + ((r && r.error) || '测试失败')
+  }
+})
+$('btnBalanceClear').addEventListener('click', async () => {
+  await cmd('balanceClear')
+  $('balanceKey').value = ''
+  $('balanceBaseUrl').value = ''
+  $('balanceTestStatus').className = 'balance-test-status'
+  $('balanceTestStatus').textContent = ''
+  void refreshBalanceConfig() // 清除后自动回显 DSH 配置（若有）
+  void queryBalance()
+})
 // 状态卡上的单项安装按钮（事件委托：卡片由 render 重建）
 $('envCards').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-env-item]');
@@ -640,7 +696,7 @@ $('feedbackOverlay').addEventListener('mousedown', (e) => {
 $('btnFeedbackCopy').addEventListener('click', async () => {
   const text = $('feedbackText').value.trim();
   if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
-  const pack = await cmd('feedbackBuild', { text, includeLogs: $('feedbackLogs').checked });
+  const pack = await cmd('feedbackBuild', { text, contact: $('feedbackContact').value, includeLogs: $('feedbackLogs').checked });
   if (pack && pack.body) {
     await cmd('clipboardWrite', pack.body);
     showFeedbackStatus('已复制完整反馈内容（含版本/环境/日志），粘贴到任意地方发送即可', 'ok');
@@ -652,14 +708,14 @@ $('btnFeedbackSend').addEventListener('click', async () => {
   const text = $('feedbackText').value.trim();
   if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
   showFeedbackStatus('正在提交…');
-  const r = await cmd('feedbackSend', { text, includeLogs: $('feedbackLogs').checked });
+  const r = await cmd('feedbackSend', { text, contact: $('feedbackContact').value, includeLogs: $('feedbackLogs').checked });
   if (!r) { showFeedbackStatus('提交失败：无响应', 'error'); return; }
   if (r.ok) {
     showFeedbackStatus('已发送到飞书反馈群（作者会即时收到），感谢反馈！', 'ok');
     return;
   }
   if (r.needWebhook) {
-    showFeedbackStatus('未配置反馈通道：请到设置页双击「反馈通道」粘贴飞书机器人 webhook，或用"复制全部"手动提交', 'error');
+    showFeedbackStatus('未配置反馈通道：请用"复制全部"手动提交，或联系作者', 'error');
     return;
   }
   showFeedbackStatus(r.error || '提交失败', 'error');
@@ -694,5 +750,8 @@ $('envLogAuto').addEventListener('change', () => refreshEnvLog());
   try {
     render(await cmd('getState'));
     renderUpdater(await cmd('updaterGetState'));
+    await refreshBalanceConfig();
+    startBalanceTimer();
+    void queryBalance(); // 面板加载即查询一次，此后每 3 分钟自动刷新
   } catch (err) { console.error('[dshl] initial state failed:', err); }
 })();
