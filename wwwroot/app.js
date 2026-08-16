@@ -147,8 +147,8 @@ function initPortWidget() {
 }
 const portCtl = initPortWidget();
 
-// ---------- 反馈令牌控件：双击输入 GitHub 反馈令牌（留空 = 未设置，只能用"复制全部"手动提交） ----------
-function initFeedbackCodeWidget() {
+// ---------- 反馈通道控件：双击输入飞书群机器人 webhook 地址（留空 = 未设置，只能用"复制全部"手动提交） ----------
+function initFeedbackHookWidget() {
   const el = $('btnFeedbackCode');
   const ui = { configured: false, editing: false };
   const setText = () => { el.textContent = ui.configured ? '已设置' : '未设置'; };
@@ -157,7 +157,7 @@ function initFeedbackCodeWidget() {
     ui.editing = true;
     const input = document.createElement('input');
     input.type = 'password';
-    input.placeholder = '输入 GitHub 反馈令牌';
+    input.placeholder = '输入飞书机器人 webhook';
     input.className = 'zoom-input';
     input.style.width = '190px';
     el.textContent = '';
@@ -168,7 +168,7 @@ function initFeedbackCodeWidget() {
     const commit = () => {
       const v = input.value.trim();
       ui.configured = !!v;
-      cmd('setFeedbackToken', v);
+      cmd('setFeedbackWebhook', v);
       finish();
     };
     input.addEventListener('keydown', (e) => {
@@ -185,7 +185,7 @@ function initFeedbackCodeWidget() {
     },
   };
 }
-const feedbackCodeCtl = initFeedbackCodeWidget();
+const feedbackCodeCtl = initFeedbackHookWidget();
 
 function buildChips(containerId, items, checkedKey, onPick) {
   const container = $(containerId);
@@ -655,11 +655,11 @@ $('btnFeedbackSend').addEventListener('click', async () => {
   const r = await cmd('feedbackSend', { text, includeLogs: $('feedbackLogs').checked });
   if (!r) { showFeedbackStatus('提交失败：无响应', 'error'); return; }
   if (r.ok) {
-    showFeedbackStatus('已提交到 GitHub（作者会收到通知），感谢反馈！' + (r.issueUrl ? ' ' + r.issueUrl : ''), 'ok');
+    showFeedbackStatus('已发送到飞书反馈群（作者会即时收到），感谢反馈！', 'ok');
     return;
   }
-  if (r.needToken) {
-    showFeedbackStatus('未配置反馈令牌：请用"复制全部"手动提交，或联系作者配置令牌', 'error');
+  if (r.needWebhook) {
+    showFeedbackStatus('未配置反馈通道：请到设置页双击「反馈通道」粘贴飞书机器人 webhook，或用"复制全部"手动提交', 'error');
     return;
   }
   showFeedbackStatus(r.error || '提交失败', 'error');

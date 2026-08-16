@@ -75,7 +75,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackToken: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, panelHideNotified: false }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, panelHideNotified: false }
 let firstRun = false
 let harnessRoot = ''
 
@@ -191,7 +191,7 @@ function loadConfig() {
       if (typeof cfg.autoRestart === 'boolean') Config.autoRestart = cfg.autoRestart
       if (typeof cfg.tabsEnabled === 'boolean') Config.tabsEnabled = cfg.tabsEnabled
       if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
-      if (typeof cfg.feedbackToken === 'string') Config.feedbackToken = cfg.feedbackToken
+      if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
       if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= 480) Config.windowWidth = cfg.windowWidth
       if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= 600) Config.windowHeight = cfg.windowHeight
       // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
@@ -1260,7 +1260,7 @@ function stateJson() {
     port: PORT,
     blocked: server.blockedReason || '',
     suggestedPort: server.suggestedPort || 0,
-    feedbackConfigured: !!(Config.feedbackToken || embeddedFeedbackToken()),
+    feedbackConfigured: !!(Config.feedbackWebhook || embeddedFeishuWebhook()),
     version: app.getVersion(),
     autostart: autostartEnabled(),
     notify: Config.notify,
@@ -1336,22 +1336,55 @@ function onTick() {
   scanNotify()
 }
 
-// ---------- 问题反馈（GitHub Issues 通道：用户无需邮件客户端，提交即建 Issue，作者按仓库通知收到） ----------
-const FEEDBACK_REPO = 'IMHaoyan/deepseek-harness-launcher'
-const FEEDBACK_BODY_MAX = 60000 // GitHub issue body 上限 65536 字符，留余量
+// ---------- 问题反馈（飞书群机器人 webhook：POST 到固定地址，作者群内即时收到） ----------
+const FEEDBACK_BODY_MAX = 60000 // 反馈内容上限（本地落盘同样截断，避免异常超大文件）
+const FEISHU_WEBHOOK_RE = /^https:\/\/open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[0-9a-fA-F-]+$/
+const FEISHU_TEXT_MAX_BYTES = 120000 // 飞书文本消息请求体上限 150KB（官方文档），留余量防 JSON 转义膨胀
 
-// 内置反馈令牌：assets/feedback-token.txt（.gitignore 排除，不进仓库；打包时随安装包分发）
-// 仅需 Issues 写权限的 fine-grained token，泄露风险面极小且可随时吊销
-function embeddedFeedbackToken() {
+// 内置反馈通道：assets/feishu-webhook.txt（.gitignore 排除，不进仓库；打包时随安装包分发）
+// 群机器人 webhook 仅能向指定群发文本消息，泄露可随时在群设置里重置，风险面小
+function embeddedFeishuWebhook() {
   try {
-    const t = fs.readFileSync(path.join(ASSETS_DIR, 'feedback-token.txt'), 'utf8').trim()
-    return t || ''
+    const t = fs.readFileSync(path.join(ASSETS_DIR, 'feishu-webhook.txt'), 'utf8').trim()
+    return FEISHU_WEBHOOK_RE.test(t) ? t : ''
   } catch { return '' }
 }
 
-// 生效令牌 = 设置页自定义（覆盖）|| 内置
-function effectiveFeedbackToken() {
-  return Config.feedbackToken || embeddedFeedbackToken()
+// 生效通道 = 设置页自定义（覆盖）|| 内置
+function effectiveFeishuWebhook() {
+  const custom = String(Config.feedbackWebhook || '').trim()
+  return FEISHU_WEBHOOK_RE.test(custom) ? custom : embeddedFeishuWebhook()
+}
+
+// 按 UTF-8 字节数截断（飞书上限按请求体字节计）：从尾部截，保住标题/描述/环境/日志头部
+function trimUtf8(text, maxBytes) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  const suffix = '\n\n…（内容超出飞书消息长度上限，已截断；完整版已保存在本地日志目录 feedback/ 下）'
+  const suffixBytes = Buffer.byteLength(suffix, 'utf8')
+  let lo = 0
+  let hi = text.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (Buffer.byteLength(text.slice(0, mid), 'utf8') + suffixBytes <= maxBytes) lo = mid
+    else hi = mid - 1
+  }
+  return text.slice(0, lo) + suffix
+}
+
+// 发送文本消息到飞书群机器人：成功返回 true，失败抛出可读错误（含飞书错误码）
+async function sendToFeishu(text) {
+  const hook = effectiveFeishuWebhook()
+  const res = await fetch(hook, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msg_type: 'text', content: { text } }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok && data.code === undefined) throw new Error('HTTP ' + res.status)
+  if (data.code !== 0 && data.StatusCode !== 0) {
+    throw new Error(data.msg || data.StatusMessage || ('飞书错误码 ' + data.code))
+  }
+  return true
 }
 
 function tailOf(file, lines) {
@@ -1392,23 +1425,6 @@ function buildFeedbackPack(text, includeLogs) {
   const filePath = path.join(dir, `feedback-${ts}.md`)
   try { fs.writeFileSync(filePath, body, 'utf8') } catch { /* noop */ }
   return { subject, body, filePath }
-}
-
-async function createGithubIssue(title, body) {
-  const token = effectiveFeedbackToken()
-  const res = await fetch(`https://api.github.com/repos/${FEEDBACK_REPO}/issues`, {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + token,
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'dshl-feedback',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ title, body }),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error((data && data.message) || ('HTTP ' + res.status))
-  return data.html_url || ''
 }
 
 // ---------- IPC 命令桥（Bridge.cs 移植） ----------
@@ -1489,7 +1505,7 @@ function registerIpc() {
           Config.tabsEnabled = false
           const portBefore = PORT
           Config.port = 0
-          Config.feedbackToken = ''
+          Config.feedbackWebhook = ''
           Config.windowWidth = 0
           Config.windowHeight = 0
           Config.webWindowWidth = 0
@@ -1533,8 +1549,8 @@ function registerIpc() {
         }
         case 'setUseSystemBrowser': Config.useSystemBrowser = !!value; saveConfig(); broadcastState(); return '{}'
         case 'setAutoRestart': Config.autoRestart = !!value; saveConfig(); broadcastState(); return '{}'
-        case 'setFeedbackToken': {
-          Config.feedbackToken = String(value || '').trim()
+        case 'setFeedbackWebhook': {
+          Config.feedbackWebhook = String(value || '').trim()
           saveConfig()
           broadcastState()
           return '{}'
@@ -1548,16 +1564,16 @@ function registerIpc() {
           const text = String(value && value.text || '').trim()
           if (!text) return JSON.stringify({ ok: false, error: '请先填写问题描述' })
           const pack = buildFeedbackPack(text, value && value.includeLogs !== false)
-          if (!effectiveFeedbackToken()) {
-            return JSON.stringify({ ok: false, needToken: true, filePath: pack.filePath })
+          if (!effectiveFeishuWebhook()) {
+            return JSON.stringify({ ok: false, needWebhook: true, filePath: pack.filePath })
           }
           try {
-            const issueUrl = await createGithubIssue(pack.subject, pack.body)
-            log('feedback submitted: ' + issueUrl)
-            return JSON.stringify({ ok: true, issueUrl, filePath: pack.filePath })
+            await sendToFeishu(trimUtf8(pack.body, FEISHU_TEXT_MAX_BYTES))
+            log('feedback sent to feishu bot')
+            return JSON.stringify({ ok: true, filePath: pack.filePath })
           } catch (err) {
-            log('feedback submit failed: ' + err.message)
-            return JSON.stringify({ ok: false, error: '提交失败：' + err.message + '（可改用"复制全部"手动提交）', filePath: pack.filePath })
+            log('feedback send failed: ' + err.message)
+            return JSON.stringify({ ok: false, error: '发送失败：' + err.message + '（可改用"复制全部"手动提交）', filePath: pack.filePath })
           }
         }
         case 'clipboardWrite': try { clipboard.writeText(String(value)) } catch { /* noop */ } return '{}'

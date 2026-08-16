@@ -6,7 +6,7 @@ dshl-selftest-*
 Thumbs.db
 # 本地命名讨论存档（内部文档，不随公开仓库发布）
 NAMES.md
-# 反馈通道令牌：仅本地存在、随安装包分发，绝不进仓库（泄露面 = 只读该仓库 Issues 的细粒度 token）
-assets/feedback-token.txt
+# 飞书反馈通道 webhook：仅本地存在、随安装包分发，绝不进仓库（泄露面 = 向指定群发文本消息，可随时在群设置重置）
+assets/feishu-webhook.txt
 # 本地 npm 镜像配置（registry/electron_mirror），随网络环境而异，不进仓库
 .npmrc
