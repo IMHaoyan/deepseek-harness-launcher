@@ -38,8 +38,9 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 function run(cmd, args) {
   console.log('> ' + cmd + ' ' + args.join(' '))
-  // Windows：.cmd 批处理无法被 CreateProcess 直接 spawn（spawnSync EINVAL），经 shell 执行
-  execFileSync(cmd, args, { stdio: 'inherit', cwd: root, shell: process.platform === 'win32' })
+  // Windows：仅 .cmd 批处理经 shell 执行（无法被 CreateProcess 直接 spawn，spawnSync EINVAL）；
+  // 其他命令（node.exe 等含空格路径）必须 shell:false，否则 cmd 会把 "C:\Program Files" 按空格拆断
+  execFileSync(cmd, args, { stdio: 'inherit', cwd: root, shell: process.platform === 'win32' && /\.cmd$/i.test(cmd) })
 }
 
 // 捕获 stdout 的命令；非零退出/不存在 → null（注意 stdio 不可用 ignore，成功也返回 null）
