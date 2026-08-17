@@ -296,16 +296,21 @@ function npmCliFor(nodeBin) {
 
 function runNpmInstall(job, nodeBin, npmCli, args) {
   return new Promise((resolve, reject) => {
+    // 关键：把 Node 可执行文件所在目录注入子进程 PATH。
+    // 无系统 Node 的干净机器上，koffi/node-pty 等原生包的生命周期脚本以 `cmd /c node xxx.js` 执行，
+    // 找不到 node 会报 "'node' 不是内部或外部命令"（npm 退出码 1）。
+    const nodeDir = path.dirname(nodeBin)
+    const env = Object.assign({}, process.env, { PATH: nodeDir + path.delimiter + (process.env.PATH || '') })
     let child
     try {
       if (npmCli) {
-        child = spawn(nodeBin, [npmCli, ...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+        child = spawn(nodeBin, [npmCli, ...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env })
       } else if (IS_WIN) {
         // cmd.exe 兜底：每个 token 独立双引号包裹（cmd /s /c 会剥外层引号），避免路径/参数含空格时错乱
         const cmdLine = ['npm', ...args].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')
-        child = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+        child = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env })
       } else {
-        child = spawn('npm', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+        child = spawn('npm', args, { stdio: ['ignore', 'pipe', 'pipe'], env })
       }
     } catch (err) { return reject(err) }
     job.child = child
