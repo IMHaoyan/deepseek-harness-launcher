@@ -21,11 +21,13 @@ const IS_WIN = process.platform === 'win32'
 let HOME = path.join(os.homedir(), '.dsh') // 始终为真实用户 HOME（安装物/插件都落在真实 HOME）
 let Config = { harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22 }
 let logFn = () => {}
+let FRESH_TEST = false // DSHL_FRESH_TEST=1：模拟全新机器（无视系统级 node/源码仓库/全局/npx 缓存，只认托管安装）
 
 function initEnv(opts = {}) {
   if (opts.realHome) HOME = opts.realHome
   if (opts.Config) Config = opts.Config
   if (opts.log) logFn = opts.log
+  FRESH_TEST = process.env.DSHL_FRESH_TEST === '1'
 }
 
 function log(message) {
@@ -124,7 +126,7 @@ function npxCacheRoots() {
 
 function nodeCandidates() {
   const list = []
-  if (Config.nodePath) list.push({ path: Config.nodePath, source: 'config' })
+  if (!FRESH_TEST && Config.nodePath) list.push({ path: Config.nodePath, source: 'config' })
   // 托管 Node（版本目录名即版本号，取满足范围的最新版；具体版本由探测确认）
   try {
     const base = managedNodeDir()
@@ -136,8 +138,8 @@ function nodeCandidates() {
       if (fs.existsSync(bin)) list.push({ path: bin, source: 'managed' })
     }
   } catch { /* 无托管 Node */ }
-  list.push({ path: 'node', source: 'system' })
-  if (!IS_WIN) {
+  if (!FRESH_TEST) list.push({ path: 'node', source: 'system' })
+  if (!FRESH_TEST && !IS_WIN) {
     const home = os.homedir()
     for (const p of [
       '/opt/homebrew/bin/node',
@@ -181,6 +183,15 @@ async function detectNode(range) {
 function detectDshEntries() {
   const entries = [] // { kind, ...readDshAt, built }，按优先级排列
   let sourceFound = false
+  if (FRESH_TEST) {
+    // 全新机模拟：无视系统级安装（源码仓库/全局/npx 缓存），只认托管目录（安装完成后即可被发现）
+    const dir = path.join(managedDshDir(), 'node_modules', '@deepseek-ai', 'dsh')
+    if (fs.existsSync(path.join(dir, 'package.json'))) {
+      const e = readDshAt(dir)
+      if (e && e.built) entries.push({ kind: 'managed', ...e })
+    }
+    return { entries, sourceFound }
+  }
   // 1) 源码仓库（显式配置 + 默认路径）
   const roots = []
   if (Config.harnessRoot) roots.push(Config.harnessRoot)

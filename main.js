@@ -28,6 +28,7 @@ function parseArgs(argv) {
   for (let i = 0; i < list.length; i++) {
     const a = list[i]
     if (a === '--selftest') out.selftest = true
+    else if (a === '--panel') out.panel = true
     else if (a === '--port' && i + 1 < list.length) {
       const p = parseInt(list[++i], 10)
       if (Number.isInteger(p)) out.port = p
@@ -94,12 +95,17 @@ function initEnvRuntime() {
     log,
     onPush: pushEnv,
     onDone: () => {
-      // 安装完成后：重新探测环境，就绪则自动启动服务；若探测暂未就绪（竞态/文件延迟），由 onTick 补启动
+      // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
+      // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动
       void (async () => {
         await refreshEnv(true)
         if (envReady()) {
           log('environment ready after install, starting service')
-          void handleStart()
+          await handleStart()
+          if (server.running()) {
+            await sleep(400)
+            openWebUi() // 新手完成感：服务就绪后自动打开 DeepSeek Harness
+          }
         } else {
           startWhenReady = true
           log('environment not ready right after install, deferred start armed')
@@ -193,8 +199,8 @@ function loadConfig() {
       if (typeof cfg.tabsEnabled === 'boolean') Config.tabsEnabled = cfg.tabsEnabled
       if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
       if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
-      if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= 480) Config.windowWidth = cfg.windowWidth
-      if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= 600) Config.windowHeight = cfg.windowHeight
+      if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= PANEL_MIN_W) Config.windowWidth = cfg.windowWidth
+      if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= PANEL_MIN_H) Config.windowHeight = cfg.windowHeight
       // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
       if (Number.isInteger(cfg.webWindowWidth) && cfg.webWindowWidth >= 640) Config.webWindowWidth = cfg.webWindowWidth
       if (Number.isInteger(cfg.webWindowHeight) && cfg.webWindowHeight >= 480) Config.webWindowHeight = cfg.webWindowHeight
@@ -704,9 +710,11 @@ function migrateLegacyAutostart() {
 let win = null
 let reallyExit = false
 
-// 启动器面板默认尺寸：窗口可调整的最小尺寸（480×600）
+// 启动器面板默认尺寸：窗口可调整的最小尺寸（480×740）。
+// 高度按"主页最低端版本行无需滚动"实测校准：面板 CSS 缩放 125%（系统 150% ÷ 1.2）时内容约需 720px，
+// 再留 20px 余量覆盖不同 Windows 标题栏高度差异（100% 缩放时内容约 540px，同样无需滚动）。
 const PANEL_MIN_W = 480
-const PANEL_MIN_H = 600
+const PANEL_MIN_H = 650
 
 function defaultPanelSize() {
   return [PANEL_MIN_W, PANEL_MIN_H]
@@ -736,8 +744,8 @@ function positionPanel(target) {
 
 function createWindow() {
   const dft = defaultPanelSize()
-  const w = Config.windowWidth >= 480 ? Config.windowWidth : dft[0]
-  const h = Config.windowHeight >= 600 ? Config.windowHeight : dft[1]
+  const w = Config.windowWidth >= PANEL_MIN_W ? Config.windowWidth : dft[0]
+  const h = Config.windowHeight >= PANEL_MIN_H ? Config.windowHeight : dft[1]
   win = new BrowserWindow({
     width: w,
     height: h,
@@ -761,7 +769,14 @@ function createWindow() {
   win.webContents.on('zoom-changed', () => {
     try { win.webContents.setZoomLevel(0) } catch { /* noop */ }
   })
-  attachContextMenu(win.webContents)
+  attachContextMenu(win.webContents, true)
+  // F12 打开面板 DevTools（UI 可视化调试：改样式立即生效）
+  win.webContents.on('before-input-event', (e, input) => {
+    if (input.type === 'keyDown' && input.key === 'F12') {
+      e.preventDefault()
+      try { win.webContents.toggleDevTools() } catch { /* noop */ }
+    }
+  })
   win.on('close', (e) => {
     if (!reallyExit) {
       e.preventDefault()
@@ -838,7 +853,8 @@ function showWebZoomOverlay(wc) {
 }
 
 // ---------- 右键编辑菜单（Electron 无默认右键菜单：为面板与 WebUI 窗口补齐 剪切/复制/粘贴/全选） ----------
-function attachContextMenu(wc) {
+// withDev=true（启动器面板）：额外提供"打开开发者工具"与"刷新"，用于 UI 可视化调试
+function attachContextMenu(wc, withDev) {
   wc.on('context-menu', (_event, params) => {
     const items = []
     if (params.isEditable) {
@@ -859,6 +875,16 @@ function attachContextMenu(wc) {
     if (params.linkURL) {
       if (items.length) items.push({ type: 'separator' })
       items.push({ label: '复制链接地址', click: () => { try { clipboard.writeText(params.linkURL) } catch { /* noop */ } } })
+    }
+    if (withDev) {
+      if (items.length) items.push({ type: 'separator' })
+      items.push(
+        {
+          label: '打开开发者工具（调试UI）',
+          click: () => { try { wc.openDevTools({ mode: 'detach' }) } catch { /* noop */ } },
+        },
+        { label: '刷新面板', click: () => { try { wc.reload() } catch { /* noop */ } } },
+      )
     }
     if (!items.length) return
     Menu.buildFromTemplate(items).popup({ window: BrowserWindow.fromWebContents(wc) })
@@ -1264,6 +1290,7 @@ function stateJson() {
     blocked: server.blockedReason || '',
     suggestedPort: server.suggestedPort || 0,
     version: app.getVersion(),
+    firstRun: firstRun,
     autostart: autostartEnabled(),
     notify: Config.notify,
     useSystemBrowser: Config.useSystemBrowser,
@@ -1274,6 +1301,7 @@ function stateJson() {
     webZoom: Config.webZoom,
     theme: Config.theme,
     env: envDetect.envSummary(envReport),
+    dshUpdate: dshUpdater.getState(),
     log: logTail,
   })
 }
@@ -1459,6 +1487,7 @@ function registerIpc() {
         case 'openUrlExternal': try { shell.openExternal(WEB_URL) } catch { /* noop */ } return '{}'
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
         case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
+        case 'openRecharge': try { shell.openExternal('https://platform.deepseek.com/usage') } catch { /* noop */ } return '{}'
         case 'openChangelog': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher/releases') } catch { /* noop */ } return '{}'
         case 'toggleAutostart': setAutostart(!autostartEnabled()); broadcastState(); return '{}'
         case 'testNotify': notify('DeepSeek Harness', '测试通知：链路正常，点击本通知打开 DeepSeek Harness', WEB_URL); return '{}'
@@ -1649,6 +1678,16 @@ function registerIpc() {
           return JSON.stringify(envInstall.getJob())
         }
         case 'openInstallLog': try { shell.openPath(envInstall.installLogPath()) } catch { /* noop */ } return '{}'
+        case 'openDshDir': { // 源码形态"手动更新"：打开源码仓库目录
+          const dir = envReport && envReport.dsh && envReport.dsh.dir
+          if (dir) {
+            try {
+              const err = await shell.openPath(dir)
+              return JSON.stringify({ ok: !err, error: err || '', dir })
+            } catch (e) { return JSON.stringify({ ok: false, error: e.message, dir }) }
+          }
+          return JSON.stringify({ ok: false, error: '未找到 DSH 安装目录' })
+        }
         case 'envCopyDiagnostics': {
           // 一键复制完整诊断信息到剪贴板（版本/环境报告/安装任务/平台），便于反馈排查
           const diag = {
@@ -1708,6 +1747,8 @@ function registerIpc() {
         case 'updaterGetState': return updater.getState()
         case 'updaterCheck': void updater.check(); return updater.getState()
         case 'updaterInstall': void updater.installNow(); return updater.getState()
+        case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
+        case 'dshCheckNow': void dshUpdater.checkOnce('manual', true); return '{}'
         case 'exit': void requestExit(); return '{}'
         default: log('bridge: unknown command ' + name); return '{}'
       }
@@ -1811,7 +1852,7 @@ async function runSelfTest() {
     if (!win || win.isDestroyed()) { selftestPrint('FAILED: window not created'); app.exit(2); return }
     const title = await win.webContents.executeJavaScript('document.title')
     const panel = await win.webContents.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnBalanceSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnRecharge') !== null && document.getElementById('btnBalanceOpenSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('btnDshCheck') !== null && document.getElementById('dshUpdaterStatus') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用
@@ -1913,7 +1954,7 @@ function init() {
     sendToPanel: (json) => { if (win && !win.isDestroyed()) { try { win.webContents.send('dsh:updater', json) } catch { /* noop */ } } },
     beforeInstall: async () => { if (server.owned()) await stopServerFast() },
   })
-  // DSH 自动更新（dsh-update.js）：静默检查最新版，托管/全局/npx 形态自动升级，无需用户确认
+  // DSH 更新（dsh-update.js）：检测全自动、更新全手动（主页卡片按钮触发）
   dshUpdater.initDshUpdater({
     Config,
     saveConfig,
@@ -1925,9 +1966,11 @@ function init() {
     getServerState: () => ({ running: server.running(), owned: server.owned() }),
     stopService: () => stopServer(),
     startService: () => handleStart(),
+    onState: () => broadcastState(),
   })
   if (firstRun) {
-    if (!autostartEnabled()) setAutostart(true) // 默认开启开机自启与消息提醒
+    // 全新机模拟（DSHL_FRESH_TEST=1）时不动真实系统的开机自启
+    if (process.env.DSHL_FRESH_TEST !== '1' && !autostartEnabled()) setAutostart(true) // 默认开启开机自启与消息提醒
     saveConfig()
   }
   clearStaleNotify()
@@ -1937,21 +1980,39 @@ function init() {
   void (async () => {
     await refreshEnv(true)
     if (!envReady()) {
-      if (firstRun) showPanel()
+      if (firstRun || args.panel) showPanel()
       log('environment not ready, panel available for one-click install')
       return
     }
     await handleStart()
     if (server.running()) {
       await sleep(400)
-      openWebUi()
+      // --panel：启动后弹出启动器面板（默认弹出 DeepSeek Harness 独立窗口）
+      if (args.panel) showPanel()
+      else openWebUi()
     }
   })()
   setInterval(onTick, 2000)
+  // 开发模式热刷新（npm run dev / VS Code F5）：wwwroot 产物变化 → 面板窗口自动重载，无需重启启动器。
+  // 面板壳（browser.html）变化时独立窗口壳一并重载（分屏视图挂的是 DSH 页面，不受影响）。
+  if (!app.isPackaged) {
+    let devReloadTimer = null
+    try {
+      fs.watch(WWWROOT, () => {
+        clearTimeout(devReloadTimer)
+        devReloadTimer = setTimeout(() => {
+          if (win && !win.isDestroyed()) { try { win.webContents.reload() } catch { /* noop */ } }
+          if (webWin && !webWin.isDestroyed()) { try { webWin.reload() } catch { /* noop */ } }
+          log('dev: wwwroot changed → panel hot-reloaded')
+        }, 150)
+      })
+      log('dev: panel hot reload enabled (npm run dev)')
+    } catch (err) { log('dev: hot reload watch failed: ' + (err && err.message ? err.message : String(err))) }
+  }
   // 启动后 20 秒静默检查一次更新（仅打包版；开发模式跳过）
   setTimeout(() => updater.autoCheck(), 20000)
-  // DSH 自动更新：启动后 20 秒首次检查，此后每 6 小时尝试一次（模块内部 24 小时节流）
-  setTimeout(() => { void dshUpdater.checkOnce('startup') }, 20000)
+  // DSH 更新检查：启动后 30 秒首次，此后每 6 小时尝试一次（模块内部 24 小时节流；只检测、绝不自动更新）
+  setTimeout(() => { void dshUpdater.checkOnce('startup') }, 30000)
   setInterval(() => { void dshUpdater.checkOnce('timer') }, 6 * 60 * 60 * 1000)
 }
 

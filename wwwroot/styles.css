@@ -181,6 +181,16 @@ body {
   line-height: 22px;
 }
 
+/* 主页面统一标签列：76px 左对齐——所有行的数值从同一竖线开始 */
+#pageMain .label {
+  width: 76px;
+}
+
+/* 余额行：标签自适应宽度，数值紧跟标签（余额为独立卡片，不参与跨卡竖线对齐） */
+#balanceCard .label {
+  width: auto;
+}
+
 /* 长标题行：标题在上、控件在下，控件左缘与其他行严格对齐（88px 标签列 + 12px 间距） */
 .row.stack {
   flex-direction: column;
@@ -229,6 +239,62 @@ body {
 .balance-test-status.ok { color: var(--success); }
 .balance-test-status.error { color: var(--danger); }
 
+/* ---------- 新手安装向导（欢迎 / 极简进度 / 完成 / 失败） ---------- */
+#pageWizard {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+}
+#pageWizard.hidden { display: none !important; }
+
+.wizard-hero { font-size: 46px; text-align: center; margin-top: 14px; }
+.wizard-title { font-size: 18px; font-weight: 600; text-align: center; margin: 12px 0 4px; }
+.wizard-sub { font-size: 13px; color: var(--text-secondary); text-align: center; }
+.wizard-points { margin: 20px 4px 14px; display: flex; flex-direction: column; gap: 10px; }
+.wizard-point { display: flex; gap: 8px; font-size: 13px; color: var(--text-secondary); align-items: center; }
+.wizard-point-icon { color: var(--success); font-weight: 700; width: 16px; text-align: center; flex: none; }
+.wizard-main-btn { width: 100%; height: 44px; margin-top: 8px; font-size: 15px; border-radius: 22px; }
+.wizard-skip { margin: 10px auto 0; display: block; }
+.wizard-note { font-size: 12px; color: var(--text-tertiary); text-align: center; margin-top: 8px; }
+.wizard-percent { font-size: 36px; font-weight: 600; text-align: center; margin: 18px 0 8px; }
+.wizard-steps { margin: 16px 0 4px; display: flex; flex-direction: column; gap: 9px; }
+.wizard-step { display: flex; gap: 8px; font-size: 13px; color: var(--text-secondary); align-items: center; }
+.wizard-step.active { color: var(--text-primary); font-weight: 500; }
+.wizard-step.done { color: var(--success); }
+.wizard-step-icon { width: 16px; text-align: center; flex: none; }
+.wizard-elapsed { font-size: 12px; color: var(--text-tertiary); margin: 8px 0 2px; }
+.wizard-remain { margin-left: 12px; }
+.wizard-actions { display: flex; gap: 8px; margin-top: 10px; justify-content: center; flex-wrap: wrap; }
+.wizard-done-icon { font-size: 46px; text-align: center; margin-top: 22px; color: var(--success); }
+.wizard-start-bar { margin: 18px 6px 0; }
+.wizard-fail-icon { font-size: 46px; text-align: center; margin-top: 22px; color: var(--danger); }
+.wizard-error-detail {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-align: center;
+  margin: 8px 6px 0;
+  user-select: text;
+  -webkit-user-select: text;
+  word-break: break-all;
+}
+#wizardLog {
+  margin-top: 10px;
+  max-height: 170px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-tertiary);
+  background: var(--log-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* 设置页：选项控件靠右对齐（label 靠左，chips/按钮贴右缘；主页状态行不受影响） */
 #pageSettings .row {
   justify-content: space-between;
@@ -258,7 +324,10 @@ body {
 }
 
 .value.strong { font-weight: 500; }
-.value.mono { font-family: var(--font-mono); font-size: 13px; color: var(--text-tertiary); }
+.value.mono { font-family: var(--font-mono); font-size: 14px; color: var(--text-tertiary); }
+
+/* 余额行：数值留在标签列右侧，操作小按钮（↻ / 充值）靠右 */
+.balance-chips { margin-left: auto; }
 
 /* 地址行：可点击，默认浏览器打开 */
 .value.link { cursor: pointer; }
@@ -336,6 +405,58 @@ body {
   align-items: center; /* 让 28px 的更新徽标与 36px 按钮文字垂直居中对齐（默认 stretch 会顶对齐） */
   gap: 8px;
   padding: 14px;
+}
+
+/* 主操作区：主按钮通栏 + 次按钮并排等宽 */
+.main-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.main-actions > .btn {
+  width: 100%;
+}
+
+.main-actions .actions-row {
+  display: flex;
+  gap: 8px;
+}
+
+.main-actions .actions-row .btn {
+  flex: 1;
+  width: auto;
+}
+
+/* 底端链接：两端对齐（首个贴左缘与"余额"对齐，末个贴右缘，中间自然分布） */
+.main-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 6px 14px;
+}
+
+.main-footer .btn {
+  flex: none;
+  padding: 0 10px;
+  margin-left: -10px; /* 内边距左移抵消：文字仍贴卡片左缘对齐"余额"，悬停底色完整包住文字 */
+  justify-content: flex-start;
+}
+
+/* 版本行（并入运行状态卡）：与其余行共用 .row 的 32px 行高/12px 间距，更新按钮同行、不换行 */
+.version-row .btn { flex: none; }
+
+.version-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 20px;
 }
 
 /* ---------- 胶囊选择器（chips，h28/r14） ---------- */
@@ -608,7 +729,7 @@ body {
   width: 0;
   border-radius: 3px;
   background: var(--primary-fill);
-  transition: width 120ms ease;
+  transition: width 400ms ease-out; /* 平滑滑行：快速阶段（下载/解压）也不瞬移 */
 }
 
 .env-stage-text {

@@ -29,16 +29,16 @@ DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DS
 ### 自动更新
 
 - 启动 20 秒后自动静默检查 GitHub Releases 上的新版本，发现即后台下载；
-- 发现新版本时：主页面出现独立的绿色 **"更新到 vX"** 卡片；设置页"检查更新"按钮同时变为绿色的"更新到 vX"，点击立即安装（下载中显示进度、就绪后可点；退出重启也会自动安装）；
+- 发现新版本时：主页面最低端"启动器版本"行内出现绿色 **"更新到 vX"** 按钮（与版本同行、不换行）；设置页"检查更新"按钮同时变为绿色的"更新到 vX"，点击立即安装（下载中显示进度、就绪后可点；退出重启也会自动安装）；
 - 下载完成弹托盘通知；设置页可手动"检查更新"并查看当前版本；
 - 主页面底端另有"Github地址"（打开仓库主页）、"更新日志"（打开 Releases 页面）与"反馈问题"按钮。
 
 ### 余额查询
 
-主页面"余额"卡片**只显示余额金额**（绿=可用/红=不可用；悬停显示明细），右侧 **↻ 立即刷新**、**⚙ 进入设置页**（cc-switch 风格，实现参照 [cc-switch](https://github.com/farion1231/cc-switch)：`GET {接口}/user/balance` + Bearer 鉴权）：
+主页面"余额"卡片**只显示余额金额**（绿=可用/红=不可用；悬停显示明细），右侧 **↻ 立即刷新**、**充值 / 用量查询**（打开 DeepSeek 开放平台 `https://platform.deepseek.com/usage` 充值/用量页）（cc-switch 风格，实现参照 [cc-switch](https://github.com/farion1231/cc-switch)：`GET {接口}/user/balance` + Bearer 鉴权）：
 
 - **默认零配置**：自动读取 DSH 的 `~/.dsh/.credentials.yaml`（`DEEPSEEK_API_KEY`）与 `~/.dsh/settings.yaml`（`llm-deepseek.baseURL`），面板加载即查询一次，此后**每 3 分钟自动刷新**；
-- **设置页**（⚙）：API Key **明文显示**、查询接口可自定义（留空 = 自动：DSH 配置 → 官方 `api.deepseek.com`）；点 **"测试并保存"**——连通（正确获取到余额）即自动保存并立即生效；"清除已保存"回到自动读取 DSH 配置；左上角 ← 返回主页；
+- **设置页**（设置列表 →"余额接口设置"）：API Key **明文显示**、查询接口可自定义（留空 = 自动：DSH 配置 → 官方 `api.deepseek.com`）；点 **"测试并保存"**——连通（正确获取到余额）即自动保存并立即生效；"清除已保存"回到自动读取 DSH 配置；左上角 ← 返回主页；
 - 401/403 提示密钥无效，非 2xx/解析失败给出具体错误；跟随重定向（与 cc-switch 的 HTTP 客户端一致，最多 5 跳，跨域重定向明确报错）。
 
 ## 目录结构
@@ -57,6 +57,7 @@ dshl/
 ├── dshl.vbs              # 开发期隐藏窗口启动脚本（可选）
 └── tools/
     ├── build-assets.mjs  # 资源生成脚本（需 sharp）
+    ├── dev.mjs           # 开发热更新守护（npm run dev）：ui-src 变化重建产物+面板热刷新、主进程文件变化自动重启
     ├── envcheck.cjs      # 脱离 Electron 的独立环境探测脚本（npm run envcheck，CI/排障用）
     └── install-smoke.cjs # 安装引擎冒烟测试（plugin = 快；dsh = 真实 npm 安装到临时 HOME）
 ```
@@ -67,12 +68,33 @@ dshl/
 cd dshl
 npm install            # 安装依赖（Electron + electron-builder + semver + electron-updater）
 npm run build:assets   # 首次/修改 ui-src 后需要（sharp 可随 DSH profile 提供：npm i -D sharp）
-npm start              # 开发模式运行（或双击 dshl.vbs 隐藏启动）
+npm start              # 开发模式运行（或双击 dshl.vbs 隐藏启动；加 --panel 启动后直接弹出启动器面板）
+npm run dev            # 开发热更新：改 ui-src → 自动重建产物+面板自动刷新；改主进程文件 → 自动重启 electron
 npm run selftest       # 自检：临时 DSH_HOME + 端口 3999，不影响正在运行的服务
 npm run envcheck       # 独立环境探测（退出码 0 就绪 / 1 缺失 / 2 错误）
 npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--publish never，不自动上传）
 npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub Release 并上传三件套
 ```
+
+### UI 可视化调试（改样式所见即所得）
+
+启动器面板内置 DevTools 入口：**F12** 或面板内**右键 → 打开开发者工具（调试UI）**（`npm run dev` 下热更新已就绪：改 `ui-src/` 保存即自动刷新面板）：
+
+- **实时试样式**：DevTools 顶部点左上角箭头 → 在面板上点任意元素 → 右侧 **Styles** 面板直接改 CSS（数值框可用 ↑/↓ 微调、颜色有点色器），改动立即生效；满意后把最终值抄回 `ui-src/styles.css` 保存，热更新会自动带上。
+- **DevTools 持久化（Workspaces）**：DevTools → Sources → 左侧 Filesystem → **Add folder to workspace** 选 `dshl/ui-src` → 之后在 DevTools 里改 Styles/Sources 会**直接写回 ui-src 文件**（`index.html` 的鲸鱼占位符在 ui-src 中保持 `__WHALE_PATH__` 原样即可，产物组装会自动内联），配合热更新即"改哪存哪、面板自动刷新"。
+- 布局尺寸类调试：选中元素后按 **Ctrl+Shift+C** 快速拾取，或在 Elements 面板直接拖拽调整 margin/padding 可视化框。
+- 临时不想上热更新链路时，也可以直接改 `wwwroot/` 下文件（`main.js` 的 fs.watch 同样会触发面板刷新），但注意下次 `build:assets` / `npm run dev` 会用 `ui-src` 覆盖 `wwwroot`，最终改动要落回 `ui-src`。
+
+### IDE 调试（VS Code）
+
+用 VS Code 打开 `dshl` 文件夹即可，已内置 `.vscode/launch.json`（Ctrl+Shift+D 选目标后 F5）：
+
+- **启动器：主进程调试（--panel）**：最常用。主进程（`main.js`、`updater.js`、`dsh-update.js` 等）可直接打断点，启动后自动弹出启动器面板。
+- **启动器：主进程 + 渲染进程调试**：额外开启 9222 调试端口；跑起来后再选 **附加到面板渲染进程（9222）**，即可在 `wwwroot/app.js` 等渲染脚本里打断点（内置 js-debug，无需装扩展）。
+- **启动器：自检（selftest）**：一键跑完整自检（临时 DSH_HOME + 3999 端口，不影响正在运行的服务）。
+- 开发热更新（F5 调试与 `npm run dev` 都生效）：改 `ui-src/` 任意文件 → 自动重建 `wwwroot` → **面板自动刷新，无需重启**；改主进程文件（`main.js`、`preload.js`、`updater.js`、`dsh-update.js`、`env-detect.js`、`env-install.js`、`balance.js`）→ `npm run dev` 会自动重启 electron（F5 下改完重按 F5 即可）。
+- **注意单实例锁**：启动前先托盘右键「退出」正在运行的启动器，否则 F5 / dev 拉起的实例会立刻退出；`npm run dev` 会打印警告。
+
 
 **发布**（`tools/release.mjs`）：前置 = 工作区干净、已 `git push origin main`、安装并登录 GitHub CLI（`winget install GitHub.cli && gh auth login`）。脚本会校验 tag 不存在、产物齐全后 `gh release create v<版本> dshl-<版本>.exe .blockmap latest.yml`；客户端 `electron-updater` 依据 `latest.yml` 自动更新。用法：`npm run release`（说明自动取上一 tag 以来的提交列表），或 `npm run release "v1.0.7 更新内容：\n- 第一条\n- 第二条"`（换行用字面 `\n`，真实换行会被 npm/cmd 批处理截断）。
 
@@ -133,7 +155,8 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 
 - **启动器缩放**：面板固定跟随系统缩放，不再提供手动调节（设置页已隐藏该选项）。
 - `webZoom` 不入配置：**对话界面缩放**（50–300，默认 = 独立窗口当前缩放），控制独立 WebUI 窗口；窗口内 Ctrl+滚轮按 5% 一格调整并实时同步此设置，调整时窗口中央显示半透明缩放值（末次调整 1 秒后淡出）。
-- 启动器面板默认尺寸：**窗口可调整的最小尺寸（480×600）**；手动调整后会记住，设置页"恢复默认设置"可一键清回默认并复位窗口。
+- 启动器面板默认尺寸：**窗口可调整的最小尺寸（480×740）**；高度按"主页最低端版本行无需滚动"实测校准（面板 CSS 缩放 125% 时内容约需 720px，留 20px 余量；100% 缩放约 540px 同样无需滚动）；手动调整后会记住，设置页"恢复默认设置"可一键清回默认并复位窗口。
+- 主页最低端分两行显示 **启动器版本** 与 **DSH版本**（DSH 未安装时显示"未安装"）；检测到新版本时，对应行内联显示更新按钮（启动器 **"更新到 vX"** / DSH **"立即更新"**），版本与按钮保持同一行不换行（放不下时版本文字省略号截断，按钮始终完整）。
 - DeepSeek Harness 独立窗口默认尺寸：**高 = 0.8 × 物理分辨率高**（物理 = 逻辑 × 系统缩放），**宽:高 = 3:2**，屏幕居中。
 - 窗口定位：DeepSeek Harness 独立窗口**屏幕居中**；启动器面板**右下角紧贴任务栏**（右缘贴屏幕、下缘贴任务栏上沿）。
 - **独立窗口几何持久化**：手动调整后的尺寸/位置/最大化状态自动记住（resize/move 防抖落盘），重启后原位恢复；位置不在任何显示器工作区内时自动回退居中（防拔副屏后窗口失踪）；"恢复默认设置"清回默认。
@@ -169,9 +192,10 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
   - **托管安装**：复用一键安装引擎重装到最新（`npm install --prefix` 覆盖旧版，进度/日志进安装日志），完成后自动重启服务；
   - **全局安装**：系统 npm 执行 `npm update -g @deepseek-ai/dsh`（registry 回退同上），完成后自动重启服务；
   - **npx 缓存**：`npm exec` 预热新版本进缓存（检测按最高版本选中），完成后自动重启服务；
-  - **源码版**：不动开发者仓库，仅记日志；
+  - **源码版**：不动开发者仓库——检测到新版本时按钮变为 **"手动更新"**，点击打开源码目录（需自行 `git pull && pnpm run build`，构建完成后重启服务生效）；
 - 更新成功弹托盘通知"已自动更新到 vX"；更新前会先停掉自己拉起的服务（更新失败自动用旧版拉起，不停摆）；**接管中的外部实例不受控制**，通知中会提示需手动重启；
-- 手动安装任务进行中时自动跳过；手动"检查更新"按钮查的仍是启动器自身，与 DSH 无关。
+- 手动安装任务进行中时自动检查跳过（设置页手动"检查更新"除外）；
+- 设置页 **"DSH版本与更新"行**（与"启动器版本与更新"并列）可**手动"检查更新"**：跳过 24h 节流立即查询 npm 最新版，详情行显示"正在检查… / 已是最新版本 / 发现新版本"；发现新版本时按钮变绿色 **"更新到 vX"**，点击立即更新（等价于主页"立即更新"）；检查/更新失败显示错误并可重试。
 
 ## 与 DSH 的协作
 

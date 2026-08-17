@@ -16,12 +16,12 @@
       </svg>
       <div class="titles">
         <h1>DeepSeek Harness Launcher</h1>
-        <p id="panelVersion">启动器面板</p>
       </div>
       <button class="btn header-btn" id="btnSettings" title="设置">⚙ 设置</button>
     </header>
 
-    <section class="card">
+    <!-- 运行状态卡：状态 / 地址 / 启动器版本 / DSH版本 统一标签列左对齐 -->
+    <section class="card" id="statusCard">
       <div class="row">
         <span class="label">状态</span>
         <span class="value strong status-value" id="statusText">
@@ -32,21 +32,34 @@
         <span class="label">地址</span>
         <span class="value mono link" id="urlText" title="在默认浏览器中打开">-</span>
       </div>
+      <div class="row version-row">
+        <span class="label">启动器版本</span>
+        <span class="version-value" id="launcherVersion">检测中…</span>
+        <button class="btn sm primary update-ready hidden" id="btnUpdateNow" title="检测到启动器新版本">更新到 v-</button>
+      </div>
+      <div class="row version-row">
+        <span class="label">DSH版本</span>
+        <span class="version-value" id="dshVersion">检测中…</span>
+        <button class="btn sm primary hidden" id="btnDshUpdateNow" title="检测到 DSH 新版本">立即更新</button>
+      </div>
     </section>
 
-    <section class="card actions">
+    <!-- 主操作区：主按钮通栏 + 两小按钮并排 -->
+    <section class="card main-actions">
       <button class="btn primary" id="btnOpen">打开 DeepSeek Harness</button>
-      <button class="btn primary" id="btnToggle">启动服务</button>
-      <button class="btn" id="btnLogs">查看日志</button>
+      <div class="actions-row">
+        <button class="btn primary" id="btnToggle">启动服务</button>
+        <button class="btn" id="btnLogs">查看日志</button>
+      </div>
     </section>
 
     <!-- 环境未就绪警示（检测到缺失/版本过低时显示） -->
     <section class="card env-warning hidden" id="envWarnCard">
-      <div class="env-warn-title">⚠ 运行环境未就绪</div>
+      <div class="env-warn-title">⚠ 还差最后一步，马上就能用</div>
       <div class="env-warn-detail" id="envWarnDetail"></div>
       <div class="actions">
-        <button class="btn primary" id="btnEnvFix">一键安装环境</button>
-        <button class="btn" id="btnEnvOpen">查看环境详情</button>
+        <button class="btn primary" id="btnEnvFix">一键安装缺失环境</button>
+        <button class="btn" id="btnEnvOpen">查看详情（高级）</button>
       </div>
     </section>
 
@@ -60,29 +73,77 @@
       </div>
     </section>
 
-    <!-- 余额（cc-switch 风格：只显示金额，↻ 手动刷新，自动每 3 分钟查询；⚙ 进入设置页） -->
+    <!-- 余额卡（单独一张，位于底端链接上方）：数值留在标签列右侧，操作小按钮靠右 -->
     <section class="card" id="balanceCard">
       <div class="row">
         <span class="label">余额</span>
-        <div class="chips">
-          <span class="value strong status-value" id="balanceValue">--</span>
+        <span class="value strong status-value" id="balanceValue">--</span>
+        <div class="chips balance-chips">
           <button class="btn sm" id="btnBalanceRefresh" title="立即查询余额（自动每 3 分钟查询一次）">↻</button>
-          <button class="btn sm" id="btnBalanceSettings" title="余额接口设置">⚙</button>
+          <button class="btn sm" id="btnRecharge" title="打开 DeepSeek 开放平台充值页">充值 / 用量查询</button>
         </div>
       </div>
     </section>
 
-    <!-- 底端：项目链接 + 反馈入口 -->
-    <section class="card actions main-footer">
+    <!-- 底端：项目链接 + 反馈入口（三个普通按钮等宽均分） -->
+    <section class="card main-footer">
       <button class="btn" id="btnGithub">Github地址</button>
       <button class="btn" id="btnChangelog">更新日志</button>
       <button class="btn" id="btnFeedback">反馈问题</button>
     </section>
+  </div>
 
-    <!-- 检测到新版本时独立一行显示完整更新按钮（替代原圆圈箭头徽标） -->
-    <section class="card hidden" id="updateCard">
-      <button class="btn primary update-ready" id="btnUpdateNow">更新到 v-</button>
-    </section>
+  <!-- 新手安装向导（首装引导：欢迎 → 极简进度 → 完成/失败；高级用户可跳过进"运行环境"页） -->
+  <div id="pageWizard" class="page hidden">
+    <div id="wizardWelcome">
+      <div class="wizard-hero">🐳</div>
+      <div class="wizard-title">欢迎使用 DeepSeek Harness Launcher</div>
+      <div class="wizard-sub">第一次使用，需要自动准备运行组件（只需这一次）</div>
+      <div class="wizard-points">
+        <div class="wizard-point"><span class="wizard-point-icon">✓</span>全自动，无需任何技术操作</div>
+        <div class="wizard-point"><span class="wizard-point-icon">✓</span>约 3–5 分钟，需要联网（下载约 100MB）</div>
+        <div class="wizard-point"><span class="wizard-point-icon">✓</span>不修改系统设置，可随时卸载</div>
+      </div>
+      <button class="btn primary wizard-main-btn" id="btnWizardStart">开始，自动完成</button>
+      <div class="wizard-note">已装好的组件会自动跳过，不会重复下载</div>
+      <button class="btn sm wizard-skip" id="btnWizardSkip">跳过向导，手动配置（高级）</button>
+    </div>
+
+    <div id="wizardProgress" class="hidden">
+      <div class="wizard-title" id="wizardStepText">准备中…</div>
+      <div class="wizard-note" id="wizardStageHint"></div>
+      <div class="wizard-percent" id="wizardPercent">0%</div>
+      <div class="progress"><div class="progress-bar" id="wizardBar"></div></div>
+      <div class="wizard-steps" id="wizardSteps"></div>
+      <div class="wizard-elapsed"><span id="wizardElapsed">已用时 0:00</span><span class="wizard-remain" id="wizardRemain"></span></div>
+      <div class="wizard-actions">
+        <button class="btn sm" id="btnWizardLogToggle">查看详细日志</button>
+        <button class="btn sm danger" id="btnWizardCancel">取消</button>
+      </div>
+      <pre id="wizardLog" class="hidden"></pre>
+    </div>
+
+    <div id="wizardDone" class="hidden">
+      <div class="wizard-done-icon">✓</div>
+      <div class="wizard-title">安装完成！</div>
+      <div class="wizard-sub">正在启动 DeepSeek Harness…</div>
+      <div class="progress wizard-start-bar"><div class="progress-bar" id="wizardStartBar"></div></div>
+      <div class="wizard-note" id="wizardStartNote">首次启动需要初始化（约 10 秒），完成后会自动打开 DeepSeek Harness</div>
+    </div>
+
+    <div id="wizardFail" class="hidden">
+      <div class="wizard-fail-icon">⚠</div>
+      <div class="wizard-title">安装没有完成</div>
+      <div class="wizard-sub" id="wizardErrorText"></div>
+      <div class="wizard-error-detail" id="wizardErrorDetail"></div>
+      <div class="wizard-actions">
+        <button class="btn primary" id="btnWizardRetry">重试</button>
+        <button class="btn" id="btnWizardCopyDiag">复制诊断信息并反馈</button>
+      </div>
+      <div class="wizard-actions">
+        <button class="btn sm" id="btnWizardFailEnv">查看详情 / 手动安装（高级）</button>
+      </div>
+    </div>
   </div>
 
   <!-- 运行环境页面（检测 + 一键安装向导） -->
@@ -90,6 +151,7 @@
     <div class="page-header">
       <button class="btn" id="btnEnvBack">← 返回</button>
       <span class="page-title">运行环境</span>
+      <button class="btn sm" id="btnEnvWizard">新手向导</button>
       <button class="btn" id="btnEnvCopyDiag">复制诊断信息</button>
       <button class="btn" id="btnEnvRecheck">重新检测</button>
     </div>
@@ -195,8 +257,14 @@
           <button class="btn sm" id="btnOpenEnv">环境详情 / 诊断</button>
         </div>
       </div>
+      <div class="row">
+        <span class="label">余额接口设置</span>
+        <div class="chips">
+          <button class="btn sm" id="btnBalanceOpenSettings">设置</button>
+        </div>
+      </div>
       <div class="row long-label">
-        <span class="label">版本与更新</span>
+        <span class="label">启动器版本与更新</span>
         <div class="chips">
           <span class="value" id="updaterStatus">v-</span>
           <button class="btn sm" id="btnUpdaterCheck">检查更新</button>
@@ -204,6 +272,16 @@
       </div>
       <div class="row" id="updaterDetailRow">
         <span class="label" id="updaterDetail"></span>
+      </div>
+      <div class="row long-label">
+        <span class="label">DSH版本与更新</span>
+        <div class="chips">
+          <span class="value" id="dshUpdaterStatus">v-</span>
+          <button class="btn sm" id="btnDshCheck">检查更新</button>
+        </div>
+      </div>
+      <div class="row" id="dshUpdaterDetailRow">
+        <span class="label" id="dshUpdaterDetail"></span>
       </div>
       <div class="row">
         <span class="label">恢复默认</span>

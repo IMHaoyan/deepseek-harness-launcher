@@ -1,0 +1,53 @@
+{
+  // VS Code 调试配置：Ctrl+Shift+D → 选目标 → F5（详见 README「IDE 调试（VS Code）」）
+  // 单实例锁：F5 前请先托盘右键「退出」正在运行的启动器。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 最常用：主进程断点调试（main.js / updater.js / dsh-update.js…），启动后直接弹出启动器面板
+      "name": "启动器：主进程调试（--panel）",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${workspaceFolder}/node_modules/electron/dist/electron.exe",
+      "args": [".", "--panel"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "outputCapture": "std",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    },
+    {
+      // 主进程 + 渲染进程一起调试：先 F5 这个，再运行「附加到面板渲染进程（9222）」
+      "name": "启动器：主进程 + 渲染进程调试",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${workspaceFolder}/node_modules/electron/dist/electron.exe",
+      "args": [".", "--panel", "--remote-debugging-port=9222"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "outputCapture": "std",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    },
+    {
+      // 面板渲染进程断点（wwwroot/app.js 等）；需先启动上面的「主进程 + 渲染进程调试」
+      "name": "附加到面板渲染进程（9222）",
+      "type": "pwa-chrome",
+      "request": "attach",
+      "port": 9222,
+      "webRoot": "${workspaceFolder}/wwwroot",
+      "urlFilter": "*wwwroot*",
+      "timeout": 20000
+    },
+    {
+      // 一键跑完整自检（临时 DSH_HOME + 3999 端口，不影响正在运行的服务）
+      "name": "启动器：自检（selftest）",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${workspaceFolder}/node_modules/electron/dist/electron.exe",
+      "args": [".", "--selftest"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "outputCapture": "std",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    }
+  ]
+}

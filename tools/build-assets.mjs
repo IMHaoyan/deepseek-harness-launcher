@@ -45,17 +45,27 @@ function loadSharp() {
 const require = loadSharp()
 const sharp = require('sharp')
 
-// ---------- 鲸鱼路径来源 ----------
-const fishLogoTsx = process.env.DSH_REPO
-  ? join(process.env.DSH_REPO, 'packages', 'client', 'ui-primitives', 'src', 'FishLogo.tsx')
-  : (existsSync('E:/deepseek-harness/packages/client/ui-primitives/src/FishLogo.tsx')
-    ? 'E:/deepseek-harness/packages/client/ui-primitives/src/FishLogo.tsx'
-    : join(homedir(), 'deepseek-harness', 'packages', 'client', 'ui-primitives', 'src', 'FishLogo.tsx'))
-
-const tsx = readFileSync(fishLogoTsx, 'utf8')
-const match = /<path d="([^"]+)"/.exec(tsx)
-if (!match) { console.error('whale path not found in ' + fishLogoTsx); process.exit(1) }
-const whalePath = match[1]
+// ---------- 鲸鱼路径来源（源码仓库 → ~/deepseek-harness → 已内联的 wwwroot/index.html 兜底） ----------
+function loadWhalePath() {
+  const candidates = [
+    process.env.DSH_REPO ? join(process.env.DSH_REPO, 'packages', 'client', 'ui-primitives', 'src', 'FishLogo.tsx') : null,
+    'E:/deepseek-harness/packages/client/ui-primitives/src/FishLogo.tsx',
+    join(homedir(), 'deepseek-harness', 'packages', 'client', 'ui-primitives', 'src', 'FishLogo.tsx'),
+  ].filter(Boolean)
+  for (const f of candidates) {
+    if (!existsSync(f)) continue
+    const m = /<path d="([^"]+)"/.exec(readFileSync(f, 'utf8'))
+    if (m) return m[1]
+  }
+  const htmlPath = join(wwwroot, 'index.html')
+  if (existsSync(htmlPath)) {
+    const m = /<path fill="currentColor" d="([^"]+)"/.exec(readFileSync(htmlPath, 'utf8'))
+    if (m) return m[1]
+  }
+  console.error('whale path not found (no DSH repo and no inlined wwwroot/index.html)')
+  process.exit(1)
+}
+const whalePath = loadWhalePath()
 console.log('whale path extracted:', whalePath.length, 'chars')
 
 mkdirSync(assets, { recursive: true })

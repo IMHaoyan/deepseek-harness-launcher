@@ -10,3 +10,5 @@ NAMES.md
 assets/feishu-webhook.txt
 # 本地 npm 镜像配置（registry/electron_mirror），随网络环境而异，不进仓库
 .npmrc
+# Node 内置发行包：发布构建时由 tools/fetch-node-dist.mjs 下载，不进仓库
+assets/node-dist/

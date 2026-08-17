@@ -1,10 +1,8 @@
-// dsh-update.js — DSH 自动更新：定期检查 @deepseek-ai/dsh 最新版，托管/全局/npx 形态自动升级到最新（无确认交互）
-// 设计：
-//  - 检查节流 24 小时（dshUpdateCheckedAt 落配置）；检查与更新全程静默，只在更新成功后弹托盘通知；
-//  - 托管安装：复用 env-install 安装引擎重装（npm install --prefix 覆盖旧版），其 onDone 已接好"重新探测 + 启动服务"；
-//  - 全局安装：系统 npm 执行 `npm update -g @deepseek-ai/dsh`（registry 失败自动回退 npmmirror）；
-//  - npx 缓存：`npm exec --yes --package @deepseek-ai/dsh@<v> -- dsh --version` 预热缓存（检测取最高版本）；
-//  - 源码版：不动开发者仓库，仅记日志。
+// dsh-update.js — DSH 更新：检测全自动、更新全手动
+// 策略（用户选定）：
+//  - 静默检查最新版（启动后 + 每 6 小时，24 小时节流）；发现新版 → 主页卡片 + 托盘气泡一次，绝不自动更新；
+//  - 用户点击卡片"立即更新"后才执行更新（托管形态：env-install 原子安装到 dsh-new 后切换，失败旧版不动）；
+//  - 全局 / npx 形态同样只由用户触发；源码版仅提示。
 'use strict'
 const { spawn } = require('child_process')
 const path = require('path')
@@ -24,9 +22,19 @@ let envDetect = null
 let getServerState = null // () => ({ running, owned })
 let stopService = null
 let startService = null
+let onState = null // 状态变化回调（main 里接 broadcastState）
+
+const state = {
+  status: 'idle', // idle | checking | available | updating | updated | error
+  current: '',
+  latest: '',
+  kind: '', // 当前安装形态（source | managed | global | npx）：source 不支持自动更新，UI 按此区分
+  error: '',
+}
 
 let checking = false
-let lastNotifiedVersion = '' // 同一新版本只通知一次
+let updating = false
+let lastNotifiedVersion = '' // 同一新版本只提示一次
 
 function initDshUpdater(o) {
   Config = o.Config
@@ -39,6 +47,20 @@ function initDshUpdater(o) {
   getServerState = o.getServerState
   stopService = o.stopService
   startService = o.startService
+  onState = o.onState || null
+}
+
+function getState() {
+  return Object.assign({}, state)
+}
+
+function pushState() {
+  try { if (onState) onState() } catch { /* noop */ }
+}
+
+function setState(patch) {
+  Object.assign(state, patch)
+  pushState()
 }
 
 // 解析 npm CLI：托管/发行版 Node 自带 <dir>/node_modules/npm/bin/npm-cli.js（与 env-install 同策略）
@@ -152,98 +174,143 @@ function waitForJob() {
   })
 }
 
-function finishAfterUpdate(latest, wasRunning, owned) {
-  Config.dshVersion = 'latest' // 自动保持最新语义
-  Config.dshUpdateCheckedAt = Date.now()
-  try { saveConfig() } catch (err) { log('dsh-update: save config failed: ' + err.message) }
-  if (lastNotifiedVersion !== latest) {
-    lastNotifiedVersion = latest
-    const hint = wasRunning && !owned ? '；接管中的运行实例不受控制，需手动重启生效' : ''
-    notify('DeepSeek Harness', `已自动更新到 v${latest}${hint}`)
-  }
-  log(`dsh-update: updated to v${latest}`)
-}
+// ---------- 检测（静默，只提示不更新） ----------
 
-async function autoUpdate(kind, latest, nodeBin) {
-  const state = getServerState ? getServerState() : { running: false, owned: false }
-  const wasRunning = state.running
-  const owned = state.owned
-  // 更新前停掉自有服务；接管的第三方实例不动（文件更新后提示手动重启）
-  if (wasRunning && owned) {
-    log('dsh-update: stopping service before update')
-    try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
-  }
-
-  if (kind === 'managed') {
-    try {
-      envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
-      const status = await waitForJob()
-      if (status !== 'done') {
-        log(`dsh-update: managed update job ${status}, restoring service`)
-        if (wasRunning && owned) await startService() // 更新失败：用旧版拉起，避免服务停摆
-        return
-      }
-      // 成功：安装引擎 onDone 已接好"重新探测 + 启动服务"，这里只补配置与通知
-      finishAfterUpdate(latest, wasRunning, owned)
-    } catch (err) {
-      log(`dsh-update: managed update failed: ${err.message}`)
-      if (wasRunning && owned) await startService()
-    }
-    return
-  }
-
-  if (kind === 'global') {
-    const r = await runGlobalUpdate()
-    if (!r.ok) { log(`dsh-update: global update failed: ${r.error}`); if (wasRunning && owned) await startService(); return }
-  } else if (kind === 'npx') {
-    const r = await runNpxWarm(latest, nodeBin)
-    if (!r.ok) { log(`dsh-update: npx warm-up failed: ${r.error}`); if (wasRunning && owned) await startService(); return }
-  } else {
-    log(`dsh-update: kind=${kind} 不支持自动更新（仅托管/全局/npx），跳过`)
-    return
-  }
-
-  // 重新探测 + 恢复服务（旧版已停止，拉起的是新版）
-  try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
-  if (wasRunning && owned) {
-    try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
-  }
-  finishAfterUpdate(latest, wasRunning, owned)
-}
-
-async function checkOnce(reason) {
-  if (checking) return
+// reason: 触发原因（'startup' / 'timer' / 'manual'）；force=true 跳过 24h 节流（设置页手动"检查更新"）
+async function checkOnce(reason, force) {
+  if (checking || updating) return
   if (!Config || !envDetect || !envInstall) return
-  // 用户手动安装任务进行中时不打扰
+  // 用户手动安装任务进行中时不打扰（手动检查除外）
   const snap = envInstall.getJob()
-  if (snap && snap.job && snap.job.status === 'running') {
+  if (!force && snap && snap.job && snap.job.status === 'running') {
     log('dsh-update: install job in progress, check skipped')
     return
   }
   const now = Date.now()
-  if (now - (Number(Config.dshUpdateCheckedAt) || 0) < CHECK_INTERVAL_MS) return
+  if (!force && now - (Number(Config.dshUpdateCheckedAt) || 0) < CHECK_INTERVAL_MS) return
   checking = true
+  setState({ status: 'checking' })
   try {
     const report = await envDetect.detectEnv(false)
-    if (!report || !report.plan) { log('dsh-update: environment not ready, check skipped'); return }
+    if (!report || !report.plan) {
+      log('dsh-update: environment not ready, check skipped')
+      setState(force ? { status: 'error', error: '运行环境未就绪，无法检查 DSH 更新' } : { status: 'idle' })
+      return
+    }
     const plan = report.plan
     const current = plan.dshVersion || ''
-    if (!current) { log('dsh-update: installed version unknown, check skipped'); return }
+    if (!current) {
+      log('dsh-update: installed version unknown, check skipped')
+      setState(force ? { status: 'error', error: '已安装的 DSH 版本未知，无法检查' } : { status: 'idle' })
+      return
+    }
     const latest = await fetchLatest(plan.nodeCmd)
-    if (!latest) return
     Config.dshUpdateCheckedAt = now
     try { saveConfig() } catch { /* noop */ }
+    if (!latest) {
+      log('dsh-update: fetch latest failed, check aborted')
+      setState(force ? { status: 'error', error: '检查失败：无法获取最新版本（网络错误）' } : { status: 'idle' })
+      return
+    }
+    setState({ current, latest: latest.version, kind: plan.kind })
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
-      log(`dsh-update: new version v${latest.version} (current v${current}, kind=${plan.kind}, reason=${reason || 'timer'})`)
-      await autoUpdate(plan.kind, latest.version, plan.nodeCmd)
+      log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, reason=${reason || 'timer'})`)
+      setState({ status: 'available' })
+      if (lastNotifiedVersion !== latest.version) {
+        lastNotifiedVersion = latest.version
+        notify('DeepSeek Harness', plan.kind === 'source'
+          ? `新版本 v${latest.version} 可用：当前为源码安装，请打开启动器面板点"手动更新"（git pull && pnpm run build）`
+          : `新版本 v${latest.version} 可用：打开启动器面板点"立即更新"即可升级（约 1 分钟）`)
+      }
     } else {
       log(`dsh-update: v${current} 已是最新（latest v${latest.version}）`)
+      setState({ status: 'up-to-date' })
     }
   } catch (err) {
     log('dsh-update: check failed: ' + (err && err.message ? err.message : String(err)))
+    setState(force ? { status: 'error', error: err && err.message ? err.message : String(err) } : { status: 'idle' })
   } finally {
     checking = false
   }
 }
 
-module.exports = { initDshUpdater, checkOnce }
+// ---------- 更新（仅用户点击触发；失败旧版不动、服务拉回） ----------
+
+async function updateNow() {
+  if (updating) return
+  if (state.status !== 'available' && state.status !== 'error') {
+    log(`dsh-update: updateNow ignored (status=${state.status})`)
+    return
+  }
+  updating = true
+  setState({ status: 'updating', error: '' })
+  try {
+    const report = await envDetect.detectEnv(false)
+    if (!report || !report.plan) throw new Error('运行环境未就绪，无法更新')
+    const plan = report.plan
+    const latest = state.latest || ''
+    if (!latest) throw new Error('没有待更新的版本')
+
+    const svc = getServerState ? getServerState() : { running: false, owned: false }
+    const wasRunning = svc.running
+    const owned = svc.owned
+
+    if (plan.kind === 'managed') {
+      // 更新前停掉自有服务；接管的第三方实例不动（文件切换后提示手动重启）
+      if (wasRunning && owned) {
+        log('dsh-update: stopping service before update')
+        try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
+      }
+      try {
+        envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
+        const status = await waitForJob()
+        if (status !== 'done') throw new Error(`更新任务未完成（${status}）`)
+      } catch (err) {
+        log(`dsh-update: managed update failed: ${err.message}`)
+        if (wasRunning && owned) { try { await startService() } catch { /* noop */ } } // 旧版完好，直接拉回
+        setState({ status: 'error', error: err.message })
+        return
+      }
+      // 成功：安装引擎 onDone 已接好"重新探测 + 启动服务"，这里补配置与通知
+      Config.dshVersion = 'latest' // 自动保持最新语义
+      Config.dshUpdateCheckedAt = Date.now()
+      try { saveConfig() } catch { /* noop */ }
+      notify('DeepSeek Harness', `已更新到 v${latest}`)
+      log(`dsh-update: updated to v${latest}`)
+      setState({ status: 'updated', current: latest })
+      return
+    }
+
+    if (plan.kind === 'global') {
+      const r = await runGlobalUpdate()
+      if (!r.ok) throw new Error(r.error)
+    } else if (plan.kind === 'npx') {
+      const r = await runNpxWarm(latest, plan.nodeCmd)
+      if (!r.ok) throw new Error(r.error)
+    } else if (plan.kind === 'source') {
+      // 源码安装：不动开发者仓库（UI 已把按钮换成"打开源码目录"，这里只兜底）
+      throw new Error('源码安装请手动更新：git pull && pnpm run build（启动器不自动修改源码仓库）')
+    } else {
+      throw new Error(`当前安装形态（${plan.kind}）不支持更新`)
+    }
+
+    // 重新探测 + 恢复服务（旧版已停止，拉起的是新版）
+    try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
+    if (wasRunning && owned) {
+      try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
+    }
+    Config.dshVersion = 'latest'
+    Config.dshUpdateCheckedAt = Date.now()
+    try { saveConfig() } catch { /* noop */ }
+    notify('DeepSeek Harness', `已更新到 v${latest}`)
+    log(`dsh-update: updated to v${latest}`)
+    setState({ status: 'updated', current: latest })
+  } catch (err) {
+    log('dsh-update: update failed: ' + (err && err.message ? err.message : String(err)))
+    setState({ status: 'error', error: err && err.message ? err.message : String(err) })
+  } finally {
+    updating = false
+  }
+}
+
+module.exports = { initDshUpdater, checkOnce, updateNow, getState }

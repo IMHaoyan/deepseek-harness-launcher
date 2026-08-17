@@ -183,19 +183,44 @@ function showPage(name) {
   $('pageLog').classList.toggle('hidden', name !== 'log');
   $('pageEnv').classList.toggle('hidden', name !== 'env');
   $('pageBalance').classList.toggle('hidden', name !== 'balance');
+  $('pageWizard').classList.toggle('hidden', name !== 'wizard');
   if (name === 'env') {
     // 打开环境页：拉取安装任务快照 + 强制重新检测
     void cmd('envGetState').then((s) => { if (s) renderEnvSnapshot(s); });
     void cmd('envDetect');
   }
+  if (name === 'wizard') {
+    // 进入向导：环境已就绪 → 完成屏；有安装任务 → 按任务状态显示；否则欢迎屏
+    void cmd('envGetState').then((s) => {
+      if (!s) return;
+      if (s.job) {
+        if (s.job.status === 'running' || s.job.status === 'done') window._wizardActive = true;
+        renderWizardJob(s.job);
+      }
+      if (Array.isArray(s.log)) appendWizardLog(s.log.map((e) => (typeof e === 'object' && e.line != null ? e.line : String(e))));
+    });
+    if (window._envSummary && window._envSummary.ready) {
+      showWizardScreen('done');
+      ensureWizardStart();
+      if (window._running) finishWizardStart();
+    } else if (window._envJob) renderWizardJob(window._envJob);
+    else showWizardScreen('welcome');
+  }
 }
 
 function render(state) {
   window._running = !!state.running;
+  window._firstRun = !!state.firstRun;
 
-  // 面板副标题显示版本号（确认运行的是哪个构建）
-  const verEl = $('panelVersion');
-  if (verEl && state.version) verEl.textContent = `启动器面板 v${state.version}`;
+  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录）
+  const lvEl = $('launcherVersion');
+  if (lvEl) lvEl.textContent = state.version ? `v${state.version}` : '-';
+  const dshV = (state.env && state.env.dsh && state.env.dsh.version) || (state.dshUpdate && state.dshUpdate.current) || '';
+  const dshVerText = dshV ? `v${dshV}` : (state.env ? '未安装' : '检测中…');
+  const dshVerEl = $('dshVersion');
+  if (dshVerEl) dshVerEl.textContent = dshVerText;
+  const dshUpdStatusEl = $('dshUpdaterStatus'); // 设置页"DSH版本与更新"行的版本值
+  if (dshUpdStatusEl) dshUpdStatusEl.textContent = dshVerText;
 
   // 状态
   const running = window._running;
@@ -246,6 +271,20 @@ function render(state) {
 
   // 运行环境：状态卡 + 主页面警示行；未就绪时首次自动进入环境页
   renderEnvSummary(state.env);
+
+  // DSH 新版本卡片（检测自动、更新手动）
+  renderDshUpdate(state.dshUpdate);
+
+  // 新手向导：安装完成且环境已就绪 → 启动进度屏（进度条走完自动回主页；DSH 窗口由主进程弹出）
+  if (window._wizardActive && window._envJob && window._envJob.status === 'done' && state.env && state.env.ready) {
+    showWizardScreen('done');
+    ensureWizardStart();
+    if (state.running) {
+      finishWizardStart();
+    } else if (wizardStartState && !wizardStartState.finished && Date.now() - wizardStartState.t0 > 90000) {
+      finishWizardStart(); // 兜底：90 秒仍未就绪也回主页（主页会显示真实状态，用户可手动处理）
+    }
+  }
 
   // 缩放微调按钮（拖动/双击输入；值变化时应用）
   zoomWidgets.launcher.setFromState(state.zoom);
@@ -317,10 +356,11 @@ function renderEnvSummary(env) {
     const issues = (env.issues && env.issues.length) ? env.issues.join('；') : '检测到运行环境缺失';
     const raw = `[node=${env.node ? env.node.status : '?'}, dsh=${env.dsh ? env.dsh.status + '/' + env.dsh.kind : '?'}, plugin=${env.plugin ? env.plugin.status : '?'}, ready=${env.ready}]`;
     $('envWarnDetail').textContent = issues + ' ' + raw;
-    // 首次检测到未就绪：自动进入环境页引导安装（仅一次，不打断用户后续操作）
+    // 首次检测到未就绪：自动进入新手向导（欢迎屏有"跳过向导，手动配置"入口；仅自动一次，不打断用户后续操作）
     if (!window._envAutoShown) {
       window._envAutoShown = true;
-      showPage('env');
+      window._wizardActive = true;
+      showPage('wizard');
     }
   } else {
     warnCard.classList.add('hidden');
@@ -363,8 +403,8 @@ function renderEnvSummary(env) {
   {
     const p = env.plugin;
     const badge = p.status === 'ok' ? 'ok' : 'bad';
-    const detail = p.status === 'ok' ? (p.path || '') : '会话完成/提问的托盘通知将不可用';
-    cards.push({ badge, name: '通知插件（dsh-notify）', version: '', detail, item: 'plugin', btnLabel: p.status === 'ok' ? '' : '安装插件' });
+    const detail = p.status === 'ok' ? (p.path || '') : '不装也能正常使用，只是少了完成/提问的托盘提醒';
+    cards.push({ badge, name: '桌面通知（可选）', version: '', detail, item: 'plugin', btnLabel: p.status === 'ok' ? '' : '安装桌面通知' });
   }
   $('envCards').innerHTML = cards.map(envCardHtml).join('');
 
@@ -408,7 +448,254 @@ function renderEnvJob(job) {
   // 提示文案只认"检测结果"（renderEnvSummary 负责），安装任务状态只显示在阶段文本里，
   // 避免"安装完成"与"检测未就绪"互相矛盾；安装进行中时给出进度提示。
   if (running) $('envInstallHint').textContent = '安装进行中…';
+
+  // 新手向导联动（仅在向导流程激活时驱动向导屏）
+  if (window._wizardActive) renderWizardJob(job);
 }
+
+// ---------- 新手安装向导（欢迎 → 极简进度 → 完成/失败；错误翻译成大白话） ----------
+
+const WIZARD_STAGE_LABELS = {
+  'node-dl': '准备基础组件（Node.js）',
+  'node-ex': '校验并解压基础组件',
+  'dsh-npm': '安装 DeepSeek Harness 主程序',
+  'dsh-verify': '检查安装结果',
+  'plugin': '安装桌面通知（可选）',
+};
+
+const WIZARD_STAGE_ACTION = {
+  'node-dl': '正在准备基础组件…',
+  'node-ex': '正在校验并解压…',
+  'dsh-npm': '正在安装 DeepSeek Harness 主程序…',
+  'dsh-verify': '正在检查安装结果…',
+  'plugin': '正在安装桌面通知组件…',
+};
+
+function showWizardScreen(name) {
+  $('wizardWelcome').classList.toggle('hidden', name !== 'welcome');
+  $('wizardProgress').classList.toggle('hidden', name !== 'progress');
+  $('wizardDone').classList.toggle('hidden', name !== 'done');
+  $('wizardFail').classList.toggle('hidden', name !== 'fail');
+}
+
+let wizardTimer = null;
+let wizardStartState = null; // 启动进度屏状态 { t0, finished }
+
+// 启动进度条：10 秒线性走到 90%（首次启动初始化），服务就绪后跳到 100% 并回主页
+function ensureWizardStart() {
+  if (wizardStartState && !wizardStartState.finished) return;
+  wizardStartState = { t0: Date.now(), finished: false };
+  const bar = $('wizardStartBar');
+  const note = $('wizardStartNote');
+  bar.style.transition = 'none';
+  bar.style.width = '0%';
+  note.textContent = '首次启动需要初始化（约 10 秒），完成后会自动打开 DeepSeek Harness';
+  requestAnimationFrame(() => {
+    bar.style.transition = 'width 10s linear';
+    bar.style.width = '90%';
+  });
+}
+
+function finishWizardStart() {
+  if (!wizardStartState || wizardStartState.finished) return;
+  wizardStartState.finished = true;
+  const bar = $('wizardStartBar');
+  bar.style.transition = 'width 400ms ease-out';
+  bar.style.width = '100%';
+  $('wizardStartNote').textContent = '已就绪，正在打开 DeepSeek Harness…';
+  if (window._wizardDoneTimer) clearTimeout(window._wizardDoneTimer);
+  window._wizardDoneTimer = setTimeout(() => {
+    window._wizardDoneTimer = null;
+    if (!$('pageWizard').classList.contains('hidden')) {
+      window._wizardActive = false;
+      showPage('main');
+    }
+  }, 600);
+}
+
+function mmss(sec) { return `${Math.floor(sec / 60)}:${String(Math.max(0, sec) % 60).padStart(2, '0')}`; }
+
+// 科学剩余时间估算：
+//   当前阶段 ETA + 后续阶段名义值
+//   - node-dl：用真实下载速率（剩余比例 ÷ 已用时间 × 剩余比例）
+//   - dsh-npm：本机学习值 − 本阶段已用时（主进程每次安装后 EWMA 更新）
+//   - 其他阶段：名义值
+function computeRemainingSec(job) {
+  if (!job || !Array.isArray(job.stages)) return 0;
+  const idx = job.currentStage >= 0 ? job.currentStage : 0;
+  const st = job.stages[idx] || {};
+  const nominal = job.stageNominalMs || {};
+  const stageElapsedSec = Math.max(0, (Date.now() - (window._stageStartedAt || Date.now())) / 1000);
+  let etaCurrent;
+  if (st.id === 'node-dl' && (job.stageProgress || 0) > 0.02) {
+    etaCurrent = stageElapsedSec * (1 - job.stageProgress) / job.stageProgress; // 真实速率推算
+  } else if (st.id === 'dsh-npm') {
+    const estMs = job.estimateNpmMs || 210000;
+    etaCurrent = Math.max(0, estMs / 1000 - stageElapsedSec);
+  } else {
+    etaCurrent = (nominal[st.id] || 10000) / 1000;
+  }
+  // 当前阶段已超预估：剩余未知，显示"即将完成"，不再叠加后续阶段名义值（否则会卡死在虚假的固定剩余上）
+  if (etaCurrent <= 0) return 0;
+  let futureSec = 0;
+  for (let i = idx + 1; i < job.stages.length; i++) {
+    futureSec += (nominal[job.stages[i].id] || 10000) / 1000;
+  }
+  return Math.max(0, Math.round(etaCurrent + futureSec));
+}
+
+function startWizardTimer() {
+  if (wizardTimer) return;
+  const start = (window._envJob && window._envJob.startedAt) || Date.now();
+  wizardTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - start) / 1000);
+    $('wizardElapsed').textContent = `已用时 ${mmss(s)}`;
+    const remain = $('wizardRemain');
+    if (remain) {
+      const r = computeRemainingSec(window._envJob);
+      remain.textContent = r > 0 ? `预计剩余 ${mmss(r)}` : '预计剩余 即将完成';
+    }
+  }, 1000);
+}
+function stopWizardTimer() {
+  if (wizardTimer) { clearInterval(wizardTimer); wizardTimer = null; }
+}
+
+// 错误翻译：把底层错误映射成一句大白话 + 行动建议（原文放小字详情）
+function translateInstallError(job) {
+  const e = String(job.error || '');
+  if (job.status === 'cancelled') return { title: '安装已取消，随时可以重新开始' };
+  if (/ETIMEDOUT|ECONNREFUSED|ECONNRESET|getaddrinfo|ENOTFOUND|网络|下载失败|超时/i.test(e)) {
+    return { title: '网络不通或防火墙拦截，下载失败了：请检查网络后点"重试"（已下载的部分会保留，不会重来）' };
+  }
+  if (/npm 退出码|is not recognized|不是内部或外部命令/i.test(e)) {
+    return { title: '安装组件时出了点小问题：点"重试"通常就能继续；反复失败请复制诊断信息反馈' };
+  }
+  if (/ENOSPC|空间不足|no space/i.test(e)) {
+    return { title: '磁盘空间不足：请清理一些空间后点"重试"' };
+  }
+  return { title: '安装没有完成：点"重试"再试一次；反复失败请复制诊断信息反馈，作者会尽快修复' };
+}
+
+// 百分比数字平滑动画：阶段跳变（如 npm 完成 77%→95%）变成 600ms 快速滑行，不再瞬跳
+function tweenWizardPercent(target) {
+  const el = $('wizardPercent');
+  if (!el) return;
+  const from = (window._wizardPctShown == null) ? target : window._wizardPctShown;
+  window._wizardPctShown = target;
+  if (from === target) { el.textContent = target + '%'; return; }
+  const t0 = performance.now();
+  const dur = 600;
+  if (window._wizardPctAnim) cancelAnimationFrame(window._wizardPctAnim);
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / dur);
+    el.textContent = Math.round(from + (target - from) * k) + '%';
+    if (k < 1) window._wizardPctAnim = requestAnimationFrame(step);
+  };
+  window._wizardPctAnim = requestAnimationFrame(step);
+}
+
+function renderWizardJob(job) {
+  if (!job) return;
+  window._envJob = job;
+  window._lastInstallItems = job.items || [];
+  if (job.status === 'running') {
+    // 新任务：重置计时；阶段切换：记录本阶段开始时刻（速率型 ETA 的基准）
+    if (window._wizardJobId !== job.id) {
+      window._wizardJobId = job.id;
+      stopWizardTimer();
+      window._stageKey = null;
+      window._wizardPctShown = null;
+    }
+    if (window._stageKey !== job.id + ':' + job.currentStage) {
+      window._stageKey = job.id + ':' + job.currentStage;
+      window._stageStartedAt = Date.now();
+    }
+    showWizardScreen('progress');
+    tweenWizardPercent(job.percent || 0);
+    $('wizardBar').style.width = Math.max(0, Math.min(100, job.percent || 0)) + '%';
+    const cs = job.stages[job.currentStage] || {};
+    $('wizardStepText').textContent = WIZARD_STAGE_ACTION[cs.id] || job.stageText || '准备中…';
+    $('wizardSteps').innerHTML = job.stages.map((s) => {
+      const icon = s.status === 'done' ? '✓' : s.status === 'active' ? '●' : '○';
+      return `<div class="wizard-step ${s.status}"><span class="wizard-step-icon">${icon}</span>${esc(WIZARD_STAGE_LABELS[s.id] || s.label)}</div>`;
+    }).join('');
+    if (cs.id === 'node-dl') {
+      const sp = job.stageProgress || 0;
+      if (sp >= 1) {
+        // 内置包：免下载，直接进入解压
+        $('wizardStageHint').textContent = '已使用安装包内置组件（免下载），正在解压…';
+      } else {
+        // 回退在线下载：显示真实字节进度
+        const mb = Math.max(0, Math.min(34, Math.round(sp * 34)));
+        $('wizardStageHint').textContent = `正在下载：约 ${mb} / 34 MB`;
+      }
+    } else if (cs.id === 'dsh-npm') {
+      const estMin = Math.max(1, Math.round((job.estimateNpmMs || 60000) / 60000));
+      $('wizardStageHint').textContent = `这一步要组装约 500 个小组件（本机通常约 ${estMin} 分钟）；进度条按预计时间平滑前进，请勿关闭`;
+    } else {
+      $('wizardStageHint').textContent = '';
+    }
+    startWizardTimer();
+  } else if (job.status === 'done') {
+    stopWizardTimer();
+    if (window._envSummary && window._envSummary.ready) showWizardScreen('done');
+    else { showWizardScreen('progress'); $('wizardStepText').textContent = '完成检查…'; }
+  } else if (job.status === 'failed' || job.status === 'cancelled') {
+    stopWizardTimer();
+    showWizardScreen('fail');
+    $('wizardErrorText').textContent = translateInstallError(job).title;
+    $('wizardErrorDetail').textContent = job.error || '';
+  }
+}
+
+function appendWizardLog(lines) {
+  if (!Array.isArray(lines) || !lines.length) return;
+  if (!window._wizardLogLines) window._wizardLogLines = [];
+  window._wizardLogLines = window._wizardLogLines.concat(lines).slice(-300);
+  const el = $('wizardLog');
+  el.textContent = window._wizardLogLines.join('\n');
+  if (!$('wizardLog').classList.contains('hidden')) el.scrollTop = el.scrollHeight;
+}
+
+$('btnWizardStart').addEventListener('click', () => {
+  window._wizardActive = true;
+  const items = missingEnvItems(window._envSummary);
+  if (items.length) void cmd('envInstall', { items });
+  else if (window._envSummary && window._envSummary.ready) showWizardScreen('done');
+});
+$('btnWizardSkip').addEventListener('click', () => {
+  window._wizardActive = false;
+  stopWizardTimer();
+  showPage('env');
+});
+$('btnWizardCancel').addEventListener('click', () => {
+  void cmd('envCancel');
+  window._wizardActive = false;
+  stopWizardTimer();
+  showPage('main');
+});
+$('btnWizardRetry').addEventListener('click', () => {
+  window._wizardActive = true;
+  const items = window._lastInstallItems || [];
+  if (items.length) void cmd('envInstall', { items });
+  else showWizardScreen('welcome');
+});
+$('btnWizardCopyDiag').addEventListener('click', () => void cmd('envCopyDiagnostics'));
+$('btnWizardFailEnv').addEventListener('click', () => {
+  window._wizardActive = false;
+  stopWizardTimer();
+  showPage('env');
+});
+$('btnWizardLogToggle').addEventListener('click', () => {
+  const el = $('wizardLog');
+  el.classList.toggle('hidden');
+  if (!el.classList.contains('hidden')) el.scrollTop = el.scrollHeight;
+});
+$('btnEnvWizard').addEventListener('click', () => {
+  if (window._envJob && window._envJob.status === 'running') window._wizardActive = true;
+  showPage('wizard');
+});
 
 // 环境页打开时的全量快照（任务状态 + 环形日志）
 function renderEnvSnapshot(s) {
@@ -503,10 +790,9 @@ function renderUpdater(u) {
   const current = u.current || '-';
   const hasUpdate = (u.status === 'downloading' || u.status === 'downloaded') && !!u.latest;
 
-  // 主页面更新卡：检测到更新时独立一行显示完整"更新到 vX"按钮（替代原圆圈箭头徽标）
-  const updateCard = $('updateCard');
+  // 主页面最低端"启动器版本"行：检测到更新时同行显示"更新到 vX"按钮
   const updateBtn = $('btnUpdateNow');
-  updateCard.classList.toggle('hidden', !hasUpdate);
+  updateBtn.classList.toggle('hidden', !hasUpdate);
   if (hasUpdate) updateBtn.textContent = `更新到 v${u.latest}`;
 
   // 有更新时"检查更新"按钮变形为绿色"更新到 vX"
@@ -559,7 +845,7 @@ function renderUpdater(u) {
 // 主页面底端链接
 $('btnGithub').addEventListener('click', () => void cmd('openGithub'));
 $('btnChangelog').addEventListener('click', () => void cmd('openChangelog'));
-// 主页面更新卡：已就绪 → 立即安装；否则 → 检查更新
+// 主页面"启动器版本"行按钮：已就绪 → 立即安装；否则 → 检查更新
 $('btnUpdateNow').addEventListener('click', () => {
   const u = window._updater;
   if (u && u.status === 'downloaded') void cmd('updaterInstall');
@@ -570,6 +856,88 @@ $('btnUpdaterCheck').addEventListener('click', () => {
   const u = window._updater;
   if (u && u.status === 'downloaded') void cmd('updaterInstall');
   else void cmd('updaterCheck');
+});
+
+// ---------- DSH 更新（检测全自动、更新全手动：点"立即更新"才执行） ----------
+// 主页最低端"DSH版本"行按钮：只有检测到更新（或更新中/失败重试）才显示；
+// 设置页"DSH版本与更新"行：检查按钮常驻，详情行显示检查/更新进度与结果；
+// 源码安装（kind=source）不自动更新：按钮改为"打开源码目录"，需手动 git pull && pnpm run build
+function renderDshUpdate(u) {
+  window._dshUpdate = u || null;
+  const status = u ? u.status : 'idle';
+  const latest = u ? u.latest : '';
+  const kind = u ? u.kind : '';
+  const isSource = kind === 'source';
+
+  // 主页面按钮
+  const btn = $('btnDshUpdateNow');
+  if (btn) {
+    const show = status === 'available' || status === 'updating' || status === 'error';
+    btn.classList.toggle('hidden', !show);
+    if (show) {
+      if (status === 'available' && isSource) {
+        btn.disabled = false;
+        btn.textContent = '手动更新';
+        btn.title = `新版本 v${latest} 可用：当前为源码安装，点此打开源码目录（git pull && pnpm run build 后重启服务）`;
+      } else if (status === 'available') {
+        btn.disabled = false;
+        btn.textContent = '立即更新';
+        btn.title = `新版本 v${latest} 可用：点击后约 1 分钟完成（会重启服务，进行中的对话会中断）`;
+      } else if (status === 'updating') {
+        btn.disabled = true;
+        btn.textContent = '更新中…';
+        btn.title = '更新完成后会自动重启服务';
+      } else {
+        btn.disabled = false;
+        btn.textContent = '重试';
+        btn.title = (u.error || '未知错误') + '（旧版本不受影响，仍可正常使用）';
+      }
+    }
+  }
+
+  // 设置页"DSH版本与更新"行
+  const checkBtn = $('btnDshCheck');
+  if (checkBtn) {
+    const ready = status === 'available' && !isSource;
+    const openDir = status === 'available' && isSource;
+    checkBtn.disabled = status === 'checking' || status === 'updating';
+    checkBtn.textContent = openDir ? '打开源码目录'
+      : ready ? `更新到 v${latest}`
+      : status === 'checking' ? '检查中…'
+      : status === 'updating' ? '更新中…'
+      : '检查更新';
+    checkBtn.classList.toggle('update-ready', ready);
+  }
+  const detailRow = $('dshUpdaterDetailRow');
+  const detail = $('dshUpdaterDetail');
+  if (detailRow && detail) {
+    let text = '';
+    if (status === 'checking') text = '正在检查更新…';
+    else if (status === 'available' && isSource) text = `发现新版本 v${latest}：当前为源码安装，启动器不自动更新——请打开源码目录执行 git pull && pnpm run build，构建完成后重启服务生效`;
+    else if (status === 'available') text = `发现新版本 v${latest}：点"更新到 v${latest}"立即更新（约 1 分钟，会重启服务）`;
+    else if (status === 'updating') text = `正在更新 v${latest}…（完成后自动重启服务）`;
+    else if (status === 'updated') text = `已更新到 v${u.current}`;
+    else if (status === 'up-to-date') text = '已是最新版本';
+    else if (status === 'error') text = '检查/更新失败：' + (u.error || '未知错误');
+    detail.textContent = text;
+    detailRow.classList.toggle('hidden', !text);
+  }
+}
+$('btnDshUpdateNow').addEventListener('click', () => {
+  const u = window._dshUpdate;
+  if (!u) { void cmd('dshCheckNow'); return; }
+  // 源码形态：打开源码目录手动更新；失败重试：源码=重新检查，其余=重试更新；其余情况=立即更新
+  if (u.kind === 'source') void cmd('openDshDir');
+  else if (u.status === 'error') void cmd('dshUpdateNow');
+  else if (u.status === 'available') void cmd('dshUpdateNow');
+  else void cmd('dshCheckNow');
+});
+// 设置页 DSH 检查按钮：源码形态 → 打开源码目录；已有更新/失败重试（非源码）→ 立即更新；否则 → 手动检查（跳过 24h 节流）
+$('btnDshCheck').addEventListener('click', () => {
+  const u = window._dshUpdate;
+  if (u && u.status === 'available' && u.kind === 'source') void cmd('openDshDir');
+  else if (u && (u.status === 'available' || (u.status === 'error' && u.kind !== 'source'))) void cmd('dshUpdateNow');
+  else void cmd('dshCheckNow');
 });
 
 // ---------- 余额（cc-switch 风格：主页只显示金额 + ↻ + ⚙；⚙ 进入设置页测试并保存） ----------
@@ -631,12 +999,15 @@ function startBalanceTimer() {
 }
 
 $('btnBalanceRefresh').addEventListener('click', () => void queryBalance())
-$('btnBalanceSettings').addEventListener('click', () => {
+// 设置页"余额接口设置"入口：刷新配置快照后进入余额设置页
+$('btnBalanceOpenSettings').addEventListener('click', () => {
   $('balanceTestStatus').className = 'balance-test-status'
   $('balanceTestStatus').textContent = ''
   void refreshBalanceConfig()
   showPage('balance')
 })
+// 主页面"充值"按钮：打开 DeepSeek 开放平台充值页
+$('btnRecharge').addEventListener('click', () => void cmd('openRecharge'))
 $('btnBalanceBack').addEventListener('click', () => showPage('main'))
 $('btnBalanceTest').addEventListener('click', async () => {
   const st = $('balanceTestStatus')
@@ -735,6 +1106,7 @@ window.dshBridge.onEnv((json) => {
     const p = JSON.parse(json);
     if (p && p.job) renderEnvJob(p.job);
     if (p && p.lines) appendEnvLog(p.lines);
+    if (p && p.lines && window._wizardActive) appendWizardLog(p.lines);
   } catch (err) { console.error('[dshl] env push error:', err); }
 });
 

@@ -69,7 +69,8 @@ if (existing !== null) {
   process.exit(1)
 }
 
-// ---------- 2. 构建（wwwroot 资源 + NSIS 安装包） ----------
+// ---------- 2. 构建（内置 Node 发行包 + wwwroot 资源 + NSIS 安装包） ----------
+run(process.execPath, ['tools/fetch-node-dist.mjs'])
 run(npm, ['run', 'build:assets'])
 run(npm, ['run', 'dist:win'])
 
