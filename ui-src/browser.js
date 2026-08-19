@@ -35,6 +35,10 @@ function render() {
   $('tabs').style.display = tabsEnabled ? '' : 'none';
   $('btnNew').style.display = tabsEnabled ? '' : 'none';
   $('btnSplit').style.display = tabsEnabled ? '' : 'none';
+
+  // 白屏修复按钮：活动标签为空白（加载失败）时显示
+  const active = state.tabs.find((t) => t.id === state.activeId);
+  $('btnFix').classList.toggle('hidden', !(active && active.blank));
   const titleOnly = $('titleOnly');
   if (titleOnly) {
     const active = state.tabs.find((t) => t.id === state.activeId);
@@ -99,6 +103,7 @@ window.addEventListener('keydown', (e) => {
 // ---------- 按钮 ----------
 $('btnNew').addEventListener('click', () => send('tabNew'));
 $('btnSplit').addEventListener('click', () => send('splitToggle'));
+$('btnFix').addEventListener('click', () => send('fixPane', { id: state.activeId }));
 $('btnMin').addEventListener('click', () => send('winMin'));
 $('btnMax').addEventListener('click', () => send('winMax'));
 $('btnClose').addEventListener('click', () => send('winClose'));

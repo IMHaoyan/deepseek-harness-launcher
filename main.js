@@ -897,7 +897,7 @@ function attachContextMenu(wc, withDev) {
 function webPushState() {
   if (!webWin || webWin.isDestroyed()) return
   webWin.webContents.send('browser:state', {
-    tabs: webTabs.map((t) => ({ id: t.id, title: t.title })),
+    tabs: webTabs.map((t) => ({ id: t.id, title: t.title, blank: !!t.blank })),
     activeId: webActiveId,
     rightId: webRightId,
     splitOn: webSplitOn,
@@ -955,12 +955,25 @@ function webCreateTab(targetUrl, targetTitle) {
       preload: path.join(__dirname, 'browser-preload.js'),
     },
   })
-  const tab = { id, view, title: targetTitle || 'DeepSeek Harness' }
+  const tab = { id, view, title: targetTitle || 'DeepSeek Harness', blank: false }
   webTabs.push(tab)
   const wc = view.webContents
+  const markBlank = (b) => { tab.blank = b; webPushState() }
+  // 外部链接（target=_blank / window.open）→ 统一交给系统默认浏览器打开，避免被 Electron 吞掉
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) { try { shell.openExternal(url) } catch { /* noop */ } }
+    return { action: 'deny' }
+  })
   try { view.setBackgroundColor('#F9FAFB') } catch { /* 旧版无此 API，忽略 */ }
   wc.on('page-title-updated', (_e, t) => { tab.title = t || 'DeepSeek Harness'; webPushState() })
   wc.on('focus', () => { webFocusedId = id; refreshPaneOverlays() })
+  // 加载失败（服务未起/端口不通）→ 标记白屏，交给壳的"修复"按钮兜底重载
+  wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame) return
+    // 用户主动取消（ERR_ABORTED/-3）不算白屏
+    if (code === -3) return
+    markBlank(true)
+  })
   wc.on('zoom-changed', (_e, direction) => {
     const f = wc.getZoomFactor()
     const next = direction === 'in' ? Math.min(f + 0.05, 3) : Math.max(f - 0.05, 0.5)
@@ -974,6 +987,7 @@ function webCreateTab(targetUrl, targetTitle) {
   wc.on('did-finish-load', () => {
     // 每次加载完成后应用当前设定（失败页/错误页会把缩放重置为 100%）
     try { wc.setZoomFactor(Config.webZoom / 100) } catch { /* noop */ }
+    markBlank(false)
     injectPaneOverlay(tab)
   })
   // 快捷键（焦点在页面内也生效）：Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右
@@ -1126,6 +1140,20 @@ function webPaneToTab(id) {
   webCreateTab(url, tab.title)
   webCloseTab(id)
   webLayout()
+}
+
+// "修复"按钮：先确保服务在跑（没起才启动，已起不动它），再重载该标签为真实应用
+async function webReloadPane(id) {
+  const tab = webTabs.find((t) => t.id === id)
+  if (!tab) return
+  const wc = tab.view && tab.view.webContents
+  if (!wc || wc.isDestroyed()) return
+  tab.blank = false
+  webPushState()
+  // 服务没在跑 → 走统一启动入口（幂等；服务已在运行则直接返回，不打断会话）。
+  // 若端口被占/环境未就绪，handleStart 会置 blockedReason / startWhenReady，面板可据此处理。
+  if (!server.running()) await handleStart()
+  try { wc.loadURL(WEB_URL) } catch { /* noop */ }
 }
 
 // 关闭当前聚焦的分屏：分屏时关聚焦侧（左关左保留右），未分屏时关当前标签
@@ -1314,6 +1342,11 @@ function broadcastState() {
   if (win && !win.isDestroyed()) { try { win.webContents.send('dsh:state', json) } catch { /* noop */ } }
 }
 
+// 判断 WebUI 窗口当前是否正在被用户聚焦（聚焦时不弹提醒、不闪烁图标）
+function webUiFocused() {
+  try { return !!(webWin && !webWin.isDestroyed() && webWin.isFocused()) } catch { return false }
+}
+
 // ---------- 通知 dropbox 扫描（dsh-notify 插件投递） ----------
 function scanNotify() {
   let file = null
@@ -1325,7 +1358,7 @@ function scanNotify() {
   try {
     const doc = JSON.parse(fs.readFileSync(file, 'utf8'))
     if (doc && typeof doc.title === 'string' && doc.title && typeof doc.message === 'string' && doc.message) {
-      if (Config.notify) {
+      if (Config.notify && !webUiFocused()) {
         startFlash()
         notify(doc.title, doc.message, typeof doc.url === 'string' ? doc.url : WEB_URL)
       }
@@ -1473,6 +1506,7 @@ function registerIpc() {
         case 'browser:closePane': webCloseFocused(); return '{}'
         case 'browser:swapPanes': webSwap(); return '{}'
         case 'browser:paneToTab': webPaneToTab(value && value.id); return '{}'
+        case 'browser:fixPane': await webReloadPane(value && value.id); return '{}'
         case 'browser:winMin': if (webWin && !webWin.isDestroyed()) { try { webWin.minimize() } catch { /* noop */ } } return '{}'
         case 'browser:winMax': {
           if (webWin && !webWin.isDestroyed()) {
