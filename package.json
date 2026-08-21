@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-launcher",
   "productName": "DeepSeek Harness Launcher",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "DeepSeek Harness Launcher（DSHL）—— Windows 托盘启动器/看护工具",
   "main": "main.js",
   "private": true,
@@ -17,12 +17,13 @@
     "release": "node tools/release.mjs"
   },
   "dependencies": {
-    "semver": "^7.7.1",
-    "electron-updater": "^6.3.9"
+    "electron-updater": "^6.3.9",
+    "semver": "^7.7.1"
   },
   "devDependencies": {
     "electron": "^34.0.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "sharp": "^0.35.3"
   },
   "build": {
     "appId": "com.dshl.launcher",

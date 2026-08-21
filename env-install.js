@@ -1,11 +1,13 @@
-// env-install.js — 一键安装引擎：托管 Node.js（官方发行包下载/校验/解压）与 DSH（npm 前缀安装）+ 通知插件拷贝
+// env-install.js — 一键安装引擎：用户级 Node.js（官方发行包下载/校验/解压 + 用户 PATH）+ DSH（全局 npm 安装）+ 通知插件拷贝
 //
 // 设计要点：
-//  - 全程零管理员权限：Node 用官方 zip（自带 npm），装到 ~/.dsh/dshl-runtime/node/<ver>/；
-//    DSH 用该 npm 安装到 ~/.dsh/dshl-runtime/dsh/（路径绝对稳定，不碰 PATH）。
+//  - 全程零管理员权限：Node 用官方 zip（自带 npm）装到 %LOCALAPPDATA%\Programs\nodejs 并写入用户 PATH
+//    （HKCU\Environment，重开终端即可用 npm/node/dsh）；DSH 用 npm install -g 装到全局根
+//    （有系统 npm 按其 prefix，否则 %APPDATA%\npm），与用户命令行 npm 完全同源。
+//  - 失败回退：全局 npm 装不上 → 回退托管目录（~/.dsh/dshl-runtime/dsh）；旧版保留不动。
 //  - 状态机单例：阶段列表 + 权重进度 + 实时日志（环形缓冲 500 行 + install.log 落盘）+ 取消。
 //  - 下载优先 Electron net（自动走系统代理）；脱离 Electron（脚本/测试）回退 Node http/https。
-//  - 官方源失败自动回退 npmmirror 镜像；Node 包校验官方 SHASUMS256.txt。
+//  - npm 源 npmmirror 优先，失败回退官方源；Node 包校验官方 SHASUMS256.txt。
 'use strict'
 
 const fs = require('fs')
@@ -40,6 +42,70 @@ function log(message) {
 
 function runtimeBase() {
   return path.join(HOME, 'dshl-runtime')
+}
+
+// 用户级 Node 安装目录（官方 zip 解压落位；免管理员；可用环境变量覆盖，测试用）。
+// 非 Windows 平台保持托管目录（macOS/Linux 用户 PATH 方案未验证，不冒险）。
+function userNodeDir() {
+  if (process.env.DSHL_USER_NODE_DIR) return process.env.DSHL_USER_NODE_DIR
+  if (!IS_WIN) return path.join(runtimeBase(), 'node')
+  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+  return path.join(local, 'Programs', 'nodejs')
+}
+
+// npm 全局根（npm i -g 落点；Windows 默认 %APPDATA%\npm，与官方安装器一致）
+function npmGlobalRoot() {
+  if (process.env.DSHL_NPM_GLOBAL_ROOT) return process.env.DSHL_NPM_GLOBAL_ROOT
+  if (!IS_WIN) return '/usr/local'
+  return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'npm')
+}
+
+// ---------- 用户 PATH（HKCU\Environment；免管理员，仅 Windows） ----------
+
+async function readUserPath() {
+  const out = { type: 'REG_EXPAND_SZ', value: '' }
+  try {
+    const r = await runExec('reg', ['query', 'HKCU\\Environment', '/v', 'Path'], { timeout: 10000 })
+    const m = /Path\s+(REG_\w+)\s+(.*)$/m.exec(r.stdout)
+    if (m) { out.type = m[1]; out.value = m[2] }
+  } catch { /* 无 Path 值，按新建处理 */ }
+  return out
+}
+
+// 把目录写入用户 PATH（默认追加；prepend=true 时置顶——用于 dshl 自装 Node 优先于过旧系统 Node）
+async function addToUserPath(job, dirs, opts = {}) {
+  if (!IS_WIN) { job.logLine('非 Windows 平台，跳过用户 PATH 写入'); return }
+  if (process.env.DSHL_SKIP_PATH === '1') { job.logLine('跳过用户 PATH 写入（DSHL_SKIP_PATH=1，测试模式）'); return }
+  const { type, value } = await readUserPath()
+  const parts = value ? value.split(';').map((p) => p.trim()).filter(Boolean) : []
+  const norm = (p) => { try { return path.resolve(p.replace(/^"(.*)"$/, '$1')).toLowerCase() } catch { return p.toLowerCase() } }
+  const added = []
+  for (const d of dirs) {
+    if (!d || parts.some((p) => norm(p) === norm(d))) continue
+    parts.push(d)
+    added.push(d)
+  }
+  if (!added.length) { job.logLine('用户 PATH 已包含所需目录，无需修改'); return }
+  if (opts.prepend) {
+    // 置顶：新装 Node 应优先于系统里过旧的 Node
+    for (const d of added) { const i = parts.indexOf(d); if (i > 0) { parts.splice(i, 1); parts.unshift(d) } }
+  }
+  const newValue = parts.join(';')
+  await runExec('reg', ['add', 'HKCU\\Environment', '/v', 'Path', '/t', type, '/d', newValue, '/f'], { timeout: 15000 })
+  job.logLine(`用户 PATH 已更新：${added.join('、')}${opts.prepend ? '（置顶）' : ''}（新开终端生效）`)
+  broadcastEnvironmentChange()
+}
+
+// 广播 WM_SETTINGCHANGE：让 Explorer 立即重载环境变量（新终端无需注销即可看到新 PATH）
+function broadcastEnvironmentChange() {
+  const ps = [
+    "Add-Type -Namespace Dshl -Name Env -MemberDefinition '[DllImport(\"user32.dll\", SetLastError = true, CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'",
+    '$r = [UIntPtr]::Zero',
+    '[Dshl.Env]::SendMessageTimeout([IntPtr]0xFFFF, 0x1A, [UIntPtr]::Zero, "Environment", 2, 5000, [ref]$r) | Out-Null',
+  ].join('; ')
+  try {
+    spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, stdio: 'ignore' })
+  } catch { /* 广播失败不影响：重开终端/重启资源管理器后仍生效 */ }
 }
 
 function installLogPath() {
@@ -251,7 +317,15 @@ async function finalizeNode(job, archivePath, extractDir, file, nodeDest, onExtr
   if (!fs.existsSync(extracted)) throw new Error(`解压后未找到目录 ${archiveRoot}`)
   fs.mkdirSync(path.dirname(nodeDest), { recursive: true })
   try { fs.rmSync(nodeDest, { recursive: true, force: true }) } catch { /* noop */ }
-  fs.renameSync(extracted, nodeDest)
+  try {
+    fs.renameSync(extracted, nodeDest)
+  } catch (e) {
+    // 跨卷（如 tmp 在 C:、目标在 D:）rename 会 EXDEV：回退复制
+    if (!e || e.code !== 'EXDEV') throw e
+    job.logLine('跨卷移动，改用复制落位…')
+    fs.cpSync(extracted, nodeDest, { recursive: true })
+    try { fs.rmSync(extracted, { recursive: true, force: true }) } catch { /* noop */ }
+  }
   try { fs.rmSync(extractDir, { recursive: true, force: true }) } catch { /* noop */ }
   try { fs.unlinkSync(archivePath) } catch { /* noop */ }
   const nodeBin = path.join(nodeDest, IS_WIN ? 'node.exe' : 'node')
@@ -360,8 +434,12 @@ function runNpmInstall(job, nodeBin, npmCli, args) {
       if (npmCli) {
         child = spawn(nodeBin, [npmCli, ...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env })
       } else if (IS_WIN) {
-        // cmd.exe 兜底：每个 token 独立双引号包裹（cmd /s /c 会剥外层引号），避免路径/参数含空格时错乱
-        const cmdLine = ['npm', ...args].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')
+        // cmd.exe 兜底：首 token（程序名）不加引号（cmd /s /c 会剥字符串首尾引号，加引号会把 npm 变成 npm"），
+        // 仅对含空格/& 的参数加引号
+        const cmdLine = args.map((a, i) => {
+          const s = String(a).replace(/"/g, '\\"')
+          return i === 0 ? s : (/\s|&/.test(s) ? `"${s}"` : s)
+        }).join(' ')
         child = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env })
       } else {
         child = spawn('npm', args, { stdio: ['ignore', 'pipe', 'pipe'], env })
@@ -385,117 +463,9 @@ function runNpmInstall(job, nodeBin, npmCli, args) {
   })
 }
 
-// ---------- pnpm 快路径（官方预编译二进制 @pnpm/exe；硬链接安装，通常比 npm 快数倍；失败自动回退 npm） ----------
+// ---------- npm 安装（统一渠道：npmmirror 镜像优先，失败回退 npm 官方源） ----------
 
-const PNPM_VERSION = '9.15.9' // v9 对生命周期脚本无白名单限制（v10+ 默认禁用 koffi/pty 等原生包脚本）
-
-// pnpm 可执行文件：~/.dsh/dshl-runtime/pnpm/node_modules/@pnpm/exe/pnpm.exe（npm 装一次，常驻复用）
-function pnpmExePath() {
-  const p = path.join(runtimeBase(), 'pnpm', 'node_modules', '@pnpm', 'exe', IS_WIN ? 'pnpm.exe' : 'pnpm')
-  return fs.existsSync(p) ? p : null
-}
-
-// 确保 pnpm 可用：用托管 Node 自带 npm 装 @pnpm/exe（~10 秒，一次性）；失败返回 null（调用方回退 npm）
-async function ensurePnpm(job, nodeBin, npmCli) {
-  const exe = pnpmExePath()
-  if (exe) return exe
-  const prefix = path.join(runtimeBase(), 'pnpm')
-  fs.mkdirSync(prefix, { recursive: true })
-  const registries = Config.npmRegistry ? [Config.npmRegistry] : [null, 'https://registry.npmmirror.com']
-  for (const registry of registries) {
-    if (job.aborted) throw job.cancelledError()
-    const args = ['install', '--prefix', prefix, '--no-audit', '--no-fund', '--loglevel=error']
-    if (registry) args.push('--registry', registry)
-    args.push(`@pnpm/exe@${PNPM_VERSION}`)
-    job.logLine(`确保 pnpm 可用（registry=${registry || '默认'}）：@pnpm/exe@${PNPM_VERSION}`)
-    try {
-      await runNpmInstall(job, nodeBin, npmCli, args)
-    } catch (e) {
-      job.logLine(`pnpm 引导失败（registry=${registry || '默认'}）：${e.message}${registry === null ? '，回退镜像源重试' : ''}`)
-      continue
-    }
-    const exe2 = pnpmExePath()
-    if (exe2) {
-      job.logLine(`pnpm 就绪：${exe2}`)
-      return exe2
-    }
-  }
-  return null
-}
-
-// 流式执行 pnpm.exe，输出进安装日志（与 runNpmInstall 同构）；失败时错误信息附 stderr 尾部
-function runPnpmInstall(job, pnpmExe, args) {
-  return new Promise((resolve, reject) => {
-    let child
-    try {
-      child = spawn(pnpmExe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    } catch (err) { return reject(err) }
-    job.child = child
-    let errTail = ''
-    const onData = (d) => {
-      const s = String(d)
-      errTail = (errTail + s).slice(-4000)
-      for (const line of s.split(/\r?\n/)) {
-        if (line.trim()) job.logLine(line)
-      }
-    }
-    child.stdout.on('data', onData)
-    child.stderr.on('data', onData)
-    child.on('error', (err) => reject(err))
-    child.on('exit', (code) => {
-      job.child = null
-      if (job.aborted) return reject(job.cancelledError())
-      if (code === 0) resolve()
-      else reject(new Error(`pnpm 退出码 ${code}` + (errTail ? '\n' + errTail.slice(-600) : '')))
-    })
-  })
-}
-
-// 返回 true = pnpm 安装成功；false = 快路径不可用/失败（调用方回退 npm）
-async function tryPnpmInstall(job, nodeBin, prefix, spec) {
-  let npmCli = npmCliFor(nodeBin)
-  if (!npmCli) {
-    job.logLine('所选 Node 未内置 npm，跳过 pnpm 快路径（用 npm 兜底）')
-    return false
-  }
-  job.logLine(`尝试 pnpm 快路径（@pnpm/exe@${PNPM_VERSION}，硬链接安装，通常比 npm 快数倍）`)
-  const pnpmExe = await ensurePnpm(job, nodeBin, npmCli)
-  if (!pnpmExe) {
-    job.logLine('pnpm 不可用，回退 npm 安装')
-    return false
-  }
-  fs.mkdirSync(prefix, { recursive: true })
-  const storeDir = path.join(runtimeBase(), 'pnpm-store')
-  const registries = Config.npmRegistry ? [Config.npmRegistry] : [null, 'https://registry.npmmirror.com']
-  let versionMismatch = false
-  for (const registry of registries) {
-    if (job.aborted) throw job.cancelledError()
-    // 注意：pnpm 无 --no-fund 选项（npm 专属），加了会直接报错退出；
-    // node-linker=hoisted：DSH 部分子包的 postinstall 隐式依赖 npm 扁平布局
-    // （如 dsh-subprocess-local 未声明 node-pty 却 import.meta.resolve('node-pty')），
-    // 扁平布局兼容这类脚本，同时保留 pnpm 仓库/硬链接的安装速度
-    const args = ['install', '--prefix', prefix, '--store-dir', storeDir, '--reporter', 'append-only', '--config.node-linker=hoisted']
-    if (registry) args.push('--registry', registry)
-    args.push(spec)
-    job.logLine(`pnpm install（registry=${registry || '默认'}）：${spec}`)
-    try {
-      await runPnpmInstall(job, pnpmExe, args)
-      return true
-    } catch (e) {
-      if (/NO_MATCHING_VERSION|notarget|No matching version/i.test(e.message)) versionMismatch = true
-      job.logLine(`pnpm 安装失败（registry=${registry || '默认'}）：${e.message}${registry === null ? '，回退镜像源重试' : ''}`)
-    }
-  }
-  if (versionMismatch) {
-    // 版本解析失败是"源上确实没有依赖版本"（上游发布不完整或镜像同步滞后），
-    // npm 兜底必然同样失败且更慢——快速失败，给出可行动的提示
-    job.logLine('检测到镜像源缺少依赖版本（上游发布/同步滞后），跳过 npm 兜底避免重复耗时')
-    throw new Error(`镜像源上缺少 DSH 依赖的某个子包版本（上游刚发布或镜像同步滞后）：请稍后重试；也可在配置里改 dshVersion 换一个版本`)
-  }
-  return false
-}
-
-// npm 双源安装循环（回退路径）：返回 true/false
+// npm 双源安装循环：返回 true/false
 async function npmInstallTo(job, nodeBin, prefix, spec) {
   let npmCli = npmCliFor(nodeBin)
   if (!npmCli) {
@@ -507,7 +477,7 @@ async function npmInstallTo(job, nodeBin, prefix, spec) {
     } catch { /* 忽略，走 cmd.exe 兜底 */ }
   }
   if (!npmCli) job.logLine('警告：所选 Node 未内置 npm，回退到 PATH 中的 npm 命令')
-  const registries = Config.npmRegistry ? [Config.npmRegistry] : [null, 'https://registry.npmmirror.com']
+  const registries = Config.npmRegistry ? [Config.npmRegistry] : ['https://registry.npmmirror.com', null]
   for (const registry of registries) {
     if (job.aborted) throw job.cancelledError()
     const args = ['install', '--prefix', prefix, '--no-audit', '--no-fund', '--loglevel=info']
@@ -518,14 +488,96 @@ async function npmInstallTo(job, nodeBin, prefix, spec) {
       await runNpmInstall(job, nodeBin, npmCli, args)
       return true
     } catch (e) {
-      job.logLine(`npm 安装失败（registry=${registry || '默认'}）：${e.message}${registry === null ? '，回退镜像源重试' : ''}`)
+      job.logLine(`npm 安装失败（registry=${registry || '默认'}）：${e.message}${registry ? '，回退官方源重试' : ''}`)
     }
   }
   return false
 }
 
-// 原子安装：永远装到 dsh-new，成功后毫秒级切换；旧版保留到切换成功（失败/取消都不影响旧版）
-async function installDsh(job, nodeBin) {
+// 全局 npm 安装：npm i -g --prefix <全局根> @deepseek-ai/dsh@<ver>（npmmirror 优先、官方回退）
+// 返回全局根（<root>/node_modules/@deepseek-ai/dsh 即安装处）；已装同版本时跳过
+async function installDshGlobal(job, nodeBin, globalRoot) {
+  const version = (job.opts && job.opts.dshVersion) || Config.dshVersion || '0.1.0-rc.6'
+  const spec = version === 'latest' ? '@deepseek-ai/dsh' : `@deepseek-ai/dsh@${version}`
+  const pkgDir = path.join(globalRoot, 'node_modules', '@deepseek-ai', 'dsh')
+  const binPath = path.join(pkgDir, 'lib', 'bin.js')
+  const installed = readInstalledVersion(pkgDir)
+  if (installed && version !== 'latest' && installed === version) {
+    job.logLine(`全局 npm 已安装 v${installed}（与目标版本一致），跳过安装`)
+    return globalRoot
+  }
+  // 落点可写性预检：给用户一条可行动的报错，而不是 npm 的深层错误
+  try {
+    const probe = path.join(globalRoot, '.dshl-write-test-' + Date.now())
+    fs.mkdirSync(globalRoot, { recursive: true })
+    fs.writeFileSync(probe, '')
+    fs.unlinkSync(probe)
+  } catch (e) {
+    throw new Error(`npm 全局目录不可写：${globalRoot}（${e.message}）`)
+  }
+  const registries = Config.npmRegistry ? [Config.npmRegistry] : ['https://registry.npmmirror.com', null]
+  let lastErr = null
+  // 解析 npm CLI：nodeBin 可能是 PATH 上的裸 'node'，先解析真实可执行路径再找同目录 npm-cli.js
+  let npmCli = npmCliFor(nodeBin)
+  if (!npmCli && nodeBin) {
+    try {
+      const res = await runExec(nodeBin, ['-p', 'process.execPath'], { timeout: 10000 })
+      const real = String(res.stdout || '').trim()
+      if (real) npmCli = npmCliFor(real)
+    } catch { /* 忽略，走 cmd.exe 兜底 */ }
+  }
+  if (!npmCli) job.logLine('警告：所选 Node 未内置 npm，回退到 PATH 中的 npm 命令')
+  for (const registry of registries) {
+    if (job.aborted) throw job.cancelledError()
+    const args = ['install', '-g', '--prefix', globalRoot, '--no-audit', '--no-fund', '--loglevel=info']
+    if (registry) args.push('--registry', registry)
+    args.push(spec)
+    job.logLine(`npm install -g（registry=${registry || '默认'}）：${spec} → ${globalRoot}`)
+    try {
+      await runNpmInstall(job, nodeBin, npmCli, args)
+      if (!fs.existsSync(binPath)) throw new Error(`安装后未找到 ${binPath}`)
+      job.logLine(`全局 npm 安装完成：${pkgDir}`)
+      return globalRoot
+    } catch (e) {
+      lastErr = e
+      job.logLine(`npm install -g 失败（registry=${registry || '默认'}）：${e.message}${registry ? '，回退官方源重试' : ''}`)
+    }
+  }
+  throw lastErr || new Error('npm install -g 失败')
+}
+
+// 已装全局 DSH 版本（npm i -g 落点）
+function readInstalledVersion(pkgDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+    return (pkg && pkg.name === '@deepseek-ai/dsh' && pkg.version) || ''
+  } catch { return '' }
+}
+
+// 解析 npm 全局根：有系统 npm 时按其真实 prefix（与用户命令行 npm 完全一致）；否则默认 %APPDATA%\npm
+async function resolveGlobalRoot(nodeBin) {
+  if (process.env.DSHL_NPM_GLOBAL_ROOT) return process.env.DSHL_NPM_GLOBAL_ROOT // 测试覆盖
+  const fallback = npmGlobalRoot()
+  const candidates = []
+  try {
+    const r = await runExec('npm', ['config', 'get', 'prefix'], { timeout: 20000 })
+    if (r.stdout && r.stdout.trim()) candidates.push(String(r.stdout).trim())
+  } catch { /* 无系统 npm */ }
+  if (nodeBin) {
+    const cli = npmCliFor(nodeBin)
+    if (cli) {
+      try {
+        const r = await runExec(nodeBin, [cli, 'config', 'get', 'prefix'], { timeout: 20000 })
+        if (r.stdout && r.stdout.trim()) candidates.push(String(r.stdout).trim())
+      } catch { /* 忽略 */ }
+    }
+  }
+  const found = candidates.find((p) => p && /[/\\]/.test(p))
+  return found || fallback
+}
+
+// 托管目录安装（回退路径）：原子安装，永远装到 dsh-new，成功后毫秒级切换；旧版保留到切换成功
+async function installDshManaged(job, nodeBin) {
   const dshDir = path.join(runtimeBase(), 'dsh')
   const freshDir = path.join(runtimeBase(), 'dsh-new')
   const oldDir = path.join(runtimeBase(), 'dsh-old')
@@ -535,13 +587,8 @@ async function installDsh(job, nodeBin) {
   try { fs.rmSync(oldDir, { recursive: true, force: true }) } catch { /* noop */ }
   fs.mkdirSync(path.dirname(freshDir), { recursive: true })
   try {
-    const pnpmOk = await tryPnpmInstall(job, nodeBin, freshDir, spec)
-    if (!pnpmOk) {
-      job.logLine('pnpm 快路径未成功，回退 npm 安装')
-      try { fs.rmSync(freshDir, { recursive: true, force: true }) } catch { /* noop */ }
-      const npmOk = await npmInstallTo(job, nodeBin, freshDir, spec)
-      if (!npmOk) throw new Error('DSH 安装失败（pnpm 与 npm 均未成功）')
-    }
+    const npmOk = await npmInstallTo(job, nodeBin, freshDir, spec)
+    if (!npmOk) throw new Error('DSH 安装失败（npmmirror 镜像与 npm 官方源均未成功）')
     // 原子切换：旧版 → dsh-old（备份）→ dsh-new → dsh → 删除备份
     if (fs.existsSync(dshDir)) fs.renameSync(dshDir, oldDir)
     fs.renameSync(freshDir, dshDir)
@@ -551,6 +598,17 @@ async function installDsh(job, nodeBin) {
   } catch (e) {
     try { fs.rmSync(freshDir, { recursive: true, force: true }) } catch { /* noop */ }
     throw e
+  }
+}
+
+// DSH 安装主入口：优先全局 npm（统一渠道）；失败回退托管目录（旧逻辑兜底）
+async function installDsh(job, nodeBin) {
+  try {
+    const globalRoot = await resolveGlobalRoot(nodeBin)
+    return await installDshGlobal(job, nodeBin, globalRoot)
+  } catch (e) {
+    job.logLine(`全局 npm 安装失败（回退托管目录）：${e.message}`)
+    return await installDshManaged(job, nodeBin)
   }
 }
 
@@ -578,11 +636,11 @@ async function installPlugin(job) {
 let currentJob = null
 let jobSeq = 0
 
-const KIND_LABELS = { source: '源码版', global: '全局安装', npx: 'npx 缓存', managed: '托管安装' }
+const KIND_LABELS = { source: '源码版', global: '全局 npm 安装', npx: 'npx 缓存', managed: '托管安装' }
 
-// dsh-npm 阶段预估耗时：默认种子值（pnpm 快路径实测 ~40s，取 60s 略留余量；npm 回退 3-6 分钟）；
+// dsh-npm 阶段预估耗时：默认种子值（npm 安装 3-6 分钟，取 4 分钟为种子；EWMA 学习后贴近本机真实水平）；
 // 真实耗时会在每台机器上持续学习（EWMA 平滑），首装之后即贴近本机真实水平
-const NPM_STAGE_ESTIMATE_MS = 60000
+const NPM_STAGE_ESTIMATE_MS = 240000
 // 各阶段名义耗时（与 buildStages 权重一致；Node 内置包解压秒级 → 名义 10s；dsh-npm 用学习值）
 const STAGE_NOMINAL_MS = { 'node-dl': 10000, 'node-ex': 10000, 'dsh-npm': NPM_STAGE_ESTIMATE_MS, 'dsh-verify': 5000, 'plugin': 3000 }
 
@@ -607,7 +665,8 @@ function loadInstallStats() {
   try {
     const s = JSON.parse(fs.readFileSync(installStatsPath(), 'utf8'))
     const ms = Number(s.dshNpmMs)
-    if (Number.isFinite(ms) && ms > 10000) return { dshNpmMs: Math.round(ms) }
+    // 下限 60s：旧版（pnpm 快路径）学习值 ~40s 会导致 npm 安装期间进度条提前跑满；EWMA 会逐步校正
+    if (Number.isFinite(ms) && ms > 10000) return { dshNpmMs: Math.max(60000, Math.round(ms)) }
   } catch { /* 首次安装或文件损坏 */ }
   return { dshNpmMs: NPM_STAGE_ESTIMATE_MS }
 }
@@ -625,41 +684,36 @@ function learnNpmDuration(actualMs) {
   return s.dshNpmMs
 }
 
+// 阶段权重由 STAGE_NOMINAL_MS 自动计算（改种子/学习值无需手调）：
+// Node 阶段（内置包解压，秒级）占小块；DSH 主程序安装（npm，数分钟）是绝对大头；尾部验证/插件小块
+const STAGE_LABELS = {
+  'node-dl': '准备 Node.js',
+  'node-ex': '校验并解压 Node.js',
+  'dsh-npm': '安装 DeepSeek Harness 主程序',
+  'dsh-verify': '验证 DeepSeek Harness',
+  plugin: '安装桌面通知',
+}
 function buildStages(items) {
+  const order = ['node-dl', 'node-ex', 'dsh-npm', 'dsh-verify', 'plugin']
+  const wanted = order.filter((id) => {
+    if (id === 'node-dl' || id === 'node-ex') return items.includes('node')
+    if (id === 'dsh-npm' || id === 'dsh-verify') return items.includes('dsh')
+    return items.includes('plugin')
+  })
+  if (!wanted.length) return []
+  const total = wanted.reduce((sum, id) => sum + (STAGE_NOMINAL_MS[id] || 10000), 0)
   const stages = []
-  const wantNode = items.includes('node')
-  const wantDsh = items.includes('dsh')
-  const wantPlugin = items.includes('plugin')
-  // 权重按"阶段名义耗时占比"分配（与 STAGE_NOMINAL_MS 一致）：
-  // Node 阶段（内置包解压，秒级）占小块；DSH 主程序安装（pnpm ~35s）是绝对大头；尾部验证/插件小块
-  if (wantNode && wantDsh && wantPlugin) {
-    stages.push({ id: 'node-dl', label: '准备 Node.js', start: 0, end: 6 })
-    stages.push({ id: 'node-ex', label: '校验并解压 Node.js', start: 6, end: 10 })
-    stages.push({ id: 'dsh-npm', label: '安装 DeepSeek Harness 主程序', start: 10, end: 93 })
-    stages.push({ id: 'dsh-verify', label: '验证 DeepSeek Harness', start: 93, end: 97 })
-    stages.push({ id: 'plugin', label: '安装桌面通知', start: 97, end: 100 })
-  } else if (wantNode && wantDsh) {
-    stages.push({ id: 'node-dl', label: '准备 Node.js', start: 0, end: 7 })
-    stages.push({ id: 'node-ex', label: '校验并解压 Node.js', start: 7, end: 11 })
-    stages.push({ id: 'dsh-npm', label: '安装 DeepSeek Harness 主程序', start: 11, end: 94 })
-    stages.push({ id: 'dsh-verify', label: '验证 DeepSeek Harness', start: 94, end: 100 })
-  } else if (wantDsh && wantPlugin) {
-    stages.push({ id: 'dsh-npm', label: '安装 DeepSeek Harness 主程序', start: 0, end: 93 })
-    stages.push({ id: 'dsh-verify', label: '验证 DeepSeek Harness', start: 93, end: 97 })
-    stages.push({ id: 'plugin', label: '安装桌面通知', start: 97, end: 100 })
-  } else if (wantNode && wantPlugin) {
-    stages.push({ id: 'node-dl', label: '准备 Node.js', start: 0, end: 75 })
-    stages.push({ id: 'node-ex', label: '校验并解压 Node.js', start: 75, end: 85 })
-    stages.push({ id: 'plugin', label: '安装桌面通知', start: 85, end: 100 })
-  } else if (wantNode) {
-    stages.push({ id: 'node-dl', label: '准备 Node.js', start: 0, end: 80 })
-    stages.push({ id: 'node-ex', label: '校验并解压 Node.js', start: 80, end: 100 })
-  } else if (wantDsh) {
-    stages.push({ id: 'dsh-npm', label: '安装 DeepSeek Harness 主程序', start: 0, end: 97 })
-    stages.push({ id: 'dsh-verify', label: '验证 DeepSeek Harness', start: 97, end: 100 })
-  } else {
-    stages.push({ id: 'plugin', label: '安装桌面通知', start: 0, end: 100 })
-  }
+  let acc = 0
+  wanted.forEach((id, i) => {
+    acc += STAGE_NOMINAL_MS[id] || 10000
+    const isLast = i === wanted.length - 1
+    stages.push({
+      id,
+      label: STAGE_LABELS[id],
+      start: i === 0 ? 0 : Math.round(((acc - (STAGE_NOMINAL_MS[id] || 10000)) / total) * 1000) / 10,
+      end: isLast ? 100 : Math.round((acc / total) * 1000) / 10,
+    })
+  })
   return stages
 }
 
@@ -677,6 +731,8 @@ function publicJob(job) {
     estimateMs: job.estimateMs || null,
     estimateNpmMs: job.estimateNpmMs || null,
     stageNominalMs: STAGE_NOMINAL_MS,
+    silent: !!(job.opts && job.opts.silent), // 静默任务（后台迁移）：完成时不自动启动服务
+    migrate: !!(job.opts && job.opts.migrate), // 迁移任务：失败重试节流用
     error: job.error || null,
   }
 }
@@ -800,19 +856,46 @@ async function runJob(job) {
   try {
     if (job.items.includes('node')) {
       job.enterStage(stageIdx('node-dl'))
-      const tmpDest = path.join(runtimeBase(), 'node', '_installing-' + Date.now())
-      try {
-        nodeBin = await installNode(job, tmpDest, () => {
+      const useUserLevel = !!process.env.DSHL_USER_NODE_DIR || IS_WIN
+      if (useUserLevel) {
+        // 用户级安装：官方 Node 发行包落位到 %LOCALAPPDATA%\Programs\nodejs（免管理员），并写入用户 PATH。
+        // 已存在时直接复用（重复迁移/重试不重复下载）。
+        const dest = userNodeDir()
+        const existing = path.join(dest, IS_WIN ? 'node.exe' : 'node')
+        if (fs.existsSync(existing)) {
+          job.logLine(`用户级 Node.js 已存在：${dest}，跳过下载/解压`)
+          nodeBin = existing
+          nodeDest = null
           job.finishStage()
           job.enterStage(stageIdx('node-ex'))
-        })
-        nodeDest = tmpDest
-      } catch (e) {
-        try { fs.rmSync(tmpDest, { recursive: true, force: true }) } catch { /* noop */ }
-        throw e
+          job.finishStage()
+        } else {
+          try {
+            nodeBin = await installNode(job, dest, () => {
+              job.finishStage()
+              job.enterStage(stageIdx('node-ex'))
+            })
+            nodeDest = null
+          } catch (e) { throw e }
+          job.finishStage()
+        }
+        job.logLine(`Node.js 就绪：${nodeBin}`)
+        await addToUserPath(job, [dest, npmGlobalRoot()], { prepend: true })
+      } else {
+        const tmpDest = path.join(runtimeBase(), 'node', '_installing-' + Date.now())
+        try {
+          nodeBin = await installNode(job, tmpDest, () => {
+            job.finishStage()
+            job.enterStage(stageIdx('node-ex'))
+          })
+          nodeDest = tmpDest
+        } catch (e) {
+          try { fs.rmSync(tmpDest, { recursive: true, force: true }) } catch { /* noop */ }
+          throw e
+        }
+        job.finishStage()
+        job.logLine(`Node.js 就绪：${nodeBin}`)
       }
-      job.finishStage()
-      job.logLine(`Node.js 就绪：${nodeBin}`)
     }
     if (job.items.includes('dsh')) {
       job.enterStage(stageIdx('dsh-npm'))
@@ -825,7 +908,7 @@ async function runJob(job) {
         }
         nodeBin = report.node.path
       }
-      // 百分比随时间线性推进（92% 封顶），npm 真正完成时 finishStage 跳到阶段终点
+      // 阶段时钟按本机预估耗时渐近爬升（CAP 98.5% 封顶，永不冻结），npm 真正完成时 finishStage 跳到阶段终点
       const npmT0 = Date.now()
       const clock = job.startStageClock(job.estimateNpmMs)
       let prefix
@@ -918,4 +1001,7 @@ module.exports = {
   installLogPath,
   runtimeBase,
   KIND_LABELS,
+  userNodeDir,
+  npmGlobalRoot,
+  resolveGlobalRoot,
 }

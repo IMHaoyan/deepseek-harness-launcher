@@ -10,6 +10,7 @@ const fs = require('fs')
 const os = require('os')
 const net = require('net')
 const { spawn, execFile, execFileSync } = require('child_process')
+const semver = require('semver')
 const envDetect = require('./env-detect')
 const envInstall = require('./env-install')
 const updater = require('./updater')
@@ -77,7 +78,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
 let firstRun = false
 let harnessRoot = ''
 
@@ -96,9 +97,16 @@ function initEnvRuntime() {
     onPush: pushEnv,
     onDone: () => {
       // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
-      // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动
+      // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动。
+      // 静默任务（后台迁移）：只切换检测结果，不自动启动/重启服务（避免打断正在运行的会话）。
+      const snap = envInstall.getJob()
+      const silent = !!(snap && snap.job && snap.job.silent)
       void (async () => {
         await refreshEnv(true)
+        if (silent) {
+          log('silent install done, detection switched (service left as-is)')
+          return
+        }
         if (envReady()) {
           log('environment ready after install, starting service')
           await handleStart()
@@ -158,8 +166,37 @@ function maybeStartDeferred() {
   }
 }
 
+// 后台静默迁移：托管/npx 形态 → 全局 npm（统一 npm 渠道；失败 24h 节流重试，不影响原渠道使用）
+function maybeMigrateDsh() {
+  if (!envReport || !envReport.dsh || !envReport.dsh.kind) return
+  const kind = envReport.dsh.kind
+  if (kind !== 'managed' && kind !== 'npx') return
+  const snap = envInstall.getJob()
+  if (snap && snap.job && snap.job.status === 'running') return
+  if (Date.now() < (Number(Config.dshMigrateRetryAt) || 0)) return
+  const nodeOk = envReport.node && envReport.node.status === 'ok'
+  const items = nodeOk ? ['dsh'] : ['node', 'dsh']
+  log(`DSH 当前为 ${kind === 'managed' ? '托管' : 'npx'} 安装，后台迁移到全局 npm（node=${nodeOk ? 'ok' : 'missing'}）…`)
+  try {
+    envInstall.startInstall(items, {
+      migrate: true,
+      silent: true,
+      dshVersion: envReport.dsh.version || Config.dshVersion,
+    })
+  } catch (err) {
+    log('DSH 迁移启动失败：' + (err && err.message ? err.message : String(err)))
+  }
+}
+
 // 安装任务进度/日志推送（主进程 → 面板；面板未打开时由环形缓冲兜底，重开时快照恢复）
 function pushEnv(patch) {
+  const j = patch && patch.job
+  // 静默迁移任务失败：记录重试节流（24h），避免每次启动都重复长时间失败安装
+  if (j && j.migrate && j.status === 'failed') {
+    Config.dshMigrateRetryAt = Date.now() + 24 * 60 * 60 * 1000
+    try { saveConfig() } catch { /* noop */ }
+    log(`DSH 迁移到全局 npm 失败，24 小时后自动重试：${j.error || ''}`)
+  }
   if (win && !win.isDestroyed()) {
     try { win.webContents.send('dsh:env', JSON.stringify(patch)) } catch { /* noop */ }
   }
@@ -213,6 +250,7 @@ function loadConfig() {
       if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
       if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
       if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
+      if (Number.isFinite(cfg.dshMigrateRetryAt) && cfg.dshMigrateRetryAt > 0) Config.dshMigrateRetryAt = cfg.dshMigrateRetryAt
       if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
       if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
       if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
@@ -448,9 +486,15 @@ async function startServer() {
   const nodeCmd = plan.nodeCmd
   const env = { ...process.env, DSH_HOME: HOME }
   if (AGENTS_HOME) env.DSH_AGENTS_HOME = AGENTS_HOME
+  // DSH web 应用自 v0.1.0-rc.8 起默认自动打开系统默认浏览器（--no-open 关闭）；
+  // 更早版本不认识该参数（传了会报 unknown option 直接退出），按版本号判断是否传
+  const dshVer = String(plan.dshVersion || '').replace(/^v/, '')
+  const noOpen = (() => { try { return semver.gte(dshVer, '0.1.0-rc.8', { includePrerelease: true }) } catch { return false } })()
+  const spawnArgs = [plan.dshBin, 'web', '--host', HOST, '--port', String(PORT)]
+  if (noOpen) spawnArgs.push('--no-open')
   let child
   try {
-    child = spawn(nodeCmd, [plan.dshBin, 'web', '--host', HOST, '--port', String(PORT)], {
+    child = spawn(nodeCmd, spawnArgs, {
       cwd: plan.cwd || harnessRoot,
       env,
       windowsHide: true,
@@ -1586,6 +1630,7 @@ function registerIpc() {
           Config.nodeMirror = ''
           Config.npmRegistry = ''
           Config.dshUpdateCheckedAt = 0
+          Config.dshMigrateRetryAt = 0
           Config.panelHideNotified = false
           Config.balanceApiKey = ''
           Config.balanceBaseUrl = ''
@@ -2013,6 +2058,7 @@ function init() {
   // 环境未就绪时：跳过服务启动，首次运行直接弹出面板（自动进入"运行环境"页引导一键安装）。
   void (async () => {
     await refreshEnv(true)
+    maybeMigrateDsh()
     if (!envReady()) {
       if (firstRun || args.panel) showPanel()
       log('environment not ready, panel available for one-click install')

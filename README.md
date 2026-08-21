@@ -22,7 +22,7 @@ DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DS
 
 1. 到 [Releases](https://github.com/IMHaoyan/deepseek-harness-launcher/releases) 下载最新 `dshl-<版本>.exe`（NSIS 安装包）。
 2. 双击安装（**无需管理员权限、无需预装 Node.js / npm / DSH**），完成后自动启动。
-3. 首次运行若检测到运行环境缺失，自动打开"运行环境"页，点击**一键安装缺失环境**即可（自动下载官方 Node.js、安装 DSH、随包插件；全程实时进度 + 日志，失败自动回退国内镜像，可取消/重试）。
+3. 首次运行若检测到运行环境缺失，自动打开"运行环境"页，点击**一键安装缺失环境**即可（自动下载官方 Node.js 装到用户级目录并写入用户 PATH、全局安装 DSH、随包插件；全程实时进度 + 日志，失败自动回退国内镜像，可取消/重试；装好后重开终端 `npm`/`node`/`dsh` 命令可直接用）。
 4. 环境就绪后自动启动 DSH 服务并弹出 DeepSeek Harness 窗口；此后托盘常驻、开机自启。
 5. 卸载：控制面板 → 卸载程序；用户数据保留在 `~/.dsh`（配置、日志、托管运行时、会话数据）。
 
@@ -50,7 +50,7 @@ dshl/
 ├── browser-preload.js    # 独立窗口（WebContentsView）预加载桥
 ├── updater.js            # electron-updater 接入（GitHub Releases）
 ├── env-detect.js         # 环境探测：Node 运行时 + DSH 四种安装形态 + 通知插件（输出 spawn 计划）
-├── env-install.js        # 一键安装引擎：托管 Node（官方发行包）+ DSH（npm 前缀安装）+ 插件拷贝，进度/日志/取消
+├── env-install.js        # 一键安装引擎：用户级 Node（官方发行包 + 用户 PATH）+ DSH（全局 npm 安装）+ 插件拷贝，进度/日志/取消
 ├── ui-src/               # 面板源码（可编辑）：index.html / styles.css / app.js（含"运行环境"页）
 ├── wwwroot/              # 组装产物（ui-src 拷贝 + 鲸鱼路径内联），由 build:assets 生成，随仓库提交
 ├── assets/               # 托盘图标（ico 等）+ plugins/dsh-notify.mjs（随包插件）
@@ -59,7 +59,8 @@ dshl/
     ├── build-assets.mjs  # 资源生成脚本（需 sharp）
     ├── dev.mjs           # 开发热更新守护（npm run dev）：ui-src 变化重建产物+面板热刷新、主进程文件变化自动重启
     ├── envcheck.cjs      # 脱离 Electron 的独立环境探测脚本（npm run envcheck，CI/排障用）
-    └── install-smoke.cjs # 安装引擎冒烟测试（plugin = 快；dsh = 真实 npm 安装到临时 HOME）
+    ├── install-smoke.cjs # 安装引擎冒烟测试（plugin = 快；dsh = 真实 npm 安装到临时 HOME）
+    └── fresh-install-demo.cjs # 全新机模拟安装演示（隔离 HOME/落点/PATH + FRESH_TEST，验证一键安装全流程）
 ```
 
 ## 开发者构建（Windows）
@@ -104,20 +105,20 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 
 **检测**（`env-detect.js`，优先级第一个可用者胜出）：
 
-- **Node.js**：`nodePath` 配置 → 托管目录（`~/.dsh/dshl-runtime/node/<ver>/`）→ PATH 上的 `node`；版本门槛 = DSH 的 engines（默认 `^22.19.0 || >=24.0.0`），不满足显示"版本过低"并引导托管安装。
-- **DSH 四种安装形态分别识别**：
+- **Node.js**：`nodePath` 配置 → PATH 上的 `node` → 用户级目录（`%LOCALAPPDATA%\Programs\nodejs`，dshl 一键安装落位）→ 托管目录（旧版 `~/.dsh/dshl-runtime/node/<ver>/`）；版本门槛 = DSH 的 engines（默认 `^22.19.0 || >=24.0.0`），不满足显示"版本过低"并引导安装。
+- **DSH 四种安装形态分别识别**（统一以 **npm 全局安装**为优先目标）：
   1. **源码仓库**：`harnessRoot` 配置或默认 `E:\deepseek-harness`，需已构建出 `apps/cli/lib/bin.js`（未构建 → 提示 `pnpm install && pnpm run build`，期间若有其他可用安装则自动回退并在构建完成后自动优先源码版）；
-  2. **全局安装**：`npm i -g @deepseek-ai/dsh`（扫常见全局 node_modules 目录）；
-  3. **npx 缓存**：`npx @deepseek-ai/dsh web` 装过的（扫 `_npx/*/node_modules/@deepseek-ai/dsh`，取最高版本）；启动器**直接 spawn 缓存里的 JS 入口**，不再调用 npx（避免 hash 目录漂移导致 profile 链接断裂），也不会重复下载；
-  4. **托管安装**：一键安装落位到 `~/.dsh/dshl-runtime/dsh/`。
+  2. **全局 npm 安装**：`npm i -g @deepseek-ai/dsh`（扫常见全局 node_modules 目录）——**首选形态**；
+  3. **托管安装**：旧版一键安装落位到 `~/.dsh/dshl-runtime/dsh/`（检测到后**后台自动迁移到全局 npm**，失败 24h 节流重试，期间原渠道照常可用）；
+  4. **npx 缓存**：`npx @deepseek-ai/dsh web` 装过的（扫 `_npx/*/node_modules/@deepseek-ai/dsh`，取最高版本；同样触发后台迁移）。
 - **通知插件**：`~/.dsh/plugins/dsh-notify/dsh-notify.mjs` 是否存在。
 
 **一键安装**（`env-install.js`，全程零管理员权限、无需预装任何东西）：
 
 - 缺失项 → 面板"一键安装缺失环境"（或单项按钮），顺序 node → dsh → plugin；
 - 全程展示：**阶段列表（当前高亮）+ 进度条 + 当前阶段说明 + 实时完整日志**（自动滚动、可关），日志同时落盘 `~/.dsh/dshl-logs/install.log`（1MB 轮转），支持**取消 / 重试**；面板关闭安装不中断，重开自动恢复进度显示；
-- Node.js 用官方发行包（`nodejs.org/dist`，自动选择 `nodeMajor`（默认 22）的最新版；下载失败自动回退 npmmirror 镜像；官方 `SHASUMS256.txt` 校验），自带 npm，解压到托管目录；
-- DSH 用该 npm 执行 `install --prefix ~/.dsh/dshl-runtime/dsh @deepseek-ai/dsh@<dshVersion>`（registry 失败自动回退 npmmirror），完成后 `--version` 验证；
+- **Node.js**：官方发行包（`nodejs.org/dist`，自动选择 `nodeMajor`（默认 22）的最新版；下载失败自动回退 npmmirror 镜像；官方 `SHASUMS256.txt` 校验），解压到**用户级目录** `%LOCALAPPDATA%\Programs\nodejs`，并把 Node 目录与 npm 全局根写入**用户 PATH**（`HKCU\Environment`，免管理员；广播 WM_SETTINGCHANGE，新开终端即生效），重开终端后 `npm`/`node`/`dsh` 命令直接可用；
+- **DSH**：统一用 npm **全局安装**：`npm install -g --prefix <全局根> @deepseek-ai/dsh@<dshVersion>`（全局根 = 系统 npm 的 `config get prefix`，无系统 npm 则 `%APPDATA%\npm`；npm 源默认 npmmirror 镜像优先，失败回退官方源），完成后 `--version` 验证；全局根不可写等失败时回退托管目录（`~/.dsh/dshl-runtime/dsh/`），旧版始终不动；
 - 安装完成后自动重新探测并启动服务（复用统一启动入口）；
 - 已装用户**绝不重复安装**：按上表识别并分别用对应入口 spawn（源码版 = 仓库 bin.js，全局/npx/托管 = 各自包内 `lib/bin.js`，统一 `web --host 127.0.0.1 --port 3080`）。
 
@@ -175,12 +176,13 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - `harnessRoot`：DSH 仓库根目录（源码版）。缺省 Windows 用 `E:\deepseek-harness`。
 - `nodePath`：Node 可执行文件绝对路径（自动探测失败时手动指定）。
 - `dshVersion`：一键安装锁定的 DSH 版本（默认 `0.1.0-rc.6`；改 `latest` 可装最新）。DSH 自动更新成功后会自动置为 `latest`。
-- `nodeMajor`：托管 Node 的主版本号（默认 22，即自动装 22.x LTS 最新版）。
+- `nodeMajor`：安装的 Node 主版本号（默认 22，即自动装 22.x LTS 最新版）。
 - `nodeMirror`：Node 发行包下载源覆盖（默认空 = nodejs.org 官方源，失败自动回退 npmmirror；可填镜像地址）。
-- `npmRegistry`：npm 源覆盖（默认空 = npm 官方源，失败自动回退 npmmirror；可填镜像地址）。
+- `npmRegistry`：npm 源覆盖（默认空 = npmmirror 镜像优先，失败回退 npm 官方源；可填镜像地址）。
 - `balanceApiKey`：余额查询自定义 API Key（默认空 = 自动读 DSH 的 `DEEPSEEK_API_KEY`）。
 - `balanceBaseUrl`：余额查询自定义接口地址（默认空 = 自动读 DSH 的 `llm-deepseek.baseURL`，其次官方 `api.deepseek.com`）。
 - `dshUpdateCheckedAt`：DSH 自动更新上次检查的时间戳（内部记账，自动维护）。
+- `dshMigrateRetryAt`：DSH 迁移到全局 npm 失败后的重试节流时间戳（内部记账，自动维护；24h 后自动重试）。
 - `panelHideNotified`：关闭启动器面板时"已最小化到托盘"的引导通知是否已提示过（**只弹一次**，之后静默缩到托盘；"恢复默认设置"会复位重新提示）。
 
 ## DSH 自动更新
@@ -188,10 +190,10 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 启动器**静默保持 DeepSeek Harness 为最新版**，全程无需用户确认（与启动器自身的"检查更新"相互独立）：
 
 - 启动 20 秒后首次检查，此后每 6 小时尝试一次（**24 小时节流**，`dshUpdateCheckedAt` 落盘防频繁请求 npm）；
-- 用 `npm view @deepseek-ai/dsh version` 对比已安装版本（registry 失败自动回退 npmmirror），有新版本则按安装形态自动升级：
-  - **托管安装**：复用一键安装引擎重装到最新（`npm install --prefix` 覆盖旧版，进度/日志进安装日志），完成后自动重启服务；
-  - **全局安装**：系统 npm 执行 `npm update -g @deepseek-ai/dsh`（registry 回退同上），完成后自动重启服务；
-  - **npx 缓存**：`npm exec` 预热新版本进缓存（检测按最高版本选中），完成后自动重启服务；
+- 用 `npm view @deepseek-ai/dsh version` 对比已安装版本（npm 源默认 npmmirror 镜像优先，失败回退官方源），有新版本则按安装形态自动升级：
+  - **全局 npm 安装（首选）**：`npm update -g --prefix <全局根> @deepseek-ai/dsh`（全局根 = 系统 npm 的 `config get prefix`，否则 `%APPDATA%\npm`；registry 回退同上），完成后自动重启服务；
+  - **托管安装**：复用一键安装引擎升级（内部优先走全局 npm，失败回退托管目录重装），完成后自动重启服务；
+  - **npx 缓存**：先迁移到全局 npm 升级（统一渠道），失败回退 `npm exec` 预热新版本进缓存，完成后自动重启服务；
   - **源码版**：不动开发者仓库——检测到新版本时按钮变为 **"手动更新"**，点击打开源码目录（需自行 `git pull && pnpm run build`，构建完成后重启服务生效）；
 - 更新成功弹托盘通知"已自动更新到 vX"；更新前会先停掉自己拉起的服务（更新失败自动用旧版拉起，不停摆）；**接管中的外部实例不受控制**，通知中会提示需手动重启；
 - 手动安装任务进行中时自动检查跳过（设置页手动"检查更新"除外）；
@@ -199,7 +201,7 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 
 ## 与 DSH 的协作
 
-- 服务启动：按环境探测结果 spawn（源码版 = `<harnessRoot>/apps/cli/lib/bin.js`；全局/npx/托管 = 各自包内 `lib/bin.js`），统一参数 `web --host 127.0.0.1 --port <服务端口（默认 3080，设置页可改）>`（隐藏窗口，日志写入 `~/.dsh/dshl-logs/server.{out,err}.log`）。
+- 服务启动：按环境探测结果 spawn（源码版 = `<harnessRoot>/apps/cli/lib/bin.js`；全局/npx/托管 = 各自包内 `lib/bin.js`），统一参数 `web --host 127.0.0.1 --port <服务端口（默认 3080，设置页可改）>`（DSH ≥0.1.0-rc.8 追加 `--no-open`：该版本起 web 应用默认自动打开系统浏览器，启动器用自己的窗口，不重复弹浏览器；隐藏窗口，日志写入 `~/.dsh/dshl-logs/server.{out,err}.log`）。
 - 环境未就绪时：不盲 spawn，托盘单击打开面板引导一键安装；自动重启看护同样跳过（重测缓存 30s，用户外部装好后自动就绪）。
 - 端口探测 + 接管：端口被占时**先做 HTTP 指纹验证**（根页面含 "DeepSeek Harness" 标题字样）确认是 DSH 才接管（退出时不停止它）；被其他程序占用则**拒绝接管与启动**：自动探测出下一个空闲端口，面板弹"⚠ 服务端口被占用"警示卡，**一键"换到端口 X 并启动"**（也可去设置页手动改端口），绝不误杀。
 - 会话通知：复用 `dsh-notify` 插件的 dropbox（`~/.dsh/dshl-logs/notify/*.json`，插件已同步使用 dshl-logs）。

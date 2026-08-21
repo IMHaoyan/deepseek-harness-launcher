@@ -2,8 +2,8 @@
 //
 // 探测结果被 startServer 直接消费（plan.spawn 参数），也供面板"运行环境"页展示。
 // 优先级（第一个可用者胜出）：
-//   Node：Config.nodePath → 托管目录（~/.dsh/dshl-runtime/node/<ver>）→ PATH node → macOS 常见路径
-//   DSH ：显式/默认源码仓库（E:\deepseek-harness、~/deepseek-harness）→ 全局 npm 目录 → npx 缓存 → 托管目录
+//   Node：Config.nodePath → PATH node → 用户级目录（%LOCALAPPDATA%\Programs\nodejs）→ 托管目录 → macOS 常见路径
+//   DSH ：显式/默认源码仓库（E:\deepseek-harness、~/deepseek-harness）→ 全局 npm 目录 → 托管目录 → npx 缓存
 'use strict'
 
 const fs = require('fs')
@@ -40,6 +40,14 @@ function runtimeBase() {
 
 function managedNodeDir() {
   return path.join(runtimeBase(), 'node')
+}
+
+// 用户级 Node 安装目录（dshl 一键安装落位；与 env-install.userNodeDir 保持一致）
+function userNodeDir() {
+  if (process.env.DSHL_USER_NODE_DIR) return process.env.DSHL_USER_NODE_DIR
+  if (!IS_WIN) return null
+  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+  return path.join(local, 'Programs', 'nodejs')
 }
 
 function managedDshDir() {
@@ -95,6 +103,9 @@ function defaultSourceRoot() {
 
 function globalRoots() {
   const roots = []
+  if (process.env.DSHL_NPM_GLOBAL_ROOT) {
+    roots.push(path.join(process.env.DSHL_NPM_GLOBAL_ROOT, 'node_modules')) // 测试/演示覆盖
+  }
   if (IS_WIN) {
     roots.push(path.join(process.env.APPDATA || '', 'npm', 'node_modules'))
     roots.push(path.join(process.env.ProgramData || '', 'npm', 'node_modules'))
@@ -127,7 +138,14 @@ function npxCacheRoots() {
 function nodeCandidates() {
   const list = []
   if (!FRESH_TEST && Config.nodePath) list.push({ path: Config.nodePath, source: 'config' })
-  // 托管 Node（版本目录名即版本号，取满足范围的最新版；具体版本由探测确认）
+  if (!FRESH_TEST) list.push({ path: 'node', source: 'system' })
+  // 用户级 Node（dshl 一键安装落位；PATH 广播后系统候选也能命中，这里兜底 dshl 自身进程）
+  const un = userNodeDir()
+  if (un) {
+    const bin = path.join(un, IS_WIN ? 'node.exe' : 'node')
+    if (fs.existsSync(bin)) list.push({ path: bin, source: 'user' })
+  }
+  // 托管 Node（旧版 dshl 落位；版本目录名即版本号，取满足范围的最新版；具体版本由探测确认）
   try {
     const base = managedNodeDir()
     const dirs = fs.readdirSync(base)
@@ -138,7 +156,6 @@ function nodeCandidates() {
       if (fs.existsSync(bin)) list.push({ path: bin, source: 'managed' })
     }
   } catch { /* 无托管 Node */ }
-  if (!FRESH_TEST) list.push({ path: 'node', source: 'system' })
   if (!FRESH_TEST && !IS_WIN) {
     const home = os.homedir()
     for (const p of [
@@ -184,11 +201,20 @@ function detectDshEntries() {
   const entries = [] // { kind, ...readDshAt, built }，按优先级排列
   let sourceFound = false
   if (FRESH_TEST) {
-    // 全新机模拟：无视系统级安装（源码仓库/全局/npx 缓存），只认托管目录（安装完成后即可被发现）
+    // 全新机模拟：无视系统级安装（源码仓库/全局/npx 缓存），只认 dshl 自装物
+    // （托管目录；DSHL_NPM_GLOBAL_ROOT 覆盖时一并识别——安装完成后即可被发现）
     const dir = path.join(managedDshDir(), 'node_modules', '@deepseek-ai', 'dsh')
     if (fs.existsSync(path.join(dir, 'package.json'))) {
       const e = readDshAt(dir)
       if (e && e.built) entries.push({ kind: 'managed', ...e })
+    }
+    const override = process.env.DSHL_NPM_GLOBAL_ROOT
+    if (override) {
+      const dir2 = path.join(override, 'node_modules', '@deepseek-ai', 'dsh')
+      if (fs.existsSync(path.join(dir2, 'package.json'))) {
+        const e2 = readDshAt(dir2)
+        if (e2 && e2.built) entries.push({ kind: 'global', ...e2 })
+      }
     }
     return { entries, sourceFound }
   }
@@ -218,7 +244,15 @@ function detectDshEntries() {
     const e = readDshAt(dir)
     if (e && e.built) entries.push({ kind: 'global', ...e })
   }
-  // 3) npx 缓存（多个 hash 目录取最高版本）
+  // 3) 托管目录（旧版 dshl 一键安装落位；同样由 npm 安装，优先于 npx 缓存）
+  {
+    const dir = path.join(managedDshDir(), 'node_modules', '@deepseek-ai', 'dsh')
+    if (fs.existsSync(path.join(dir, 'package.json'))) {
+      const e = readDshAt(dir)
+      if (e && e.built) entries.push({ kind: 'managed', ...e })
+    }
+  }
+  // 4) npx 缓存（多个 hash 目录取最高版本）
   const npxEntries = []
   for (const base of npxCacheRoots()) {
     let subs = []
@@ -233,14 +267,6 @@ function detectDshEntries() {
   if (npxEntries.length) {
     npxEntries.sort((a, b) => semver.rcompare(a.version || '0.0.0', b.version || '0.0.0'))
     entries.push(npxEntries[0])
-  }
-  // 4) 托管目录
-  {
-    const dir = path.join(managedDshDir(), 'node_modules', '@deepseek-ai', 'dsh')
-    if (fs.existsSync(path.join(dir, 'package.json'))) {
-      const e = readDshAt(dir)
-      if (e && e.built) entries.push({ kind: 'managed', ...e })
-    }
   }
   return { entries, sourceFound }
 }
@@ -285,10 +311,13 @@ async function buildReport() {
     if (!sourceEntry) issues.push('未检测到 DeepSeek Harness')
   }
   if (dsh && dsh.built && sourceEntry && !sourceEntry.built) {
-    const label = dsh.kind === 'managed' ? '托管安装' : dsh.kind === 'global' ? '全局安装' : 'npx 缓存'
+    const label = dsh.kind === 'managed' ? '托管安装' : dsh.kind === 'global' ? '全局 npm 安装' : 'npx 缓存'
     issues.push(`当前将使用${label}的 DSH（v${dsh.version || '?'}），源码版构建完成后自动优先使用源码版`)
   }
   if (plugin.status === 'missing') issues.push('通知插件缺失（会话完成/提问将无法弹出托盘通知）')
+  if (dsh && dsh.built && (dsh.kind === 'managed' || dsh.kind === 'npx')) {
+    issues.push(`检测到 ${dsh.kind === 'managed' ? '托管' : 'npx'} 形态的 DSH（v${dsh.version || '?'}），将自动迁移到全局 npm 安装（迁移失败不影响当前使用）`)
+  }
 
   const plan = buildPlan(node, dsh)
   return {
@@ -360,5 +389,6 @@ module.exports = {
   runtimeBase,
   managedNodeDir,
   managedDshDir,
+  userNodeDir,
   pluginPath,
 }

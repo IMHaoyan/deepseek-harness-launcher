@@ -1,7 +1,7 @@
 // install-smoke.cjs — 安装引擎冒烟测试（脱离 Electron，纯 Node）
 // 用法：node tools/install-smoke.cjs plugin   （快：仅插件拷贝，验证状态机/日志/回调）
-//       node tools/install-smoke.cjs node     （中：真实下载 Node 官方发行包，校验 sha256 + 解压落位）
-//       node tools/install-smoke.cjs dsh      （慢：真实 npm 安装 @deepseek-ai/dsh 到临时 HOME）
+//       node tools/install-smoke.cjs node     （中：真实下载 Node 官方发行包，校验 sha256 + 解压落位到用户级目录）
+//       node tools/install-smoke.cjs dsh      （慢：真实 npm install -g @deepseek-ai/dsh 到临时全局根）
 // 退出码：0 = 通过；1 = 失败
 'use strict'
 
@@ -11,6 +11,10 @@ const fs = require('fs')
 
 const mode = process.argv[2] || 'plugin'
 const tmpHome = path.join(os.tmpdir(), `dshl-smoke-${mode}-${Date.now()}`)
+// 测试隔离：用户级 Node 目录 / npm 全局根 指向临时目录，且不写真实用户 PATH
+process.env.DSHL_USER_NODE_DIR = path.join(tmpHome, 'user-node')
+process.env.DSHL_NPM_GLOBAL_ROOT = path.join(tmpHome, 'npm-global')
+process.env.DSHL_SKIP_PATH = '1'
 
 const envInstall = require('../env-install')
 const envDetect = require('../env-detect')
@@ -35,21 +39,22 @@ function finish(code) {
   if (finished) return
   finished = true
   setTimeout(() => {
-    if (code === 0 && mode === 'dsh') {
-      const bin = path.join(tmpHome, 'dshl-runtime', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-      console.log('dsh bin exists:', fs.existsSync(bin))
+    if (mode === 'dsh') {
+      const bin = path.join(process.env.DSHL_NPM_GLOBAL_ROOT, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+      const ok = fs.existsSync(bin)
+      console.log('global dsh bin exists:', ok)
+      if (!ok) code = 1
     }
-    if (code === 0 && mode === 'plugin') {
+    if (mode === 'plugin') {
       const p = path.join(tmpHome, 'plugins', 'dsh-notify', 'dsh-notify.mjs')
       console.log('plugin exists:', fs.existsSync(p))
     }
-    if (code === 0 && mode === 'node') {
-      const base = path.join(tmpHome, 'dshl-runtime', 'node')
-      const entries = fs.readdirSync(base).filter((d) => /^\d+\.\d+\.\d+$/.test(d))
-      const bin = entries.length ? path.join(base, entries[0], process.platform === 'win32' ? 'node.exe' : 'node') : ''
-      console.log('managed node dirs:', entries.join(', '))
-      console.log('node bin exists:', !!bin && fs.existsSync(bin))
-      if (!bin || !fs.existsSync(bin)) finish(1)
+    if (mode === 'node') {
+      const bin = path.join(process.env.DSHL_USER_NODE_DIR, process.platform === 'win32' ? 'node.exe' : 'node')
+      const ok = fs.existsSync(bin)
+      console.log('user node dir:', process.env.DSHL_USER_NODE_DIR)
+      console.log('node bin exists:', ok)
+      if (!ok) code = 1
     }
     console.log('tmpHome:', tmpHome)
     process.exit(code)

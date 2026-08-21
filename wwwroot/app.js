@@ -212,15 +212,27 @@ function render(state) {
   window._running = !!state.running;
   window._firstRun = !!state.firstRun;
 
-  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录）
+  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录；版本号后注明安装渠道）
   const lvEl = $('launcherVersion');
   if (lvEl) lvEl.textContent = state.version ? `v${state.version}` : '-';
   const dshV = (state.env && state.env.dsh && state.env.dsh.version) || (state.dshUpdate && state.dshUpdate.current) || '';
-  const dshVerText = dshV ? `v${dshV}` : (state.env ? '未安装' : '检测中…');
+  const dshKind = state.env && state.env.dsh ? state.env.dsh.kind : '';
+  const dshKindLabel = ENV_KIND_LABELS[dshKind];
+  const dshVerText = dshV
+    ? `v${dshV}${dshKindLabel && dshKind !== 'none' ? `（${dshKindLabel}）` : ''}`
+    : (state.env ? '未安装' : '检测中…');
   const dshVerEl = $('dshVersion');
-  if (dshVerEl) dshVerEl.textContent = dshVerText;
+  if (dshVerEl) {
+    dshVerEl.textContent = dshVerText;
+    dshVerEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
+      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '';
+  }
   const dshUpdStatusEl = $('dshUpdaterStatus'); // 设置页"DSH版本与更新"行的版本值
-  if (dshUpdStatusEl) dshUpdStatusEl.textContent = dshVerText;
+  if (dshUpdStatusEl) {
+    dshUpdStatusEl.textContent = dshVerText;
+    dshUpdStatusEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
+      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '';
+  }
 
   // 状态
   const running = window._running;
@@ -311,7 +323,7 @@ function render(state) {
 
 const ENV_KIND_LABELS = {
   source: '源码仓库',
-  global: '全局安装',
+  global: '全局 npm 安装',
   npx: 'npx 缓存',
   managed: '托管安装',
   none: '未安装',
@@ -385,10 +397,10 @@ function renderEnvSummary(env) {
     const badge = n.status === 'ok' ? 'ok' : n.status === 'tooOld' ? 'warn' : 'bad';
     const version = n.version ? `v${n.version}` : '';
     const detail = n.status === 'ok'
-      ? (n.source === 'managed' ? '托管安装' : n.source === 'config' ? '手动指定' : '系统检测') + (n.path ? ` · ${n.path}` : '')
+      ? (n.source === 'user' ? '用户级安装' : n.source === 'managed' ? '托管安装' : n.source === 'config' ? '手动指定' : '系统检测') + (n.path ? ` · ${n.path}` : '')
       : n.status === 'tooOld' ? `版本过低（需要 ${env.engineRange || '22.19+/24+'}）${n.path ? ' · ' + n.path : ''}`
       : n.path ? `配置的路径不可用：${n.path}` : '未检测到 Node.js';
-    cards.push({ badge, name: 'Node.js', version, detail, item: 'node', btnLabel: n.status === 'ok' ? '' : '安装 Node.js（托管版）' });
+    cards.push({ badge, name: 'Node.js', version, detail, item: 'node', btnLabel: n.status === 'ok' ? '' : '安装 Node.js（用户级）' });
   }
   {
     const d = env.dsh;
@@ -398,7 +410,7 @@ function renderEnvSummary(env) {
     let detail = `${kindLabel}` + (d.dir ? ` · ${d.dir}` : '');
     if (d.status === 'unbuilt') detail = '源码仓库已检出，但尚未构建（缺少 apps/cli/lib/bin.js，需 pnpm install && pnpm run build）';
     if (env.source && env.source.found && !env.source.built && d.kind !== 'source') detail += ` · 当前回退到${kindLabel}，构建源码后自动优先使用源码版`;
-    cards.push({ badge, name: 'DeepSeek Harness', version, detail, item: 'dsh', btnLabel: d.status === 'ok' ? '' : '安装 DSH（托管版）' });
+    cards.push({ badge, name: 'DeepSeek Harness', version, detail, item: 'dsh', btnLabel: d.status === 'ok' ? '' : '安装 DSH（全局 npm）' });
   }
   {
     const p = env.plugin;

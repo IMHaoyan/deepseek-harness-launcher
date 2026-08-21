@@ -1,8 +1,9 @@
 // dsh-update.js — DSH 更新：检测全自动、更新全手动
 // 策略（用户选定）：
 //  - 静默检查最新版（启动后 + 每 6 小时，24 小时节流）；发现新版 → 主页卡片 + 托盘气泡一次，绝不自动更新；
-//  - 用户点击卡片"立即更新"后才执行更新（托管形态：env-install 原子安装到 dsh-new 后切换，失败旧版不动）；
-//  - 全局 / npx 形态同样只由用户触发；源码版仅提示。
+//  - 用户点击卡片"立即更新"后才执行更新（全局 npm：npm update -g --prefix 全局根，npmmirror 优先）；
+//  - 托管形态走统一引擎（内部优先全局 npm，失败回退托管原子安装，失败旧版不动）；
+//  - npx 形态先迁移到全局 npm 再更新（失败回退 npx 预热）；源码版仅提示。
 'use strict'
 const { spawn } = require('child_process')
 const path = require('path')
@@ -126,7 +127,7 @@ async function runNpm(args, opts = {}) {
 }
 
 function registries() {
-  return Config.npmRegistry ? [Config.npmRegistry] : [null, 'https://registry.npmmirror.com']
+  return Config.npmRegistry ? [Config.npmRegistry] : ['https://registry.npmmirror.com', null]
 }
 
 async function fetchLatest(nodeBin) {
@@ -140,19 +141,19 @@ async function fetchLatest(nodeBin) {
       log(`dsh-update: npm view 输出异常：${line || '(空)'}`)
       return null
     }
-    log(`dsh-update: npm view 失败（registry=${registry || '默认'}）：${r.error}${registry === null ? '，回退镜像源重试' : ''}`)
+    log(`dsh-update: npm view 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
   }
   return null
 }
 
-async function runGlobalUpdate() {
+async function runGlobalUpdate(nodeBin, globalRoot) {
   for (const registry of registries()) {
-    const args = ['update', '-g', '@deepseek-ai/dsh']
+    const args = ['update', '-g', '--prefix', globalRoot, '@deepseek-ai/dsh']
     if (registry) args.push('--registry', registry)
-    // 全局安装必须用"拥有 %APPDATA%\npm 全局目录"的系统 npm（PATH），不能用托管 Node 的 npm
-    const r = await runNpm(args, { nodeBin: null })
+    // 用当前环境 npm（用户级/系统均可）并显式指定全局根，确保落在与 npm i -g 相同的目录
+    const r = await runNpm(args, { nodeBin })
     if (r.ok) return r
-    log(`dsh-update: npm update -g 失败（registry=${registry || '默认'}）：${r.error}${registry === null ? '，回退镜像源重试' : ''}`)
+    log(`dsh-update: npm update -g 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
   }
   return { ok: false, error: '全局更新失败' }
 }
@@ -220,7 +221,7 @@ async function checkOnce(reason, force) {
         lastNotifiedVersion = latest.version
         notify('DeepSeek Harness', plan.kind === 'source'
           ? `新版本 v${latest.version} 可用：当前为源码安装，请打开启动器面板点"手动更新"（git pull && pnpm run build）`
-          : `新版本 v${latest.version} 可用：打开启动器面板点"立即更新"即可升级（约 1 分钟）`)
+          : `新版本 v${latest.version} 可用：打开启动器面板点"立即更新"即可升级（npm 安装约 2-5 分钟）`)
       }
     } else {
       log(`dsh-update: v${current} 已是最新（latest v${latest.version}）`)
@@ -256,7 +257,7 @@ async function updateNow() {
     const owned = svc.owned
 
     if (plan.kind === 'managed') {
-      // 更新前停掉自有服务；接管的第三方实例不动（文件切换后提示手动重启）
+      // 托管形态：更新走统一引擎（内部优先全局 npm，失败回退托管），失败旧版不动
       if (wasRunning && owned) {
         log('dsh-update: stopping service before update')
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
@@ -282,11 +283,41 @@ async function updateNow() {
     }
 
     if (plan.kind === 'global') {
-      const r = await runGlobalUpdate()
+      const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
+      const r = await runGlobalUpdate(plan.nodeCmd, globalRoot)
       if (!r.ok) throw new Error(r.error)
     } else if (plan.kind === 'npx') {
-      const r = await runNpxWarm(latest, plan.nodeCmd)
-      if (!r.ok) throw new Error(r.error)
+      // npx 缓存：先迁移到全局 npm（统一渠道），失败回退 npx 预热
+      if (wasRunning && owned) {
+        log('dsh-update: stopping service before migrate')
+        try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
+      }
+      let migrated = false
+      try {
+        envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
+        const status = await waitForJob()
+        if (status !== 'done') throw new Error(`迁移任务未完成（${status}）`)
+        migrated = true
+      } catch (err) {
+        log(`dsh-update: migrate-to-global failed, fallback npx warm: ${err.message}`)
+        const r = await runNpxWarm(latest, plan.nodeCmd)
+        if (!r.ok) {
+          if (wasRunning && owned) { try { await startService() } catch { /* noop */ } }
+          throw new Error(r.error)
+        }
+      }
+      if (!migrated) {
+        // 回退成功：npx 预热后重新探测即可命中缓存新版本
+        try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
+        if (wasRunning && owned) { try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) } }
+        Config.dshVersion = 'latest'
+        Config.dshUpdateCheckedAt = Date.now()
+        try { saveConfig() } catch { /* noop */ }
+        notify('DeepSeek Harness', `已更新到 v${latest}`)
+        log(`dsh-update: updated to v${latest} (npx fallback)`)
+        setState({ status: 'updated', current: latest })
+        return
+      }
     } else if (plan.kind === 'source') {
       // 源码安装：不动开发者仓库（UI 已把按钮换成"打开源码目录"，这里只兜底）
       throw new Error('源码安装请手动更新：git pull && pnpm run build（启动器不自动修改源码仓库）')
