@@ -23,6 +23,8 @@ let envDetect = null
 let getServerState = null // () => ({ running, owned })
 let stopService = null
 let startService = null
+let loadWebTabs = null // (reason) => 把 WebUI 窗口所有标签切到状态说明页（避免更新期间白屏）
+let reloadWebTabs = null // () => 强制重载 WebUI 所有标签（新版页面替换旧会话）
 let onState = null // 状态变化回调（main 里接 broadcastState）
 
 const state = {
@@ -48,6 +50,8 @@ function initDshUpdater(o) {
   getServerState = o.getServerState
   stopService = o.stopService
   startService = o.startService
+  loadWebTabs = o.loadWebTabs || null
+  reloadWebTabs = o.reloadWebTabs || null
   onState = o.onState || null
 }
 
@@ -258,6 +262,7 @@ async function updateNow() {
 
     if (plan.kind === 'managed') {
       // 托管形态：更新走统一引擎（内部优先全局 npm，失败回退托管），失败旧版不动
+      if (loadWebTabs) loadWebTabs('update') // 页面切"正在更新…"说明页，避免更新期间白屏
       if (wasRunning && owned) {
         log('dsh-update: stopping service before update')
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
@@ -268,7 +273,10 @@ async function updateNow() {
         if (status !== 'done') throw new Error(`更新任务未完成（${status}）`)
       } catch (err) {
         log(`dsh-update: managed update failed: ${err.message}`)
-        if (wasRunning && owned) { try { await startService() } catch { /* noop */ } } // 旧版完好，直接拉回
+        if (wasRunning && owned) {
+          try { await startService() } catch { /* noop */ } // 旧版完好，直接拉回
+          if (reloadWebTabs) reloadWebTabs() // 强制重载，把白屏/说明页拉回旧版页面
+        }
         setState({ status: 'error', error: err.message })
         return
       }
@@ -283,11 +291,26 @@ async function updateNow() {
     }
 
     if (plan.kind === 'global') {
+      // 全局 npm：必须先停服务再更新（npm update -g 会在服务运行中替换包文件，
+      // 旧进程+新文件会触发 DSH HMR 导致页面白屏且无自愈路径）；
+      // 更新期间窗口显示"正在更新…"说明页（带进度条），完成后强制重载为新版页面
+      if (loadWebTabs) loadWebTabs('update')
+      if (wasRunning && owned) {
+        log('dsh-update: stopping service before global update')
+        try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
+      }
       const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
       const r = await runGlobalUpdate(plan.nodeCmd, globalRoot)
-      if (!r.ok) throw new Error(r.error)
+      if (!r.ok) {
+        if (wasRunning && owned) {
+          try { await startService() } catch { /* noop */ } // 旧版完好，直接拉回
+          if (reloadWebTabs) reloadWebTabs()
+        }
+        throw new Error(r.error)
+      }
     } else if (plan.kind === 'npx') {
       // npx 缓存：先迁移到全局 npm（统一渠道），失败回退 npx 预热
+      if (loadWebTabs) loadWebTabs('update')
       if (wasRunning && owned) {
         log('dsh-update: stopping service before migrate')
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
@@ -302,14 +325,20 @@ async function updateNow() {
         log(`dsh-update: migrate-to-global failed, fallback npx warm: ${err.message}`)
         const r = await runNpxWarm(latest, plan.nodeCmd)
         if (!r.ok) {
-          if (wasRunning && owned) { try { await startService() } catch { /* noop */ } }
+          if (wasRunning && owned) {
+            try { await startService() } catch { /* noop */ }
+            if (reloadWebTabs) reloadWebTabs()
+          }
           throw new Error(r.error)
         }
       }
       if (!migrated) {
         // 回退成功：npx 预热后重新探测即可命中缓存新版本
         try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
-        if (wasRunning && owned) { try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) } }
+        if (wasRunning && owned) {
+          try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
+          if (reloadWebTabs) reloadWebTabs()
+        }
         Config.dshVersion = 'latest'
         Config.dshUpdateCheckedAt = Date.now()
         try { saveConfig() } catch { /* noop */ }
@@ -329,6 +358,9 @@ async function updateNow() {
     try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
     if (wasRunning && owned) {
       try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
+      if (reloadWebTabs) reloadWebTabs() // 强制重载：新版页面替换旧会话，杜绝残留白屏
+    } else if (loadWebTabs) {
+      loadWebTabs('offline') // 更新前服务未在运行：页面切"未启动"状态，而不是停留在"正在更新…"
     }
     Config.dshVersion = 'latest'
     Config.dshUpdateCheckedAt = Date.now()

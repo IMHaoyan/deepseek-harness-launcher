@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'">
+  <title>DeepSeek Harness</title>
+  <style>
+    html, body { height: 100%; }
+    body {
+      margin: 0; display: flex; align-items: center; justify-content: center;
+      background: #F9FAFB;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      color: #0F1115;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #353536; color: #F9FAFB; }
+      .card { background: #2B2B2C !important; border-color: rgba(255, 255, 255, 0.12) !important; }
+      .sub { color: #D3D5D6 !important; }
+      .bar .fill { background: #4D8DFF !important; }
+      #btnReload { background: rgba(255,255,255,0.92) !important; color: #1A1C1E !important; }
+    }
+    .card {
+      background: #FFFFFF;
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      border-radius: 12px;
+      padding: 32px 40px;
+      text-align: center;
+      max-width: 460px;
+    }
+    h1 { font-size: 16px; font-weight: 500; margin: 0 0 14px; }
+    .bar {
+      height: 4px; border-radius: 2px; background: rgba(0, 0, 0, 0.08);
+      overflow: hidden; margin: 0 0 14px;
+    }
+    .bar .fill {
+      width: 40%; height: 100%; border-radius: 2px; background: #2563EB;
+      animation: dshl-slide 1.4s ease-in-out infinite;
+    }
+    @keyframes dshl-slide {
+      0% { transform: translateX(-100%); }
+      50% { transform: translateX(80%); }
+      100% { transform: translateX(260%); }
+    }
+    .fill-static { width: 100% !important; animation: none !important; opacity: 0.35; }
+    body.failed .bar { display: none; }
+    .sub { font-size: 13px; color: #61666B; line-height: 20px; margin: 0 0 16px; }
+    body.failed h1 { color: #B42318; }
+    #btnReload {
+      border: none; border-radius: 8px; padding: 9px 22px;
+      background: rgba(15, 17, 21, 0.92); color: #FFFFFF;
+      font-size: 13px; cursor: pointer;
+    }
+    #btnReload:hover { background: rgba(30, 35, 44, 0.95); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="title">正在启动 DeepSeek Harness 服务…</h1>
+    <div class="bar"><div class="fill"></div></div>
+    <p class="sub" id="sub">首次启动通常需要 3~15 秒，服务就绪后窗口会自动进入。</p>
+    <button id="btnReload">重新加载</button>
+  </div>
+  <script src="loading.js"></script>
+</body>
+</html>

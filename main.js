@@ -10,6 +10,7 @@ const fs = require('fs')
 const os = require('os')
 const net = require('net')
 const { spawn, execFile, execFileSync } = require('child_process')
+const { pathToFileURL } = require('url')
 const semver = require('semver')
 const envDetect = require('./env-detect')
 const envInstall = require('./env-install')
@@ -78,7 +79,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
 let firstRun = false
 let harnessRoot = ''
 
@@ -188,6 +189,71 @@ function maybeMigrateDsh() {
   }
 }
 
+// ---------- Defender 排除项（安装/升级后首次运行自动尝试一次：预读排除项 → 缺则 UAC 授权添加） ----------
+// 无法静默：加排除项必须管理员（UAC 弹一次）；Win11 默认"篡改保护"开启时即使管理员也拒绝，仅记录日志。
+// 每个 dshl 版本只尝试一次（defExcludeTryVersion 记账），避免每次启动都弹 UAC。
+
+function runPwsh(script, { timeoutMs = 120000 } = {}) {
+  return new Promise((resolve) => {
+    try {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        resolve({ ok: !err, code: err ? (err.code || 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || '') })
+      })
+    } catch (e) {
+      resolve({ ok: false, code: 1, stdout: '', stderr: e.message })
+    }
+  })
+}
+
+async function readDefenderExclusions() {
+  const r = await runPwsh('(Get-MpPreference).ExclusionPath', { timeoutMs: 60000 })
+  if (!r.ok) throw new Error(r.stderr.trim() || r.stdout.trim() || '无法读取 Defender 排除项')
+  return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter((s) => s && s !== '::')
+}
+
+// 提权添加排除项：外层普通权限 PowerShell 用 -Verb RunAs 拉起内层（EncodedCommand 免转义），结果写入临时文件
+async function addDefenderExclusions(paths) {
+  const resultFile = path.join(os.tmpdir(), `dshl-defender-${process.pid}-${Date.now()}.txt`)
+  const inner = [
+    `$r = '${resultFile.replace(/'/g, "''")}'`,
+    `try { Add-MpPreference -ExclusionPath @(${paths.map((p) => `'${p.replace(/'/g, "''")}'`).join(',')}) -ErrorAction Stop; 'OK' | Out-File -FilePath $r -Encoding utf8 } catch { 'ERR: ' + $_.Exception.Message | Out-File -FilePath $r -Encoding utf8 }`,
+  ].join('; ')
+  const b64 = Buffer.from(inner, 'utf16le').toString('base64')
+  const outer = `Start-Process powershell.exe -Verb RunAs -Wait -ArgumentList @('-NoProfile','-EncodedCommand','${b64}')`
+  const r = await runPwsh(outer, { timeoutMs: 300000 })
+  let text = ''
+  try { text = fs.readFileSync(resultFile, 'utf8').trim() } catch { /* 无结果文件 = UAC 被取消/拒绝 */ }
+  try { fs.unlinkSync(resultFile) } catch { /* noop */ }
+  if (!text) text = 'ERR: UAC 被取消或被拒绝' + (r.stderr.trim() ? '（' + r.stderr.trim().slice(0, 200) + '）' : '')
+  return text
+}
+
+async function maybeApplyDefenderExclusion() {
+  if (!app.isPackaged || !IS_WIN) return
+  if (Config.defExcludeTryVersion === app.getVersion()) return
+  Config.defExcludeTryVersion = app.getVersion()
+  try { saveConfig() } catch { /* noop */ }
+  const paths = [
+    path.dirname(app.getPath('exe')), // dshl 安装目录
+    path.join(process.env.APPDATA || '', 'npm'), // npm 全局目录（DSH 包）
+    path.join(os.homedir(), '.dsh'), // DSH 配置 / profile / 会话
+  ].filter(Boolean)
+  log('defender: 检查排除项（' + paths.join('；') + '）…')
+  try {
+    const cur = await readDefenderExclusions()
+    const missing = paths.filter((p) => !cur.some((c) => c.toLowerCase() === p.toLowerCase()))
+    if (!missing.length) {
+      log('defender: 排除项已存在，跳过')
+      return
+    }
+    log('defender: 缺少排除项 ' + missing.join('、') + '，请求添加（将弹出一次 UAC 授权）…')
+    const result = await addDefenderExclusions(missing)
+    log('defender: ' + result)
+  } catch (e) {
+    log('defender: 检查/添加排除项失败：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
 // 安装任务进度/日志推送（主进程 → 面板；面板未打开时由环形缓冲兜底，重开时快照恢复）
 function pushEnv(patch) {
   const j = patch && patch.job
@@ -251,6 +317,7 @@ function loadConfig() {
       if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
       if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
       if (Number.isFinite(cfg.dshMigrateRetryAt) && cfg.dshMigrateRetryAt > 0) Config.dshMigrateRetryAt = cfg.dshMigrateRetryAt
+      if (typeof cfg.defExcludeTryVersion === 'string') Config.defExcludeTryVersion = cfg.defExcludeTryVersion
       if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
       if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
       if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
@@ -321,6 +388,15 @@ const server = {
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
   running() { return this.owned() || (this.adoptedPid !== 0 && this.adoptedAlive) },
   displayPid() { return this.owned() ? this.child.pid : this.adoptedPid },
+}
+
+// 服务阶段（供 WebUI 壳/说明页展示）：starting=正在启动 / restarting=看护重启中 / ready=就绪 / stopped=未运行
+let serverRestarting = false
+function servicePhase() {
+  if (server.child && server.child.__starting) return 'starting'
+  if (serverRestarting) return 'restarting'
+  if (server.running()) return 'ready'
+  return 'stopped'
 }
 
 function portOpenAt(port) {
@@ -519,6 +595,15 @@ async function startServer() {
     if (server.stopping) return
     if (child.__starting) return // 启动阶段退出由 startServer 的等待循环报告失败
     log(`DSH exited unexpectedly (code ${code}${signal ? ', signal ' + signal : ''})`)
+    // 页面立即切到"服务正在自动重启…"说明页（文字说明 + 刷新按钮；就绪后由 refreshWebUiOnReady 自动切回）
+    if (!SELF_TEST) {
+      const reason = Config.autoRestart ? 'restart' : 'offline'
+      for (const t of webTabs) {
+        const wc = t.view && t.view.webContents
+        if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl(reason, t.id)) } catch { /* noop */ } }
+      }
+      webPushState()
+    }
     startFlash()
     notify('DeepSeek Harness', '服务意外退出', WEB_URL)
     broadcastState()
@@ -609,8 +694,10 @@ async function maybeAutoRestart() {
   if (restartAttempts >= 5) { log('auto-restart attempts exhausted (5)'); return }
   lastRestartAt = now
   restartAttempts++
+  serverRestarting = true
   await sleep(3000) // 等端口彻底释放
   const ok = await startServer()
+  serverRestarting = false
   if (ok) {
     restartAttempts = 0
     log('service auto-restarted')
@@ -620,6 +707,7 @@ async function maybeAutoRestart() {
   } else {
     log('auto-restart failed')
     broadcastState()
+    void refreshWebUiPhase() // 重启失败：说明页切到"服务未启动"状态
   }
 }
 
@@ -733,8 +821,10 @@ function setAutostart(enabled) {
 // 迁移：删除旧 C# 版"启动"文件夹快捷方式；清理历史身份的旧注册表项（com.dsh.tray / com.dsh.launcher）。
 // 注意：Electron 按 AppUserModelID 匹配注册表项，身份改名为 com.dshl.launcher 后旧项成为 API 无法清除的孤儿，
 // 必须手动清一次；若旧项曾存在则保留"开机自启"意图（当前项缺失时重建）。
+// 仅打包版执行：dev 模式误删/误写自启项会把用户的开机自启改写成 dev electron 路径。
 function migrateLegacyAutostart() {
   if (!IS_WIN || SELF_TEST) return
+  if (!app.isPackaged) { log('dev mode: skip legacy autostart migration'); return }
   try {
     const lnk = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'dsh-tray.lnk') // 旧 C# 版遗留的自启快捷方式文件名，仅用于清理
     if (fs.existsSync(lnk)) { fs.unlinkSync(lnk); log('removed legacy C# autostart shortcut (dsh-tray.lnk)') }
@@ -948,6 +1038,7 @@ function webPushState() {
     splitRatio: webSplitRatio,
     maximized: webWin.isMaximized(),
     tabsEnabled: Config.tabsEnabled,
+    service: servicePhase(),
   })
 }
 
@@ -984,9 +1075,22 @@ function webLayout() {
   refreshPaneOverlays()
 }
 
+// 服务状态说明页（白屏自愈 / 启动中 / 重启中 / 未启动）：文案随服务阶段生成，pane=标签 id 供页内刷新按钮回传
+function loadingUrl(reason, tabId) {
+  return `${pathToFileURL(path.join(WWWROOT, 'loading.html')).href}?reason=${reason}&pane=${tabId || ''}`
+}
+function reasonForPhase(phase) {
+  if (phase === 'starting') return 'start'
+  if (phase === 'restarting') return 'restart'
+  if (phase === 'ready') return 'failed'
+  return 'offline'
+}
+
 // 新建标签页：视图先在后台创建并加载，激活时才挂载（切换无白屏）
 // targetUrl / targetTitle：分屏"在新标签页中打开"时复制来源页地址与标题
-function webCreateTab(targetUrl, targetTitle) {
+// opts.loading：服务未就绪时先加载状态说明页（窗口秒开），就绪后由 refreshWebUiOnReady 自动切到真实页面
+// opts.loadingReason：说明页文案（start/restart/offline/failed/update）；缺省按当前服务阶段推导
+function webCreateTab(targetUrl, targetTitle, opts = {}) {
   const id = 't' + (++webSeq)
   const view = new WebContentsView({
     webPreferences: {
@@ -1011,12 +1115,16 @@ function webCreateTab(targetUrl, targetTitle) {
   try { view.setBackgroundColor('#F9FAFB') } catch { /* 旧版无此 API，忽略 */ }
   wc.on('page-title-updated', (_e, t) => { tab.title = t || 'DeepSeek Harness'; webPushState() })
   wc.on('focus', () => { webFocusedId = id; refreshPaneOverlays() })
-  // 加载失败（服务未起/端口不通）→ 标记白屏，交给壳的"修复"按钮兜底重载
+  // 加载失败（服务未起/端口不通）→ 标记白屏，并立即换成"服务状态说明页"（文字说明 + 当前页刷新按钮），
+  // 服务就绪后 refreshWebUiOnReady 会自动切回真实页面；自检模式保持原逻辑（检查空白页）
   wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
     if (!isMainFrame) return
     // 用户主动取消（ERR_ABORTED/-3）不算白屏
     if (code === -3) return
     markBlank(true)
+    if (!SELF_TEST) {
+      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), id)) } catch { /* noop */ }
+    }
   })
   wc.on('zoom-changed', (_e, direction) => {
     const f = wc.getZoomFactor()
@@ -1042,7 +1150,7 @@ function webCreateTab(targetUrl, targetTitle) {
     else if (input.control && input.key === 'Delete') { _event.preventDefault(); webCloseFocused() }
     else if (input.shift && input.alt && key === 's') { _event.preventDefault(); webSwap() }
   })
-  view.webContents.loadURL(targetUrl || WEB_URL).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
+  view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id) : (targetUrl || WEB_URL)).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
   webActivateTab(id)
   return tab
 }
@@ -1197,7 +1305,10 @@ async function webReloadPane(id) {
   // 服务没在跑 → 走统一启动入口（幂等；服务已在运行则直接返回，不打断会话）。
   // 若端口被占/环境未就绪，handleStart 会置 blockedReason / startWhenReady，面板可据此处理。
   if (!server.running()) await handleStart()
-  try { wc.loadURL(WEB_URL) } catch { /* noop */ }
+  const phase = servicePhase()
+  // 就绪 → 真实页面；未就绪 → 状态说明页（说明 + 刷新按钮）；自检模式保持原逻辑
+  const url = (SELF_TEST || phase === 'ready') ? WEB_URL : loadingUrl(reasonForPhase(phase), tab.id)
+  try { wc.loadURL(url) } catch { /* noop */ }
 }
 
 // 关闭当前聚焦的分屏：分屏时关聚焦侧（左关左保留右），未分屏时关当前标签
@@ -1317,7 +1428,7 @@ function openWebUi(opts = {}) {
   webWin.on('maximize', () => { webLayout(); webPushState(); saveWebWindowState() })
   webWin.on('unmaximize', () => { webLayout(); webPushState(); saveWebWindowState() })
   webWin.loadFile(path.join(WWWROOT, 'browser.html')).catch(() => { /* noop */ })
-  webCreateTab() // 首个标签页：后台加载，挂载即显示
+  webCreateTab(undefined, undefined, { loading: !!opts.loading, loadingReason: opts.loadingReason }) // 首个标签页：后台加载，挂载即显示（loading=先开状态说明页）
   // 点 ✕ 只隐藏到后台继续运行（页面与会话保持存活），托盘退出时才真正关闭
   webWin.on('close', (e) => {
     if (!reallyExit) {
@@ -1335,13 +1446,39 @@ function openWebUi(opts = {}) {
   })
 }
 
-// 服务就绪时自愈：逐个检查标签页视图，空白错误页 → 重新加载真实应用；健康页面不打扰
-async function refreshWebUiOnReady() {
+// 服务就绪时自愈：逐个检查标签页视图，状态说明页/空白错误页 → 重新加载真实应用；健康页面不打扰
+// force=true：无条件重载所有标签（DSH 版本升级后必须用新版本页面替换旧会话）
+async function refreshWebUiOnReady(force = false) {
   for (const t of webTabs) {
     const wc = t.view.webContents
     if (wc.isDestroyed()) continue
-    if (await isPageBlank(wc)) {
+    if (force || (wc.getURL() || '').includes('loading.html') || await isPageBlank(wc)) {
       try { wc.loadURL(WEB_URL) } catch { /* noop */ }
+    }
+  }
+}
+
+// 把 WebUI 窗口所有标签切到状态说明页（DSH 更新/重启期间给出文字说明与进度，避免白屏）
+function webLoadTabs(reason) {
+  if (SELF_TEST) return
+  for (const t of webTabs) {
+    const wc = t.view && t.view.webContents
+    if (wc && !wc.isDestroyed()) {
+      t.blank = true
+      try { wc.loadURL(loadingUrl(reason, t.id)) } catch { /* noop */ }
+    }
+  }
+  webPushState()
+}
+
+// 启动失败/阶段变化后：把还在显示"启动中"的说明页刷新为当前实际状态（未启动/重启中/卡住）
+async function refreshWebUiPhase() {
+  if (SELF_TEST) return
+  for (const t of webTabs) {
+    const wc = t.view.webContents
+    if (wc.isDestroyed()) continue
+    if ((wc.getURL() || '').includes('loading.html')) {
+      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), t.id)) } catch { /* noop */ }
     }
   }
 }
@@ -1384,6 +1521,7 @@ function broadcastState() {
   if (json === lastBroadcast) return
   lastBroadcast = json
   if (win && !win.isDestroyed()) { try { win.webContents.send('dsh:state', json) } catch { /* noop */ } }
+  webPushState() // WebUI 壳同步服务阶段（白屏说明文案依赖）
 }
 
 // 判断 WebUI 窗口当前是否正在被用户聚焦（聚焦时不弹提醒、不闪烁图标）
@@ -1631,6 +1769,7 @@ function registerIpc() {
           Config.npmRegistry = ''
           Config.dshUpdateCheckedAt = 0
           Config.dshMigrateRetryAt = 0
+          Config.defExcludeTryVersion = ''
           Config.panelHideNotified = false
           Config.balanceApiKey = ''
           Config.balanceBaseUrl = ''
@@ -2045,6 +2184,8 @@ function init() {
     getServerState: () => ({ running: server.running(), owned: server.owned() }),
     stopService: () => stopServer(),
     startService: () => handleStart(),
+    loadWebTabs: (reason) => webLoadTabs(reason),
+    reloadWebTabs: () => { void refreshWebUiOnReady(true) },
     onState: () => broadcastState(),
   })
   if (firstRun) {
@@ -2054,23 +2195,27 @@ function init() {
   }
   clearStaleNotify()
   migrateLegacyAutostart()
-  // 启动默认触发一次"打开 DeepSeek Harness"：服务运行成功、就绪通知弹出之后再打开独立窗口。
+  // 启动默认触发一次"打开 DeepSeek Harness"：先开窗口（立即反馈，显示启动说明页），服务就绪后自动切到真实页面。
   // 环境未就绪时：跳过服务启动，首次运行直接弹出面板（自动进入"运行环境"页引导一键安装）。
   void (async () => {
     await refreshEnv(true)
     maybeMigrateDsh()
+    void maybeApplyDefenderExclusion() // 安装/升级后首次运行：尝试添加 Defender 排除项（一次 UAC）
     if (!envReady()) {
       if (firstRun || args.panel) showPanel()
       log('environment not ready, panel available for one-click install')
       return
     }
-    await handleStart()
-    if (server.running()) {
-      await sleep(400)
-      // --panel：启动后弹出启动器面板（默认弹出 DeepSeek Harness 独立窗口）
-      if (args.panel) showPanel()
-      else openWebUi()
+    if (args.panel) {
+      showPanel()
+      await handleStart()
+      return
     }
+    // 默认：先开窗（窗口立即出现，"正在启动服务…"说明页 + 进度条），服务异步就绪后自动进入真实页面
+    // loadingReason='start'：此刻服务尚未拉起（phase=stopped），避免说明页误显示"服务未启动"
+    openWebUi({ loading: !server.running(), loadingReason: 'start' })
+    await handleStart()
+    if (!server.running() && !SELF_TEST) void refreshWebUiPhase() // 启动失败：说明页切换为对应状态（未启动/卡住等）
   })()
   setInterval(onTick, 2000)
   // 开发模式热刷新（npm run dev / VS Code F5）：wwwroot 产物变化 → 面板窗口自动重载，无需重启启动器。
