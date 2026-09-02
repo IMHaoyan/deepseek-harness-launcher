@@ -333,6 +333,10 @@ body {
 .value.link { cursor: pointer; }
 .value.link:hover { color: var(--brand); text-decoration: underline; }
 
+/* DSH 版本行：可点击，打开 npm 官方页（class 为 version-value，需单独命中） */
+.version-value.link { cursor: pointer; }
+.version-value.link:hover { color: var(--brand); text-decoration: underline; }
+
 /* ---------- 按钮（胶囊，h36/r18，对齐 Button.module.css） ---------- */
 
 .btn {
@@ -446,6 +450,10 @@ body {
 
 /* 版本行（并入运行状态卡）：与其余行共用 .row 的 32px 行高/12px 间距，更新按钮同行、不换行 */
 .version-row .btn { flex: none; }
+
+/* 悬停"检查更新"按钮：鼠标移入版本行才显示；有可用更新时由 JS 隐藏（避免与"更新到 vX"并存） */
+.version-row .check-now { display: none; }
+.version-row:hover .check-now { display: inline-flex; }
 
 .version-value {
   flex: 1;

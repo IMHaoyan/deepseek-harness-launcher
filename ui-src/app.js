@@ -212,20 +212,18 @@ function render(state) {
   window._running = !!state.running;
   window._firstRun = !!state.firstRun;
 
-  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录；版本号后注明安装渠道）
+  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录；点击打开 npm 官方页）
   const lvEl = $('launcherVersion');
   if (lvEl) lvEl.textContent = state.version ? `v${state.version}` : '-';
   const dshV = (state.env && state.env.dsh && state.env.dsh.version) || (state.dshUpdate && state.dshUpdate.current) || '';
   const dshKind = state.env && state.env.dsh ? state.env.dsh.kind : '';
   const dshKindLabel = ENV_KIND_LABELS[dshKind];
-  const dshVerText = dshV
-    ? `v${dshV}${dshKindLabel && dshKind !== 'none' ? `（${dshKindLabel}）` : ''}`
-    : (state.env ? '未安装' : '检测中…');
+  const dshVerText = dshV ? `v${dshV}` : (state.env ? '未安装' : '检测中…');
   const dshVerEl = $('dshVersion');
   if (dshVerEl) {
     dshVerEl.textContent = dshVerText;
     dshVerEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
-      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '';
+      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '在浏览器打开 npm 官方页';
   }
   const dshUpdStatusEl = $('dshUpdaterStatus'); // 设置页"DSH版本与更新"行的版本值
   if (dshUpdStatusEl) {
@@ -277,8 +275,6 @@ function render(state) {
   // 开关 chip
   renderToggleChip('btnNotify', state.notify !== false, '开启', '关闭');
   renderToggleChip('btnAuto', !!state.autostart, '开启', '关闭');
-  renderToggleChip('btnAutoRestart', state.autoRestart !== false, '开启', '关闭');
-  renderToggleChip('btnSystemBrowser', !!state.useSystemBrowser, '开启', '关闭');
   renderToggleChip('btnTabsEnabled', !!state.tabsEnabled, '开启', '关闭');
 
   // 运行环境：状态卡 + 主页面警示行；未就绪时首次自动进入环境页
@@ -743,6 +739,8 @@ $('btnOpen').addEventListener('click', () => {
 $('urlText').addEventListener('click', () => {
   if (window._currentUrl) cmd('openUrlExternal');
 });
+// DSH 版本行：点击打开 npm 官方页面
+$('dshVersion').addEventListener('click', () => cmd('openNpmDsh'));
 $('btnToggle').addEventListener('click', () => cmd(window._running ? 'stop' : 'start'));
 $('btnTest').addEventListener('click', () => cmd('testNotify'));
 $('btnLogs').addEventListener('click', () => showPage('log'));
@@ -751,17 +749,9 @@ $('btnSettings').addEventListener('click', () => showPage('settings'));
 $('btnSettingsBack').addEventListener('click', () => showPage('main'));
 $('btnOpenLogsDir').addEventListener('click', () => cmd('openLogs'));
 $('btnAuto').addEventListener('click', () => cmd('toggleAutostart'));
-$('btnAutoRestart').addEventListener('click', () => {
-  const chip = $('btnAutoRestart');
-  cmd('setAutoRestart', !chip.classList.contains('checked'));
-});
 $('btnNotify').addEventListener('click', () => {
   const chip = $('btnNotify');
   cmd('setNotify', !chip.classList.contains('checked'));
-});
-$('btnSystemBrowser').addEventListener('click', () => {
-  const chip = $('btnSystemBrowser');
-  cmd('setUseSystemBrowser', !chip.classList.contains('checked'));
 });
 $('btnTabsEnabled').addEventListener('click', () => {
   const chip = $('btnTabsEnabled');
@@ -806,6 +796,9 @@ function renderUpdater(u) {
   const updateBtn = $('btnUpdateNow');
   updateBtn.classList.toggle('hidden', !hasUpdate);
   if (hasUpdate) updateBtn.textContent = `更新到 v${u.latest}`;
+  // 悬停"检查更新"按钮：有可用更新时隐藏（避免与"更新到 vX"并存）
+  const hoverCheck = $('btnUpCheckNow');
+  if (hoverCheck) hoverCheck.style.display = hasUpdate ? 'none' : '';
 
   // 有更新时"检查更新"按钮变形为绿色"更新到 vX"
   checkBtn.textContent = hasUpdate ? `更新到 v${u.latest}` : '检查更新';
@@ -869,6 +862,8 @@ $('btnUpdaterCheck').addEventListener('click', () => {
   if (u && u.status === 'downloaded') void cmd('updaterInstall');
   else void cmd('updaterCheck');
 });
+// 主页面"启动器版本"行：悬停"检查更新"按钮
+$('btnUpCheckNow').addEventListener('click', () => void cmd('updaterCheck'));
 
 // ---------- DSH 更新（检测全自动、更新全手动：点"立即更新"才执行） ----------
 // 主页最低端"DSH版本"行按钮：只有检测到更新（或更新中/失败重试）才显示；
@@ -906,6 +901,10 @@ function renderDshUpdate(u) {
       }
     }
   }
+
+  // 悬停"检查更新"按钮：已有更新/更新中/失败重试时隐藏（避免与"立即更新/重试"并存）
+  const hoverCheck = $('btnDshCheckHover');
+  if (hoverCheck) hoverCheck.style.display = (status === 'available' || status === 'updating' || status === 'error') ? 'none' : '';
 
   // 设置页"DSH版本与更新"行
   const checkBtn = $('btnDshCheck');
@@ -951,6 +950,8 @@ $('btnDshCheck').addEventListener('click', () => {
   else if (u && (u.status === 'available' || (u.status === 'error' && u.kind !== 'source'))) void cmd('dshUpdateNow');
   else void cmd('dshCheckNow');
 });
+// 主页面"DSH版本"行：悬停"检查更新"按钮
+$('btnDshCheckHover').addEventListener('click', () => void cmd('dshCheckNow'));
 
 // ---------- 余额（cc-switch 风格：主页只显示金额 + ↻ + ⚙；⚙ 进入设置页测试并保存） ----------
 const BALANCE_INTERVAL_MS = 3 * 60 * 1000

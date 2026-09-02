@@ -1,5 +1,5 @@
 'use strict'
-// loading.html 的文案与刷新按钮（白屏/启动中/重启中状态页；页面视图由主进程加载，reason/pane 经 URL 传入）
+// loading.html 的文案与按钮（白屏/启动中/重启中/未启动/端口被占用状态页；页面视图由主进程加载，参数经 URL 传入）
 const q = new URLSearchParams(location.search)
 const reason = q.get('reason') || 'start'
 const pane = q.get('pane') || ''
@@ -30,13 +30,32 @@ const TEXTS = {
     sub: '服务在运行，但页面没有加载成功（可能卡住了）。点击下方按钮重新加载；仍失败请到启动器面板「查看日志」。',
     btn: '重新加载',
   },
+  blocked: {
+    title: '端口被其他程序占用',
+    sub: '', // 由 detail 参数填充（占用原因 + 建议端口）
+    btn: '换到空闲端口并启动',
+  },
 }
 const t = TEXTS[reason] || TEXTS.start
+const subEl = document.getElementById('sub')
+const btnEl = document.getElementById('btnReload')
 document.getElementById('title').textContent = t.title
-document.getElementById('sub').textContent = t.sub
-document.getElementById('btnReload').textContent = t.btn
+subEl.textContent = t.sub
+btnEl.textContent = t.btn
 if (reason === 'failed' || reason === 'offline') document.body.classList.add('failed')
 
+// 端口冲突页：detail 展示冲突原因；suggest 有值 → 一键换端口启动；无值 → 引导打开启动器面板
+const detail = (q.get('detail') || '').slice(0, 500)
+const suggest = q.get('suggest') || ''
+if (reason === 'blocked') {
+  subEl.textContent = detail || t.sub
+  btnEl.textContent = suggest ? `换到端口 ${suggest} 并启动` : '打开启动器面板（更换端口）'
+  document.body.classList.add('failed')
+}
+
 document.getElementById('btnReload').addEventListener('click', () => {
-  try { window.browserBridge.send('fixPane', { id: pane }) } catch (e) { /* 桥未就绪忽略 */ }
+  try {
+    if (reason === 'blocked' && suggest) window.browserBridge.send('blockSwitch', { port: Number(suggest) })
+    else window.browserBridge.send('fixPane', { id: pane })
+  } catch (e) { /* 桥未就绪忽略 */ }
 })

@@ -1,4 +1,4 @@
-# verify-dev.ps1 v5 — profile 用 junction（pnpm junction 农场不可浅拷贝）；截图带重试
+﻿# verify-dev.ps1 v5 — profile 用 junction（pnpm junction 农场不可浅拷贝）；截图带重试
 $ErrorActionPreference = 'Continue'
 $repo = 'C:\Users\gonghaoyan\Desktop\dshl'
 $base = Join-Path $env:TEMP ("dshl-verify-" + [DateTime]::Now.ToString('yyyyMMdd-HHmmss'))

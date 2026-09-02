@@ -49,9 +49,11 @@ let PORT = args.port || (SELF_TEST ? 3999 : 3080)
 let WEB_URL = `http://${HOST}:${PORT}`
 const READY_TIMEOUT_SEC = 60
 
-// 按当前配置重算运行端口（配置缺失/非法一律回退默认 3080）
-function applyRuntimePort() {
-  const p = args.port || (SELF_TEST ? 3999 : (Number.isInteger(Config.port) && Config.port >= 1024 && Config.port <= 65535 && Config.port !== 0 ? Config.port : 3080))
+// 按当前配置重算运行端口（配置缺失/非法一律回退默认 3080）。
+// seed=true（仅启动时）：命令行 --port 优先，作为本次会话的种子；运行时（设置页/一键换端口）一律以 Config.port 为准，
+// 否则 CLI 端口会永久压住切换后的新端口（bug：换端口"一直卡住"）。
+function applyRuntimePort(seed = false) {
+  const p = (seed && args.port) || (SELF_TEST ? 3999 : (Number.isInteger(Config.port) && Config.port >= 1024 && Config.port <= 65535 && Config.port !== 0 ? Config.port : 3080))
   if (p !== PORT) {
     PORT = p
     WEB_URL = `http://${HOST}:${PORT}`
@@ -600,7 +602,7 @@ async function startServer() {
       const reason = Config.autoRestart ? 'restart' : 'offline'
       for (const t of webTabs) {
         const wc = t.view && t.view.webContents
-        if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl(reason, t.id)) } catch { /* noop */ } }
+        if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl(reason, t.id, loadingParams())) } catch { /* noop */ } }
       }
       webPushState()
     }
@@ -732,7 +734,7 @@ function notify(title, message, url) {
 function notifyStartResult(ok) {
   if (ok && server.owned()) notify('DeepSeek Harness', `服务已就绪：${WEB_URL}`)
   else if (ok) notify('DeepSeek Harness', `检测到已在运行的服务（PID ${server.displayPid()}），已接管`)
-  else if (server.blockedReason) notify('DeepSeek Harness', server.blockedReason)
+  else if (server.blockedReason) notify('DeepSeek Harness', server.blockedReason + '（启动器面板已打开，可一键切换）')
   else if (envReady()) notify('DeepSeek Harness', '服务启动失败，请打开启动器面板查看日志')
   else notify('DeepSeek Harness', '运行环境未就绪，请打开启动器面板一键安装')
 }
@@ -752,7 +754,23 @@ async function handleStart() {
   const ok = await startServer()
   notifyStartResult(ok)
   if (ok) refreshWebUiOnReady()
+  else if (server.blockedReason && !SELF_TEST) showPanel() // 端口被其他程序占用：自动弹出面板（警示卡 + 一键换端口）
   broadcastState()
+}
+
+// 一键换端口（面板警示卡 / WebUI 端口冲突说明页共用）：保存建议端口并立即尝试启动
+async function switchToSuggestedPort(port) {
+  const p = Number(port)
+  if (!Number.isInteger(p) || p < 1024 || p > 65535) return false
+  if (server.suggestedPort && p !== server.suggestedPort) return false // 只接受当前建议的端口
+  Config.port = p
+  saveConfig()
+  applyRuntimePort()
+  server.blockedReason = ''
+  server.suggestedPort = 0
+  await handleStart()
+  broadcastState()
+  return true
 }
 
 // 统一"打开"入口：环境未就绪或端口被占用 → 打开启动器面板（一键安装/一键换端口入口）；否则 → 独立窗口
@@ -1075,15 +1093,24 @@ function webLayout() {
   refreshPaneOverlays()
 }
 
-// 服务状态说明页（白屏自愈 / 启动中 / 重启中 / 未启动）：文案随服务阶段生成，pane=标签 id 供页内刷新按钮回传
-function loadingUrl(reason, tabId) {
-  return `${pathToFileURL(path.join(WWWROOT, 'loading.html')).href}?reason=${reason}&pane=${tabId || ''}`
+// 服务状态说明页（白屏自愈 / 启动中 / 重启中 / 未启动 / 端口被占用）：文案随服务阶段生成，pane=标签 id 供页内按钮回传
+function loadingUrl(reason, tabId, extra) {
+  let q = `reason=${reason}&pane=${tabId || ''}`
+  if (extra && extra.detail) q += '&detail=' + encodeURIComponent(String(extra.detail).slice(0, 500))
+  if (extra && extra.suggest) q += '&suggest=' + encodeURIComponent(String(extra.suggest))
+  return `${pathToFileURL(path.join(WWWROOT, 'loading.html')).href}?${q}`
 }
 function reasonForPhase(phase) {
+  if (server.blockedReason) return 'blocked' // 端口被其他程序占用：说明页直接展示冲突原因与一键换端口
   if (phase === 'starting') return 'start'
   if (phase === 'restarting') return 'restart'
   if (phase === 'ready') return 'failed'
   return 'offline'
+}
+
+// 端口冲突时说明页的附加参数（冲突详情 + 建议端口）
+function loadingParams() {
+  return server.blockedReason ? { detail: server.blockedReason, suggest: server.suggestedPort || '' } : {}
 }
 
 // 新建标签页：视图先在后台创建并加载，激活时才挂载（切换无白屏）
@@ -1123,7 +1150,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     if (code === -3) return
     markBlank(true)
     if (!SELF_TEST) {
-      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), id)) } catch { /* noop */ }
+      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), id, loadingParams())) } catch { /* noop */ }
     }
   })
   wc.on('zoom-changed', (_e, direction) => {
@@ -1150,7 +1177,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     else if (input.control && input.key === 'Delete') { _event.preventDefault(); webCloseFocused() }
     else if (input.shift && input.alt && key === 's') { _event.preventDefault(); webSwap() }
   })
-  view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id) : (targetUrl || WEB_URL)).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
+  view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id, loadingParams()) : (targetUrl || WEB_URL)).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
   webActivateTab(id)
   return tab
 }
@@ -1307,7 +1334,7 @@ async function webReloadPane(id) {
   if (!server.running()) await handleStart()
   const phase = servicePhase()
   // 就绪 → 真实页面；未就绪 → 状态说明页（说明 + 刷新按钮）；自检模式保持原逻辑
-  const url = (SELF_TEST || phase === 'ready') ? WEB_URL : loadingUrl(reasonForPhase(phase), tab.id)
+  const url = (SELF_TEST || phase === 'ready') ? WEB_URL : loadingUrl(reasonForPhase(phase), tab.id, loadingParams())
   try { wc.loadURL(url) } catch { /* noop */ }
 }
 
@@ -1465,7 +1492,7 @@ function webLoadTabs(reason) {
     const wc = t.view && t.view.webContents
     if (wc && !wc.isDestroyed()) {
       t.blank = true
-      try { wc.loadURL(loadingUrl(reason, t.id)) } catch { /* noop */ }
+      try { wc.loadURL(loadingUrl(reason, t.id, loadingParams())) } catch { /* noop */ }
     }
   }
   webPushState()
@@ -1478,7 +1505,7 @@ async function refreshWebUiPhase() {
     const wc = t.view.webContents
     if (wc.isDestroyed()) continue
     if ((wc.getURL() || '').includes('loading.html')) {
-      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), t.id)) } catch { /* noop */ }
+      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), t.id, loadingParams())) } catch { /* noop */ }
     }
   }
 }
@@ -1689,6 +1716,7 @@ function registerIpc() {
         case 'browser:swapPanes': webSwap(); return '{}'
         case 'browser:paneToTab': webPaneToTab(value && value.id); return '{}'
         case 'browser:fixPane': await webReloadPane(value && value.id); return '{}'
+        case 'browser:blockSwitch': await switchToSuggestedPort((value && value.port) || server.suggestedPort); return '{}'
         case 'browser:winMin': if (webWin && !webWin.isDestroyed()) { try { webWin.minimize() } catch { /* noop */ } } return '{}'
         case 'browser:winMax': {
           if (webWin && !webWin.isDestroyed()) {
@@ -1701,6 +1729,7 @@ function registerIpc() {
         case 'stop': await stopServer(); notify('DeepSeek Harness', '服务已停止'); broadcastState(); return '{}'
         case 'openWeb': openDshOrPanel(); return '{}' // 环境未就绪/端口被占用时自动改打开启动器面板
         case 'openUrlExternal': try { shell.openExternal(WEB_URL) } catch { /* noop */ } return '{}'
+        case 'openNpmDsh': try { shell.openExternal('https://www.npmjs.com/package/@deepseek-ai/dsh') } catch { /* noop */ } return '{}'
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
         case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
         case 'openRecharge': try { shell.openExternal('https://platform.deepseek.com/usage') } catch { /* noop */ } return '{}'
@@ -1847,15 +1876,7 @@ function registerIpc() {
         }
         case 'portSwitchStart': {
           // "端口被占用"场景的一键换端口：保存建议端口并立即尝试启动
-          const p = Number(value && value.port)
-          if (!Number.isInteger(p) || p < 1024 || p > 65535) return '{}'
-          Config.port = p
-          saveConfig()
-          applyRuntimePort()
-          server.blockedReason = ''
-          server.suggestedPort = 0
-          await handleStart()
-          broadcastState()
+          await switchToSuggestedPort(value && value.port)
           return '{}'
         }
         case 'setTabsEnabled': {
@@ -2144,7 +2165,10 @@ function cssZoomPct() {
 // ---------- 初始化 ----------
 function init() {
   loadConfig()
-  applyRuntimePort() // 端口配置生效（命令行 --port / 设置页"服务端口"）
+  // 设置项已从界面移除（v1.0.16+）：行为锁定默认值——DSH 用启动器独立窗口打开、意外退出自动重启看护
+  Config.useSystemBrowser = false
+  Config.autoRestart = true
+  applyRuntimePort(true) // 端口配置生效（启动时 CLI --port 作种子；运行时切换以 Config.port 为准）
   initEnvRuntime()
   Config.zoom = systemZoom() // 启动器缩放默认跟随系统（不持久化，每次启动重读）
   Config.webZoom = cssZoomPct() // 对话界面缩放默认 = 独立窗口当前缩放（校正后）
