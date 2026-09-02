@@ -781,6 +781,16 @@ $('btnEnvRetry').addEventListener('click', () => {
 });
 $('btnEnvOpenInstallLog').addEventListener('click', () => void cmd('openInstallLog'));
 
+// 版本行内联检查结果提示：8 秒后自动消失（新状态到达会重置计时）
+const versionHintTimers = {};
+function flashVersionHint(el, text, title, key) {
+  if (!el) return;
+  if (versionHintTimers[key]) { clearTimeout(versionHintTimers[key]); versionHintTimers[key] = null; }
+  el.textContent = text;
+  el.title = title || '';
+  if (text) versionHintTimers[key] = setTimeout(() => { el.textContent = ''; el.title = ''; versionHintTimers[key] = null; }, 8000);
+}
+
 // ---------- 自动更新（electron-updater → GitHub Releases） ----------
 function renderUpdater(u) {
   if (!u) return;
@@ -796,9 +806,24 @@ function renderUpdater(u) {
   const updateBtn = $('btnUpdateNow');
   updateBtn.classList.toggle('hidden', !hasUpdate);
   if (hasUpdate) updateBtn.textContent = `更新到 v${u.latest}`;
-  // 悬停"检查更新"按钮：有可用更新时隐藏（避免与"更新到 vX"并存）
+  // 悬停"检查更新"按钮：有可用更新时隐藏（避免与"更新到 vX"并存）；检查中显示"检查中…"并禁用
   const hoverCheck = $('btnUpCheckNow');
-  if (hoverCheck) hoverCheck.style.display = hasUpdate ? 'none' : '';
+  if (hoverCheck) {
+    hoverCheck.style.display = hasUpdate ? 'none' : '';
+    hoverCheck.disabled = u.status === 'checking';
+    hoverCheck.textContent = u.status === 'checking' ? '检查中…' : '检查更新';
+  }
+  // 版本行内联检查结果反馈（8 秒后自动消失，避免常驻）
+  const rowHint = $('updRowHint');
+  if (rowHint) {
+    let text = '';
+    if (u.status === 'checking') text = '正在检查更新…';
+    else if (u.status === 'downloading') text = `发现新版本 v${u.latest}，下载中…`;
+    else if (u.status === 'downloaded') text = `新版本 v${u.latest} 已就绪`;
+    else if (u.status === 'up-to-date') text = '已是最新版本';
+    else if (u.status === 'error') text = '检查更新失败';
+    flashVersionHint(rowHint, text, text === '检查更新失败' ? (u.error || '') : '', 'upd');
+  }
 
   // 有更新时"检查更新"按钮变形为绿色"更新到 vX"
   checkBtn.textContent = hasUpdate ? `更新到 v${u.latest}` : '检查更新';
@@ -902,9 +927,25 @@ function renderDshUpdate(u) {
     }
   }
 
-  // 悬停"检查更新"按钮：已有更新/更新中/失败重试时隐藏（避免与"立即更新/重试"并存）
+  // 悬停"检查更新"按钮：已有更新/更新中/失败重试时隐藏；检查中显示"检查中…"并禁用
   const hoverCheck = $('btnDshCheckHover');
-  if (hoverCheck) hoverCheck.style.display = (status === 'available' || status === 'updating' || status === 'error') ? 'none' : '';
+  if (hoverCheck) {
+    hoverCheck.style.display = (status === 'available' || status === 'updating' || status === 'error') ? 'none' : '';
+    hoverCheck.disabled = status === 'checking';
+    hoverCheck.textContent = status === 'checking' ? '检查中…' : '检查更新';
+  }
+  // 版本行内联检查结果反馈（8 秒后自动消失，避免常驻）
+  const rowHint = $('dshUpdRowHint');
+  if (rowHint) {
+    let text = '';
+    if (status === 'checking') text = '正在检查更新…';
+    else if (status === 'available') text = `发现新版本 v${latest}`;
+    else if (status === 'updating') text = `更新中 v${latest}…`;
+    else if (status === 'updated') text = `已更新到 v${u.current}`;
+    else if (status === 'up-to-date') text = '已是最新版本';
+    else if (status === 'error') text = '检查/更新失败';
+    flashVersionHint(rowHint, text, text === '检查/更新失败' ? (u.error || '') : '', 'dsh');
+  }
 
   // 设置页"DSH版本与更新"行
   const checkBtn = $('btnDshCheck');

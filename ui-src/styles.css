@@ -455,6 +455,18 @@ body {
 .version-row .check-now { display: none; }
 .version-row:hover .check-now { display: inline-flex; }
 
+/* 版本行内联检查结果（已是最新/检查中/发现新版本/失败） */
+.version-hint {
+  flex: none;
+  max-width: 132px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--text-secondary, #61666B);
+}
+
 .version-value {
   flex: 1;
   min-width: 0;

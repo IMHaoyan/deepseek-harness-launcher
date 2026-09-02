@@ -1,11 +1,11 @@
-# install-fixed.ps1 — 静默安装修复版 v1.0.16 并验证（杀托盘保持服务，安装后重启托盘接管）
+# install-fixed.ps1 — 静默安装 v1.0.17 并验证（杀托盘保持服务，安装后重启托盘接管）
 $ErrorActionPreference = 'Continue'
 $result = Join-Path $env:TEMP 'dshl-install-result.txt'
 function Log([string]$m) { $m | Out-File -FilePath $result -Encoding utf8 -Append }
 Set-Content -Path $result -Value "start $(Get-Date -Format 'HH:mm:ss')" -Encoding utf8
 
 $exeDir = 'C:\Users\gonghaoyan\AppData\Local\Programs\deepseek-harness-launcher'
-$installer = 'C:\Users\gonghaoyan\Desktop\dshl\dist\dshl-1.0.16.exe'
+$installer = 'C:\Users\gonghaoyan\Desktop\dshl\dist\dshl-1.0.17.exe'
 
 # 1) 杀托盘主进程（不带 /T：DSH 服务子进程保留，会话不断）
 $tray = Get-CimInstance Win32_Process -Filter "Name='DeepSeek Harness Launcher.exe'" | Where-Object { $_.ExecutablePath -like "*$exeDir*" -and $_.CommandLine -notmatch 'type=' } | Select-Object -First 1
