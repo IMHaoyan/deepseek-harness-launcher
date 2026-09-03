@@ -84,6 +84,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
 let firstRun = false
 let harnessRoot = ''
+let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
 
 // ---------- 环境探测/安装（env-detect.js / env-install.js） ----------
 let envReport = null
@@ -321,6 +322,8 @@ function loadConfig() {
       if (Number.isFinite(cfg.dshMigrateRetryAt) && cfg.dshMigrateRetryAt > 0) Config.dshMigrateRetryAt = cfg.dshMigrateRetryAt
       if (typeof cfg.defExcludeTryVersion === 'string') Config.defExcludeTryVersion = cfg.defExcludeTryVersion
       if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
+      // 对话界面缩放：用户改过才持久化；没改过时启动跟随系统默认（见 init）
+      if (Number.isInteger(cfg.webZoom) && cfg.webZoom >= 50 && cfg.webZoom <= 300) { Config.webZoom = cfg.webZoom; webZoomLoaded = true }
       if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
       if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
     }
@@ -1160,6 +1163,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       if (!t2.view.webContents.isDestroyed()) { try { t2.view.webContents.setZoomFactor(next) } catch { /* noop */ } }
     }
     Config.webZoom = Math.round(next * 100)
+    saveConfig() // 对话窗口 Ctrl+滚轮缩放同样持久化（重启不丢）
     showWebZoomOverlay(wc)
     broadcastState()
   })
@@ -1745,7 +1749,7 @@ function registerIpc() {
         }
         case 'setWebZoom': {
           const z = Number(value)
-          // 对话界面缩放：50-300，同步应用到所有 DSH 页面视图
+          // 对话界面缩放：50-300，同步应用到所有 DSH 页面视图；用户设置持久化（重启不丢）
           if (Number.isInteger(z) && z >= 50 && z <= 300) {
             Config.webZoom = z
             let first = null
@@ -1756,6 +1760,7 @@ function registerIpc() {
               if (!first) first = wc
             }
             if (first) showWebZoomOverlay(first)
+            saveConfig() // 用户设置持久化：重启后仍保持该缩放
           }
           broadcastState()
           return '{}'
@@ -1774,7 +1779,7 @@ function registerIpc() {
         case 'resetDefaults': {
           // 恢复默认设置：所有选项回到默认值，窗口恢复默认尺寸与位置
           Config.zoom = systemZoom()
-          Config.webZoom = cssZoomPct()
+          Config.webZoom = defaultWebZoomPct()
           Config.theme = 'light'
           Config.notify = true
           Config.useSystemBrowser = false
@@ -2162,6 +2167,13 @@ function cssZoomPct() {
   return Math.round(Config.zoom * (IS_WIN ? 100 / 120 : 1))
 }
 
+// 对话界面默认缩放：在 cssZoomPct 基础上收敛到 100–125%
+// 锚点：系统 150% → 125%（比"通用正常物理大小"大 25%，用户品味基准，与 150% 档实测一致）；
+// 修掉旧公式两端问题：100% 系统不再 83%（缩水）、200% 系统不再 167%（物理 3.3×）。
+function defaultWebZoomPct() {
+  return Math.min(Math.max(cssZoomPct(), 100), 125)
+}
+
 // ---------- 初始化 ----------
 function init() {
   loadConfig()
@@ -2171,7 +2183,7 @@ function init() {
   applyRuntimePort(true) // 端口配置生效（启动时 CLI --port 作种子；运行时切换以 Config.port 为准）
   initEnvRuntime()
   Config.zoom = systemZoom() // 启动器缩放默认跟随系统（不持久化，每次启动重读）
-  Config.webZoom = cssZoomPct() // 对话界面缩放默认 = 独立窗口当前缩放（校正后）
+  if (!webZoomLoaded) Config.webZoom = defaultWebZoomPct() // 对话界面缩放默认：用户未设置过时用收敛默认；改过则用持久化值
   // 主题设置驱动原生标题栏与所有渲染进程的 prefers-color-scheme（tab 栏壳深色变量随之生效）
   try { nativeTheme.themeSource = Config.theme } catch { /* noop */ }
   harnessRoot = resolveHarnessRoot()
