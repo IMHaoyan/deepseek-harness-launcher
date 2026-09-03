@@ -164,14 +164,17 @@ body:not(.ready) #tabbar { visibility: hidden; }
 
 .bar-btn.hidden { display: none; }
 
-/* 白屏修复按钮：琥珀色醒目，提醒"页面空白，点击修复" */
+/* 刷新按钮：常显中性（仅符号 ↻）；页面空白时琥珀警示 */
 .bar-btn.fix {
-  color: #B45309;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+  font-size: 15px;
+  line-height: 1;
   -webkit-app-region: no-drag;
 }
-.bar-btn.fix:hover { background: #FEF3C7; }
+.bar-btn.fix.warn {
+  color: #B45309;
+  font-weight: 600;
+}
+.bar-btn.fix.warn:hover { background: #FEF3C7; }
 
 /* 窗口按钮组：贴右缘、彼此无间距、全高直角（Edge 式） */
 .win-group {

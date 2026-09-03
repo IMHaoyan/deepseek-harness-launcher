@@ -36,9 +36,9 @@ function render() {
   $('btnNew').style.display = tabsEnabled ? '' : 'none';
   $('btnSplit').style.display = tabsEnabled ? '' : 'none';
 
-  // 白屏修复按钮：活动标签为空白（加载失败）时显示
+  // 刷新按钮常显（仅符号 ↻）：页面空白时切琥珀警示态；点击 = 刷新当前页（服务没跑会自动拉起）
   const active = state.tabs.find((t) => t.id === state.activeId);
-  $('btnFix').classList.toggle('hidden', !(active && active.blank));
+  $('btnReload').classList.toggle('warn', !!(active && active.blank));
   const titleOnly = $('titleOnly');
   if (titleOnly) {
     const active = state.tabs.find((t) => t.id === state.activeId);
@@ -103,7 +103,7 @@ window.addEventListener('keydown', (e) => {
 // ---------- 按钮 ----------
 $('btnNew').addEventListener('click', () => send('tabNew'));
 $('btnSplit').addEventListener('click', () => send('splitToggle'));
-$('btnFix').addEventListener('click', () => send('fixPane', { id: state.activeId }));
+$('btnReload').addEventListener('click', () => send('fixPane', { id: state.activeId }));
 $('btnMin').addEventListener('click', () => send('winMin'));
 $('btnMax').addEventListener('click', () => send('winMax'));
 $('btnClose').addEventListener('click', () => send('winClose'));

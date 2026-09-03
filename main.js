@@ -1173,13 +1173,14 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     markBlank(false)
     injectPaneOverlay(tab)
   })
-  // 快捷键（焦点在页面内也生效）：Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右
+  // 快捷键（焦点在页面内也生效）：Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页
   wc.on('before-input-event', (_event, input) => {
     if (input.type !== 'keyDown') return
     const key = (input.key || '').toLowerCase()
     if (input.control && key === '\\') { _event.preventDefault(); webToggleSplit() }
     else if (input.control && input.key === 'Delete') { _event.preventDefault(); webCloseFocused() }
     else if (input.shift && input.alt && key === 's') { _event.preventDefault(); webSwap() }
+    else if (input.key === 'F5' || (input.control && key === 'r')) { _event.preventDefault(); webReloadFocusedPane() }
   })
   view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id, loadingParams()) : (targetUrl || WEB_URL)).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
   webActivateTab(id)
@@ -1213,8 +1214,9 @@ function injectPaneOverlay(tab) {
     var btnClose = document.createElement('button'); btnClose.id = '__dshPaneClose'; btnClose.title = '关闭此分屏'; btnClose.textContent = '\\u2715';
     var menu = document.createElement('div'); menu.id = '__dshPaneMenu';
     var swap = document.createElement('div'); swap.textContent = '切换左右分屏';
+    var reload = document.createElement('div'); reload.textContent = '刷新此页';
     var openTab = document.createElement('div'); openTab.textContent = '在新标签页中打开此网页';
-    menu.appendChild(swap); menu.appendChild(openTab);
+    menu.appendChild(swap); menu.appendChild(reload); menu.appendChild(openTab);
     bar.appendChild(btnMenu); bar.appendChild(btnClose);
     root.appendChild(bar); root.appendChild(menu);
     var host = document.body || document.documentElement;
@@ -1224,6 +1226,7 @@ function injectPaneOverlay(tab) {
     btnClose.addEventListener('click', function() { hideMenu(); send('closePane'); });
     btnMenu.addEventListener('click', function() { menu.classList.toggle('open'); });
     swap.addEventListener('click', function() { hideMenu(); send('swapPanes'); });
+    reload.addEventListener('click', function() { hideMenu(); send('fixPane', { id: '${paneId}' }); });
     openTab.addEventListener('click', function() { hideMenu(); send('paneToTab', { id: '${paneId}' }); });
     document.addEventListener('click', function(e) { if (!root.contains(e.target)) hideMenu(); }, true);
     window.addEventListener('blur', function() { hideMenu(); });
@@ -1323,6 +1326,12 @@ function webPaneToTab(id) {
   webCreateTab(url, tab.title)
   webCloseTab(id)
   webLayout()
+}
+
+// 刷新"当前聚焦页面"（无聚焦则活动标签）：F5 / Ctrl+R / 顶栏 ↻ / 分屏 ⋯ 菜单共用入口
+function webReloadFocusedPane() {
+  const id = webFocusedId || webActiveId
+  if (id) void webReloadPane(id)
 }
 
 // "修复"按钮：先确保服务在跑（没起才启动，已起不动它），再重载该标签为真实应用
@@ -1448,6 +1457,13 @@ function openWebUi(opts = {}) {
   // 壳页面缩放固定 100%（Ctrl+滚轮只作用于页面视图）
   webWin.webContents.on('zoom-changed', () => {
     try { webWin.webContents.setZoomLevel(0) } catch { /* noop */ }
+  })
+  // 焦点在壳（标签栏）时 F5 / Ctrl+R 同样刷新当前聚焦页面（默认菜单已移除，不会误触发壳重载）
+  webWin.webContents.on('before-input-event', (_event, input) => {
+    if (input.type === 'keyDown' && (input.key === 'F5' || (input.control && (input.key || '').toLowerCase() === 'r'))) {
+      _event.preventDefault()
+      webReloadFocusedPane()
+    }
   })
   attachContextMenu(webWin.webContents)
   webWin.on('resize', () => { webLayout(); scheduleSaveWebWindowState() })
@@ -2186,6 +2202,9 @@ function init() {
   if (!webZoomLoaded) Config.webZoom = defaultWebZoomPct() // 对话界面缩放默认：用户未设置过时用收敛默认；改过则用持久化值
   // 主题设置驱动原生标题栏与所有渲染进程的 prefers-color-scheme（tab 栏壳深色变量随之生效）
   try { nativeTheme.themeSource = Config.theme } catch { /* noop */ }
+  // 移除默认应用菜单：其 Ctrl+R 加速键会重载"壳窗口"而非对话页面（视图在主进程持有，壳重载≠页面刷新）。
+  // 刷新统一走 F5 / Ctrl+R（页面级）/ 顶栏 ↻ 按钮；改用前后行为一致。
+  try { Menu.setApplicationMenu(null) } catch { /* noop */ }
   harnessRoot = resolveHarnessRoot()
   loadIcons()
   fs.mkdirSync(LOG_DIR, { recursive: true })
