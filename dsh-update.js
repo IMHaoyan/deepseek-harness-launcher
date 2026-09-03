@@ -33,10 +33,12 @@ const state = {
   latest: '',
   kind: '', // 当前安装形态（source | managed | global | npx）：source 不支持自动更新，UI 按此区分
   error: '',
+  prewarmed: false, // 新版完整依赖树是否已预热进 npm/npx 缓存（点击"立即更新"可秒级完成）
 }
 
 let checking = false
 let updating = false
+let warming = null // 当前预热任务（防重入）
 let lastNotifiedVersion = '' // 同一新版本只提示一次
 
 function initDshUpdater(o) {
@@ -167,6 +169,41 @@ async function runNpxWarm(latest, nodeBin) {
   return runNpm(['exec', '--yes', '--package', `@deepseek-ai/dsh@${latest}`, '--', 'dsh', '--version'], { nodeBin })
 }
 
+// ---------- 预热缓存（发现新版本后后台执行，纯尽力而为） ----------
+// 把新版"完整依赖树"下载进 npm/npx 缓存：用户点"立即更新"时几乎不再走网络，秒级完成。
+// 失败静默（只记日志）：不影响检测/更新主流程，下次检查发现新版时会重试。
+async function warmLatest(latest, nodeBin, kind) {
+  if (warming) return warming
+  warming = (async () => {
+    try {
+      if (kind === 'npx') {
+        await runNpxWarm(latest, nodeBin)
+      } else {
+        // managed / global：临时目录完整安装（--ignore-scripts 只拉包不跑构建），npm 共享缓存被灌满全依赖树
+        const tmp = path.join(os.tmpdir(), 'dshl-dsh-warm')
+        fs.mkdirSync(tmp, { recursive: true })
+        let ok = false
+        for (const registry of registries()) {
+          const args = ['install', '--prefix', tmp, `@deepseek-ai/dsh@${latest}`, '--ignore-scripts', '--no-audit', '--no-fund']
+          if (registry) args.push('--registry', registry)
+          const r = await runNpm(args, { nodeBin, timeoutMs: 15 * 60 * 1000 })
+          if (r.ok) { ok = true; break }
+          log(`dsh-update: warm failed (registry=${registry || '默认'}): ${r.error}`)
+        }
+        if (!ok) throw new Error('npm 预热失败')
+      }
+      log(`dsh-update: warm cached v${latest} (kind=${kind})`)
+      setState({ prewarmed: true })
+    } catch (err) {
+      log('dsh-update: warm error: ' + (err && err.message ? err.message : String(err)))
+      setState({ prewarmed: false })
+    } finally {
+      warming = null
+    }
+  })()
+  return warming
+}
+
 function waitForJob() {
   return new Promise((resolve) => {
     const t0 = Date.now()
@@ -220,7 +257,10 @@ async function checkOnce(reason, force) {
     setState({ current, latest: latest.version, kind: plan.kind })
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
       log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, reason=${reason || 'timer'})`)
-      setState({ status: 'available' })
+      const newVersionSeen = state.latest !== latest.version
+      setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false } : {}))
+      // 后台预热缓存（不阻塞检测）：点"立即更新"时依赖树已在 npm/npx 缓存里，秒级完成
+      if (!state.prewarmed) void warmLatest(latest.version, plan.nodeCmd, plan.kind)
       if (lastNotifiedVersion !== latest.version) {
         lastNotifiedVersion = latest.version
         notify('DeepSeek Harness', plan.kind === 'source'

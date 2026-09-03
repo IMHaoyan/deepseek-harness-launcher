@@ -805,7 +805,10 @@ function renderUpdater(u) {
   // 主页面最低端"启动器版本"行：检测到更新时同行显示"更新到 vX"按钮
   const updateBtn = $('btnUpdateNow');
   updateBtn.classList.toggle('hidden', !hasUpdate);
-  if (hasUpdate) updateBtn.textContent = `更新到 v${u.latest}`;
+  updateBtn.disabled = u.status === 'downloading'; // 下载中禁用：此时点它只会"重新检查"，误导用户
+  updateBtn.classList.toggle('update-ready', u.status === 'downloaded'); // 只对"已就绪"用绿色强调
+  if (u.status === 'downloading') updateBtn.textContent = `下载中 ${u.percent || 0}%…`;
+  else if (hasUpdate) updateBtn.textContent = `更新到 v${u.latest}`;
   // 悬停"检查更新"按钮：有可用更新时隐藏（避免与"更新到 vX"并存）；检查中显示"检查中…"并禁用
   const hoverCheck = $('btnUpCheckNow');
   if (hoverCheck) {
@@ -825,9 +828,11 @@ function renderUpdater(u) {
     flashVersionHint(rowHint, text, text === '检查更新失败' ? (u.error || '') : '', 'upd');
   }
 
-  // 有更新时"检查更新"按钮变形为绿色"更新到 vX"
-  checkBtn.textContent = hasUpdate ? `更新到 v${u.latest}` : '检查更新';
-  checkBtn.classList.toggle('update-ready', hasUpdate);
+  // 有更新时"检查更新"按钮变形为绿色"更新到 vX"（下载中则显示进度并禁用）
+  checkBtn.textContent = u.status === 'downloading' ? `下载中 ${u.percent || 0}%…`
+    : hasUpdate ? `更新到 v${u.latest}`
+    : '检查更新';
+  checkBtn.classList.toggle('update-ready', u.status === 'downloaded');
 
   switch (u.status) {
     case 'dev':
@@ -914,7 +919,9 @@ function renderDshUpdate(u) {
       } else if (status === 'available') {
         btn.disabled = false;
         btn.textContent = '立即更新';
-        btn.title = `新版本 v${latest} 可用：点击后约 1 分钟完成（会重启服务，进行中的对话会中断）`;
+        btn.title = u.prewarmed
+          ? `新版本 v${latest} 可用（缓存已预热）：点击后约 10 秒完成（会重启服务，进行中的对话会中断）`
+          : `新版本 v${latest} 可用：点击后约 1-2 分钟完成（会重启服务，进行中的对话会中断）`;
       } else if (status === 'updating') {
         btn.disabled = true;
         btn.textContent = '更新中…';
@@ -966,7 +973,7 @@ function renderDshUpdate(u) {
     let text = '';
     if (status === 'checking') text = '正在检查更新…';
     else if (status === 'available' && isSource) text = `发现新版本 v${latest}：当前为源码安装，启动器不自动更新——请打开源码目录执行 git pull && pnpm run build，构建完成后重启服务生效`;
-    else if (status === 'available') text = `发现新版本 v${latest}：点"更新到 v${latest}"立即更新（约 1 分钟，会重启服务）`;
+    else if (status === 'available') text = `发现新版本 v${latest}：点"更新到 v${latest}"立即更新（${u.prewarmed ? '缓存已预热，约 10 秒' : '约 1-2 分钟'}，会重启服务）`;
     else if (status === 'updating') text = `正在更新 v${latest}…（完成后自动重启服务）`;
     else if (status === 'updated') text = `已更新到 v${u.current}`;
     else if (status === 'up-to-date') text = '已是最新版本';

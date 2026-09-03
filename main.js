@@ -2270,10 +2270,12 @@ function init() {
       log('dev: panel hot reload enabled (npm run dev)')
     } catch (err) { log('dev: hot reload watch failed: ' + (err && err.message ? err.message : String(err))) }
   }
-  // 启动后 20 秒静默检查一次更新（仅打包版；开发模式跳过）
-  setTimeout(() => updater.autoCheck(), 20000)
-  // DSH 更新检查：启动后 30 秒首次，此后每 6 小时尝试一次（模块内部 24 小时节流；只检测、绝不自动更新）
-  setTimeout(() => { void dshUpdater.checkOnce('startup') }, 30000)
+  // 启动后 10 秒静默检查启动器更新（仅打包版；轻量只读 GitHub latest.yml，10s 避开新窗口弹出瞬间即可，开发模式跳过）
+  setTimeout(() => updater.autoCheck(), 10000)
+  // DSH 更新检查：启动后 15 秒首次（此时环境探测/服务启动均已完成，检测越早用户越早看到新版提示），
+  // 此后每 6 小时一次（模块内 24h 节流；只检测绝不自动更新）
+  // 发现新版后由 dsh-update.warmLatest 立即后台预热缓存，用户点"立即更新"时秒级完成
+  setTimeout(() => { void dshUpdater.checkOnce('startup') }, 15000)
   setInterval(() => { void dshUpdater.checkOnce('timer') }, 6 * 60 * 60 * 1000)
 }
 
