@@ -19,7 +19,7 @@ const { spawn, execFile } = require('child_process')
 const IS_WIN = process.platform === 'win32'
 
 let HOME = path.join(os.homedir(), '.dsh')
-let Config = { nodeMajor: 22, dshVersion: '0.1.0-rc.6', npmRegistry: '' }
+let Config = { nodeMajor: 22, dshVersion: 'latest', npmRegistry: '' }
 let ASSETS_DIR = ''
 let logFn = () => {}
 let onPushFn = () => {}
@@ -497,7 +497,7 @@ async function npmInstallTo(job, nodeBin, prefix, spec) {
 // 全局 npm 安装：npm i -g --prefix <全局根> @deepseek-ai/dsh@<ver>（npmmirror 优先、官方回退）
 // 返回全局根（<root>/node_modules/@deepseek-ai/dsh 即安装处）；已装同版本时跳过
 async function installDshGlobal(job, nodeBin, globalRoot) {
-  const version = (job.opts && job.opts.dshVersion) || Config.dshVersion || '0.1.0-rc.6'
+  const version = (job.opts && job.opts.dshVersion) || Config.dshVersion || 'latest' // 无指定版本一律装 latest（首次安装不落老版本）
   const spec = version === 'latest' ? '@deepseek-ai/dsh' : `@deepseek-ai/dsh@${version}`
   const pkgDir = path.join(globalRoot, 'node_modules', '@deepseek-ai', 'dsh')
   const binPath = path.join(pkgDir, 'lib', 'bin.js')
@@ -581,7 +581,7 @@ async function installDshManaged(job, nodeBin) {
   const dshDir = path.join(runtimeBase(), 'dsh')
   const freshDir = path.join(runtimeBase(), 'dsh-new')
   const oldDir = path.join(runtimeBase(), 'dsh-old')
-  const version = (job.opts && job.opts.dshVersion) || Config.dshVersion || '0.1.0-rc.6'
+  const version = (job.opts && job.opts.dshVersion) || Config.dshVersion || 'latest' // 无指定版本一律装 latest（首次安装不落老版本）
   const spec = version === 'latest' ? '@deepseek-ai/dsh' : `@deepseek-ai/dsh@${version}`
   try { fs.rmSync(freshDir, { recursive: true, force: true }) } catch { /* noop */ }
   try { fs.rmSync(oldDir, { recursive: true, force: true }) } catch { /* noop */ }

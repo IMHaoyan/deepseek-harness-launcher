@@ -19,7 +19,7 @@ const CACHE_MS = 30000
 const IS_WIN = process.platform === 'win32'
 
 let HOME = path.join(os.homedir(), '.dsh') // 始终为真实用户 HOME（安装物/插件都落在真实 HOME）
-let Config = { harnessRoot: '', nodePath: '', dshVersion: '0.1.0-rc.6', nodeMajor: 22 }
+let Config = { harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22 }
 let logFn = () => {}
 let FRESH_TEST = false // DSHL_FRESH_TEST=1：模拟全新机器（无视系统级 node/源码仓库/全局/npx 缓存，只认托管安装）
 
