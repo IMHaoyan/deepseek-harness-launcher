@@ -8,6 +8,7 @@
 const { spawn } = require('child_process')
 const path = require('path')
 const fs = require('fs')
+const os = require('os')
 const semver = require('semver')
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000 // 检查节流：24 小时
@@ -152,14 +153,17 @@ async function fetchLatest(nodeBin) {
   return null
 }
 
-async function runGlobalUpdate(nodeBin, globalRoot) {
+// 全局 npm 更新：npm i -g --prefix <全局根> @deepseek-ai/dsh@<版本>（npmmirror 优先、官方回退）
+// 用 install + 显式版本（而非 npm update）：幂等且指定精确目标版本，失败重试不会留下"半套"文件；
+// 超时给足 25 分钟（慢速网络全量依赖树约 13 分钟，90s 默认超时会永远杀不掉大下载）。
+async function runGlobalUpdate(nodeBin, globalRoot, version) {
   for (const registry of registries()) {
-    const args = ['update', '-g', '--prefix', globalRoot, '@deepseek-ai/dsh']
+    const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund']
     if (registry) args.push('--registry', registry)
     // 用当前环境 npm（用户级/系统均可）并显式指定全局根，确保落在与 npm i -g 相同的目录
-    const r = await runNpm(args, { nodeBin })
+    const r = await runNpm(args, { nodeBin, timeoutMs: 25 * 60 * 1000 })
     if (r.ok) return r
-    log(`dsh-update: npm update -g 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
+    log(`dsh-update: npm install -g 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
   }
   return { ok: false, error: '全局更新失败' }
 }
@@ -296,14 +300,13 @@ async function updateNow() {
     const latest = state.latest || ''
     if (!latest) throw new Error('没有待更新的版本')
 
-    const svc = getServerState ? getServerState() : { running: false, owned: false }
+    const svc = getServerState ? getServerState() : { running: false }
     const wasRunning = svc.running
-    const owned = svc.owned
 
     if (plan.kind === 'managed') {
       // 托管形态：更新走统一引擎（内部优先全局 npm，失败回退托管），失败旧版不动
       if (loadWebTabs) loadWebTabs('update') // 页面切"正在更新…"说明页，避免更新期间白屏
-      if (wasRunning && owned) {
+      if (wasRunning) {
         log('dsh-update: stopping service before update')
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
       }
@@ -313,7 +316,7 @@ async function updateNow() {
         if (status !== 'done') throw new Error(`更新任务未完成（${status}）`)
       } catch (err) {
         log(`dsh-update: managed update failed: ${err.message}`)
-        if (wasRunning && owned) {
+        if (wasRunning) {
           try { await startService() } catch { /* noop */ } // 旧版完好，直接拉回
           if (reloadWebTabs) reloadWebTabs() // 强制重载，把白屏/说明页拉回旧版页面
         }
@@ -335,14 +338,14 @@ async function updateNow() {
       // 旧进程+新文件会触发 DSH HMR 导致页面白屏且无自愈路径）；
       // 更新期间窗口显示"正在更新…"说明页（带进度条），完成后强制重载为新版页面
       if (loadWebTabs) loadWebTabs('update')
-      if (wasRunning && owned) {
+      if (wasRunning) {
         log('dsh-update: stopping service before global update')
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
       }
       const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
-      const r = await runGlobalUpdate(plan.nodeCmd, globalRoot)
+      const r = await runGlobalUpdate(plan.nodeCmd, globalRoot, latest)
       if (!r.ok) {
-        if (wasRunning && owned) {
+        if (wasRunning) {
           try { await startService() } catch { /* noop */ } // 旧版完好，直接拉回
           if (reloadWebTabs) reloadWebTabs()
         }
@@ -351,7 +354,7 @@ async function updateNow() {
     } else if (plan.kind === 'npx') {
       // npx 缓存：先迁移到全局 npm（统一渠道），失败回退 npx 预热
       if (loadWebTabs) loadWebTabs('update')
-      if (wasRunning && owned) {
+      if (wasRunning) {
         log('dsh-update: stopping service before migrate')
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
       }
@@ -365,7 +368,7 @@ async function updateNow() {
         log(`dsh-update: migrate-to-global failed, fallback npx warm: ${err.message}`)
         const r = await runNpxWarm(latest, plan.nodeCmd)
         if (!r.ok) {
-          if (wasRunning && owned) {
+          if (wasRunning) {
             try { await startService() } catch { /* noop */ }
             if (reloadWebTabs) reloadWebTabs()
           }
@@ -375,7 +378,7 @@ async function updateNow() {
       if (!migrated) {
         // 回退成功：npx 预热后重新探测即可命中缓存新版本
         try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
-        if (wasRunning && owned) {
+        if (wasRunning) {
           try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
           if (reloadWebTabs) reloadWebTabs()
         }
@@ -394,9 +397,9 @@ async function updateNow() {
       throw new Error(`当前安装形态（${plan.kind}）不支持更新`)
     }
 
-    // 重新探测 + 恢复服务（旧版已停止，拉起的是新版）
+    // 重新探测 + 恢复服务（旧版已停止，拉起的是新版；含"已接管"服务——更新前已统一停掉）
     try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
-    if (wasRunning && owned) {
+    if (wasRunning) {
       try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
       if (reloadWebTabs) reloadWebTabs() // 强制重载：新版页面替换旧会话，杜绝残留白屏
     } else if (loadWebTabs) {
@@ -416,4 +419,4 @@ async function updateNow() {
   }
 }
 
-module.exports = { initDshUpdater, checkOnce, updateNow, getState }
+module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest }
