@@ -390,9 +390,17 @@ const server = {
   stopping: false,
   blockedReason: '',
   suggestedPort: 0,
+  launchUrl: null, // 本轮服务 stdout 打印的访问地址（新 DSH 带一次性 token，形如 ?token=xxx）；null=未知/无鉴权
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
   running() { return this.owned() || (this.adoptedPid !== 0 && this.adoptedAlive) },
   displayPid() { return this.owned() ? this.child.pid : this.adoptedPid },
+}
+
+// WebUI 应加载的地址：新 DSH（v0.1.2-rc.1 起）每次启动生成一次性 launch token，
+// 首次访问带 token 的地址才能换取浏览器 cookie（默认 30 天），之后裸地址凭 cookie 也可用。
+// 有 token 就带 token 加载（顺带续期），没有（旧版 DSH / 外部接管服务看不到其 stdout）退回裸地址。
+function uiUrl() {
+  return server.launchUrl || WEB_URL
 }
 
 // 服务阶段（供 WebUI 壳/说明页展示）：starting=正在启动 / restarting=看护重启中 / ready=就绪 / stopped=未运行
@@ -515,7 +523,8 @@ function probeDsh() {
     sock.once('close', () => {
       if (settled) return
       const text = Buffer.concat(buf).toString('utf8')
-      done(/DeepSeek Harness/i.test(text), 'fingerprint')
+      // 新版 DSH 对裸地址直接回 401 鉴权页（"dsh web authentication required..."），同样计为指纹命中
+      done(/DeepSeek Harness|dsh web authentication required/i.test(text), 'fingerprint')
     })
   })
 }
@@ -530,6 +539,7 @@ async function startServer() {
     if (probe.ok) {
       server.adoptedPid = await findListenPid()
       server.adoptedAlive = server.adoptedPid !== 0
+      server.launchUrl = null // 外部启动的服务看不到其 stdout，拿不到 launch token，只能靠既有 cookie 访问
       log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
       return true
     }
@@ -573,6 +583,7 @@ async function startServer() {
   const noOpen = (() => { try { return semver.gte(dshVer, '0.1.0-rc.8', { includePrerelease: true }) } catch { return false } })()
   const spawnArgs = [plan.dshBin, 'web', '--host', HOST, '--port', String(PORT)]
   if (noOpen) spawnArgs.push('--no-open')
+  server.launchUrl = null // 新进程的 launch token 只在本轮 stdout 中出现
   let child
   try {
     child = spawn(nodeCmd, spawnArgs, {
@@ -589,7 +600,32 @@ async function startServer() {
   rotateFileSync(ERR_LOG)
   const outS = fs.createWriteStream(OUT_LOG, { flags: 'a' })
   const errS = fs.createWriteStream(ERR_LOG, { flags: 'a' })
-  child.stdout.on('data', (d) => { try { outS.write(d) } catch { /* noop */ } })
+  // 解析 dsh web 启动时打印的访问地址：新 DSH（v0.1.2-rc.1 起）每次启动生成一次性
+  // launch token（"dsh web: http://127.0.0.1:4399/?token=xxx"），页面须带 token 首次访问
+  // 换取浏览器 cookie（默认 30 天）。捕获后立即刷新 WebUI：首次加载可能早于本行到达而
+  // 停在鉴权页/空白，由 refreshWebUiOnReady 与 did-finish-load 鉴权兜底补上。
+  let launchBuf = ''
+  child.stdout.on('data', (d) => {
+    try { outS.write(d) } catch { /* noop */ }
+    launchBuf = (launchBuf + String(d)).slice(-8192)
+    let nl
+    while ((nl = launchBuf.indexOf('\n')) >= 0) {
+      const line = launchBuf.slice(0, nl).trim()
+      launchBuf = launchBuf.slice(nl + 1)
+      const m = line.match(/dsh web:\s*(https?:\/\/[^\s]+)/)
+      if (!m) continue
+      let launchUrl
+      try {
+        launchUrl = new URL(m[1])
+        const hostOk = launchUrl.hostname === HOST || launchUrl.hostname === 'localhost'
+        const portOk = (launchUrl.port === '' ? (launchUrl.protocol === 'https:' ? '443' : '80') : launchUrl.port) === String(PORT)
+        if (!hostOk || !portOk || !launchUrl.searchParams.has('token')) continue // 只认本机当前端口的带 token 地址
+      } catch { continue }
+      server.launchUrl = launchUrl.href
+      log('captured dsh web launch URL (token auth page)')
+      if (server.running()) void refreshWebUiOnReady(false) // 加载早于本行到达的标签会停在鉴权页/空白，立即补拉
+    }
+  })
   child.stderr.on('data', (d) => { try { errS.write(d) } catch { /* noop */ } })
   child.__starting = true
   child.on('exit', (code, signal) => {
@@ -597,6 +633,7 @@ async function startServer() {
     try { errS.end() } catch { /* noop */ }
     if (server.child !== child) return
     server.child = null
+    server.launchUrl = null // 新一轮服务的 token 只在新一轮 stdout 里，旧 token 作废
     if (server.stopping) return
     if (child.__starting) return // 启动阶段退出由 startServer 的等待循环报告失败
     log(`DSH exited unexpectedly (code ${code}${signal ? ', signal ' + signal : ''})`)
@@ -678,7 +715,7 @@ async function restartServerOnNewPort() {
   if (ok) {
     for (const t of webTabs) {
       const wc = t.view && t.view.webContents
-      if (wc && !wc.isDestroyed()) { try { wc.loadURL(WEB_URL) } catch { /* noop */ } }
+      if (wc && !wc.isDestroyed()) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } }
     }
   }
   return ok
@@ -982,7 +1019,7 @@ let webSeq = 0
 function isPageBlank(wc) {
   try {
     return wc.executeJavaScript(
-      "document.title === '' || !document.body || document.body.innerHTML.length < 10",
+      "document.title === '' || !document.body || document.body.innerHTML.length < 10 || (document.body.innerText || '').indexOf('authentication required') >= 0",
     ).catch(() => true)
   } catch { return Promise.resolve(true) }
 }
@@ -1172,6 +1209,20 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     try { wc.setZoomFactor(Config.webZoom / 100) } catch { /* noop */ }
     markBlank(false)
     injectPaneOverlay(tab)
+    // 鉴权兜底：新 DSH 的 401 提示页（"dsh web authentication required..."），首屏加载早于
+    // token 捕获时会停在上面 → 换带 token 地址重载换取 cookie（页面较长的正常应用不会命中）
+    if (server.launchUrl) {
+      const url = wc.getURL() || ''
+      if ((url.startsWith(WEB_URL) || url === WEB_URL) && !url.includes('token=')) {
+        try {
+          wc.executeJavaScript("(function(){var b=document.body;return !!(b&&b.innerText.indexOf('authentication required')>=0&&b.innerText.length<300)})()")
+            .then((hit) => {
+              if (hit && !wc.isDestroyed()) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } }
+            })
+            .catch(() => { /* noop */ })
+        } catch { /* noop */ }
+      }
+    }
   })
   // 快捷键（焦点在页面内也生效）：Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页
   wc.on('before-input-event', (_event, input) => {
@@ -1182,7 +1233,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     else if (input.shift && input.alt && key === 's') { _event.preventDefault(); webSwap() }
     else if (input.key === 'F5' || (input.control && key === 'r')) { _event.preventDefault(); webReloadFocusedPane() }
   })
-  view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id, loadingParams()) : (targetUrl || WEB_URL)).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
+  view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id, loadingParams()) : (targetUrl || uiUrl())).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
   webActivateTab(id)
   return tab
 }
@@ -1275,7 +1326,7 @@ function webToggleSplit() {
     } else if (webActiveId) {
       // 单标签分屏（Edge 行为）：复制当前页作为右分屏，原页保持左侧
       const cur = webTabs.find((t) => t.id === webActiveId)
-      let url = WEB_URL
+      let url = uiUrl()
       try {
         const u = cur.view.webContents.getURL()
         if (u && u !== '' && !u.startsWith('about:')) url = u
@@ -1315,7 +1366,7 @@ function webSwap() {
 function webPaneToTab(id) {
   const tab = webTabs.find((t) => t.id === id)
   if (!tab || !webSplitOn || (id !== webActiveId && id !== webRightId)) return
-  let url = WEB_URL
+  let url = uiUrl()
   try {
     const u = tab.view.webContents.getURL()
     if (u && u !== '' && !u.startsWith('about:')) url = u
@@ -1347,7 +1398,7 @@ async function webReloadPane(id) {
   if (!server.running()) await handleStart()
   const phase = servicePhase()
   // 就绪 → 真实页面；未就绪 → 状态说明页（说明 + 刷新按钮）；自检模式保持原逻辑
-  const url = (SELF_TEST || phase === 'ready') ? WEB_URL : loadingUrl(reasonForPhase(phase), tab.id, loadingParams())
+  const url = (SELF_TEST || phase === 'ready') ? uiUrl() : loadingUrl(reasonForPhase(phase), tab.id, loadingParams())
   try { wc.loadURL(url) } catch { /* noop */ }
 }
 
@@ -1393,9 +1444,10 @@ function scheduleSaveWebWindowState() {
 function openWebUi(opts = {}) {
   log('open DeepSeek Harness window (systemBrowser=' + Config.useSystemBrowser + ')')
   stopFlash() // 任何"打开"动作都视为已读提醒
-  // 设置项"使用系统浏览器打开DSH"开启 → 交给系统默认浏览器（每次新开标签页）
+  // 设置项"使用系统浏览器打开DSH"开启 → 交给系统默认浏览器（每次新开标签页）；
+  // 带 token 地址首次访问才能在浏览器侧换取 cookie
   if (Config.useSystemBrowser) {
-    try { shell.openExternal(WEB_URL) } catch { /* noop */ }
+    try { shell.openExternal(uiUrl()) } catch { /* noop */ }
     return
   }
   if (webWin && !webWin.isDestroyed()) {
@@ -1500,7 +1552,7 @@ async function refreshWebUiOnReady(force = false) {
     const wc = t.view.webContents
     if (wc.isDestroyed()) continue
     if (force || (wc.getURL() || '').includes('loading.html') || await isPageBlank(wc)) {
-      try { wc.loadURL(WEB_URL) } catch { /* noop */ }
+      try { wc.loadURL(uiUrl()) } catch { /* noop */ }
     }
   }
 }
@@ -1748,7 +1800,7 @@ function registerIpc() {
         case 'start': await handleStart(); return '{}'
         case 'stop': await stopServer(); notify('DeepSeek Harness', '服务已停止'); broadcastState(); return '{}'
         case 'openWeb': openDshOrPanel(); return '{}' // 环境未就绪/端口被占用时自动改打开启动器面板
-        case 'openUrlExternal': try { shell.openExternal(WEB_URL) } catch { /* noop */ } return '{}'
+        case 'openUrlExternal': try { shell.openExternal(uiUrl()) } catch { /* noop */ } return '{}'
         case 'openNpmDsh': try { shell.openExternal('https://www.npmjs.com/package/@deepseek-ai/dsh') } catch { /* noop */ } return '{}'
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
         case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
@@ -2116,7 +2168,7 @@ async function runSelfTest() {
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用
-    await wc.loadURL(WEB_URL).catch(() => { /* 服务已停，预期失败 */ })
+    await wc.loadURL(uiUrl()).catch(() => { /* 服务已停，预期失败 */ })
     await sleep(1500)
     if (!(await isPageBlank(wc))) { selftestPrint('FAILED: webview not blank while service down'); app.exit(2); return }
     selftestPrint('WEBUI OK: blank page while service down')
