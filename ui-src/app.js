@@ -276,11 +276,13 @@ function render(state) {
   $('urlText').textContent = state.url || '-';
   window._currentUrl = state.url || '';
 
-  // 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示）
+  // 稳定性提示：上次未正常退出 / 已自动回退配置（可关闭；同一次崩溃关掉后不再重复提示）
   const crashEl = $('crashNote');
   if (crashEl) {
     const notes = [];
-    if (state.lastExit === 'crashed') {
+    // crashNotice 由主进程按「该次崩溃是否已被关闭」下发；缺省时按 lastExit 兜底（兼容旧状态）
+    const showCrash = state.crashNotice !== undefined ? !!state.crashNotice : state.lastExit === 'crashed';
+    if (showCrash && state.lastExit === 'crashed') {
       notes.push(`上次启动器未正常退出（最近一次启动 ${state.lastCrashAt || '未知时间'}），诊断报告已保存到日志目录`);
     }
     if (state.recoveredAt) {
@@ -769,6 +771,12 @@ $('urlText').addEventListener('click', () => {
 // DSH 版本行：点击打开 npm 官方页面
 $('dshVersion').addEventListener('click', () => cmd('openNpmDsh'));
 $('btnToggle').addEventListener('click', () => cmd(window._running ? 'stop' : 'start'));
+// 崩溃提示卡「知道了」：主进程记账后立即隐藏（同一次崩溃不再重复提示）
+$('btnCrashNoteClose').addEventListener('click', async () => {
+  await cmd('ackCrashNotice');
+  const el = $('crashNote');
+  if (el) el.classList.add('hidden');
+});
 $('btnTest').addEventListener('click', () => cmd('testNotify'));
 $('btnLogs').addEventListener('click', () => showPage('log'));
 $('btnBack').addEventListener('click', () => showPage('main'));

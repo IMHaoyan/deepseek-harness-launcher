@@ -616,6 +616,23 @@ body {
 /* 主页面环境警示卡 */
 .env-warning { border-color: rgba(236, 19, 19, 0.35); }
 
+/* 崩溃提示卡：文案 + 右侧「知道了」按钮 */
+.crash-note-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.crash-note-row .env-warn-title {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.crash-note-row .btn {
+  flex: none;
+}
+
 .env-warn-title {
   font-size: 14px;
   font-weight: 500;

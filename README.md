@@ -175,7 +175,7 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - **日志轮转**：`dshl.log` 与 `server.{out,err}.log` 超过 1MB 自动转存 `.1/.2/.3`，保留最近 3 份。
 - **托盘闪烁不自动停**：通知触发的图标闪烁持续到点击托盘/打开窗口为止，不错过提醒。
 - **稳定性机制（v1.1.7+，借鉴 dsh-desktop 的主流做法）**：
-  - **活跃运行证据**：每次启动写 `~/.dsh/dshl-logs/active-run.json`（owner token + 原子写入）；托盘正常退出/受控退出删除标记；下次启动发现残留 = 上次非受控退出（强杀/崩溃），立即弹通知并自动生成**诊断报告**（脱敏后保存到 `~/.dsh/dshl-logs/diagnostics/diag-*.md`，保留 3 份；面板"查看日志"可打开，设置/反馈流程同样可用）；
+  - **活跃运行证据**：每次启动写 `~/.dsh/dshl-logs/active-run.json`（owner token + 原子写入）；托盘正常退出/受控退出删除标记；下次启动发现残留 = 上次非受控退出（强杀/崩溃），弹一次通知 + 面板顶部警示卡，并自动生成**诊断报告**（脱敏后保存到 `~/.dsh/dshl-logs/diagnostics/diag-*.md`，保留 3 份）；警示卡带「知道了」按钮，关掉后**同一次崩溃不再重复提示**，只有再次发生新的崩溃才重新提醒。开发模式热重启（`npm run dev` / F5）由 `tools/dev.mjs` 写 `.dev-restart.json` 标记，不会被误判为崩溃；
   - **日志脱敏**：所有落盘日志（`dshl.log`、反馈正文、诊断报告）统一脱敏——`sk-` 风格 key、JWT、长 hex/base64 token、Authorization/Bearer/Basic/token 鉴权头（含多值 Cookie）、URL 内联凭据、敏感 query 值；`server.out/err.log` 是子进程原文落盘，反馈正文在发送前统一过 `redact()`（含 DSH 的一次性 launch token）；
   - **启动中状态**：面板状态行区分「正在启动服务… / 服务正在自动重启… / 运行中 / 已停止」（`state.phase`），启动期间「启动/停止服务」按钮禁用；就绪超时（60 秒）会强杀卡住的子进程并如实报失败，不再留下"进程活着但永远显示正在启动"的状态；
   - **生命周期事件**：`~/.dsh/dshl-logs/lifecycle.jsonl`（有界 JSONL：单条 8KB、文件 256KB 丢最旧行）记录 启动/环境/服务/更新/恢复 关键节点，配合日志定位"卡在哪一步"；

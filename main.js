@@ -88,7 +88,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '', crashNoticeSeen: '', crashNoticeDismissed: '' }
 let firstRun = false
 let harnessRoot = ''
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
@@ -331,6 +331,9 @@ function applyConfigJson(cfg) {
   if (Number.isInteger(cfg.webZoom) && cfg.webZoom >= 50 && cfg.webZoom <= 300) { Config.webZoom = cfg.webZoom; webZoomLoaded = true }
   if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
   if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
+  // 崩溃提示的"已读/已关闭"记账：按上次崩溃的启动时间戳去重，避免同一条提示每次开面板都出现
+  if (typeof cfg.crashNoticeSeen === 'string') Config.crashNoticeSeen = cfg.crashNoticeSeen
+  if (typeof cfg.crashNoticeDismissed === 'string') Config.crashNoticeDismissed = cfg.crashNoticeDismissed
 }
 
 function loadConfig() {
@@ -1846,6 +1849,8 @@ function stateJson() {
     // 稳定性状态（面板"上次未正常退出/已回退配置"提示用）
     lastExit: runGuardHandle ? (runGuardHandle.previousRun ? 'crashed' : 'clean') : 'unknown',
     lastCrashAt: (runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt) || '',
+    // 是否还要展示崩溃提示：该次崩溃已被用户"知道了/关闭"过就不再重复打扰
+    crashNotice: !!(runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt !== Config.crashNoticeDismissed),
     recoveredAt: lastRecoveryAt || '',
     autoRestartStopped: autoRestartStopped,
     diagnosticsDir: DIAG_DIR,
@@ -2131,6 +2136,8 @@ function registerIpc() {
           Config.panelHideNotified = false
           Config.balanceApiKey = ''
           Config.balanceBaseUrl = ''
+          Config.crashNoticeSeen = ''
+          Config.crashNoticeDismissed = ''
           applyRuntimePort()
           // 端口复位到默认 3080：若自己拉起的服务跑在自定义端口，重启到默认端口并重载页面
           if (PORT !== portBefore && server.owned()) await restartServerOnNewPort()
@@ -2238,6 +2245,14 @@ function registerIpc() {
           return JSON.stringify({ ok: !!file, file })
         }
         case 'openDiagnosticsDir': try { shell.openPath(DIAG_DIR) } catch { /* noop */ } return '{}'
+        case 'ackCrashNotice': {
+          // 用户点击崩溃提示的「知道了/×」：按该次崩溃的启动时间戳记账，之后不再重复提示
+          const at = (runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt) || ''
+          Config.crashNoticeDismissed = at
+          try { saveConfig() } catch { /* noop */ }
+          broadcastState()
+          return JSON.stringify({ ok: true, at })
+        }
         case 'openDshDir': { // 源码形态"手动更新"：打开源码仓库目录
           const dir = envReport && envReport.dsh && envReport.dsh.dir
           if (dir) {
@@ -2628,6 +2643,22 @@ function init() {
     })
     if (runGuardHandle && !runGuardHandle.previousRun) log('run-guard: clean previous exit')
   } catch (err) { log('run-guard begin failed: ' + err.message) }
+  // 开发者热重启（tools/dev.mjs 写 .dev-restart.json 后强杀）：这次退出是"预期"的，
+  // 不算崩溃证据，避免每次改主进程代码都弹一次崩溃提示卡 + 生成诊断报告。
+  try {
+    const devMarker = path.join(LOG_DIR, '.dev-restart.json')
+    if (fs.existsSync(devMarker)) {
+      const info = JSON.parse(fs.readFileSync(devMarker, 'utf8'))
+      fs.unlinkSync(devMarker)
+      const prevPid = runGuardHandle && runGuardHandle.previousRun ? runGuardHandle.previousRun.pid : 0
+      if (info && (!info.pid || !prevPid || Number(info.pid) === Number(prevPid))) {
+        runGuardHandle.previousRun = undefined
+        log(`run-guard: dev restart detected (prev PID ${info.pid || '?'}), crash evidence ignored`)
+      } else {
+        log('run-guard: dev restart marker found but PID mismatch, keeping crash evidence')
+      }
+    }
+  } catch (err) { log('run-guard: dev marker check failed: ' + (err && err.message ? err.message : String(err))) }
   lifecycle.initLifecycle({ dir: LOG_DIR, log })
   health.initHealth({ configPath: CONFIG_PATH, snapshotDir: path.join(HOME, 'dshl', 'health-snapshots'), log })
   diagnostics.initDiagnostics({ dir: DIAG_DIR, log })
@@ -2649,8 +2680,14 @@ function init() {
       ? { unreadable: true }
       : { pid: prev.pid, startedAt: prev.startedAt, version: prev.version }))
     if (!SELF_TEST) saveCrashDiagnostics()
-    if (!SELF_TEST && Config.notify) {
-      notify('DeepSeek Harness Launcher', `上次启动器未正常退出：诊断报告已保存（${DIAG_DIR}），可交给开发者排查`)
+    // 每次崩溃都会重新提示一次（按该次崩溃的启动时间戳去重，用户关掉后不再重复）
+    if (prev.startedAt && prev.startedAt !== Config.crashNoticeSeen) {
+      Config.crashNoticeSeen = prev.startedAt
+      Config.crashNoticeDismissed = ''
+      try { saveConfig() } catch { /* noop */ }
+      if (!SELF_TEST && Config.notify) {
+        notify('DeepSeek Harness Launcher', `上次启动器未正常退出：诊断报告已保存（${DIAG_DIR}），可交给开发者排查`)
+      }
     }
   }
   // 自动更新（electron-updater → GitHub Releases）：状态推送走 dsh:updater，下载完成弹通知 + 托盘闪烁
@@ -2746,6 +2783,13 @@ app.on('before-quit', () => {
 }) // 覆盖更新安装等非托盘路径的退出
 app.on('window-all-closed', () => { /* 托盘常驻，不退出 */ })
 app.on('activate', () => openDshOrPanel()) // macOS Dock 点击
+// 开发者热重启（tools/dev.mjs 用 taskkill /F 结束进程）与其它受控终止：收到 SIGTERM 后先清理
+// active-run 标记再退出，否则每次热重启都会在下次启动被当成"上次非正常退出"，弹出崩溃提示。
+process.on('SIGTERM', () => {
+  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
+  try { lifecycle.emit('app.exit', { reason: 'sigterm' }) } catch { /* noop */ }
+  app.quit()
+})
 process.on('uncaughtException', (err) => {
   // 只记录，不清理 active-run marker：本进程未受控退出（随后可能被系统/用户强杀），
   // marker 必须留下作为"上次非正常退出"的证据，交给下次启动弹通知 + 自动收集诊断报告。

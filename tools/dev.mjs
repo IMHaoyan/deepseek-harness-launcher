@@ -78,14 +78,23 @@ let electron = null
 let running = true
 let restartTimer = null
 
+// 结束当前 electron（热重启 / Ctrl+C）：
+// 先写"预期重启"标记，让下一个实例知道这次退出是开发者主动触发的（否则会被判成"上次非正常退出"，
+// 弹出崩溃提示卡 + 生成诊断报告）；再尽力优雅终止，最后强杀兜底。
+// 注：Windows 的 taskkill 无法可靠投递 SIGTERM，所以不依赖信号，用标记文件通信。
 function killElectron() {
   const child = electron
   electron = null
   if (!child || !child.pid) return
+  try {
+    writeFileSync(join(homedir(), '.dsh', 'dshl-logs', '.dev-restart.json'), JSON.stringify({ pid: child.pid, at: Date.now() }))
+  } catch { /* 标记写不了就退化为普通强杀 */ }
   if (process.platform === 'win32') {
-    // /T 结束 electron 进程树；DSH 服务是"接管的外部实例"（独立进程树），不受影响
+    // 先请求优雅终止（无 /F），给主进程机会清理 active-run 标记
+    spawnSync('taskkill', ['/T', '/PID', String(child.pid)], { stdio: 'ignore', windowsHide: true })
     spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore', windowsHide: true })
   } else {
+    try { child.kill('SIGTERM') } catch { /* noop */ }
     try { child.kill('SIGKILL') } catch { /* noop */ }
   }
 }

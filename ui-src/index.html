@@ -48,9 +48,12 @@
       </div>
     </section>
 
-    <!-- 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示） -->
+    <!-- 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示，可关闭） -->
     <section class="card env-warning hidden" id="crashNote">
-      <div class="env-warn-title" id="crashNoteText"></div>
+      <div class="crash-note-row">
+        <div class="env-warn-title" id="crashNoteText"></div>
+        <button class="btn sm" id="btnCrashNoteClose" title="关闭提示（同一次崩溃不再重复提醒）">知道了</button>
+      </div>
     </section>
 
     <!-- 主操作区：主按钮通栏 + 两小按钮并排 -->
