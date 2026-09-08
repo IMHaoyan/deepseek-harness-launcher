@@ -92,6 +92,7 @@
         <span class="value strong status-value" id="balanceValue">--</span>
         <div class="chips balance-chips">
           <button class="btn sm" id="btnBalanceRefresh" title="立即查询余额（自动每 3 分钟查询一次）">↻</button>
+          <button class="btn sm" id="btnBalanceOpenSettings" title="余额接口设置（API Key / 查询接口）">⚙</button>
           <button class="btn sm" id="btnRecharge" title="打开 DeepSeek 开放平台充值页">充值 / 用量查询</button>
         </div>
       </div>
@@ -251,11 +252,15 @@
           <button class="btn sm" id="btnOpenEnv">环境详情 / 诊断</button>
         </div>
       </div>
-      <div class="row">
-        <span class="label">余额接口设置</span>
+      <div class="row long-label">
+        <span class="label">插件市场</span>
         <div class="chips">
-          <button class="btn sm" id="btnBalanceOpenSettings">设置</button>
+          <span class="value" id="pluginMarketState">-</span>
+          <button class="btn sm" id="btnPluginMarket">安装</button>
         </div>
+      </div>
+      <div class="row" id="pluginMarketDetailRow">
+        <span class="label" id="pluginMarketDetail"></span>
       </div>
       <div class="row long-label">
         <span class="label">启动器版本与更新</span>

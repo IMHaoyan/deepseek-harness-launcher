@@ -13,6 +13,8 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "outputCapture": "std",
+      // 开发期诊断开关：服务启停的防重入日志（含调用栈）写进 dshl.log，便于定位"停止被忽略"类问题
+      "env": { "DSHL_DEBUG_STOP": "1" },
       "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
     },
     {
@@ -25,6 +27,7 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "outputCapture": "std",
+      "env": { "DSHL_DEBUG_STOP": "1" },
       "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
     },
     {

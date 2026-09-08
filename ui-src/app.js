@@ -237,12 +237,19 @@ function render(state) {
   // 启动中/重启中：服务进程已起但端口还没就绪（或看护正在重启）。此时不能显示"已停止"，
   // 也不能让"启动服务"按钮可点（再点一次会命中 startServer 的 owned 早退 → 误报"服务已就绪"）。
   const phase = state.phase || (running ? 'ready' : 'stopped');
+  const stopping = phase === 'stopping';
   const starting = phase === 'starting' || phase === 'restarting';
   window._starting = starting;
+  window._stopping = stopping;
   const rowDot = $('statusRowDot');
   const rowWrap = $('statusText');
   $('portWarnCard').classList.add('hidden');
-  if (starting) {
+  if (stopping) {
+    rowWrap.className = 'value strong status-value stopped';
+    rowDot.className = 'dot stopped';
+    $('statusRowText').textContent = '正在停止服务…';
+    $('statusRowText').title = '正在结束服务进程，请稍候';
+  } else if (starting) {
     rowWrap.className = 'value strong status-value running';
     rowDot.className = 'dot running';
     $('statusRowText').textContent = phase === 'restarting' ? '服务正在自动重启…' : '正在启动服务…';
@@ -297,10 +304,13 @@ function render(state) {
 
   // 启动/停止 合一按钮
   const toggle = $('btnToggle');
-  toggle.textContent = starting ? (phase === 'restarting' ? '重启中…' : '启动中…') : (running ? '停止服务' : '启动服务');
-  toggle.disabled = starting; // 启动/重启期间禁止重复点击（否则会误报"服务已就绪"）
-  toggle.classList.toggle('primary', !running && !starting);
-  toggle.classList.toggle('danger', running && !starting);
+  const busy = starting || stopping; // 启动/重启/停止过程中一律禁用，避免重复点击
+  toggle.textContent = stopping ? '停止中…'
+    : starting ? (phase === 'restarting' ? '重启中…' : '启动中…')
+      : (running ? '停止服务' : '启动服务');
+  toggle.disabled = busy;
+  toggle.classList.toggle('primary', !running && !busy);
+  toggle.classList.toggle('danger', running && !busy);
 
   // 开关 chip
   renderToggleChip('btnNotify', state.notify !== false, '开启', '关闭');
@@ -322,6 +332,9 @@ function render(state) {
       finishWizardStart(); // 兜底：90 秒仍未就绪也回主页（主页会显示真实状态，用户可手动处理）
     }
   }
+
+  // 插件市场（dshmarket）：已安装 → 按钮变「卸载」，未安装 → 「安装」；操作中禁用
+  renderPluginMarket(state.pluginMarket);
 
   // 缩放微调按钮（拖动/双击输入；值变化时应用）
   zoomWidgets.launcher.setFromState(state.zoom);
@@ -1084,6 +1097,66 @@ async function queryBalance() {
   })
   renderBalanceResult(r)
 }
+
+// ---------- 插件市场（dshmarket）：安装 / 卸载（主进程走 dsh plugin --profile web add|remove） ----------
+function renderPluginMarket(m) {
+  const stateEl = $('pluginMarketState');
+  const btn = $('btnPluginMarket');
+  const detail = $('pluginMarketDetail');
+  if (!stateEl || !btn) return;
+  const info = m || { installed: false, busy: '', error: '' };
+  const busy = info.busy === 'installing' || info.busy === 'uninstalling';
+  stateEl.textContent = info.installed ? `已安装${info.version ? ' v' + String(info.version).replace(/^[^\d]*/, '') : ''}` : '未安装';
+  stateEl.title = info.installed ? (info.bundle ? '已启用（dsh.profile.bundles）' : '已装依赖但未在 bundles 中启用') : 'DSH 内的可视化插件市场（dshmarket）';
+  btn.textContent = busy ? (info.busy === 'installing' ? '安装中…' : '卸载中…') : (info.installed ? '卸载' : '安装');
+  btn.disabled = busy;
+  btn.classList.toggle('danger', info.installed && !busy);
+  btn.classList.toggle('primary', !info.installed && !busy);
+  if (detail) {
+    const lines = [];
+    if (info.error) lines.push('✕ ' + info.error);
+    else if (info.lastChange) lines.push('✓ ' + info.lastChange);
+    detail.textContent = lines.join(' ');
+    detail.title = info.error || info.lastChange || '';
+    const row = $('pluginMarketDetailRow');
+    if (row) row.classList.toggle('hidden', lines.length === 0);
+  }
+}
+
+// 二次确认（内联，不用 window.confirm——沙箱渲染进程里 confirm 可能被忽略）：
+// 第一次点击把按钮变成「确认安装/卸载？」，5 秒内再点才真正执行。
+let pluginMarketArmed = null;
+
+$('btnPluginMarket').addEventListener('click', async () => {
+  const btn = $('btnPluginMarket');
+  const s = await cmd('marketGetState');
+  const installed = !!(s && s.installed);
+  const verb = installed ? '卸载' : '安装';
+  if (pluginMarketArmed !== verb) {
+    pluginMarketArmed = verb;
+    btn.textContent = `确认${verb}？`;
+    btn.classList.add('danger');
+    setTimeout(() => {
+      if (pluginMarketArmed !== verb) return;
+      pluginMarketArmed = null;
+      void cmd('marketGetState').then((x) => renderPluginMarket(x));
+    }, 5000);
+    return;
+  }
+  pluginMarketArmed = null;
+  btn.disabled = true;
+  btn.textContent = verb + '中…';
+  const r = await cmd(installed ? 'marketUninstall' : 'marketInstall');
+  if (r && r.ok) await cmd('marketDecline', installed); // 主动卸载 → 不再自动装回来
+  const fresh = await cmd('marketGetState');
+  renderPluginMarket(fresh || { installed: !installed });
+  if (!r || !r.ok) {
+    const d = $('pluginMarketDetail');
+    const row = $('pluginMarketDetailRow');
+    if (d) d.textContent = '✕ ' + ((r && r.error) || '操作失败，请查看日志');
+    if (row) row.classList.remove('hidden');
+  }
+});
 
 function startBalanceTimer() {
   if (balanceTimer) clearInterval(balanceTimer)

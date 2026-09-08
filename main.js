@@ -22,6 +22,8 @@ const runGuard = require('./run-guard')
 const lifecycle = require('./lifecycle')
 const health = require('./health')
 const diagnostics = require('./diagnostics')
+const market = require('./market')
+const stopGuard = require('./service-stop-guard')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -88,7 +90,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '', crashNoticeSeen: '', crashNoticeDismissed: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '', crashNoticeSeen: '', crashNoticeDismissed: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false }
 let firstRun = false
 let harnessRoot = ''
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
@@ -121,6 +123,7 @@ function initEnvRuntime() {
         if (envReady()) {
           log('environment ready after install, starting service')
           await handleStart()
+          void maybeAutoInstallPluginMarket() // 首次安装环境完成后：默认装上插件市场
           if (server.running()) {
             await sleep(400)
             openWebUi() // 新手完成感：服务就绪后自动打开 DeepSeek Harness
@@ -174,6 +177,7 @@ function maybeStartDeferred() {
     startWhenReady = false
     log('environment became ready, starting deferred service')
     void handleStart()
+    void maybeAutoInstallPluginMarket() // 环境/服务刚就绪：补上插件市场默认安装
   }
 }
 
@@ -334,6 +338,9 @@ function applyConfigJson(cfg) {
   // 崩溃提示的"已读/已关闭"记账：按上次崩溃的启动时间戳去重，避免同一条提示每次开面板都出现
   if (typeof cfg.crashNoticeSeen === 'string') Config.crashNoticeSeen = cfg.crashNoticeSeen
   if (typeof cfg.crashNoticeDismissed === 'string') Config.crashNoticeDismissed = cfg.crashNoticeDismissed
+  // 插件市场（dshmarket）自动安装记账：每个启动器版本只自动尝试一次
+  if (typeof cfg.pluginMarketAutoTryVersion === 'string') Config.pluginMarketAutoTryVersion = cfg.pluginMarketAutoTryVersion
+  if (typeof cfg.pluginMarketDeclined === 'boolean') Config.pluginMarketDeclined = cfg.pluginMarketDeclined
 }
 
 function loadConfig() {
@@ -405,6 +412,30 @@ function debounce(fn, ms) {
 }
 
 // ---------- 服务器（DshServer.cs + TcpPid.cs 移植） ----------
+// 服务启停互斥标志：停止过程中重复点击/重复调用只允许一次真正执行；看门狗兜底复位
+// （底层 taskkill 卡住时标志会永久停在 true → 表现为"点停止没反应、按钮变灰、服务不停"）。
+// 逻辑在 service-stop-guard.js（纯函数、可单测）。
+const STOP_WATCHDOG_MS = stopGuard.DEFAULT_TIMEOUT_MS
+
+function beginServiceStop() {
+  return stopGuard.beginStop({
+    timeoutMs: STOP_WATCHDOG_MS,
+    onTimeout: () => {
+      log(`stop watchdog fired after ${STOP_WATCHDOG_MS}ms：停止流程未在预期时间内结束，已强制复位（服务可能仍在运行，请查看日志/手动结束进程）`)
+      try { lifecycle.emit('service.stopTimeout', { ms: STOP_WATCHDOG_MS }) } catch { /* noop */ }
+      broadcastState()
+    },
+  })
+}
+
+function endServiceStop() {
+  stopGuard.endStop()
+}
+
+function serviceStopping() {
+  return stopGuard.isStopping()
+}
+
 const server = {
   child: null,
   adoptedPid: 0,
@@ -425,10 +456,11 @@ function uiUrl() {
   return server.launchUrl || WEB_URL
 }
 
-// 服务阶段（供 WebUI 壳/说明页展示）：starting=正在启动 / restarting=看护重启中 / ready=就绪 / stopped=未运行
+// 服务阶段（供 WebUI 壳/说明页展示）：starting=正在启动 / stopping=正在停止 / restarting=看护重启中 / ready=就绪 / stopped=未运行
 let serverRestarting = false
 function servicePhase() {
   if (server.child && server.child.__starting) return 'starting'
+  if (serviceStopping()) return 'stopping'
   if (serverRestarting) return 'restarting'
   if (server.running()) return 'ready'
   return 'stopped'
@@ -727,30 +759,46 @@ function killPid(pid, force) {
   })
 }
 
+// 返回 true = 本次真的执行了停止；false = 已有停止在进行（被防重入挡下）
 async function stopServer() {
-  if (server.owned()) {
-    server.stopping = true
-    const child = server.child
-    const pid = child.pid
-    await killPid(pid, false) // 优雅停止；Windows taskkill 不带 /F
-    const exited = await new Promise((resolve) => {
-      const t0 = Date.now()
-      const iv = setInterval(() => {
-        if (child.exitCode !== null || Date.now() - t0 > 1500) { clearInterval(iv); resolve(child.exitCode !== null) }
-      }, 100)
-    })
-    if (!exited) await killPid(pid, true) // 超时强杀
-    server.child = null
-    server.stopping = false
-    log(`DSH stopped (PID ${pid})`)
-  } else if (server.adoptedPid !== 0) {
-    const pid = server.adoptedPid
-    await killPid(pid, false)
-    await sleep(1000)
-    if (await portOpen()) await killPid(pid, true)
-    log(`adopted DSH stopped (PID ${pid})`)
-    server.adoptedPid = 0
-    server.adoptedAlive = false
+  // 诊断：每次进入都记（含调用栈），确认调用次数与来源
+  if (process.env.DSHL_DEBUG_STOP === '1') log('stopServer enter\n' + new Error('enter').stack)
+  // 幂等/防重入：停止过程中再次调用直接返回（由 beginServiceStop 判定并置位，含看门狗）
+  if (!beginServiceStop()) {
+    if (process.env.DSHL_DEBUG_STOP === '1') log('stopServer ignored (already stopping)\n' + new Error('stack').stack)
+    else log('stopServer ignored (already stopping)')
+    return false
+  }
+  broadcastState() // 立刻让面板显示"正在停止服务…"并禁用按钮
+  try {
+    if (process.env.DSHL_DEBUG_STOP === '1') log(`stopServer branch owned=${server.owned()} adopted=${server.adoptedPid} child=${server.child ? server.child.pid : 'null'} exitCode=${server.child ? server.child.exitCode : 'n/a'}`)
+    if (server.owned()) {
+      server.stopping = true
+      const child = server.child
+      const pid = child.pid
+      await killPid(pid, false) // 优雅停止；Windows taskkill 不带 /F
+      const exited = await new Promise((resolve) => {
+        const t0 = Date.now()
+        const iv = setInterval(() => {
+          if (child.exitCode !== null || Date.now() - t0 > 1500) { clearInterval(iv); resolve(child.exitCode !== null) }
+        }, 100)
+      })
+      if (!exited) await killPid(pid, true) // 超时强杀
+      server.child = null
+      server.stopping = false
+      log(`DSH stopped (PID ${pid})`)
+    } else if (server.adoptedPid !== 0) {
+      const pid = server.adoptedPid
+      await killPid(pid, false)
+      await sleep(1000)
+      if (await portOpen()) await killPid(pid, true)
+      log(`adopted DSH stopped (PID ${pid})`)
+      server.adoptedPid = 0
+      server.adoptedAlive = false
+    }
+    return true
+  } finally {
+    endServiceStop()
   }
 }
 
@@ -978,6 +1026,66 @@ function saveCrashDiagnostics() {
   }
 }
 
+// ---------- 插件市场：变更后重启服务生效 ----------
+// 与 DSH 更新同一套「停服务 → 装/卸 → 起服务 → 强制重载页面」，期间页面切"正在应用插件变更…"。
+async function applyPluginChange(verb, version) {
+  const name = market.PLUGIN_NAME + (version ? '@' + version : '')
+  log(`market: ${verb} ${name} → restarting service`)
+  lifecycle.emit('update.dsh', { step: verb + '-plugin', name })
+  if (server.running()) {
+    webLoadTabs('plugin')
+    await stopServer()
+  }
+  const ok = await handleStart()
+  if (ok) {
+    refreshWebUiOnReady(true)
+    notify('DeepSeek Harness', verb === 'install' ? `插件市场已安装（${name}），服务已重启生效` : '插件市场已卸载，服务已重启生效')
+  } else {
+    notify('DeepSeek Harness', `插件市场${verb === 'install' ? '已安装' : '已卸载'}，但服务重启失败，请查看面板日志`)
+  }
+  broadcastState()
+}
+
+// 插件市场默认安装（幂等，可多处调用）：
+//   - 触发点：① 启动时（环境已就绪）② 一键安装环境完成后 ③ 延后启动真正拉起服务后
+//   - 每个启动器版本最多真正尝试一次（pluginMarketAutoTryVersion 记账）；
+//   - 环境一直不就绪（首次安装还没装完）时不记账、不重试安装，等下次触发点再来；
+//   - 用户主动卸载过（pluginMarketDeclined）就不再自动装回来。
+let marketAutoInstalling = false
+async function maybeAutoInstallPluginMarket() {
+  if (SELF_TEST) return
+  if (marketAutoInstalling) return
+  if (Config.pluginMarketDeclined) return
+  if (market.installed().installed) return
+  const ver = app.getVersion()
+  if (Config.pluginMarketAutoTryVersion === ver) return // 本版本已尝试过（失败也不反复打扰）
+  if (!envReady()) {
+    // 环境还没装好：不记账（留给环境装好后的触发点），直接返回
+    log('market: 环境未就绪，暂不自动安装插件市场')
+    return
+  }
+  marketAutoInstalling = true
+  try {
+    Config.pluginMarketAutoTryVersion = ver
+    try { saveConfig() } catch { /* noop */ }
+    log(`market: 自动安装 ${market.PLUGIN_NAME} …`)
+    // 等服务就绪后再动：安装要停服务（pnpm 改写 profile 依赖树时不能有进程占用）。
+    // 首次安装环境后服务刚拉起，最多等 3 分钟。
+    const deadline = Date.now() + 180 * 1000
+    while (Date.now() < deadline && !server.running()) await sleep(1000)
+    const r = await market.install()
+    if (r.ok) {
+      await applyPluginChange('install', r.version || market.getState().version)
+    } else {
+      log('market: 自动安装失败：' + (r.error || '未知原因'))
+      notify('DeepSeek Harness Launcher', '插件市场自动安装失败（可在设置页手动重试）：' + String(r.error || '').slice(0, 120))
+    }
+    broadcastState()
+  } finally {
+    marketAutoInstalling = false
+  }
+}
+
 // ---------- 通知 ----------
 function notify(title, message, url) {
   if (SELF_TEST) { log('[notify] ' + title + ': ' + message); return } // 自检不弹真实通知
@@ -1008,6 +1116,11 @@ function notifyStartResult(ok) {
 // 返回 true = 服务确实在跑（自己拉起或接管外部实例）；false = 未就绪/环境未就绪/启动失败。
 // 调用方（尤其 dsh-update 的"更新后校验"）必须依赖返回值判定，而不是 try/catch——本函数不抛错。
 async function handleStart() {
+  // 停止过程中点"启动"：直接拒绝（否则会在旧进程还没退干净时再 spawn 一个）
+  if (serviceStopping()) {
+    log('handleStart ignored (stop in progress)')
+    return false
+  }
   if (!envReport) {
     try { envReport = await envDetect.detectEnv(false) } catch { /* 保持 null */ }
   }
@@ -1853,6 +1966,7 @@ function stateJson() {
     crashNotice: !!(runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt !== Config.crashNoticeDismissed),
     recoveredAt: lastRecoveryAt || '',
     autoRestartStopped: autoRestartStopped,
+    pluginMarket: market.getState(),
     diagnosticsDir: DIAG_DIR,
   })
 }
@@ -2034,6 +2148,7 @@ function isTrustedSender(event) {
 function registerIpc() {
   ipcMain.handle('dsh:cmd', async (event, name, value) => {
     try {
+      if (process.env.DSHL_DEBUG_STOP === '1' && name !== 'getState') log(`ipc: ${name} (trusted=${isTrustedSender(event)})`)
       if (!isTrustedSender(event)) {
         log('bridge: rejected command from untrusted sender (' + String(name) + ')')
         return '{}'
@@ -2060,7 +2175,21 @@ function registerIpc() {
         }
         case 'browser:winClose': if (webWin && !webWin.isDestroyed()) { try { webWin.hide() } catch { /* noop */ } } return '{}'
         case 'start': await handleStart(); return '{}'
-        case 'stop': await stopServer(); notify('DeepSeek Harness', '服务已停止'); broadcastState(); return '{}'
+        case 'stop': {
+          // 停止中重复点击：直接返回，不再重复 taskkill / 重复弹"服务已停止"通知
+          if (serviceStopping()) {
+            if (process.env.DSHL_DEBUG_STOP === '1') log('stop ignored (already stopping)')
+            return JSON.stringify({ ok: false, stopping: true })
+          }
+          if (process.env.DSHL_DEBUG_STOP === '1') log(`stop begin (owned=${server.owned()} adopted=${server.adoptedPid} running=${server.running()})`)
+          // 不在这里置位：由 stopServer → beginServiceStop 统一置位（含看门狗）。
+          // 先广播一次"停止中"由 stopServer 内部置位后负责，避免两处状态不同步。
+          const ok = await stopServer()
+          if (ok !== false) notify('DeepSeek Harness', '服务已停止')
+          broadcastState()
+          if (process.env.DSHL_DEBUG_STOP === '1') log('stop handler done')
+          return JSON.stringify({ ok: true })
+        }
         case 'openWeb': openDshOrPanel(); return '{}' // 环境未就绪/端口被占用时自动改打开启动器面板
         case 'openUrlExternal': try { shell.openExternal(uiUrl()) } catch { /* noop */ } return '{}'
         case 'openNpmDsh': try { shell.openExternal('https://www.npmjs.com/package/@deepseek-ai/dsh') } catch { /* noop */ } return '{}'
@@ -2252,6 +2381,26 @@ function registerIpc() {
           try { saveConfig() } catch { /* noop */ }
           broadcastState()
           return JSON.stringify({ ok: true, at })
+        }
+        // ---------- 插件市场（dshmarket 安装/卸载） ----------
+        case 'marketGetState': return JSON.stringify(market.getState())
+        case 'marketInstall': {
+          const r = await market.install()
+          broadcastState()
+          if (r.ok && !r.already) await applyPluginChange('install', market.getState().version)
+          return JSON.stringify(r)
+        }
+        case 'marketUninstall': {
+          const r = await market.uninstall()
+          broadcastState()
+          if (r.ok && !r.already) await applyPluginChange('uninstall', '')
+          return JSON.stringify(r)
+        }
+        case 'marketDecline': {
+          // 用户在设置里明确卸载 → 不再自动装回来（直到手动重新安装）
+          Config.pluginMarketDeclined = !!value
+          try { saveConfig() } catch { /* noop */ }
+          return JSON.stringify({ ok: true, declined: Config.pluginMarketDeclined })
         }
         case 'openDshDir': { // 源码形态"手动更新"：打开源码仓库目录
           const dir = envReport && envReport.dsh && envReport.dsh.dir
@@ -2718,6 +2867,8 @@ function init() {
     lifecycleEmit: (event, detail) => lifecycle.emit(event, detail),
     statePath: path.join(HOME, 'dshl', 'dsh-update-state.json'),
   })
+  // 插件市场（market.js）：把 dshmarket 装进 DSH 的 web profile（dsh plugin add/remove 薄封装）
+  market.initMarket({ home: realHome, envDetect, log })
   if (firstRun) {
     // 全新机模拟（DSHL_FRESH_TEST=1）时不动真实系统的开机自启
     if (process.env.DSHL_FRESH_TEST !== '1' && !autostartEnabled()) setAutostart(true) // 默认开启开机自启与消息提醒
@@ -2736,6 +2887,7 @@ function init() {
       log('environment not ready, panel available for one-click install')
       return
     }
+    void maybeAutoInstallPluginMarket() // 插件市场默认安装（每个版本只自动尝试一次）
     if (args.panel) {
       showPanel()
       await handleStart()

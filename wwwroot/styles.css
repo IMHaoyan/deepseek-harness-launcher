@@ -326,8 +326,10 @@ body {
 .value.strong { font-weight: 500; }
 .value.mono { font-family: var(--font-mono); font-size: 14px; color: var(--text-tertiary); }
 
-/* 余额行：数值留在标签列右侧，操作小按钮（↻ / 充值）靠右 */
-.balance-chips { margin-left: auto; }
+/* 余额行：数值留在标签列右侧，操作小按钮（↻ / ⚙ / 充值）靠右 */
+.balance-chips { margin-left: auto; gap: 4px; }
+/* 余额设置入口（⚙）比"充值"按钮窄，且刷新按钮因此左移一点 */
+#btnBalanceOpenSettings { padding: 0 8px; min-width: 30px; }
 
 /* 地址行：可点击，默认浏览器打开 */
 .value.link { cursor: pointer; }
