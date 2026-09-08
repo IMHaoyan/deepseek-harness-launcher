@@ -9,12 +9,10 @@ DSHL 是 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（DS
 
 ## 软件界面
 
-![软件界面 1](docs/screenshots/ui-1.png)
-
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/ui-2.png" alt="软件界面 2" width="100%"></td>
-    <td width="50%"><img src="docs/screenshots/ui-3.png" alt="软件界面 3" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/ui-1.png" alt="启动器面板：服务状态、余额与常用入口" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/ui-2.png" alt="设置页：缩放、主题、端口、插件市场与版本更新" width="100%"></td>
   </tr>
 </table>
 
