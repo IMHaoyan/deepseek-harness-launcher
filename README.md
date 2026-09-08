@@ -232,12 +232,15 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 
 ## 维护者：发布新版本
 
-1. 更新 `package.json` 的 `version`（如 `1.0.5`），提交并推送；
-2. `npm run dist:win`（构建 NSIS 安装包与更新元数据，产物在 `dist/`）；
-3. 创建 GitHub Release（electron-updater 按 `v<版本>` 标签查找）：
+**发布说明必须遵守 [`docs/release-notes-style.md`](./docs/release-notes-style.md)**（版本头只写「版本号 — 日期」，正文按 新增/优化/调整/修复/移除 分组、每条一行、动词开头、只讲用户可感知的变化；不写文件名、函数名、测试结果、根因分析）。
+
+1. 更新 `package.json` 的 `version`，写好发布说明，提交并推送；
+2. `npm run release "vX.Y.Z 的说明…"`（或先把说明写进文件，用 `gh release create --notes-file`）——脚本会自动补上 `## vX.Y.Z — <今天>` 的版本头并打印最终说明；
+3. 不加参数时脚本会退化成「按提交类型分组」的兜底说明，仅供应急，正式发布请显式提供说明。
 
 ```powershell
-gh release create v1.0.5 dist/dshl-1.0.5.exe dist/latest.yml dist/dshl-1.0.5.exe.blockmap --title "v1.0.5" --notes "更新说明…"
+# 推荐：一条命令完成构建 + 建 Release + 上传三件套
+npm run release "**新增**\n- 设置页新增…\n\n**修复**\n- 修复…"
 ```
 
 已安装用户下次启动会自动检测到新版本并后台下载，退出重启即完成升级。

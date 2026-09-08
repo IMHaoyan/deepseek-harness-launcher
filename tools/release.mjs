@@ -24,15 +24,47 @@ const exePath = join(root, 'dist', exe)
 const blockmapPath = exePath + '.blockmap'
 const latestYml = join(root, 'dist', 'latest.yml')
 
-// 说明：命令行参数里请用字面 \n 表示换行（真实换行会被 npm/cmd 批处理在传递时截断，导致 Release 说明只剩第一行）
-function defaultNotes() {
+// 说明：命令行参数里请用字面 \n 表示换行（真实换行会被 npm/cmd 批处理在传递时截断）。
+// 发布说明必须遵守 docs/release-notes-style.md：版本头只写「版本号 — 日期」，
+// 正文按 新增/优化/调整/修复/移除 分组、每条一行、动词开头、只讲用户可感知的变化。
+function today() {
+  const d = new Date()
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+function header() {
+  return `## ${tag} — ${today()}`
+}
+
+// 兜底：没给说明时，按提交类型分组生成（feat→新增 / perf→优化 / refactor→调整 / fix→修复），
+// chore/docs/test 等不面向用户的提交直接跳过，避免把内部提交写进发布说明。
+function notesFromCommits() {
   try {
     const prev = execFileSync('git', ['describe', '--tags', '--abbrev=0'], { cwd: root, encoding: 'utf8' }).trim()
-    const log = execFileSync('git', ['log', `${prev}..HEAD`, '--pretty=format:- %s'], { cwd: root, encoding: 'utf8' }).trim()
-    return log ? `${tag} 更新内容：\n${log}` : tag
-  } catch { return tag }
+    const log = execFileSync('git', ['log', `${prev}..HEAD`, '--pretty=format:%s'], { cwd: root, encoding: 'utf8' }).trim()
+    const groups = { 新增: [], 优化: [], 调整: [], 修复: [] }
+    for (const line of log.split('\n')) {
+      const m = /^(feat|fix|perf|refactor|style|chore|docs|test|build|ci)\b[:\s]*(.*)$/i.exec(line.trim())
+      const body = (m ? m[2] : line).trim()
+      if (!body) continue
+      const kind = (m ? m[1] : '').toLowerCase()
+      const bucket = kind === 'feat' ? '新增' : kind === 'fix' ? '修复' : kind === 'perf' ? '优化' : kind === 'refactor' ? '调整' : ''
+      if (!bucket) continue
+      groups[bucket].push('- ' + body)
+    }
+    const parts = []
+    for (const k of ['新增', '优化', '调整', '修复']) {
+      if (groups[k].length) parts.push(`**${k}**\n${groups[k].join('\n')}`)
+    }
+    return parts.length ? parts.join('\n\n') : '- 维护性更新'
+  } catch { return '- 维护性更新' }
 }
-const notes = process.argv.slice(2).join(' ').trim().replace(/\\n/g, '\n') || defaultNotes()
+
+const rawNotes = process.argv.slice(2).join(' ').trim().replace(/\\n/g, '\n')
+const body = rawNotes || notesFromCommits()
+const notes = `${header()}\n\n${body}\n`
+console.log('--- 发布说明 ---\n' + notes + '----------------')
 
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
