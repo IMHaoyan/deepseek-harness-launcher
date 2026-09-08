@@ -13,27 +13,44 @@ const http = require('http')
 const OFFICIAL_BASE = 'https://api.deepseek.com'
 const TIMEOUT_MS = 15000
 
-// 极简 YAML 行解析（只取顶层 `KEY: value`，够 .credentials.yaml 用）
+// 极简 YAML 行解析：只认标量叶子 `KEY: value`，嵌套键用点号拼接（`refs.DEEPSEEK_API_KEY`），
+// 同时保留顶层短名（`DEEPSEEK_API_KEY`）。段头（`refs:` / `records:` / `payload:` 等空值行）不算叶子。
+// 这样兼容两种 .credentials.yaml 布局：
+//   - 旧版扁平：DEEPSEEK_API_KEY: sk-...            （顶层）
+//   - 新版嵌套：version: 1 / refs: / <缩进>DEEPSEEK_API_KEY: sk-...（DSH 0.1.x 起）
 function parseSimpleYaml(text) {
   const out = {}
+  const stack = [] // [{ indent, key }]：当前打开的段路径
   for (const line of String(text || '').split(/\r?\n/)) {
     const t = line.trim()
     if (!t || t.startsWith('#')) continue
-    const m = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/)
+    const m = line.match(/^(\s*)([A-Za-z0-9_.-]+)\s*:\s*(.*)$/)
     if (!m) continue
-    out[m[1]] = m[2].trim().replace(/^["']|["']$/g, '')
+    const indent = m[1].length
+    const key = m[2]
+    const value = m[3].trim().replace(/^["']|["']$/g, '')
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop()
+    if (!value) {
+      // 段头（可能带行内注释）：压栈，后续更深缩进的键挂到它下面
+      stack.push({ indent, key })
+      continue
+    }
+    out[key] = value
+    const dotted = stack.map((s) => s.key).concat(key).join('.')
+    out[dotted] = value
   }
   return out
 }
 
 // 从 DSH 配置读取 DeepSeek 密钥与自定义接口（零配置体验）：
-//   ~/.dsh/.credentials.yaml  →  DEEPSEEK_API_KEY: sk-...
+//   ~/.dsh/.credentials.yaml  →  refs.DEEPSEEK_API_KEY: sk-...（新版嵌套）或顶层 DEEPSEEK_API_KEY（旧版）
 //   ~/.dsh/settings.yaml      →  llm-deepseek: { baseURL: https://..., apiKeyEnv: DEEPSEEK_API_KEY }
 function readDshKeyInfo(homeDir) {
   const info = { key: '', baseUrl: '' }
   try {
     const cred = parseSimpleYaml(fs.readFileSync(path.join(homeDir, '.credentials.yaml'), 'utf8'))
-    if (typeof cred.DEEPSEEK_API_KEY === 'string' && cred.DEEPSEEK_API_KEY) info.key = cred.DEEPSEEK_API_KEY
+    const key = cred['refs.DEEPSEEK_API_KEY'] || cred.DEEPSEEK_API_KEY
+    if (typeof key === 'string' && key) info.key = key
   } catch { /* 文件不存在/读不了：忽略 */ }
   try {
     const lines = fs.readFileSync(path.join(homeDir, 'settings.yaml'), 'utf8').split(/\r?\n/)

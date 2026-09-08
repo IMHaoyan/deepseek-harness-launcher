@@ -64,7 +64,7 @@ body:not(.ready) #tabbar { visibility: hidden; }
   height: 100%;
 }
 
-/* 精简形态（"启用标签和内部分屏功能"关闭时）：仅显示窗口标题 */
+/* 精简形态（标签/内部分屏恒关）：仅显示窗口标题 */
 .title-only {
   display: flex;
   align-items: center;

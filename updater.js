@@ -11,6 +11,7 @@ let onNotify = null // (title, message) => void
 let onFlash = null // () => void（托盘闪烁提醒）
 let sendToPanel = null // (json) => void
 let beforeInstall = null // () => Promise<void>（安装前收尾，如停掉自管的 DSH 服务）
+let onEvent = null // (event, detail) => void（生命周期事件，可选）
 
 const state = {
   status: 'idle', // idle | dev | checking | up-to-date | downloading | downloaded | error
@@ -48,6 +49,7 @@ function initUpdater(opts = {}) {
   onFlash = opts.onFlash || null
   sendToPanel = opts.sendToPanel || null
   beforeInstall = opts.beforeInstall || null
+  onEvent = opts.onEvent || null
   state.current = opts.currentVersion || app.getVersion()
 
   autoUpdater.autoDownload = true
@@ -69,6 +71,7 @@ function initUpdater(opts = {}) {
   autoUpdater.on('update-downloaded', (info) => {
     log(`updater: v${info.version} downloaded, will install on quit`)
     setStatus('downloaded', { latest: info.version, percent: 100, error: '' })
+    if (onEvent) { try { onEvent('update.launcher', { status: 'downloaded', latest: info.version }) } catch { /* noop */ } }
     if (onFlash) { try { onFlash() } catch { /* noop */ } }
     if (onNotify) {
       onNotify('DeepSeek Harness Launcher', `新版本 v${info.version} 已下载完成：点设置页"更新到 v${info.version}"立即安装（退出重启也会自动安装）`)
@@ -78,6 +81,7 @@ function initUpdater(opts = {}) {
     log('updater error: ' + (err && err.message ? err.message : String(err)))
     // 已下载完成后的退出安装类错误不应覆盖"已就绪"状态
     if (state.status !== 'downloaded') setStatus('error', { error: err && err.message ? err.message : String(err) })
+    if (onEvent) { try { onEvent('update.launcher', { status: 'error', error: (err && err.message || String(err)).slice(0, 128) }) } catch { /* noop */ } }
   })
 }
 

@@ -234,10 +234,20 @@ function render(state) {
 
   // 状态
   const running = window._running;
+  // 启动中/重启中：服务进程已起但端口还没就绪（或看护正在重启）。此时不能显示"已停止"，
+  // 也不能让"启动服务"按钮可点（再点一次会命中 startServer 的 owned 早退 → 误报"服务已就绪"）。
+  const phase = state.phase || (running ? 'ready' : 'stopped');
+  const starting = phase === 'starting' || phase === 'restarting';
+  window._starting = starting;
   const rowDot = $('statusRowDot');
   const rowWrap = $('statusText');
   $('portWarnCard').classList.add('hidden');
-  if (running) {
+  if (starting) {
+    rowWrap.className = 'value strong status-value running';
+    rowDot.className = 'dot running';
+    $('statusRowText').textContent = phase === 'restarting' ? '服务正在自动重启…' : '正在启动服务…';
+    $('statusRowText').title = '服务进程已启动，正在等待端口就绪';
+  } else if (running) {
     rowWrap.className = 'value strong status-value running';
     rowDot.className = 'dot running';
     const origin = state.owned ? '由本工具启动' : '接管外部服务';
@@ -260,22 +270,39 @@ function render(state) {
   } else {
     rowWrap.className = 'value strong status-value stopped';
     rowDot.className = 'dot stopped';
-    $('statusRowText').textContent = '已停止';
-    $('statusRowText').title = '';
+    $('statusRowText').textContent = state.autoRestartStopped ? '已停止（自动恢复已停止，请查看日志）' : '已停止';
+    $('statusRowText').title = state.autoRestartStopped ? '服务连续启动失败，自动恢复已停止；请查看日志后手动启动服务' : '';
   }
   $('urlText').textContent = state.url || '-';
   window._currentUrl = state.url || '';
 
+  // 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示）
+  const crashEl = $('crashNote');
+  if (crashEl) {
+    const notes = [];
+    if (state.lastExit === 'crashed') {
+      notes.push(`上次启动器未正常退出（最近一次启动 ${state.lastCrashAt || '未知时间'}），诊断报告已保存到日志目录`);
+    }
+    if (state.recoveredAt) {
+      notes.push(`服务反复启动失败，已自动回退到上一个正常配置（${state.recoveredAt}）`);
+    }
+    crashEl.classList.toggle('hidden', notes.length === 0);
+    if (notes.length) {
+      const t = $('crashNoteText');
+      if (t) t.textContent = '⚠ ' + notes.join('；');
+    }
+  }
+
   // 启动/停止 合一按钮
   const toggle = $('btnToggle');
-  toggle.textContent = running ? '停止服务' : '启动服务';
-  toggle.classList.toggle('primary', !running);
-  toggle.classList.toggle('danger', running);
+  toggle.textContent = starting ? (phase === 'restarting' ? '重启中…' : '启动中…') : (running ? '停止服务' : '启动服务');
+  toggle.disabled = starting; // 启动/重启期间禁止重复点击（否则会误报"服务已就绪"）
+  toggle.classList.toggle('primary', !running && !starting);
+  toggle.classList.toggle('danger', running && !starting);
 
   // 开关 chip
   renderToggleChip('btnNotify', state.notify !== false, '开启', '关闭');
   renderToggleChip('btnAuto', !!state.autostart, '开启', '关闭');
-  renderToggleChip('btnTabsEnabled', !!state.tabsEnabled, '开启', '关闭');
 
   // 运行环境：状态卡 + 主页面警示行；未就绪时首次自动进入环境页
   renderEnvSummary(state.env);
@@ -752,10 +779,6 @@ $('btnAuto').addEventListener('click', () => cmd('toggleAutostart'));
 $('btnNotify').addEventListener('click', () => {
   const chip = $('btnNotify');
   cmd('setNotify', !chip.classList.contains('checked'));
-});
-$('btnTabsEnabled').addEventListener('click', () => {
-  const chip = $('btnTabsEnabled');
-  cmd('setTabsEnabled', !chip.classList.contains('checked'));
 });
 $('btnOpenEnv').addEventListener('click', () => showPage('env'));
 $('btnReset').addEventListener('click', () => cmd('resetDefaults'));

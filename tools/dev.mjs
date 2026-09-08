@@ -70,7 +70,7 @@ function changedName(prev, cur) {
 }
 
 const UI_FILES = ['index.html', ...COPIED]
-const MAIN_FILES = ['main.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'balance.js', 'package.json']
+const MAIN_FILES = ['main.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'balance.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'diagnostics.js', 'package.json']
 
 // ---------- electron 子进程管理 ----------
 const electronExe = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')

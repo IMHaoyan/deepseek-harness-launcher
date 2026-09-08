@@ -49,16 +49,23 @@ dshl/
 ├── preload.js            # 渲染进程安全桥（contextIsolation + sandbox）
 ├── browser-preload.js    # 独立窗口（WebContentsView）预加载桥
 ├── updater.js            # electron-updater 接入（GitHub Releases）
+├── redact.js             # 日志/反馈/诊断统一脱敏（sk- key / token / 鉴权头 / URL 凭据）
+├── run-guard.js          # 活跃运行证据（active-run marker：owner token + 原子发布 + 崩溃检测）
+├── lifecycle.js          # 生命周期 JSONL 事件日志（有界：单条 8KB、文件 256KB）
+├── health.js             # 健康快照（3 槽 last-known-good）+ 崩溃循环自动回退
+├── diagnostics.js        # 诊断报告（脱敏文本，保留 3 份）
 ├── env-detect.js         # 环境探测：Node 运行时 + DSH 四种安装形态 + 通知插件（输出 spawn 计划）
 ├── env-install.js        # 一键安装引擎：用户级 Node（官方发行包 + 用户 PATH）+ DSH（全局 npm 安装）+ 插件拷贝，进度/日志/取消
 ├── ui-src/               # 面板源码（可编辑）：index.html / styles.css / app.js（含"运行环境"页）
 ├── wwwroot/              # 组装产物（ui-src 拷贝 + 鲸鱼路径内联），由 build:assets 生成，随仓库提交
 ├── assets/               # 托盘图标（ico 等）+ plugins/dsh-notify.mjs（随包插件）
 ├── dshl.vbs              # 开发期隐藏窗口启动脚本（可选）
+├── tests/                # 单元测试（node --test，零依赖）：redact / run-guard / lifecycle / health / 更新回滚决策
 └── tools/
     ├── build-assets.mjs  # 资源生成脚本（需 sharp）
     ├── dev.mjs           # 开发热更新守护（npm run dev）：ui-src 变化重建产物+面板热刷新、主进程文件变化自动重启
     ├── envcheck.cjs      # 脱离 Electron 的独立环境探测脚本（npm run envcheck，CI/排障用）
+    ├── verify-package-files.cjs # 校验 build.files 白名单覆盖全部本地 require 闭包（打包前防漏）
     ├── install-smoke.cjs # 安装引擎冒烟测试（plugin = 快；dsh = 真实 npm 安装到临时 HOME）
     └── fresh-install-demo.cjs # 全新机模拟安装演示（隔离 HOME/落点/PATH + FRESH_TEST，验证一键安装全流程）
 ```
@@ -71,7 +78,8 @@ npm install            # 安装依赖（Electron + electron-builder + semver + e
 npm run build:assets   # 首次/修改 ui-src 后需要（sharp 可随 DSH profile 提供：npm i -D sharp）
 npm start              # 开发模式运行（或双击 dshl.vbs 隐藏启动；加 --panel 启动后直接弹出启动器面板）
 npm run dev            # 开发热更新：改 ui-src → 自动重建产物+面板自动刷新；改主进程文件 → 自动重启 electron
-npm run selftest       # 自检：临时 DSH_HOME + 端口 3999，不影响正在运行的服务
+npm run selftest       # 自检：临时 DSH_HOME + 端口 3999，不影响正在运行的服务（含 run-guard/redact/lifecycle/health 检查）
+npm test               # 单元测试（node --test，零依赖；覆盖脱敏/崩溃证据/生命周期/健康快照与回退/更新回滚决策）
 npm run envcheck       # 独立环境探测（退出码 0 就绪 / 1 缺失 / 2 错误）
 npm run dist:win       # 打包 NSIS 安装包 → dist/dshl-<版本>.exe（--publish never，不自动上传）
 npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub Release 并上传三件套
@@ -93,7 +101,7 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - **启动器：主进程调试（--panel）**：最常用。主进程（`main.js`、`updater.js`、`dsh-update.js` 等）可直接打断点，启动后自动弹出启动器面板。
 - **启动器：主进程 + 渲染进程调试**：额外开启 9222 调试端口；跑起来后再选 **附加到面板渲染进程（9222）**，即可在 `wwwroot/app.js` 等渲染脚本里打断点（内置 js-debug，无需装扩展）。
 - **启动器：自检（selftest）**：一键跑完整自检（临时 DSH_HOME + 3999 端口，不影响正在运行的服务）。
-- 开发热更新（F5 调试与 `npm run dev` 都生效）：改 `ui-src/` 任意文件 → 自动重建 `wwwroot` → **面板自动刷新，无需重启**；改主进程文件（`main.js`、`preload.js`、`updater.js`、`dsh-update.js`、`env-detect.js`、`env-install.js`、`balance.js`）→ `npm run dev` 会自动重启 electron（F5 下改完重按 F5 即可）。
+- 开发热更新（F5 调试与 `npm run dev` 都生效）：改 `ui-src/` 任意文件 → 自动重建 `wwwroot` → **面板自动刷新，无需重启**；改主进程文件（`main.js`、`preload.js`、`updater.js`、`dsh-update.js`、`env-detect.js`、`env-install.js`、`balance.js`、`redact.js`、`run-guard.js`、`lifecycle.js`、`health.js`、`diagnostics.js`）→ `npm run dev` 会自动重启 electron（F5 下改完重按 F5 即可）。
 - **注意单实例锁**：启动前先托盘右键「退出」正在运行的启动器，否则 F5 / dev 拉起的实例会立刻退出；`npm run dev` 会打印警告。
 
 
@@ -134,7 +142,6 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
   "notify": true,
   "useSystemBrowser": false,
   "autoRestart": true,
-  "tabsEnabled": false,
   "port": 0,
   "webWindowWidth": 0,
   "webWindowHeight": 0,
@@ -164,13 +171,21 @@ npm run release        # 一键发布：build:assets + dist:win + 创建 GitHub 
 - **服务端口**（设置页，默认 3080）：双击输入新端口（1024–65535）。自己拉起的服务会**立即重启到新端口**并重载所有打开的页面；接管的外部实例不受控制（仅保存，下次由启动器启动时生效）；恢复默认回 3080。
 - **问题反馈**（主页"反馈问题"按钮）：弹窗填写问题（可选填联系方式，方便作者回访）后一键发送到作者的飞书反馈群（飞书群机器人 webhook，作者即时收到；自动附带版本/环境信息与 dshl/server 日志，同时落盘 `~/.dsh/dshl-logs/feedback/`）。通道地址**随安装包内置**（`assets/feishu-webhook.txt`，.gitignore 排除不进仓库；webhook 仅能向指定群发文本消息，泄露可随时在群设置重置）；**界面不提供改地址入口**，作者换群时改 `~/.dsh/dshl/config.json` 的 `feedbackWebhook` 字段或重新打包即可；用户侧无需任何配置与邮箱客户端。
 - 设置页"恢复默认设置"按钮：所有选项（缩放/主题/提醒/浏览器方式/自动重启/窗口尺寸/自启）一次恢复默认值。
-- **自动重启看护**（v1.0.16+ 移除设置项，始终开启）：服务意外退出后自动拉起（10 秒冷却、连续 5 次上限防崩溃死循环），成功后弹"服务已自动重启"通知；接管的外部实例死亡同样触发。
+- **自动重启看护**（v1.0.16+ 移除设置项，始终开启）：服务意外退出后自动拉起（10 秒冷却；**最近 10 分钟内最多 5 次**，防崩溃死循环），成功后弹"服务已自动重启"通知；接管的外部实例死亡同样触发。计数只在服务**稳定存活 120 秒**（或健康快照捕获成功）后清空——服务"能绑端口但随后崩溃"的循环同样会累计到阈值，从而触发配置回退 / 显式停止。
 - **日志轮转**：`dshl.log` 与 `server.{out,err}.log` 超过 1MB 自动转存 `.1/.2/.3`，保留最近 3 份。
 - **托盘闪烁不自动停**：通知触发的图标闪烁持续到点击托盘/打开窗口为止，不错过提醒。
+- **稳定性机制（v1.1.7+，借鉴 dsh-desktop 的主流做法）**：
+  - **活跃运行证据**：每次启动写 `~/.dsh/dshl-logs/active-run.json`（owner token + 原子写入）；托盘正常退出/受控退出删除标记；下次启动发现残留 = 上次非受控退出（强杀/崩溃），立即弹通知并自动生成**诊断报告**（脱敏后保存到 `~/.dsh/dshl-logs/diagnostics/diag-*.md`，保留 3 份；面板"查看日志"可打开，设置/反馈流程同样可用）；
+  - **日志脱敏**：所有落盘日志（`dshl.log`、反馈正文、诊断报告）统一脱敏——`sk-` 风格 key、JWT、长 hex/base64 token、Authorization/Bearer/Basic/token 鉴权头（含多值 Cookie）、URL 内联凭据、敏感 query 值；`server.out/err.log` 是子进程原文落盘，反馈正文在发送前统一过 `redact()`（含 DSH 的一次性 launch token）；
+  - **启动中状态**：面板状态行区分「正在启动服务… / 服务正在自动重启… / 运行中 / 已停止」（`state.phase`），启动期间「启动/停止服务」按钮禁用；就绪超时（60 秒）会强杀卡住的子进程并如实报失败，不再留下"进程活着但永远显示正在启动"的状态；
+  - **生命周期事件**：`~/.dsh/dshl-logs/lifecycle.jsonl`（有界 JSONL：单条 8KB、文件 256KB 丢最旧行）记录 启动/环境/服务/更新/恢复 关键节点，配合日志定位"卡在哪一步"；
+  - **健康快照与自动回退**：健康启动（服务就绪 + 页面加载成功，或就绪后存活 120s）把 `config.json` 快照到 `~/.dsh/dshl/health-snapshots/<slot-1..3>/`（sha256 校验、三槽轮转、原子写入）；服务连续崩溃自动重启 5 次仍失败时，**自动回退到上一个正常配置**（原配置备份为 `config.broken-<时间戳>.json`，每次运行最多回退一次），回退后仅允许一次重试——仍失败则**显式停止自动恢复**（一次性通知"自动恢复已停止" + 面板状态提示，不再循环重启/重复通知），人工启动成功后自动重新武装看护；
+  - **DSH 更新事务**：更新时记录 `~/.dsh/dshl/dsh-update-state.json`（从哪升级到哪）；全局 npm 更新后若**新版启动失败或版本不匹配**，自动重装旧版回滚（每次更新最多一次），回滚失败弹出手动命令；服务没起来时不会谎报"已更新"（以 `handleStart()` 返回值为准）；
+  - **诊断报告手动入口**：面板"查看日志"旁的诊断生成（IPC `diagnosticNow`）+ 崩溃自动收集，均为脱敏文本（无 zip 依赖）。
 - `useSystemBrowser`（v1.0.16+ 移除设置项，锁定 `false`）："打开 DeepSeek Harness"始终走托盘自管的独立窗口（复用同一个；点 ✕ 只隐藏到后台继续运行，托盘退出才真正关闭；服务就绪自动刷新错误页）。
+- `tabsEnabled`（v1.1.7+ 移除设置项，锁定 `false`）：独立窗口恒为精简标题栏（标题 + 最小化 / 最大化 / 关闭），标签与内部分屏按钮及快捷键一并禁用；历史配置里的该字段不再读取。
 - 独立窗口右上角为 Edge 式**直角窗口按钮**（46px 宽、全高、贴窗缘无圆角、细线 SVG 图标）：**最小化 / 最大化·还原 / 关闭到托盘**（最大化状态图标实时切换）。
 - 主题设置（浅色/深色/跟随系统）同时驱动：**启动器面板原生标题栏颜色、独立窗口 tab 栏配色**（经 `nativeTheme.themeSource` 落地，页面内 `prefers-color-scheme` 一并跟随）。
-- **"启用标签和内部分屏功能"**（设置页开关，默认关闭）：开启后独立窗口标题栏为完整形态（标签列表 + 新建 ＋、右侧 分屏 / 最小化 / 最大化 / 关闭）；关闭后标题栏只保留 **标题 + 最小化 / 最大化 / 关闭**，标签与分屏按钮及对应快捷键全部禁用（关闭瞬间自动退出分屏并只保留当前标签）。
 - 托盘交互：单击图标打开 DeepSeek Harness（独立窗口），右键菜单仅"显示启动器面板 / 打开 DeepSeek Harness / 退出"；启动时**服务运行成功后自动弹出一次** DeepSeek Harness（等价于点击"打开 DeepSeek Harness"按钮），启动器面板不自动打开。
 - 独立窗口是 **Edge 式原生分屏**：顶部 tab 栏（高度 42px：38px × 130% × 85% 取整；标签标题字体 12.6px、tab 横向长度最长 243px、直角矩形 Edge 外观；＋ 新建、× 关闭、点击切换、可拖动窗口），**"分屏"按钮位于最右侧（最小化按钮左侧）**，开启左右双视图（分隔条可拖拽，20%–80%；**单标签分屏自动复制当前页为右分屏，关闭任一侧即退出分屏并铺满**）；页面视图用 **WebContentsView 原生挂载**（与 Edge 同源的合成器方案，切换/分屏零闪烁，新标签后台预热无白屏）；快捷键 **Ctrl+\\** 分屏、**Ctrl+Del** 关闭聚焦侧、**Shift+Alt+S** 交换左右；**聚焦单个分屏时该侧右上角浮出 Edge 式控件**：✕ 关闭此分屏、⋯ 菜单（切换左右分屏 / 在新标签页中打开此网页——复制当前 URL 到新标签后关闭原分屏）；Ctrl+滚轮缩放对所有视图同步生效并显示中央浮层。
 - `harnessRoot`：DSH 仓库根目录（源码版）。缺省 Windows 用 `E:\deepseek-harness`。

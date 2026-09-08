@@ -7,9 +7,9 @@ const send = (name, payload) => window.browserBridge.send(name, payload);
 let state = { tabs: [], activeId: null, rightId: null, splitOn: false, splitRatio: 0.5, maximized: false, tabsEnabled: false };
 
 function render() {
+  // 标签/分屏恒关（设置页开关已移除）：标题栏只保留 标题 + 最小化/最大化/关闭
   const tabsEnabled = state.tabsEnabled !== false;
 
-  // 标签列表：功能开启才渲染
   const tabsEl = $('tabs');
   tabsEl.textContent = '';
   if (tabsEnabled) {
@@ -31,7 +31,7 @@ function render() {
     }
   }
 
-  // 精简形态（功能关闭）：标题栏只有 标题 + 最小化/最大化/关闭
+  // 精简形态：标题栏只显示当前页标题
   $('tabs').style.display = tabsEnabled ? '' : 'none';
   $('btnNew').style.display = tabsEnabled ? '' : 'none';
   $('btnSplit').style.display = tabsEnabled ? '' : 'none';
@@ -41,8 +41,7 @@ function render() {
   $('btnReload').classList.toggle('warn', !!(active && active.blank));
   const titleOnly = $('titleOnly');
   if (titleOnly) {
-    const active = state.tabs.find((t) => t.id === state.activeId);
-    const text = active?.title || 'DeepSeek Harness';
+    const text = (active && active.title) || 'DeepSeek Harness';
     titleOnly.textContent = text;
     titleOnly.title = text;
     titleOnly.classList.toggle('hidden', tabsEnabled);
@@ -93,7 +92,7 @@ window.addEventListener('pointerup', () => {
 
 // ---------- 快捷键（焦点在壳上时；焦点在页面内时由主进程 before-input-event 处理） ----------
 window.addEventListener('keydown', (e) => {
-  if (state.tabsEnabled === false) return; // 功能关闭：标签/分屏快捷键一并禁用
+  if (state.tabsEnabled === false) return; // 功能恒关：标签/分屏快捷键一并禁用
   const key = (e.key || '').toLowerCase();
   if (e.ctrlKey && key === '\\') { e.preventDefault(); send('splitToggle'); }
   else if (e.ctrlKey && e.key === 'Delete') { e.preventDefault(); send('closePane'); }

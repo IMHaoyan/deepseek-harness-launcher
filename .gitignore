@@ -12,3 +12,5 @@ assets/feishu-webhook.txt
 .npmrc
 # Node 内置发行包：发布构建时由 tools/fetch-node-dist.mjs 下载，不进仓库
 assets/node-dist/
+# 本地分析克隆（dsh-desktop 等临时参照，不进仓库）
+.analysis/

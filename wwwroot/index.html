@@ -48,6 +48,11 @@
       </div>
     </section>
 
+    <!-- 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示） -->
+    <section class="card env-warning hidden" id="crashNote">
+      <div class="env-warn-title" id="crashNoteText"></div>
+    </section>
+
     <!-- 主操作区：主按钮通栏 + 两小按钮并排 -->
     <section class="card main-actions">
       <button class="btn primary" id="btnOpen">打开 DeepSeek Harness</button>
@@ -235,12 +240,6 @@
         <span class="label">服务端口</span>
         <div class="chips">
           <button class="chip" id="btnPort" title="双击输入新端口（1024–65535），保存后服务自动切换到新端口">3080</button>
-        </div>
-      </div>
-      <div class="row long-label">
-        <span class="label">启用标签和内部分屏功能</span>
-        <div class="chips">
-          <button class="chip" id="btnTabsEnabled">关闭</button>
         </div>
       </div>
       <div class="row">

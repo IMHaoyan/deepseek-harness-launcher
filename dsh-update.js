@@ -27,6 +27,8 @@ let startService = null
 let loadWebTabs = null // (reason) => 把 WebUI 窗口所有标签切到状态说明页（避免更新期间白屏）
 let reloadWebTabs = null // () => 强制重载 WebUI 所有标签（新版页面替换旧会话）
 let onState = null // 状态变化回调（main 里接 broadcastState）
+let lifecycleEmit = null // (event, detail) => void（可选：生命周期事件）
+let statePath = '' // 更新事务状态文件（~/.dsh/dshl/dsh-update-state.json）；空 = 不记录
 
 const state = {
   status: 'idle', // idle | checking | available | updating | updated | error
@@ -41,6 +43,42 @@ let checking = false
 let updating = false
 let warming = null // 当前预热任务（防重入）
 let lastNotifiedVersion = '' // 同一新版本只提示一次
+let rollbackUsed = false // 每次更新周期最多一次回滚
+
+function emitLifecycle(event, detail) {
+  try { if (lifecycleEmit) lifecycleEmit(event, detail) } catch { /* noop */ }
+}
+
+// 更新事务状态：写入/清空（best-effort，仅用于诊断与回滚依据）
+function writeUpdateState(value) {
+  if (!statePath) return
+  try {
+    fs.mkdirSync(path.dirname(statePath), { recursive: true })
+    fs.writeFileSync(statePath, JSON.stringify(Object.assign({ updatedAt: new Date().toISOString() }, value), null, 2))
+  } catch (e) { log('dsh-update: state write failed: ' + (e && e.message ? e.message : String(e))) }
+}
+
+function clearUpdateState() {
+  if (!statePath) return
+  try { fs.unlinkSync(statePath) } catch { /* noop */ }
+}
+
+/**
+ * 更新后校验决策（纯函数，便于测试；错误文本不参与决策）。
+ * @param {{startOk: boolean, runningVersion: string, latest: string, fromVersion: string, kind: string, rollbackUsed: boolean}} input
+ * @returns {{action: 'none'} | {action: 'rollback', reason: string} | {action: 'report', startOk: boolean, runningVersion: string}}
+ */
+function decideRollback(input) {
+  const { startOk, runningVersion, latest, fromVersion, kind, rollbackUsed } = input
+  const versionMismatch = !!latest && runningVersion !== latest
+  if (!startOk || versionMismatch) {
+    if (kind === 'global' && !!fromVersion && fromVersion !== latest && !rollbackUsed) {
+      return { action: 'rollback', reason: startOk ? 'version-mismatch' : 'start-failed' }
+    }
+    return { action: 'report', startOk, runningVersion }
+  }
+  return { action: 'none' }
+}
 
 function initDshUpdater(o) {
   Config = o.Config
@@ -56,6 +94,8 @@ function initDshUpdater(o) {
   loadWebTabs = o.loadWebTabs || null
   reloadWebTabs = o.reloadWebTabs || null
   onState = o.onState || null
+  lifecycleEmit = o.lifecycleEmit || null
+  statePath = o.statePath || ''
 }
 
 function getState() {
@@ -292,6 +332,7 @@ async function updateNow() {
     return
   }
   updating = true
+  rollbackUsed = false // 每个更新周期最多一次回滚
   setState({ status: 'updating', error: '' })
   try {
     const report = await envDetect.detectEnv(false)
@@ -299,6 +340,11 @@ async function updateNow() {
     const plan = report.plan
     const latest = state.latest || ''
     if (!latest) throw new Error('没有待更新的版本')
+    const fromVersion = plan.dshVersion || ''
+    // 更新事务状态：写入"从哪来"（回滚依据）
+    try { writeUpdateState({ kind: plan.kind, from: fromVersion, to: latest, phase: 'start' }) } catch { /* noop */ }
+    emitLifecycle('update.dsh', { step: 'start', from: fromVersion, to: latest, kind: plan.kind })
+    let globalRootForRollback = ''
 
     const svc = getServerState ? getServerState() : { running: false }
     const wasRunning = svc.running
@@ -329,6 +375,8 @@ async function updateNow() {
       try { saveConfig() } catch { /* noop */ }
       notify('DeepSeek Harness', `已更新到 v${latest}`)
       log(`dsh-update: updated to v${latest}`)
+      emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
+      try { clearUpdateState() } catch { /* noop */ }
       setState({ status: 'updated', current: latest })
       return
     }
@@ -343,6 +391,7 @@ async function updateNow() {
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
       }
       const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
+      globalRootForRollback = globalRoot
       const r = await runGlobalUpdate(plan.nodeCmd, globalRoot, latest)
       if (!r.ok) {
         if (wasRunning) {
@@ -387,6 +436,8 @@ async function updateNow() {
         try { saveConfig() } catch { /* noop */ }
         notify('DeepSeek Harness', `已更新到 v${latest}`)
         log(`dsh-update: updated to v${latest} (npx fallback)`)
+        emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: 'npx' })
+        try { clearUpdateState() } catch { /* noop */ }
         setState({ status: 'updated', current: latest })
         return
       }
@@ -399,24 +450,80 @@ async function updateNow() {
 
     // 重新探测 + 恢复服务（旧版已停止，拉起的是新版；含"已接管"服务——更新前已统一停掉）
     try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
+    // startService（main.handleStart）不抛错，靠返回值判定：false = 服务没起来（含环境未就绪/端口占用）
+    let startOk = true
     if (wasRunning) {
-      try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
+      try { startOk = (await startService()) !== false } catch (err) { startOk = false; log('dsh-update: restart threw: ' + err.message) }
+      if (!startOk) log('dsh-update: restart failed (handleStart returned false)')
       if (reloadWebTabs) reloadWebTabs() // 强制重载：新版页面替换旧会话，杜绝残留白屏
     } else if (loadWebTabs) {
       loadWebTabs('offline') // 更新前服务未在运行：页面切"未启动"状态，而不是停留在"正在更新…"
     }
+    // —— 更新事务校验：服务必须真的跑起来且版本对上，否则自动回滚（仅全局 npm 形态可回滚） ——
+    let runningVersion = ''
+    try {
+      const re2 = await envDetect.detectEnv(false)
+      runningVersion = re2 && re2.plan ? (re2.plan.dshVersion || '') : ''
+    } catch { /* noop */ }
+    const decision = decideRollback({ startOk, runningVersion, latest, fromVersion, kind: plan.kind, rollbackUsed })
+    if (decision.action !== 'none') {
+      if (decision.action === 'rollback') {
+        rollbackUsed = true
+        const why = decision.reason
+        log(`dsh-update: v${latest} 启动失败/版本不符，回滚到 v${fromVersion} …（${why}）`)
+        emitLifecycle('update.dsh', { step: 'rollback-start', from: fromVersion, to: latest, reason: why })
+        const rb = await runGlobalUpdate(plan.nodeCmd, globalRootForRollback, fromVersion)
+        if (rb.ok) {
+          try { await refreshEnv(true) } catch { /* noop */ }
+          if (wasRunning) {
+            const ok2 = (await startService()) !== false
+            if (reloadWebTabs) reloadWebTabs()
+            log(`dsh-update: rollback restart ${ok2 ? 'ok' : 'failed'}`)
+          }
+          Config.dshVersion = fromVersion
+          Config.dshUpdateCheckedAt = Date.now()
+          try { saveConfig() } catch { /* noop */ }
+          notify('DeepSeek Harness', `新版本 v${latest} 启动失败，已自动回滚到 v${fromVersion}（原配置不受影响；如仍异常请查看面板日志）`)
+          log(`dsh-update: rolled back to v${fromVersion}`)
+          emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest })
+          setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}` })
+          try { clearUpdateState() } catch { /* noop */ }
+          return
+        }
+        log('dsh-update: rollback failed: ' + (rb.error || ''))
+        emitLifecycle('update.dsh', { step: 'rollback-failed', from: fromVersion, to: latest })
+        notify('DeepSeek Harness', `DSH v${latest} 启动失败，回滚到 v${fromVersion} 也未成功；请手动执行：npm i -g --prefix "${globalRootForRollback}" @deepseek-ai/dsh@${fromVersion}，然后重新启动服务`)
+        setState({ status: 'error', error: `v${latest} 启动失败，回滚也未成功（请查看面板日志）` })
+        try { clearUpdateState() } catch { /* noop */ }
+        return
+      }
+      log(`dsh-update: post-update verification failed (start=${startOk}, runningVersion=${runningVersion || '?'})`)
+      emitLifecycle('update.dsh', { step: 'verify-failed', start: startOk, runningVersion })
+    }
     Config.dshVersion = 'latest'
     Config.dshUpdateCheckedAt = Date.now()
     try { saveConfig() } catch { /* noop */ }
+    // 服务没起来时不再谎报"已更新"（此前的 startOk 恒 true 会让新版启动失败也报成功）
+    if (!startOk) {
+      notify('DeepSeek Harness', `已更新到 v${latest}，但服务未能启动，请打开启动器面板查看日志`)
+      log(`dsh-update: updated to v${latest} but service failed to start`)
+      emitLifecycle('update.dsh', { step: 'updated-start-failed', from: fromVersion, to: latest })
+      try { clearUpdateState() } catch { /* noop */ }
+      setState({ status: 'error', error: `已更新到 v${latest}，但服务未能启动（请查看面板日志）` })
+      return
+    }
     notify('DeepSeek Harness', `已更新到 v${latest}`)
     log(`dsh-update: updated to v${latest}`)
+    emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest })
+    try { clearUpdateState() } catch { /* noop */ }
     setState({ status: 'updated', current: latest })
   } catch (err) {
     log('dsh-update: update failed: ' + (err && err.message ? err.message : String(err)))
+    emitLifecycle('update.dsh', { step: 'failed', error: ((err && err.message) || String(err)).slice(0, 128) })
     setState({ status: 'error', error: err && err.message ? err.message : String(err) })
   } finally {
     updating = false
   }
 }
 
-module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest }
+module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback }

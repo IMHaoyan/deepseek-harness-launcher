@@ -62,13 +62,19 @@ function npmGlobalRoot() {
 
 // ---------- 用户 PATH（HKCU\Environment；免管理员，仅 Windows） ----------
 
+// 读用户 PATH。ok=false 表示"查询失败"（reg 超时/被拦截/输出格式变化），调用方必须区分：
+// 此时绝不能把空值当成"用户 PATH 本来就是空的"写回去，否则会用只含 DSHL 目录的值覆盖整条用户 PATH。
 async function readUserPath() {
-  const out = { type: 'REG_EXPAND_SZ', value: '' }
+  const out = { ok: false, type: 'REG_EXPAND_SZ', value: '' }
   try {
     const r = await runExec('reg', ['query', 'HKCU\\Environment', '/v', 'Path'], { timeout: 10000 })
     const m = /Path\s+(REG_\w+)\s+(.*)$/m.exec(r.stdout)
     if (m) { out.type = m[1]; out.value = m[2] }
-  } catch { /* 无 Path 值，按新建处理 */ }
+    // 查询命令成功执行即视为可信（值可能确实不存在 → 按新建处理）
+    out.ok = true
+  } catch (e) {
+    out.error = (e && e.message ? e.message : String(e))
+  }
   return out
 }
 
@@ -76,7 +82,13 @@ async function readUserPath() {
 async function addToUserPath(job, dirs, opts = {}) {
   if (!IS_WIN) { job.logLine('非 Windows 平台，跳过用户 PATH 写入'); return }
   if (process.env.DSHL_SKIP_PATH === '1') { job.logLine('跳过用户 PATH 写入（DSHL_SKIP_PATH=1，测试模式）'); return }
-  const { type, value } = await readUserPath()
+  const { ok, type, value, error } = await readUserPath()
+  if (!ok) {
+    // 失败关闭：宁可不动 PATH，也不拿空值覆盖用户环境变量
+    job.logLine('读取用户 PATH 失败，已跳过 PATH 写入（避免覆盖现有 PATH）：' + (error || '未知原因'))
+    job.logLine('如需手动添加：把以下目录加入用户 PATH —— ' + dirs.filter(Boolean).join('、'))
+    return
+  }
   const parts = value ? value.split(';').map((p) => p.trim()).filter(Boolean) : []
   const norm = (p) => { try { return path.resolve(p.replace(/^"(.*)"$/, '$1')).toLowerCase() } catch { return p.toLowerCase() } }
   const added = []

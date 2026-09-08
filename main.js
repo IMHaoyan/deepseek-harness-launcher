@@ -17,6 +17,11 @@ const envInstall = require('./env-install')
 const updater = require('./updater')
 const balance = require('./balance')
 const dshUpdater = require('./dsh-update')
+const { redact } = require('./redact')
+const runGuard = require('./run-guard')
+const lifecycle = require('./lifecycle')
+const health = require('./health')
+const diagnostics = require('./diagnostics')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -72,6 +77,8 @@ const TRAY_LOG = path.join(LOG_DIR, 'dshl.log')
 const NOTIFY_DIR = path.join(LOG_DIR, 'notify')
 const OUT_LOG = path.join(LOG_DIR, 'server.out.log')
 const ERR_LOG = path.join(LOG_DIR, 'server.err.log')
+const DIAG_DIR = path.join(LOG_DIR, 'diagnostics')
+const ACTIVE_RUN = path.join(LOG_DIR, 'active-run.json')
 const CONFIG_PATH = SELF_TEST
   ? path.join(os.tmpdir(), 'dshl-selftest-config.json')
   : path.join(HOME, 'dshl', 'config.json')
@@ -289,45 +296,57 @@ function log(message) {
     fs.mkdirSync(LOG_DIR, { recursive: true })
     rotateFileSync(TRAY_LOG)
     // 本地时间戳（sv-SE 格式即 YYYY-MM-DD HH:mm:ss）；此前用 toISOString 是 UTC，排查时极易与系统时间对不上
-    fs.appendFileSync(TRAY_LOG, `[${new Date().toLocaleString('sv-SE', { hour12: false })}] ${message}\n`)
+    // 统一脱敏：sk- key / token / 鉴权头 / URL 凭据在落盘前替换（反馈与诊断包复用同一文本，因此天然安全）
+    fs.appendFileSync(TRAY_LOG, `[${new Date().toLocaleString('sv-SE', { hour12: false })}] ${redact(message)}\n`)
   } catch { /* 日志失败不致命 */ }
+}
+
+// 逐字段应用配置（loadConfig 与"健康快照恢复后重载"共用，保证校验规则一致）
+function applyConfigJson(cfg) {
+  if (cfg.theme === 'light' || cfg.theme === 'dark' || cfg.theme === 'system') Config.theme = cfg.theme
+  if (typeof cfg.notify === 'boolean') Config.notify = cfg.notify
+  if (typeof cfg.useSystemBrowser === 'boolean') Config.useSystemBrowser = cfg.useSystemBrowser
+  if (typeof cfg.autoRestart === 'boolean') Config.autoRestart = cfg.autoRestart
+  // tabsEnabled：设置页开关已移除，恒为关闭（精简标题栏）；历史配置里的值不再生效
+  if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
+  if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
+  if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= PANEL_MIN_W) Config.windowWidth = cfg.windowWidth
+  if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= PANEL_MIN_H) Config.windowHeight = cfg.windowHeight
+  // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
+  if (Number.isInteger(cfg.webWindowWidth) && cfg.webWindowWidth >= 640) Config.webWindowWidth = cfg.webWindowWidth
+  if (Number.isInteger(cfg.webWindowHeight) && cfg.webWindowHeight >= 480) Config.webWindowHeight = cfg.webWindowHeight
+  if (typeof cfg.webWindowMaximized === 'boolean') Config.webWindowMaximized = cfg.webWindowMaximized
+  if (Number.isInteger(cfg.webWindowX) && Number.isInteger(cfg.webWindowY)) { Config.webWindowX = cfg.webWindowX; Config.webWindowY = cfg.webWindowY }
+  if (typeof cfg.harnessRoot === 'string' && cfg.harnessRoot) Config.harnessRoot = cfg.harnessRoot
+  if (typeof cfg.nodePath === 'string' && cfg.nodePath) Config.nodePath = cfg.nodePath
+  if (typeof cfg.dshVersion === 'string' && cfg.dshVersion) Config.dshVersion = cfg.dshVersion
+  if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
+  if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
+  if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
+  if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
+  if (Number.isFinite(cfg.dshMigrateRetryAt) && cfg.dshMigrateRetryAt > 0) Config.dshMigrateRetryAt = cfg.dshMigrateRetryAt
+  if (typeof cfg.defExcludeTryVersion === 'string') Config.defExcludeTryVersion = cfg.defExcludeTryVersion
+  if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
+  // 对话界面缩放：用户改过才持久化；没改过时启动跟随系统默认（见 init）
+  if (Number.isInteger(cfg.webZoom) && cfg.webZoom >= 50 && cfg.webZoom <= 300) { Config.webZoom = cfg.webZoom; webZoomLoaded = true }
+  if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
+  if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
 }
 
 function loadConfig() {
   firstRun = !fs.existsSync(CONFIG_PATH)
+  if (firstRun) return
   try {
-    if (!firstRun) {
-      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
-      if (cfg.theme === 'light' || cfg.theme === 'dark' || cfg.theme === 'system') Config.theme = cfg.theme
-      if (typeof cfg.notify === 'boolean') Config.notify = cfg.notify
-      if (typeof cfg.useSystemBrowser === 'boolean') Config.useSystemBrowser = cfg.useSystemBrowser
-      if (typeof cfg.autoRestart === 'boolean') Config.autoRestart = cfg.autoRestart
-      if (typeof cfg.tabsEnabled === 'boolean') Config.tabsEnabled = cfg.tabsEnabled
-      if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
-      if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
-      if (Number.isInteger(cfg.windowWidth) && cfg.windowWidth >= PANEL_MIN_W) Config.windowWidth = cfg.windowWidth
-      if (Number.isInteger(cfg.windowHeight) && cfg.windowHeight >= PANEL_MIN_H) Config.windowHeight = cfg.windowHeight
-      // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
-      if (Number.isInteger(cfg.webWindowWidth) && cfg.webWindowWidth >= 640) Config.webWindowWidth = cfg.webWindowWidth
-      if (Number.isInteger(cfg.webWindowHeight) && cfg.webWindowHeight >= 480) Config.webWindowHeight = cfg.webWindowHeight
-      if (typeof cfg.webWindowMaximized === 'boolean') Config.webWindowMaximized = cfg.webWindowMaximized
-      if (Number.isInteger(cfg.webWindowX) && Number.isInteger(cfg.webWindowY)) { Config.webWindowX = cfg.webWindowX; Config.webWindowY = cfg.webWindowY }
-      if (typeof cfg.harnessRoot === 'string' && cfg.harnessRoot) Config.harnessRoot = cfg.harnessRoot
-      if (typeof cfg.nodePath === 'string' && cfg.nodePath) Config.nodePath = cfg.nodePath
-      if (typeof cfg.dshVersion === 'string' && cfg.dshVersion) Config.dshVersion = cfg.dshVersion
-      if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
-      if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
-      if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
-      if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
-      if (Number.isFinite(cfg.dshMigrateRetryAt) && cfg.dshMigrateRetryAt > 0) Config.dshMigrateRetryAt = cfg.dshMigrateRetryAt
-      if (typeof cfg.defExcludeTryVersion === 'string') Config.defExcludeTryVersion = cfg.defExcludeTryVersion
-      if (typeof cfg.panelHideNotified === 'boolean') Config.panelHideNotified = cfg.panelHideNotified
-      // 对话界面缩放：用户改过才持久化；没改过时启动跟随系统默认（见 init）
-      if (Number.isInteger(cfg.webZoom) && cfg.webZoom >= 50 && cfg.webZoom <= 300) { Config.webZoom = cfg.webZoom; webZoomLoaded = true }
-      if (typeof cfg.balanceApiKey === 'string' && cfg.balanceApiKey) Config.balanceApiKey = cfg.balanceApiKey
-      if (typeof cfg.balanceBaseUrl === 'string' && cfg.balanceBaseUrl) Config.balanceBaseUrl = cfg.balanceBaseUrl
-    }
+    applyConfigJson(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
   } catch { log('config parse failed, using defaults') }
+}
+
+// 健康快照恢复后：从磁盘重新加载配置到内存 Config（避免"文件已回退、内存还是旧值"的错位）
+function mergeConfigFromDisk() {
+  try {
+    applyConfigJson(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+    log('config re-merged from disk after recovery')
+  } catch (err) { log('config reload failed: ' + err.message) }
 }
 
 function saveConfig() {
@@ -541,6 +560,7 @@ async function startServer() {
       server.adoptedAlive = server.adoptedPid !== 0
       server.launchUrl = null // 外部启动的服务看不到其 stdout，拿不到 launch token，只能靠既有 cookie 访问
       log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
+      lifecycle.emit('service.adopt', { pid: server.adoptedPid, port: PORT })
       return true
     }
     const pid = await findListenPid()
@@ -553,6 +573,7 @@ async function startServer() {
       ? `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；建议切换到空闲端口 ${suggested}（启动器面板可一键切换），或关闭占用程序`
       : `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；附近端口均被占用，请关闭占用程序后重试`
     log(server.blockedReason + '；probe=' + (probe.reason || 'fingerprint-mismatch'))
+    lifecycle.emit('service.blocked', { port: PORT, reason: 'port-conflict' })
     return false
   }
   server.adoptedPid = 0
@@ -634,25 +655,32 @@ async function startServer() {
     if (server.child !== child) return
     server.child = null
     server.launchUrl = null // 新一轮服务的 token 只在新一轮 stdout 里，旧 token 作废
+    lifecycle.emit('service.exit', { code, signal, expected: !!server.stopping || !!child.__starting })
     if (server.stopping) return
     if (child.__starting) return // 启动阶段退出由 startServer 的等待循环报告失败
+    markHealthFault() // 就绪后异常退出：本次运行不再捕获健康快照
     log(`DSH exited unexpectedly (code ${code}${signal ? ', signal ' + signal : ''})`)
     // 页面立即切到"服务正在自动重启…"说明页（文字说明 + 刷新按钮；就绪后由 refreshWebUiOnReady 自动切回）
     if (!SELF_TEST) {
-      const reason = Config.autoRestart ? 'restart' : 'offline'
+      const reason = autoRestartStopped ? 'offline' : (Config.autoRestart ? 'restart' : 'offline')
       for (const t of webTabs) {
         const wc = t.view && t.view.webContents
         if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl(reason, t.id, loadingParams())) } catch { /* noop */ } }
       }
       webPushState()
     }
-    startFlash()
-    notify('DeepSeek Harness', '服务意外退出', WEB_URL)
+    // 已显式停止自动恢复时不再重复打扰（通知+闪烁只发一次，halt 时已交代）
+    if (!autoRestartStopped) {
+      startFlash()
+      notify('DeepSeek Harness', '服务意外退出', WEB_URL)
+    }
     broadcastState()
     void maybeAutoRestart()
   })
   server.child = child
   log('starting DSH web (hidden window)')
+  lifecycle.emit('service.start', { port: PORT })
+  broadcastState() // 立刻把 phase=starting 推给面板（否则启动期间面板一直显示上一次的"已停止"）
   const deadline = Date.now() + READY_TIMEOUT_SEC * 1000
   while (Date.now() < deadline) {
     if (server.child !== child) return false // 已被 stop 打断
@@ -660,11 +688,27 @@ async function startServer() {
     if (await portOpen()) {
       child.__starting = false
       log(`DSH ready on ${WEB_URL} (PID ${child.pid})`)
+      lifecycle.emit('service.ready', { pid: child.pid, port: PORT })
+      scheduleHealthyCapture(child.pid) // 存活 120s 兜底；页面加载成功是快路径
+      // 任何一次成功就绪都重新武装看护（手动启动/自动重启同理；清掉"已停止"历史）。
+      // 计数窗口不在这里清空：服务"起来就崩"的循环必须继续累计，否则回退/halt 永远到不了阈值。
+      readySince = Date.now()
+      autoRestartStopped = false
       return true
     }
     await sleep(500)
   }
-  log('DSH did not become ready in time')
+  // 就绪超时：必须收拾干净再返回 false。
+  // 否则子进程与 __starting 都留着 → servicePhase() 永远返回 'starting'（WebUI 永久卡在
+  // "正在启动服务…"）、scheduleHealthyCapture 也没安排，而面板还显示"运行中"。
+  log(`DSH did not become ready in ${READY_TIMEOUT_SEC}s, killing PID ${child.pid}`)
+  lifecycle.emit('service.readyTimeout', { pid: child.pid, port: PORT, timeoutSec: READY_TIMEOUT_SEC })
+  child.__starting = false
+  if (server.child === child) { server.child = null; server.launchUrl = null }
+  if (healthTimer) { clearTimeout(healthTimer); healthTimer = null }
+  server.stopping = true
+  try { await killPid(child.pid, true) } catch { /* noop */ }
+  server.stopping = false
   return false
 }
 
@@ -721,11 +765,50 @@ async function restartServerOnNewPort() {
   return ok
 }
 
-// 自动重启看护：服务意外退出后自动拉起（设置页开关，默认开；10s 冷却 + 最多连续 5 次，防崩溃死循环）
-let restartAttempts = 0
+// 自动重启看护：服务意外退出后自动拉起（设置页开关，默认开；10s 冷却 + 10 分钟内最多 5 次，防崩溃死循环）
+// 计数口径：按"最近 10 分钟内的重启次数"（时间窗），而不是"连续失败次数"——因为服务只要绑上端口就
+// 算就绪，把计数清零会让"能绑端口但几秒后崩溃"的循环永远停在 1 次，回退/halt 永远不可达。
+// 只有服务稳定存活 RESTART_STABLE_MS（120s，与健康快照同口径）后才清空时间窗。
+// 终态原则（借鉴 dsh-desktop "失败代际不自动复活"）：回退健康配置后仅允许一次重试，仍失败 → 显式停止
+// 自动恢复（autoRestartStopped），不再发起新一轮循环；人工启动成功后自动重新武装。
+const RESTART_WINDOW_MS = 10 * 60 * 1000 // 计数窗口
+const RESTART_MAX = 5 // 窗口内允许的自动重启次数
+const RESTART_STABLE_MS = 120 * 1000 // 服务存活多久才算"稳定"（清空计数窗口）
+let restartWindow = [] // 最近窗口内的自动重启时间戳
 let lastRestartAt = 0
+let autoRestartStopped = false
+let readySince = 0 // 本轮服务就绪时刻（0 = 未就绪）
+
+function restartAttemptsInWindow() {
+  const cutoff = Date.now() - RESTART_WINDOW_MS
+  restartWindow = restartWindow.filter((t) => t > cutoff)
+  return restartWindow.length
+}
+
+// 测试/自检用：把计数窗口直接填成 N 次（避免真跑 10 分钟）
+function seedRestartAttempts(n) {
+  const now = Date.now()
+  restartWindow = Array.from({ length: Math.max(0, n) }, () => now)
+}
+
+function clearRestartTracking() {
+  restartWindow = []
+  lastRestartAt = 0
+  readySince = 0
+}
+
+function haltAutoRestart() {
+  if (autoRestartStopped) return
+  autoRestartStopped = true
+  log('auto-restart stopped (recovery exhausted), waiting for user')
+  lifecycle.emit('service.autoRestartHalted', { attempts: restartAttemptsInWindow(), restoredAt: lastRecoveryAt || '' })
+  notify('DeepSeek Harness', '自动恢复已停止：服务仍无法稳定运行，请打开启动器面板查看日志并手动处理')
+  broadcastState()
+}
+
 async function maybeAutoRestart() {
   if (!Config.autoRestart || reallyExit) return
+  if (autoRestartStopped) return // 已显式停止：等待用户人工处理（启动成功后重新武装）
   // 环境报告可能尚未建立（启动探测未完成/自检路径）：这里兜底探测一次再判断
   if (!envReport) {
     try { envReport = await envDetect.detectEnv(false) } catch { /* 保持 null，按未就绪跳过 */ }
@@ -733,15 +816,26 @@ async function maybeAutoRestart() {
   if (!envReady()) { log('auto-restart skipped: environment not ready'); return }
   const now = Date.now()
   if (now - lastRestartAt < 10000) return
-  if (restartAttempts >= 5) { log('auto-restart attempts exhausted (5)'); return }
+  const attempts = restartAttemptsInWindow()
+  if (attempts >= RESTART_MAX) {
+    if (recoveryDone) {
+      // 已回退过一次仍失败：显式终态，不进入新一轮循环（避免无进展的反复重启/通知/闪烁）
+      haltAutoRestart()
+      return
+    }
+    log(`auto-restart attempts exhausted (${attempts} in 10min)`)
+    lifecycle.emit('service.autoRestartExhausted', { attempts })
+    await attemptConfigRecovery() // 崩溃循环：自动回退上一个健康配置（每次运行最多一次）
+    return
+  }
   lastRestartAt = now
-  restartAttempts++
+  restartWindow.push(now)
+  lifecycle.emit('service.autoRestart', { attempt: restartWindow.length })
   serverRestarting = true
   await sleep(3000) // 等端口彻底释放
   const ok = await startServer()
   serverRestarting = false
   if (ok) {
-    restartAttempts = 0
     log('service auto-restarted')
     void refreshWebUiOnReady()
     broadcastState()
@@ -750,6 +844,134 @@ async function maybeAutoRestart() {
     log('auto-restart failed')
     broadcastState()
     void refreshWebUiPhase() // 重启失败：说明页切到"服务未启动"状态
+  }
+}
+
+// ---------- 稳定性：活跃运行证据 / 健康门 / 健康快照 / 崩溃回退 / 诊断（借鉴 dsh-desktop） ----------
+let runGuardHandle = null // run-guard 会话句柄（markClean 必需，禁止跨会话缓存）
+let healthCaptured = false // 本次运行是否已捕获健康快照（single-flight）
+let healthTimer = null
+let healthFault = false // 就绪后到捕获前出现加载失败/异常退出 → 本次不捕获
+let recoveryDone = false // 本次运行最多一次配置回退
+let lastRestoredSlot = ''
+let lastRecoveryAt = ''
+
+// 健康门判据：服务 owned 且就绪 +（页面加载成功 或 就绪后存活 120s）；两者都满足才允许写健康快照
+function maybeCaptureHealthy(reason) {
+  if (healthCaptured || SELF_TEST) return
+  if (!server.owned() || !server.running()) return
+  try {
+    const r = health.captureHealthy({
+      dshlVersion: app.getVersion(),
+      dshKind: envReport && envReport.dsh ? envReport.dsh.kind : '',
+      dshVersion: envReport && envReport.plan ? (envReport.plan.dshVersion || '') : '',
+      nodeVersion: envReport && envReport.node ? (envReport.node.version || '') : '',
+      port: PORT,
+      reason,
+    })
+    healthCaptured = true
+    if (healthTimer) { clearTimeout(healthTimer); healthTimer = null }
+    // 服务已稳定存活（健康门通过）：清空自动重启计数窗口，让"偶发一次崩溃"不累积成崩溃循环
+    clearRestartTracking()
+    if (r.status === 'captured') {
+      lifecycle.emit('health.capture', { slotId: r.slotId, reason })
+      log(`health: captured slot ${r.slotId} (reason=${reason})`)
+    } else if (r.status === 'skipped') {
+      lifecycle.emit('health.capture', { skipped: r.restoredSlotId })
+      log(`health: skip marker consumed (restored slot ${r.restoredSlotId})`)
+    }
+  } catch (e) {
+    log('health capture failed: ' + (e && e.message ? e.message : String(e)))
+  }
+}
+
+// 服务就绪后安排延迟捕获（页面加载成功是快路径；120s 存活是慢速兜底）
+function scheduleHealthyCapture(pid) {
+  if (SELF_TEST) return
+  if (healthTimer) clearTimeout(healthTimer)
+  healthTimer = setTimeout(() => {
+    if (healthCaptured) return
+    // 仍是无故障的同一子进程（未被重启/接管/失败覆盖）才算健康
+    if (server.owned() && server.child && server.child.pid === pid && !healthFault) {
+      maybeCaptureHealthy('survived-120s')
+    }
+  }, RESTART_STABLE_MS)
+}
+
+function markHealthFault() {
+  healthFault = true
+}
+
+// 崩溃循环（连续 5 次自动重启失败）→ 自动回退到上一个健康配置（每次运行最多一次）
+async function attemptConfigRecovery() {
+  if (recoveryDone) return
+  const target = health.pickRestoreTarget(health.configHash(), lastRestoredSlot)
+  if (!health.shouldRecover(restartAttemptsInWindow(), target !== null)) return
+  recoveryDone = true
+  try {
+    const r = health.restore(target)
+    if (r.status !== 'restored') {
+      log('config recovery: restore no-op')
+      return
+    }
+    lastRestoredSlot = r.slotId
+    lastRecoveryAt = new Date().toISOString()
+    mergeConfigFromDisk() // 文件已回退，内存 Config 同步
+    applyRuntimePort() // 端口可能随快照回退
+    // 配置可能已变化（nodePath/harnessRoot/port）：重新探测环境，重试基于新配置而非旧缓存
+    try { await refreshEnv(true) } catch (e) { log('config recovery: env refresh failed: ' + e.message) }
+    clearRestartTracking() // 回退后重新计数（只允许这一次重试）
+    log(`config recovered from slot ${r.slotId} (backup ${path.basename(r.backupPath)})`)
+    lifecycle.emit('recovery.restore', { slotId: r.slotId, backup: path.basename(r.backupPath), at: lastRecoveryAt })
+    notify('DeepSeek Harness Launcher', '服务反复启动失败，已自动回退到上一个正常配置；原配置已备份为 ' + path.basename(r.backupPath) + '（日志目录可查）')
+    broadcastState()
+    // 回退后仅允许这一次重试；仍失败（且不是端口被占用等已交代的场景）→ 显式停止自动恢复
+    if (envReady()) {
+      await sleep(2000)
+      const ok = await handleStart()
+      if (!ok && !server.blockedReason && !server.running()) {
+        haltAutoRestart()
+      }
+    } else {
+      haltAutoRestart() // 回退后环境仍不可用：交给面板引导
+    }
+  } catch (err) {
+    log('config recovery failed: ' + (err && err.message ? err.message : String(err)))
+  }
+}
+
+// ---------- 诊断报告（脱敏后保存，保留最近 3 份） ----------
+function safeParseJson(text) {
+  try { return JSON.parse(text) } catch { return null }
+}
+
+function buildDiagReport() {
+  return diagnostics.collectReport({
+    appVersion: app.getVersion(),
+    platform: process.platform + '-' + process.arch,
+    envSummary: envDetect.envSummary(envReport) || {},
+    installState: envInstall.getJob() || {},
+    updaterState: safeParseJson(updater.getState()) || {},
+    dshUpdateState: dshUpdater.getState() || {},
+    serverState: { running: server.running(), owned: server.owned(), pid: server.displayPid(), port: PORT, blocked: server.blockedReason || '' },
+    configRedacted: JSON.stringify(Config, null, 2),
+    lastExit: runGuardHandle && runGuardHandle.previousRun ? 'crashed' : 'clean',
+    lastCrashAt: (runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt) || '',
+    lifecycleTail: lifecycle.tail(60).join('\n'),
+    tails: [
+      { label: 'dshl.log（尾部 300 行）', text: tailOf(TRAY_LOG, 300) },
+      { label: 'server.out.log（尾部 100 行）', text: tailOf(OUT_LOG, 100) },
+      { label: 'server.err.log（尾部 100 行）', text: tailOf(ERR_LOG, 100) },
+    ],
+  })
+}
+
+function saveCrashDiagnostics() {
+  try {
+    const file = diagnostics.saveReport(buildDiagReport())
+    if (file) lifecycle.emit('diagnostics.saved', { reason: 'crash', file: path.basename(file) })
+  } catch (err) {
+    log('diagnostics failed: ' + (err && err.message ? err.message : String(err)))
   }
 }
 
@@ -779,7 +1001,9 @@ function notifyStartResult(ok) {
   else notify('DeepSeek Harness', '运行环境未就绪，请打开启动器面板一键安装')
 }
 
-// 统一启动入口：面板按钮 / 托盘菜单 / 启动时共用
+// 统一启动入口：面板按钮 / 托盘菜单 / 启动时共用。
+// 返回 true = 服务确实在跑（自己拉起或接管外部实例）；false = 未就绪/环境未就绪/启动失败。
+// 调用方（尤其 dsh-update 的"更新后校验"）必须依赖返回值判定，而不是 try/catch——本函数不抛错。
 async function handleStart() {
   if (!envReport) {
     try { envReport = await envDetect.detectEnv(false) } catch { /* 保持 null */ }
@@ -788,7 +1012,7 @@ async function handleStart() {
     startWhenReady = true
     log('environment not ready, start skipped（面板"运行环境"页可一键安装；就绪后自动补启动）')
     broadcastState()
-    return
+    return false
   }
   startWhenReady = false
   const ok = await startServer()
@@ -796,6 +1020,7 @@ async function handleStart() {
   if (ok) refreshWebUiOnReady()
   else if (server.blockedReason && !SELF_TEST) showPanel() // 端口被其他程序占用：自动弹出面板（警示卡 + 一键换端口）
   broadcastState()
+  return !!ok
 }
 
 // 一键换端口（面板警示卡 / WebUI 端口冲突说明页共用）：保存建议端口并立即尝试启动
@@ -1095,7 +1320,7 @@ function webPushState() {
     splitOn: webSplitOn,
     splitRatio: webSplitRatio,
     maximized: webWin.isMaximized(),
-    tabsEnabled: Config.tabsEnabled,
+    tabsEnabled: Config.tabsEnabled, // 恒为 false（设置页开关已移除）：壳渲染精简标题栏
     service: servicePhase(),
   })
 }
@@ -1188,6 +1413,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     if (!isMainFrame) return
     // 用户主动取消（ERR_ABORTED/-3）不算白屏
     if (code === -3) return
+    markHealthFault() // 主窗口加载失败：本次运行不捕获健康快照
     markBlank(true)
     if (!SELF_TEST) {
       try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), id, loadingParams())) } catch { /* noop */ }
@@ -1209,6 +1435,11 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     try { wc.setZoomFactor(Config.webZoom / 100) } catch { /* noop */ }
     markBlank(false)
     injectPaneOverlay(tab)
+    // 健康门快路径：真实应用页面（非状态说明页）加载成功 = 本代服务健康的最强证据
+    if (!SELF_TEST) {
+      const loaded = (() => { try { return wc.getURL() || '' } catch { return '' } })()
+      if (loaded.startsWith(WEB_URL)) maybeCaptureHealthy('page-loaded')
+    }
     // 鉴权兜底：新 DSH 的 401 提示页（"dsh web authentication required..."），首屏加载早于
     // token 捕获时会停在上面 → 换带 token 地址重载换取 cookie（页面较长的正常应用不会命中）
     if (server.launchUrl) {
@@ -1318,7 +1549,7 @@ function webCloseTab(id) {
 }
 
 function webToggleSplit() {
-  if (!Config.tabsEnabled) return // 功能关闭：分屏整体禁用
+  if (!Config.tabsEnabled) return // 功能恒关：分屏整体禁用
   webSplitOn = !webSplitOn
   if (webSplitOn && !webRightId) {
     if (webTabs.length > 1) {
@@ -1404,7 +1635,7 @@ async function webReloadPane(id) {
 
 // 关闭当前聚焦的分屏：分屏时关聚焦侧（左关左保留右），未分屏时关当前标签
 function webCloseFocused() {
-  if (!Config.tabsEnabled) return // 功能关闭：不关闭唯一标签
+  if (!Config.tabsEnabled) return // 功能恒关：不关闭唯一标签
   if (!webSplitOn) { if (webActiveId) webCloseTab(webActiveId); return }
   if (webFocusedId && webFocusedId === webRightId) webCloseTab(webRightId)
   else if (webActiveId) webCloseTab(webActiveId)
@@ -1592,6 +1823,7 @@ function stateJson() {
   return JSON.stringify({
     running: server.running(),
     owned: server.owned(),
+    phase: servicePhase(), // starting | restarting | ready | stopped（面板"启动中…"状态与按钮禁用依赖它）
     pid: server.displayPid(),
     url: WEB_URL,
     port: PORT,
@@ -1611,6 +1843,12 @@ function stateJson() {
     env: envDetect.envSummary(envReport),
     dshUpdate: dshUpdater.getState(),
     log: logTail,
+    // 稳定性状态（面板"上次未正常退出/已回退配置"提示用）
+    lastExit: runGuardHandle ? (runGuardHandle.previousRun ? 'crashed' : 'clean') : 'unknown',
+    lastCrashAt: (runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt) || '',
+    recoveredAt: lastRecoveryAt || '',
+    autoRestartStopped: autoRestartStopped,
+    diagnosticsDir: DIAG_DIR,
   })
 }
 
@@ -1764,6 +2002,9 @@ function buildFeedbackPack(text, contact, includeLogs) {
   }
   let body = parts.join('\n')
   if (body.length > FEEDBACK_BODY_MAX) body = body.slice(0, FEEDBACK_BODY_MAX) + '\n\n…（超出长度限制，已截断）'
+  // 统一脱敏：server.out/err 是 DSH 子进程 stdout/stderr 原样落盘（含 "?token=<一次性启动令牌>"），
+  // 反馈正文会 POST 到外部 webhook，因此落盘与发送前都必须过 redact（dshl.log 在写入时已脱敏）。
+  body = redact(body)
   const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
   const dir = path.join(LOG_DIR, 'feedback')
   try { fs.mkdirSync(dir, { recursive: true }) } catch { /* noop */ }
@@ -1773,9 +2014,25 @@ function buildFeedbackPack(text, contact, includeLogs) {
 }
 
 // ---------- IPC 命令桥（Bridge.cs 移植） ----------
+// 来源校验：只有两个"自己人"页面可以调命令——启动器面板（index.html）与独立窗口壳（browser.html）。
+// 其余一律拒绝，尤其是挂在每个页面视图上的 browser-preload 桥：DSH 页面（或用户在其中跳转到的任意
+// 站点）若能在同页拿到 window.browserBridge，就能调 browser:* 改端口/重启服务/关窗口，必须封死。
+function isTrustedSender(event) {
+  try {
+    const wc = event.sender
+    if (win && !win.isDestroyed() && wc === win.webContents) return true
+    if (webWin && !webWin.isDestroyed() && wc === webWin.webContents) return true
+  } catch { /* 取不到按不可信处理 */ }
+  return false
+}
+
 function registerIpc() {
-  ipcMain.handle('dsh:cmd', async (_event, name, value) => {
+  ipcMain.handle('dsh:cmd', async (event, name, value) => {
     try {
+      if (!isTrustedSender(event)) {
+        log('bridge: rejected command from untrusted sender (' + String(name) + ')')
+        return '{}'
+      }
       switch (name) {
         case 'getState': return stateJson()
         case 'browserInit': return JSON.stringify({ url: WEB_URL })
@@ -1852,7 +2109,6 @@ function registerIpc() {
           Config.notify = true
           Config.useSystemBrowser = false
           Config.autoRestart = true
-          Config.tabsEnabled = false
           const portBefore = PORT
           Config.port = 0
           Config.feedbackWebhook = ''
@@ -1952,22 +2208,6 @@ function registerIpc() {
           await switchToSuggestedPort(value && value.port)
           return '{}'
         }
-        case 'setTabsEnabled': {
-          // 关闭时：退出分屏并只保留当前标签，标题栏回到"标题 + 最小化/最大化/关闭"精简形态
-          Config.tabsEnabled = !!value
-          saveConfig()
-          if (!Config.tabsEnabled && webWin && !webWin.isDestroyed()) {
-            webSplitOn = false
-            webRightId = null
-            const keepId = webActiveId
-            for (const t of [...webTabs]) {
-              if (t.id !== keepId) webCloseTab(t.id)
-            }
-          }
-          webPushState()
-          broadcastState()
-          return '{}'
-        }
         case 'envDetect': {
           // 强制重新探测环境（面板"运行环境"页刷新按钮）
           const report = await refreshEnv(true)
@@ -1990,6 +2230,14 @@ function registerIpc() {
           return JSON.stringify(envInstall.getJob())
         }
         case 'openInstallLog': try { shell.openPath(envInstall.installLogPath()) } catch { /* noop */ } return '{}'
+        case 'diagnosticNow': {
+          // 手动生成诊断报告（反馈前可先产出）：保存到日志目录诊断文件夹，保留最近 3 份
+          const file = diagnostics.saveReport(buildDiagReport())
+          try { if (file) lifecycle.emit('diagnostics.saved', { reason: 'manual', file: path.basename(file) }) } catch { /* noop */ }
+          notify('DeepSeek Harness Launcher', file ? `诊断报告已保存：${path.basename(file)}（"打开日志目录"可查看）` : '诊断报告保存失败，请查看日志')
+          return JSON.stringify({ ok: !!file, file })
+        }
+        case 'openDiagnosticsDir': try { shell.openPath(DIAG_DIR) } catch { /* noop */ } return '{}'
         case 'openDshDir': { // 源码形态"手动更新"：打开源码仓库目录
           const dir = envReport && envReport.dsh && envReport.dsh.dir
           if (dir) {
@@ -2092,6 +2340,8 @@ async function requestExit() {
   if (server.owned()) await stopServerFast()
   log('tray exiting')
   try { saveConfig() } catch { /* noop */ }
+  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* 证据清理失败不阻断退出 */ }
+  lifecycle.emit('app.exit', { reason: 'tray' })
   if (tray) { try { tray.destroy() } catch { /* noop */ } tray = null }
   app.quit()
 }
@@ -2164,7 +2414,7 @@ async function runSelfTest() {
     if (!win || win.isDestroyed()) { selftestPrint('FAILED: window not created'); app.exit(2); return }
     const title = await win.webContents.executeJavaScript('document.title')
     const panel = await win.webContents.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnSystemBrowser') !== null && document.getElementById('btnAutoRestart') !== null && document.getElementById('btnTabsEnabled') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnRecharge') !== null && document.getElementById('btnBalanceOpenSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('btnDshCheck') !== null && document.getElementById('dshUpdaterStatus') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnRecharge') !== null && document.getElementById('btnBalanceOpenSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('btnDshCheck') !== null && document.getElementById('dshUpdaterStatus') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用
@@ -2207,6 +2457,115 @@ async function runSelfTest() {
     rotateFileSync(TRAY_LOG)
     if (!fs.existsSync(TRAY_LOG + '.1')) { selftestPrint('FAILED: log rotation'); app.exit(2); return }
     selftestPrint('LOG ROTATION OK')
+    // —— 稳定性机制自检：run-guard / redact / lifecycle / health ——
+    try {
+      const gp = path.join(LOG_DIR, 'active-run.test.json')
+      const g1 = runGuard.beginRun(gp, { startedAt: new Date().toISOString(), pid: process.pid, version: 'selftest' })
+      const g2 = runGuard.beginRun(gp, { startedAt: new Date().toISOString(), pid: process.pid, version: 'selftest-2' })
+      const prevOk = !!(g2.previousRun && g2.previousRun.pid === process.pid)
+      g1.markClean() // 旧进程延迟退出：不得删 g2 的 marker
+      const keepOk = fs.existsSync(gp)
+      g2.markClean()
+      const cleanOk = !fs.existsSync(gp)
+      selftestPrint(`RUN-GUARD ${prevOk && keepOk && cleanOk ? 'OK' : 'FAILED'}`)
+      // 未清理 → 下次检测到崩溃证据（g3 不 markClean 模拟崩溃，g4 应检测到）
+      const g3 = runGuard.beginRun(gp, { startedAt: new Date().toISOString(), pid: process.pid, version: 'selftest-3' })
+      const g4 = runGuard.beginRun(gp, { startedAt: new Date().toISOString(), pid: process.pid, version: 'selftest-4' })
+      const crashDetect = !!(g4.previousRun && g4.previousRun.pid === process.pid)
+      g4.markClean()
+      selftestPrint(`RUN-GUARD CRASH-DETECT ${crashDetect ? 'OK' : 'FAILED'}`)
+    } catch (err) { selftestPrint('RUN-GUARD FAILED: ' + err.message) }
+    {
+      const ok = redact('sk-abcdefghijklmnopqrstuvwxyz123456') === 'sk-***' && redact('plain text 123') === 'plain text 123'
+      selftestPrint(`REDACT ${ok ? 'OK' : 'FAILED'}`)
+    }
+    {
+      // 崩溃计数时间窗：填充到阈值必须"看得见"，清空后必须归零（否则回退/halt 永远不可达）
+      seedRestartAttempts(RESTART_MAX)
+      const full = restartAttemptsInWindow()
+      clearRestartTracking()
+      const cleared = restartAttemptsInWindow()
+      selftestPrint(`RESTART-WINDOW ${full === RESTART_MAX && cleared === 0 ? 'OK' : 'FAILED'} (full=${full} cleared=${cleared})`)
+    }
+    try {
+      lifecycle.emit('app.started', { version: 'selftest', seq: 'roundtrip' })
+      const lcOk = lifecycle.tail(10).some((l) => { try { return JSON.parse(l).detail && JSON.parse(l).detail.seq === 'roundtrip' } catch { return false } })
+      selftestPrint(`LIFECYCLE ${lcOk ? 'OK' : 'FAILED'}`)
+    } catch (err) { selftestPrint('LIFECYCLE FAILED: ' + err.message) }
+    try {
+      // 健康快照往返：捕获 → 篡改 → 恢复 → skip marker 消费（临时路径，不影响真实配置）
+      if (!fs.existsSync(CONFIG_PATH)) fs.writeFileSync(CONFIG_PATH, JSON.stringify(Config, null, 2))
+      const before = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+      const h1 = health.captureHealthy({ dshlVersion: 'selftest', reason: 'selftest' })
+      const snapDir = path.join(HOME, 'dshl', 'health-snapshots')
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(Object.assign({}, before, { theme: 'dark' }), null, 2))
+      const target = health.pickRestoreTarget(health.configHash())
+      const h2 = health.restore(target)
+      const after = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+      const snapCfg = JSON.parse(fs.readFileSync(path.join(snapDir, h1.slotId, 'config.json'), 'utf8'))
+      const restoreOk = h1.status === 'captured' && h2.status === 'restored' && after.theme === snapCfg.theme && fs.existsSync(h2.backupPath)
+      selftestPrint(`HEALTH ${restoreOk ? 'OK' : 'FAILED'}`)
+      const h3 = health.captureHealthy({ dshlVersion: 'selftest', reason: 'selftest-2' })
+      selftestPrint(`HEALTH SKIP-MARKER ${h3.status === 'skipped' ? 'OK' : 'FAILED'}`)
+      // —— 集成演练：连续失败(5) → 自动回退（真实接线：maybeAutoRestart → attemptConfigRecovery → restore）——
+      const cfgSaved = fs.readFileSync(CONFIG_PATH, 'utf8')
+      const hRec = health.captureHealthy({ dshlVersion: 'selftest', reason: 'recovery-drill' })
+      // 篡改配置（模拟"用户改了配置后从未健康启动"），并把重试计数推向触发阈值
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(Object.assign({}, Config, { theme: 'dark', port: 3888 }), null, 2))
+      seedRestartAttempts(RESTART_MAX) // 直接填满计数窗口（避免真等 10 分钟）
+      lastRestartAt = 0
+      recoveryDone = false
+      lastRestoredSlot = ''
+      lastRecoveryAt = ''
+      await maybeAutoRestart() // 应触发恢复：恢复配置 + 备份 + 计数复位 + 重新拉起服务
+      const cfgAfterRec = fs.readFileSync(CONFIG_PATH, 'utf8')
+      const recJson = JSON.parse(stateJson())
+      const recEvent = lifecycle.tail(30).some((l) => { try { return JSON.parse(l).event === 'recovery.restore' } catch { return false } })
+      const recOk = cfgAfterRec === cfgSaved
+        && restartAttemptsInWindow() === 0
+        && recoveryDone === true
+        && !!lastRecoveryAt
+        && !!lastRestoredSlot
+        && recJson.recoveredAt === lastRecoveryAt
+        && recEvent
+      selftestPrint(`RECOVERY ${recOk ? 'OK' : 'FAILED'}`)
+      if (server.owned()) await stopServerFast() // 恢复演练拉起过服务：收尾停掉
+      // —— 恢复失败后的显式停止：不再发起新一轮崩溃循环（借鉴 dsh-desktop "失败代际不自动复活"） ——
+      seedRestartAttempts(RESTART_MAX)
+      lastRestartAt = 0
+      await maybeAutoRestart() // recoveryDone=true → halt 分支（不再重启服务、只发一次通知）
+      const haltEvent = lifecycle.tail(30).some((l) => { try { return JSON.parse(l).event === 'service.autoRestartHalted' } catch { return false } })
+      const haltState = JSON.parse(stateJson())
+      const haltOk = autoRestartStopped === true
+        && haltState.autoRestartStopped === true
+        && haltEvent
+        && !server.running()
+      selftestPrint(`RECOVERY-HALT ${haltOk ? 'OK' : 'FAILED'}`)
+      // 复位，避免影响后续检查
+      autoRestartStopped = false
+      clearRestartTracking()
+      recoveryDone = false
+      lastRecoveryAt = ''
+      // 清理 selftest 快照目录，避免残留
+      try { fs.rmSync(snapDir, { recursive: true, force: true }) } catch { /* noop */ }
+    } catch (err) { selftestPrint('HEALTH FAILED: ' + err.message) }
+    try {
+      // 诊断接线自检：直接落入日志的敏感行（绕过 log() 脱敏）→ 报告文本必须脱敏；stateJson 暴露稳定性字段
+      fs.appendFileSync(TRAY_LOG, 'FAKEKEY sk-abcdefghijklmnopqrstuvwxyz123456 redact-check\n')
+      saveCrashDiagnostics()
+      const files = fs.readdirSync(DIAG_DIR).filter((f) => f.startsWith('diag-')).sort()
+      const newest = files[files.length - 1]
+      const st = JSON.parse(stateJson())
+      let diagOk = false
+      if (newest) {
+        const text = fs.readFileSync(path.join(DIAG_DIR, newest), 'utf8')
+        const noLeak = !text.includes('sk-abcdefghijklmnopqrstuvwxyz123456')
+        const masked = text.includes('sk-***')
+        const stateOk = typeof st.lastExit === 'string' && typeof st.lastCrashAt === 'string' && typeof st.diagnosticsDir === 'string'
+        diagOk = noLeak && masked && stateOk
+      }
+      selftestPrint(`DIAG-REPORT ${diagOk ? 'OK' : 'FAILED'}`)
+    } catch (err) { selftestPrint('DIAG-REPORT FAILED: ' + err.message) }
     try { fs.rmSync(path.join(os.tmpdir(), 'dshl-selftest-home'), { recursive: true, force: true }) } catch { /* noop */ }
     try { fs.rmSync(path.join(os.tmpdir(), 'dshl-selftest-agents'), { recursive: true, force: true }) } catch { /* noop */ }
     try { fs.unlinkSync(path.join(os.tmpdir(), 'dshl-selftest-config.json')) } catch { /* noop */ }
@@ -2260,6 +2619,18 @@ function init() {
   harnessRoot = resolveHarnessRoot()
   loadIcons()
   fs.mkdirSync(LOG_DIR, { recursive: true })
+  // —— 稳定性：活跃运行证据 / 生命周期事件 / 健康快照 / 诊断（借鉴 dsh-desktop） ——
+  try {
+    runGuardHandle = runGuard.beginRun(ACTIVE_RUN, {
+      startedAt: new Date().toISOString(),
+      pid: process.pid,
+      version: app.getVersion(),
+    })
+    if (runGuardHandle && !runGuardHandle.previousRun) log('run-guard: clean previous exit')
+  } catch (err) { log('run-guard begin failed: ' + err.message) }
+  lifecycle.initLifecycle({ dir: LOG_DIR, log })
+  health.initHealth({ configPath: CONFIG_PATH, snapshotDir: path.join(HOME, 'dshl', 'health-snapshots'), log })
+  diagnostics.initDiagnostics({ dir: DIAG_DIR, log })
   registerIpc()
   createWindow()
 
@@ -2270,6 +2641,18 @@ function init() {
 
   buildTray()
   log('tray started')
+  lifecycle.emit('app.started', { version: app.getVersion(), platform: process.platform })
+  // 上次非受控退出证据：通知 + 自动收集诊断报告（脱敏，保留 3 份）
+  if (runGuardHandle && runGuardHandle.previousRun) {
+    const prev = runGuardHandle.previousRun
+    lifecycle.emit('crash.previousRun', Object.assign({}, 'unreadable' in prev
+      ? { unreadable: true }
+      : { pid: prev.pid, startedAt: prev.startedAt, version: prev.version }))
+    if (!SELF_TEST) saveCrashDiagnostics()
+    if (!SELF_TEST && Config.notify) {
+      notify('DeepSeek Harness Launcher', `上次启动器未正常退出：诊断报告已保存（${DIAG_DIR}），可交给开发者排查`)
+    }
+  }
   // 自动更新（electron-updater → GitHub Releases）：状态推送走 dsh:updater，下载完成弹通知 + 托盘闪烁
   updater.initUpdater({
     log,
@@ -2278,6 +2661,7 @@ function init() {
     onFlash: startFlash,
     sendToPanel: (json) => { if (win && !win.isDestroyed()) { try { win.webContents.send('dsh:updater', json) } catch { /* noop */ } } },
     beforeInstall: async () => { if (server.owned()) await stopServerFast() },
+    onEvent: (event, detail) => lifecycle.emit(event, detail),
   })
   // DSH 更新（dsh-update.js）：检测全自动、更新全手动（主页卡片按钮触发）
   dshUpdater.initDshUpdater({
@@ -2294,6 +2678,8 @@ function init() {
     loadWebTabs: (reason) => webLoadTabs(reason),
     reloadWebTabs: () => { void refreshWebUiOnReady(true) },
     onState: () => broadcastState(),
+    lifecycleEmit: (event, detail) => lifecycle.emit(event, detail),
+    statePath: path.join(HOME, 'dshl', 'dsh-update-state.json'),
   })
   if (firstRun) {
     // 全新机模拟（DSHL_FRESH_TEST=1）时不动真实系统的开机自启
@@ -2352,10 +2738,20 @@ function init() {
 
 // ---------- 应用生命周期 ----------
 if (IS_WIN) { try { app.setAppUserModelId('com.dshl.launcher') } catch { /* noop */ } }
-app.on('before-quit', () => { reallyExit = true; saveWebWindowState() }) // 覆盖更新安装等非托盘路径的退出
+app.on('before-quit', () => {
+  reallyExit = true
+  saveWebWindowState()
+  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ } // 覆盖更新安装等非托盘路径的退出
+  lifecycle.emit('app.exit', { reason: 'quit' })
+}) // 覆盖更新安装等非托盘路径的退出
 app.on('window-all-closed', () => { /* 托盘常驻，不退出 */ })
 app.on('activate', () => openDshOrPanel()) // macOS Dock 点击
-process.on('uncaughtException', (err) => { try { log('uncaught: ' + ((err && err.stack) || err)) } catch { /* noop */ } })
+process.on('uncaughtException', (err) => {
+  // 只记录，不清理 active-run marker：本进程未受控退出（随后可能被系统/用户强杀），
+  // marker 必须留下作为"上次非正常退出"的证据，交给下次启动弹通知 + 自动收集诊断报告。
+  try { lifecycle.emit('app.uncaught', { err: ((err && err.message) || String(err)).slice(0, 128) }) } catch { /* noop */ }
+  try { log('uncaught: ' + ((err && err.stack) || err)) } catch { /* noop */ }
+})
 
 try { fs.unlinkSync(SELFTEST_RESULT) } catch { /* noop */ }
 
