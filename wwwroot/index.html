@@ -262,25 +262,9 @@
       <div class="row" id="pluginMarketDetailRow">
         <span class="label" id="pluginMarketDetail"></span>
       </div>
-      <div class="row long-label">
-        <span class="label">启动器版本与更新</span>
-        <div class="chips">
-          <span class="value" id="updaterStatus">v-</span>
-          <button class="btn sm" id="btnUpdaterCheck">检查更新</button>
-        </div>
-      </div>
-      <div class="row" id="updaterDetailRow">
-        <span class="label" id="updaterDetail"></span>
-      </div>
-      <div class="row long-label">
-        <span class="label">DSH版本与更新</span>
-        <div class="chips">
-          <span class="value" id="dshUpdaterStatus">v-</span>
-          <button class="btn sm" id="btnDshCheck">检查更新</button>
-        </div>
-      </div>
-      <div class="row" id="dshUpdaterDetailRow">
-        <span class="label" id="dshUpdaterDetail"></span>
+      <div class="row" title="latest：跟随 npm latest（默认）；alpha：跟随 npm alpha，可提前拿到预览版。切换后立即按新渠道重新检查。">
+        <span class="label">DSH 更新渠道</span>
+        <div class="chips" id="dshChannelChips"></div>
       </div>
       <div class="row">
         <span class="label">恢复默认</span>

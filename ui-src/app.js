@@ -19,6 +19,11 @@ const THEME_VALUES = [
   { key: 'light', label: '亮色' },
   { key: 'dark', label: '暗色' },
 ];
+// DSH 更新渠道：latest = npm latest（默认，稳定线）；alpha = npm alpha（预览线）
+const DSH_CHANNEL_VALUES = [
+  { key: 'latest', label: 'latest' },
+  { key: 'alpha', label: 'alpha' },
+];
 
 // ---------- 缩放微调控件：按住左右拖动（5% 一格），双击变输入框（越界 clamp） ----------
 function makeZoomWidget(id, min, max, cmdName) {
@@ -225,11 +230,11 @@ function render(state) {
     dshVerEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
       ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '在浏览器打开 npm 官方页';
   }
-  const dshUpdStatusEl = $('dshUpdaterStatus'); // 设置页"DSH版本与更新"行的版本值
-  if (dshUpdStatusEl) {
-    dshUpdStatusEl.textContent = dshVerText;
-    dshUpdStatusEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
-      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '';
+  // DSH 更新渠道（设置页）：latest / alpha，切换后主进程立即按新渠道重新检查
+  const dshChannel = (state.dshUpdate && state.dshUpdate.channel) || 'latest';
+  if (window._lastDshChannel !== dshChannel) {
+    window._lastDshChannel = dshChannel;
+    buildChips('dshChannelChips', DSH_CHANNEL_VALUES, dshChannel, (c) => cmd('setDshChannel', c.key));
   }
 
   // 状态
@@ -849,11 +854,6 @@ function flashVersionHint(el, text, title, key) {
 function renderUpdater(u) {
   if (!u) return;
   window._updater = u;
-  const statusEl = $('updaterStatus');
-  const checkBtn = $('btnUpdaterCheck');
-  const detailRow = $('updaterDetailRow');
-  const detail = $('updaterDetail');
-  const current = u.current || '-';
   const hasUpdate = (u.status === 'downloading' || u.status === 'downloaded') && !!u.latest;
 
   // 主页面最低端"启动器版本"行：检测到更新时同行显示"更新到 vX"按钮
@@ -881,54 +881,6 @@ function renderUpdater(u) {
     else if (u.status === 'error') text = '检查更新失败';
     flashVersionHint(rowHint, text, text === '检查更新失败' ? (u.error || '') : '', 'upd');
   }
-
-  // 有更新时"检查更新"按钮变形为绿色"更新到 vX"（下载中则显示进度并禁用）
-  checkBtn.textContent = u.status === 'downloading' ? `下载中 ${u.percent || 0}%…`
-    : hasUpdate ? `更新到 v${u.latest}`
-    : '检查更新';
-  checkBtn.classList.toggle('update-ready', u.status === 'downloaded');
-
-  switch (u.status) {
-    case 'dev':
-      statusEl.textContent = `v${current}`;
-      detail.textContent = '开发模式（npm start）不支持在线更新';
-      detailRow.classList.remove('hidden');
-      checkBtn.disabled = true;
-      break;
-    case 'checking':
-      statusEl.textContent = `v${current}`;
-      detail.textContent = '正在检查更新…';
-      detailRow.classList.remove('hidden');
-      checkBtn.disabled = true;
-      break;
-    case 'downloading':
-      statusEl.textContent = `v${current}`;
-      detail.textContent = `发现新版本 v${u.latest}，正在下载 ${u.percent || 0}%…（下载完成后点"更新到 v${u.latest}"立即安装，退出重启也会自动安装）`;
-      detailRow.classList.remove('hidden');
-      checkBtn.disabled = true;
-      break;
-    case 'downloaded':
-      statusEl.textContent = `v${current}`;
-      detail.textContent = `新版本 v${u.latest} 已就绪：点"更新到 v${u.latest}"立即安装（退出重启也会自动安装）`;
-      detailRow.classList.remove('hidden');
-      checkBtn.disabled = false;
-      break;
-    case 'up-to-date':
-      statusEl.textContent = `v${current}（已是最新）`;
-      detailRow.classList.add('hidden');
-      checkBtn.disabled = false;
-      break;
-    case 'error':
-      statusEl.textContent = `v${current}`;
-      detail.textContent = '检查更新失败：' + (u.error || '网络错误');
-      detailRow.classList.remove('hidden');
-      checkBtn.disabled = false;
-      break;
-    default:
-      statusEl.textContent = `v${current}`;
-      detailRow.classList.add('hidden');
-      checkBtn.disabled = false;
-  }
 }
 
 // 主页面底端链接
@@ -936,12 +888,6 @@ $('btnGithub').addEventListener('click', () => void cmd('openGithub'));
 $('btnChangelog').addEventListener('click', () => void cmd('openChangelog'));
 // 主页面"启动器版本"行按钮：已就绪 → 立即安装；否则 → 检查更新
 $('btnUpdateNow').addEventListener('click', () => {
-  const u = window._updater;
-  if (u && u.status === 'downloaded') void cmd('updaterInstall');
-  else void cmd('updaterCheck');
-});
-// 版本与更新按钮（设置页）：已就绪 → 立即安装；否则 → 检查更新
-$('btnUpdaterCheck').addEventListener('click', () => {
   const u = window._updater;
   if (u && u.status === 'downloaded') void cmd('updaterInstall');
   else void cmd('updaterCheck');
@@ -1008,33 +954,7 @@ function renderDshUpdate(u) {
     flashVersionHint(rowHint, text, text === '检查/更新失败' ? (u.error || '') : '', 'dsh');
   }
 
-  // 设置页"DSH版本与更新"行
-  const checkBtn = $('btnDshCheck');
-  if (checkBtn) {
-    const ready = status === 'available' && !isSource;
-    const openDir = status === 'available' && isSource;
-    checkBtn.disabled = status === 'checking' || status === 'updating';
-    checkBtn.textContent = openDir ? '打开源码目录'
-      : ready ? `更新到 v${latest}`
-      : status === 'checking' ? '检查中…'
-      : status === 'updating' ? '更新中…'
-      : '检查更新';
-    checkBtn.classList.toggle('update-ready', ready);
-  }
-  const detailRow = $('dshUpdaterDetailRow');
-  const detail = $('dshUpdaterDetail');
-  if (detailRow && detail) {
-    let text = '';
-    if (status === 'checking') text = '正在检查更新…';
-    else if (status === 'available' && isSource) text = `发现新版本 v${latest}：当前为源码安装，启动器不自动更新——请打开源码目录执行 git pull && pnpm run build，构建完成后重启服务生效`;
-    else if (status === 'available') text = `发现新版本 v${latest}：点"更新到 v${latest}"立即更新（${u.prewarmed ? '缓存已预热，约 10 秒' : '约 1-2 分钟'}，会重启服务）`;
-    else if (status === 'updating') text = `正在更新 v${latest}…（完成后自动重启服务）`;
-    else if (status === 'updated') text = `已更新到 v${u.current}`;
-    else if (status === 'up-to-date') text = '已是最新版本';
-    else if (status === 'error') text = '检查/更新失败：' + (u.error || '未知错误');
-    detail.textContent = text;
-    detailRow.classList.toggle('hidden', !text);
-  }
+  // 设置页不再有"DSH版本与更新"行：版本、检查、更新入口都在主页面行内
 }
 $('btnDshUpdateNow').addEventListener('click', () => {
   const u = window._dshUpdate;
@@ -1043,13 +963,6 @@ $('btnDshUpdateNow').addEventListener('click', () => {
   if (u.kind === 'source') void cmd('openDshDir');
   else if (u.status === 'error') void cmd('dshUpdateNow');
   else if (u.status === 'available') void cmd('dshUpdateNow');
-  else void cmd('dshCheckNow');
-});
-// 设置页 DSH 检查按钮：源码形态 → 打开源码目录；已有更新/失败重试（非源码）→ 立即更新；否则 → 手动检查（跳过 24h 节流）
-$('btnDshCheck').addEventListener('click', () => {
-  const u = window._dshUpdate;
-  if (u && u.status === 'available' && u.kind === 'source') void cmd('openDshDir');
-  else if (u && (u.status === 'available' || (u.status === 'error' && u.kind !== 'source'))) void cmd('dshUpdateNow');
   else void cmd('dshCheckNow');
 });
 // 主页面"DSH版本"行：悬停"检查更新"按钮

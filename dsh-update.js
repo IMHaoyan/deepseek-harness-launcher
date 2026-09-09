@@ -44,6 +44,12 @@ let updating = false
 let warming = null // 当前预热任务（防重入）
 let lastNotifiedVersion = '' // 同一新版本只提示一次
 let rollbackUsed = false // 每次更新周期最多一次回滚
+let lastFetchError = '' // 最近一次取版本失败的原因（用于给用户可读的检查失败提示）
+
+// 更新渠道：latest（默认，跟随 npm latest）/ alpha（跟随 npm alpha，提前拿预览版）
+function channelOf() {
+  return Config && Config.dshChannel === 'alpha' ? 'alpha' : 'latest'
+}
 
 function emitLifecycle(event, detail) {
   try { if (lifecycleEmit) lifecycleEmit(event, detail) } catch { /* noop */ }
@@ -61,6 +67,63 @@ function writeUpdateState(value) {
 function clearUpdateState() {
   if (!statePath) return
   try { fs.unlinkSync(statePath) } catch { /* noop */ }
+}
+
+function readUpdateState() {
+  if (!statePath) return null
+  try {
+    const v = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+    return v && typeof v === 'object' ? v : null
+  } catch { return null }
+}
+
+// ---------- 中断的更新自愈 ----------
+// 事务状态在更新开始时写入、成功收尾时清除。启动时若读到残留的 phase='start'，
+// 说明上次更新没走完（典型：装到一半退出启动器）——npm 全局安装会残留半套文件，
+// DSH 能启动但几秒后加载到缺失模块就崩，看起来就是"就绪后 code 1 反复重启"。
+async function recoverInterruptedUpdate() {
+  const st = readUpdateState()
+  if (!st || st.phase !== 'start') return { recovered: false, reason: 'no-pending' }
+  const from = String(st.from || '')
+  const to = String(st.to || '')
+  const kind = String(st.kind || '')
+  log(`dsh-update: 检测到未完成的更新事务（${from || '?'} → ${to || '?'}, kind=${kind}）`)
+  emitLifecycle('update.dsh', { step: 'interrupted', from, to, kind })
+  if (!to) { clearUpdateState(); return { recovered: false, reason: 'no-target' } }
+  notify('DeepSeek Harness', `上次 DSH 更新未完成（${from || '?'} → ${to}），正在自动修复…`)
+  let nodeBin = 'node'
+  try {
+    const r = await envDetect.detectEnv(false)
+    if (r && r.plan) nodeBin = r.plan.nodeCmd || 'node'
+  } catch { /* 用默认 node */ }
+  let ok = false
+  try {
+    if (kind === 'global') {
+      const globalRoot = await envInstall.resolveGlobalRoot(nodeBin)
+      ok = (await runGlobalUpdate(nodeBin, globalRoot, to)).ok
+    } else if (kind === 'managed') {
+      envInstall.startInstall(['dsh'], { dshVersion: to, autoUpdate: true })
+      ok = (await waitForJob()) === 'done'
+    } else {
+      log('dsh-update: 该安装形态不支持自动修复（kind=' + kind + '）')
+    }
+  } catch (err) {
+    log('dsh-update: 中断修复异常：' + (err && err.message ? err.message : String(err)))
+  }
+  if (!ok) {
+    // 标记为已处理，避免每次启动都重试一遍失败的安装
+    try { writeUpdateState({ kind, from, to, phase: 'repair-failed' }) } catch { /* noop */ }
+    notify('DeepSeek Harness', `自动修复失败：请手动执行 npm i -g @deepseek-ai/dsh@${to}，或在面板「运行环境」页重装`)
+    log('dsh-update: 中断修复失败，已标记 repair-failed')
+    emitLifecycle('update.dsh', { step: 'interrupted-repair-failed', from, to, kind })
+    return { recovered: false, reason: 'failed' }
+  }
+  try { await refreshEnv(true) } catch { /* noop */ }
+  clearUpdateState()
+  log(`dsh-update: 未完成的更新已修复到 v${to}`)
+  emitLifecycle('update.dsh', { step: 'interrupted-repaired', from, to, kind })
+  notify('DeepSeek Harness', `上次未完成的 DSH 更新已修复（v${to}）`)
+  return { recovered: true, to }
 }
 
 /**
@@ -99,7 +162,7 @@ function initDshUpdater(o) {
 }
 
 function getState() {
-  return Object.assign({}, state)
+  return Object.assign({}, state, { channel: channelOf() })
 }
 
 function pushState() {
@@ -178,17 +241,20 @@ function registries() {
 }
 
 async function fetchLatest(nodeBin) {
+  const channel = channelOf()
+  lastFetchError = ''
   for (const registry of registries()) {
-    const args = ['view', '@deepseek-ai/dsh', 'version']
+    const args = ['view', `@deepseek-ai/dsh@${channel}`, 'version']
     if (registry) args.push('--registry', registry)
     const r = await runNpm(args, { nodeBin })
     if (r.ok) {
       const line = String(r.stdout).trim().split(/\r?\n/)[0].trim()
-      if (semver.valid(line)) return { version: line, registry }
+      if (semver.valid(line)) return { version: line, registry, channel }
       log(`dsh-update: npm view 输出异常：${line || '(空)'}`)
       return null
     }
-    log(`dsh-update: npm view 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
+    lastFetchError = /404/.test(r.error || '') ? `渠道 ${channel} 暂无可用版本` : (r.error || '网络错误')
+    log(`dsh-update: npm view 失败（registry=${registry || '默认'}, channel=${channel}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
   }
   return null
 }
@@ -295,12 +361,12 @@ async function checkOnce(reason, force) {
     try { saveConfig() } catch { /* noop */ }
     if (!latest) {
       log('dsh-update: fetch latest failed, check aborted')
-      setState(force ? { status: 'error', error: '检查失败：无法获取最新版本（网络错误）' } : { status: 'idle' })
+      setState(force ? { status: 'error', error: '检查失败：' + (lastFetchError || '无法获取最新版本（网络错误）') } : { status: 'idle' })
       return
     }
     setState({ current, latest: latest.version, kind: plan.kind })
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
-      log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, reason=${reason || 'timer'})`)
+      log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, reason=${reason || 'timer'})`)
       const newVersionSeen = state.latest !== latest.version
       setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false } : {}))
       // 后台预热缓存（不阻塞检测）：点"立即更新"时依赖树已在 npm/npx 缓存里，秒级完成
@@ -333,6 +399,7 @@ async function updateNow() {
   }
   updating = true
   rollbackUsed = false // 每个更新周期最多一次回滚
+  let txInfo = null // 事务信息（catch 里写终态用：区分"失败"与"被中断"）
   setState({ status: 'updating', error: '' })
   try {
     const report = await envDetect.detectEnv(false)
@@ -343,6 +410,7 @@ async function updateNow() {
     const fromVersion = plan.dshVersion || ''
     // 更新事务状态：写入"从哪来"（回滚依据）
     try { writeUpdateState({ kind: plan.kind, from: fromVersion, to: latest, phase: 'start' }) } catch { /* noop */ }
+    txInfo = { kind: plan.kind, from: fromVersion, to: latest }
     emitLifecycle('update.dsh', { step: 'start', from: fromVersion, to: latest, kind: plan.kind })
     let globalRootForRollback = ''
 
@@ -521,9 +589,11 @@ async function updateNow() {
     log('dsh-update: update failed: ' + (err && err.message ? err.message : String(err)))
     emitLifecycle('update.dsh', { step: 'failed', error: ((err && err.message) || String(err)).slice(0, 128) })
     setState({ status: 'error', error: err && err.message ? err.message : String(err) })
+    // 已明确失败（非被中断）：写终态，避免下次启动被自愈逻辑当成"未完成的更新"重装一遍
+    if (txInfo) { try { writeUpdateState(Object.assign({}, txInfo, { phase: 'failed' })) } catch { /* noop */ } }
   } finally {
     updating = false
   }
 }
 
-module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback }
+module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback, recoverInterruptedUpdate }

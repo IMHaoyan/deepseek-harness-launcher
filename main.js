@@ -91,7 +91,7 @@ const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '', crashNoticeSeen: '', crashNoticeDismissed: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, useSystemBrowser: false, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', windowWidth: 0, windowHeight: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', dshChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, balanceApiKey: '', balanceBaseUrl: '', crashNoticeSeen: '', crashNoticeDismissed: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false }
 let firstRun = false
 let harnessRoot = ''
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
@@ -325,6 +325,7 @@ function applyConfigJson(cfg) {
   if (typeof cfg.harnessRoot === 'string' && cfg.harnessRoot) Config.harnessRoot = cfg.harnessRoot
   if (typeof cfg.nodePath === 'string' && cfg.nodePath) Config.nodePath = cfg.nodePath
   if (typeof cfg.dshVersion === 'string' && cfg.dshVersion) Config.dshVersion = cfg.dshVersion
+  if (cfg.dshChannel === 'alpha' || cfg.dshChannel === 'latest') Config.dshChannel = cfg.dshChannel
   if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
   if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
   if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
@@ -1030,6 +1031,9 @@ async function runHandover(fromPid, code, signal) {
 function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
   const verdictSource = source || 'handover'
   markHealthFault()
+  // 就绪后很快又崩 = 崩溃循环特征：计入硬止损计数（与计数窗口独立）
+  if (readySince && Date.now() - readySince < RESTART_STABLE_MS) fastCrashStreak += 1
+  else fastCrashStreak = 0
   log(`DSH exited unexpectedly (code ${code === null || code === undefined ? '未知' : code}${signal ? ', signal ' + signal : ''})`)
   server.handover = { at: new Date().toISOString(), fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, elapsedMs: elapsedMs || 0 }
   lifecycle.emit('service.handover', { fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, port: PORT, elapsedMs: elapsedMs || 0 })
@@ -1215,6 +1219,19 @@ async function maybeAutoRestart() {
   const now = Date.now()
   const deferred = handover.planCooldownRetry({ now, lastRestartAt, cooldownMs: RESTART_COOLDOWN_MS })
   if (deferred) { scheduleRestartRetry(deferred.waitMs, 'cooldown'); return }
+  // 硬止损：就绪后立即崩溃连续达到阈值 —— 不依赖计数窗口，窗口被任何路径清掉也一定能停
+  if (fastCrashStreak >= RESTART_MAX) {
+    const target = health.pickRestoreTarget(health.configHash(), lastRestoredSlot)
+    if (!recoveryDone && target !== null) {
+      log(`fast-crash streak ${fastCrashStreak}：服务就绪后立即崩溃，尝试回退配置`)
+      lifecycle.emit('service.autoRestartExhausted', { attempts: fastCrashStreak, reason: 'fast-crash-streak' })
+      await attemptConfigRecovery(true)
+    } else {
+      log(`fast-crash streak ${fastCrashStreak}：服务就绪后立即崩溃，停止自动恢复（硬止损）`)
+      haltAutoRestart()
+    }
+    return
+  }
   const attempts = restartAttemptsInWindow()
   if (attempts >= RESTART_MAX) {
     if (recoveryDone) {
@@ -1251,6 +1268,7 @@ let runGuardHandle = null // run-guard 会话句柄（markClean 必需，禁止�
 let healthCaptured = false // 本次运行是否已捕获健康快照（single-flight）
 let healthTimer = null
 let healthFault = false // 就绪后到捕获前出现加载失败/异常退出 → 本次不捕获
+let fastCrashStreak = 0 // 就绪后 RESTART_STABLE_MS 内再次崩溃的连续次数：不依赖计数窗口的硬止损
 let recoveryDone = false // 本次运行最多一次配置回退
 let lastRestoredSlot = ''
 let lastRecoveryAt = ''
@@ -1260,9 +1278,6 @@ let lastRecoveryAt = ''
 function maybeCaptureHealthy(reason) {
   if (SELF_TEST) return
   if (!server.running() || !server.managed()) return
-  // 服务已稳定存活（健康门通过）：清空自动重启计数窗口，让"偶发一次崩溃"不累积成崩溃循环。
-  // 必须在 healthCaptured 早退之前：清计数才是这条路径的意义，快照只写一次不影响它。
-  clearRestartTracking()
   if (healthCaptured) return
   try {
     const r = health.captureHealthy({
@@ -1274,7 +1289,6 @@ function maybeCaptureHealthy(reason) {
       reason,
     })
     healthCaptured = true
-    if (healthTimer) { clearTimeout(healthTimer); healthTimer = null }
     if (r.status === 'captured') {
       lifecycle.emit('health.capture', { slotId: r.slotId, reason })
       log(`health: captured slot ${r.slotId} (reason=${reason})`)
@@ -1288,15 +1302,19 @@ function maybeCaptureHealthy(reason) {
 }
 
 // 服务就绪后安排延迟捕获（页面加载成功是快路径；120s 存活是慢速兜底）
+// 这里同时承担"稳定性证明"：只有连续存活满 RESTART_STABLE_MS 才清空崩溃计数窗口——
+// 页面加载成功不算证明（起来就崩的服务也能加载出页面，否则崩溃循环永远攒不到回退阈值）。
 function scheduleHealthyCapture(pid) {
   if (SELF_TEST) return
   if (healthTimer) clearTimeout(healthTimer)
   healthTimer = setTimeout(() => {
-    if (healthCaptured) return
-    // 仍是无故障的同一代服务（未被重启/接管/失败覆盖）才算健康；认领的后继同样适用
-    if (server.managed() && server.displayPid() === pid && !healthFault) {
-      maybeCaptureHealthy('survived-120s')
-    }
+    healthTimer = null
+    // 仍是无故障的同一代服务（未被重启/接管/失败覆盖）才算稳定；认领的后继同样适用
+    if (!server.managed() || server.displayPid() !== pid || healthFault) return
+    clearRestartTracking()
+    fastCrashStreak = 0
+    log(`service stable for ${Math.round(RESTART_STABLE_MS / 1000)}s：清空自动重启计数窗口`)
+    if (!healthCaptured) maybeCaptureHealthy('survived-120s')
   }, RESTART_STABLE_MS)
 }
 
@@ -1305,10 +1323,11 @@ function markHealthFault() {
 }
 
 // 崩溃循环（连续 5 次自动重启失败）→ 自动回退到上一个健康配置（每次运行最多一次）
-async function attemptConfigRecovery() {
+async function attemptConfigRecovery(force) {
   if (recoveryDone) return
   const target = health.pickRestoreTarget(health.configHash(), lastRestoredSlot)
-  if (!health.shouldRecover(restartAttemptsInWindow(), target !== null)) return
+  if (!force && !health.shouldRecover(restartAttemptsInWindow(), target !== null)) return
+  if (target === null) return
   recoveryDone = true
   try {
     const r = health.restore(target)
@@ -2676,6 +2695,7 @@ function registerIpc() {
           Config.harnessRoot = ''
           Config.nodePath = ''
           Config.dshVersion = 'latest' // 重置默认：安装/升级都装 latest
+          Config.dshChannel = 'latest' // 更新渠道也回默认
           Config.nodeMajor = 22
           Config.nodeMirror = ''
           Config.npmRegistry = ''
@@ -2715,6 +2735,18 @@ function registerIpc() {
         }
         case 'setUseSystemBrowser': Config.useSystemBrowser = !!value; saveConfig(); broadcastState(); return '{}'
         case 'setAutoRestart': Config.autoRestart = !!value; saveConfig(); broadcastState(); return '{}'
+        case 'setDshChannel': {
+          const ch = value === 'alpha' ? 'alpha' : 'latest'
+          if (Config.dshChannel !== ch) {
+            Config.dshChannel = ch
+            Config.dshUpdateCheckedAt = 0 // 换渠道后立刻重新检查，不必等 24h 节流
+            saveConfig()
+            log('dsh-update: channel switched to ' + ch)
+            void dshUpdater.checkOnce('manual', true)
+          }
+          broadcastState()
+          return '{}'
+        }
         case 'feedbackBuild': {
           const text = String(value && value.text || '').trim()
           if (!text) return '{}'
@@ -3020,7 +3052,7 @@ async function runSelfTest() {
     if (!win || win.isDestroyed()) { selftestPrint('FAILED: window not created'); app.exit(2); return }
     const title = await win.webContents.executeJavaScript('document.title')
     const panel = await win.webContents.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnRecharge') !== null && document.getElementById('btnBalanceOpenSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('btnDshCheck') !== null && document.getElementById('dshUpdaterStatus') !== null && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('btnZoom') !== null && document.getElementById('btnWebZoom') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnBalanceRefresh') !== null && document.getElementById('balanceValue') !== null && document.getElementById('btnRecharge') !== null && document.getElementById('btnBalanceOpenSettings') !== null && document.getElementById('balanceKey') !== null && document.getElementById('btnBalanceTest') !== null && document.getElementById('btnBalanceBack') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.getElementById('dshChannelChips').children.length === 2 && document.getElementById('urlText') !== null && document.getElementById('urlText').classList.contains('link') && document.getElementById('btnReset') !== null ? 'panel-ok' : 'panel-missing'",
     )
     selftestPrint(`WEBVIEW OK: ${title} | ${panel}`)
     // 自愈链路：服务已停止 → webview 重载为空白；重启服务 → 自动恢复真实应用
@@ -3144,6 +3176,20 @@ async function runSelfTest() {
       clearRestartTracking()
       autoRestartStopped = false
     }
+    // —— 硬止损：就绪后立即崩溃连续达阈值 → 即使计数窗口为空也必须停止自动恢复 ——
+    {
+      clearRestartTracking() // 模拟"窗口被清空"的坏情况：靠 streak 仍必须停下来
+      autoRestartStopped = false
+      recoveryDone = true // 本场景只验 halt 分支
+      fastCrashStreak = RESTART_MAX
+      await maybeAutoRestart()
+      const halted = autoRestartStopped === true && !server.running() && !restartRetryPending()
+      selftestPrint(`FAST-CRASH-HALT ${halted ? 'OK' : 'FAILED'} (stopped=${autoRestartStopped}, running=${server.running()}, retryPending=${restartRetryPending()})`)
+      if (!halted) { selftestPrint('FAILED: fast-crash hard stop broken'); app.exit(2); return }
+      autoRestartStopped = false
+      fastCrashStreak = 0
+      clearRestartTracking()
+    }
     // —— 通知去重：同标题+同内容在窗口期内只弹一次（崩溃循环不再刷屏）——
     {
       const tag = 'dedupe-' + Date.now()
@@ -3224,6 +3270,7 @@ async function runSelfTest() {
       fs.writeFileSync(CONFIG_PATH, JSON.stringify(Object.assign({}, Config, { theme: 'dark', port: 3888 }), null, 2))
       seedRestartAttempts(RESTART_MAX) // 直接填满计数窗口（避免真等 10 分钟）
       lastRestartAt = 0
+      fastCrashStreak = 0 // 前面的演练故意杀过服务：先清掉，确保走"窗口阈值"这条路径
       recoveryDone = false
       lastRestoredSlot = ''
       lastRecoveryAt = ''
@@ -3427,6 +3474,8 @@ function init() {
   void (async () => {
     await refreshEnv(true)
     maybeMigrateDsh()
+    // 上次 DSH 更新若被中断（装到一半退出启动器），安装目录会残留半套文件 → 先自愈再探测/拉服务
+    try { await dshUpdater.recoverInterruptedUpdate() } catch (err) { log('dsh-update: 中断恢复异常：' + (err && err.message ? err.message : String(err))) }
     void maybeApplyDefenderExclusion() // 安装/升级后首次运行：尝试添加 Defender 排除项（一次 UAC）
     if (!envReady()) {
       if (firstRun || args.panel) showPanel()
