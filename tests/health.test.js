@@ -107,3 +107,66 @@ test('无快照时恢复 no-op；restore 未知槽抛错', (t) => {
   assert.equal(health.restore('slot-1').status, 'noop')
   assert.throws(() => health.restore('slot-9'))
 })
+
+// —— 回归：审计发现的三处缺陷 ——
+
+test('备份保留：broken 备份超过 3 份时按时间删最旧（此前正则不匹配，永不清理）', (t) => {
+  const env = initH(t)
+  health.captureHealthy(meta)
+  const dir = path.dirname(env.configPath)
+  const base = path.basename(env.configPath)
+  // 预置 6 份历史备份（时间戳递增）
+  for (let i = 0; i < 6; i++) {
+    fs.writeFileSync(path.join(dir, `${base}.broken-2026-01-0${i + 1}-00-00-00-aaaa000${i}.json`), `{"n":${i}}`)
+  }
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 7777 }, null, 2))
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  const left = fs.readdirSync(dir).filter((n) => n.startsWith(`${base}.broken-`))
+  assert.equal(left.length, 3, '只保留最近 3 份，实际 ' + left.length)
+  // 保留的应是最新的三份（2026-01-04/05/06 与本次恢复各占一份）
+  assert.ok(left.some((n) => n.includes('2026-01-06')), '最新备份必须保留')
+  assert.ok(!left.some((n) => n.includes('2026-01-01')), '最旧备份必须删除')
+})
+
+test('skip marker 与配置内容绑定：恢复后又改配置 → 标记失效并正常捕获新快照', (t) => {
+  const env = initH(t)
+  health.captureHealthy(meta) // 快照 A（port 3080）
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 7777 }, null, 2))
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  // 用户改成另一份健康配置 Z
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 4321 }, null, 2))
+  const r2 = health.captureHealthy({ ...meta, port: 4321 })
+  assert.equal(r2.status, 'captured', '恢复后又改配置时不应再被 skip marker 吃掉')
+  // Z 已入槽，且是最新 known-good
+  const cfg = JSON.parse(fs.readFileSync(path.join(env.snapshotDir, r2.slotId, 'config.json'), 'utf8'))
+  assert.equal(cfg.port, 4321)
+})
+
+test('孤儿槽恢复：按 mtime 取最新（此前按随机 UUID 排序会取到旧的）', (t) => {
+  const env = initH(t)
+  health.captureHealthy(meta)
+  const slotDir = path.join(env.snapshotDir, 'slot-1')
+  // 把有效槽改名成"旧的孤儿"，再手工造一个"新的孤儿"
+  const oldOrphan = path.join(env.snapshotDir, 'slot-1.old-00000000-0000-0000-0000-000000000000')
+  fs.renameSync(slotDir, oldOrphan)
+  const newOrphan = path.join(env.snapshotDir, 'slot-1.old-ffffffff-ffff-ffff-ffff-ffffffffffff')
+  fs.mkdirSync(newOrphan, { recursive: true })
+  const cfg = JSON.parse(fs.readFileSync(path.join(oldOrphan, 'config.json'), 'utf8'))
+  fs.writeFileSync(path.join(newOrphan, 'config.json'), JSON.stringify({ ...cfg, port: 2222 }, null, 2))
+  // 复制 meta 并同步 sha256/size（让新孤儿成为一个有效槽）
+  const metaRaw = JSON.parse(fs.readFileSync(path.join(oldOrphan, 'meta.json'), 'utf8'))
+  const bytes = fs.readFileSync(path.join(newOrphan, 'config.json'))
+  metaRaw.sha256 = health.sha256(bytes)
+  metaRaw.size = bytes.byteLength
+  fs.writeFileSync(path.join(newOrphan, 'meta.json'), JSON.stringify(metaRaw, null, 2))
+  // 让新孤儿的 mtime 明确晚于旧的
+  const past = new Date(Date.now() - 60 * 1000)
+  fs.utimesSync(oldOrphan, past, past)
+  const slots = health.listSlots()
+  const restored = slots.find((s) => s.slotId === 'slot-1')
+  assert.ok(restored && restored.valid, 'slot-1 应从孤儿恢复为有效槽')
+  const got = JSON.parse(fs.readFileSync(path.join(env.snapshotDir, 'slot-1', 'config.json'), 'utf8'))
+  assert.equal(got.port, 2222, '应恢复 mtime 最新的孤儿（2222），而不是随机名排序后的旧槽')
+})

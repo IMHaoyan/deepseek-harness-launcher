@@ -12,9 +12,10 @@
     "dev": "node tools/dev.mjs",
     "selftest": "electron . --selftest",
     "test": "node --test \"tests/**/*.test.js\"",
+    "verify": "node tools/verify-package-files.cjs",
     "envcheck": "node tools/envcheck.cjs",
     "dist:win": "electron-builder --win --publish never",
-    "dist:mac": "electron-builder --mac",
+    "dist:mac": "electron-builder --mac --publish never",
     "release": "node tools/release.mjs"
   },
   "dependencies": {
@@ -45,6 +46,7 @@
       "diagnostics.js",
       "market.js",
       "service-stop-guard.js",
+      "service-handover.js",
       "wwwroot/**/*",
       "assets/**/*",
       "!assets/node-dist/**"

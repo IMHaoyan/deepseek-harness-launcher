@@ -120,19 +120,24 @@ function readSnapshotConfig(slotId) {
   return { meta, bytes }
 }
 
-// 恢复槽目录的孤儿（rename 一半时崩溃留下 .old-*）：槽位缺失时优先补回最新的
+// 恢复槽目录的孤儿（rename 一半时崩溃留下 .old-*）：槽位缺失时优先补回最新的。
+// 注意：孤儿目录名里的 UUID 是随机的，按名字排序毫无意义——必须按目录 mtime 取最新。
 function recoverOrphanSlot(slotId) {
   if (fs.existsSync(slotDir(slotId))) return
   let names = []
-  try { names = fs.readdirSync(snapshotDir).filter((n) => n.startsWith(`${slotId}.old-`)).sort().reverse() } catch { return }
+  try { names = fs.readdirSync(snapshotDir).filter((n) => n.startsWith(`${slotId}.old-`)) } catch { return }
+  const candidates = []
   for (const name of names) {
-    const candidate = path.join(snapshotDir, name)
+    const p = path.join(snapshotDir, name)
     try {
-      const st = fs.lstatSync(candidate)
+      const st = fs.lstatSync(p)
       if (st.isSymbolicLink() || !st.isDirectory()) continue
-      fs.renameSync(candidate, slotDir(slotId))
-      return
-    } catch { /* 下一个 */ }
+      candidates.push({ p, mtime: st.mtimeMs })
+    } catch { /* 跳过不可读项 */ }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime) // 最新在前
+  for (const c of candidates) {
+    try { fs.renameSync(c.p, slotDir(slotId)); return } catch { /* 下一个 */ }
   }
 }
 
@@ -165,12 +170,15 @@ function readSkipMarker() {
     if (v.version !== SKIP_MARKER_VERSION || typeof v.restoredSlotId !== 'string' || typeof v.restoredAt !== 'string') {
       throw new Error('invalid skip marker')
     }
+    // restoredSha：恢复当时写回的配置哈希。只有当前配置仍等于它（即"刚恢复的配置一直没被改过"）
+    // 才跳过捕获；用户之后又改过配置时，标记失效并正常捕获新快照。
+    if (v.restoredSha !== undefined && typeof v.restoredSha !== 'string') throw new Error('invalid skip marker sha')
     return v
   } catch { return undefined }
 }
 
 /**
- * 健康启动快照。存在 skip marker 时只消费标记（不覆盖快照）。
+ * 健康启动快照。存在**仍然适用**的 skip marker 时只消费标记（不覆盖快照）。
  * @param {{dshlVersion, dshKind, dshVersion, nodeVersion, port, reason}} meta
  */
 function captureHealthy(meta = {}) {
@@ -181,9 +189,16 @@ function captureHealthy(meta = {}) {
   }
   const skip = readSkipMarker()
   if (skip !== undefined) {
-    try { fs.unlinkSync(skipMarkerPath()) } catch { /* noop */ }
-    info(`health: skip marker consumed (restored slot ${skip.restoredSlotId})`)
-    return { status: 'skipped', restoredSlotId: skip.restoredSlotId }
+    const currentSha = sha256(fs.readFileSync(configPath))
+    if (skip.restoredSha && currentSha !== skip.restoredSha) {
+      // 恢复后又改过配置：标记失效，删掉它并继续正常捕获
+      try { fs.unlinkSync(skipMarkerPath()) } catch { /* noop */ }
+      info(`health: skip marker stale (config changed since restore of ${skip.restoredSlotId}), capturing instead`)
+    } else {
+      try { fs.unlinkSync(skipMarkerPath()) } catch { /* noop */ }
+      info(`health: skip marker consumed (restored slot ${skip.restoredSlotId})`)
+      return { status: 'skipped', restoredSlotId: skip.restoredSlotId }
+    }
   }
   const configBytes = fs.readFileSync(configPath)
   const snapshotId = crypto.randomUUID()
@@ -273,18 +288,21 @@ function restore(slotId) {
   const snap = readSnapshotConfig(slotId)
   if (snap === undefined) return { status: 'noop', slotId }
   const restoredAt = new Date().toISOString()
-  // 先持久化 skip marker：恢复后下一次健康启动不覆盖检查点（先写后改，崩溃中途也安全）
-  writeJsonChecked(skipMarkerPath(), { version: SKIP_MARKER_VERSION, restoredSlotId: slotId, restoredAt })
+  // 快照内容先读出来并校验（防恢复期间快照被改）。校验必须在写 skip marker 之前：
+  // 否则校验失败会留下一个"白吃一次快照刷新"的标记。
+  const bytes = fs.readFileSync(snapshotConfigPath(slotId))
+  if (sha256(bytes) !== snap.meta.sha256) throw new Error(`checkpoint changed during restore: ${slotId}`)
+  const restoredSha = sha256(bytes)
+  // 持久化 skip marker：记录写回的配置哈希，仅当配置仍等于它时才跳过下次捕获（先写后改，崩溃中途也安全）
+  writeJsonChecked(skipMarkerPath(), { version: SKIP_MARKER_VERSION, restoredSlotId: slotId, restoredAt, restoredSha })
   // 备份当前配置（保留最近 BROKEN_KEEP 份）
-  const backupPath = `${configPath}.broken-${restoredAt.replace(/[:T]/g, '-').slice(0, 19)}.json`
+  const backupPath = `${configPath}.broken-${restoredAt.replace(/[:T]/g, '-').slice(0, 19)}-${crypto.randomUUID().slice(0, 8)}.json`
   const cur = lstatOptional(configPath)
   if (cur !== undefined && cur.isFile() && !cur.isSymbolicLink()) {
     writeDurable(backupPath, fs.readFileSync(configPath))
     pruneBrokenBackups()
   }
-  // 原子写回快照配置（再校验一次，防恢复期间快照被改）
-  const bytes = fs.readFileSync(snapshotConfigPath(slotId))
-  if (sha256(bytes) !== snap.meta.sha256) throw new Error(`checkpoint changed during restore: ${slotId}`)
+  // 原子写回快照配置
   writeDurable(configPath, bytes)
   info(`health: restored slot ${slotId} (${restoredAt}), backup=${path.basename(backupPath)}`)
   return { status: 'restored', slotId, backupPath }
@@ -293,9 +311,11 @@ function restore(slotId) {
 function pruneBrokenBackups() {
   try {
     const dir = path.dirname(configPath)
-    const names = fs.readdirSync(dir)
-      .filter((n) => /^config\.broken-.*\.json$/.test(n))
-      .sort()
+    const base = path.basename(configPath)
+    // 真实文件名形如 config.json.broken-<时间戳>.json —— 正则必须按 basename 前缀匹配，
+    // 此前写成 /^config\.broken-/ 永不命中，BROKEN_KEEP 形同虚设。
+    const re = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.broken-.*\\.json$`)
+    const names = fs.readdirSync(dir).filter((n) => re.test(n)).sort() // 时间戳升序 = 最旧在前
     while (names.length > BROKEN_KEEP) {
       const oldest = names.shift()
       try { fs.unlinkSync(path.join(dir, oldest)) } catch { /* noop */ }

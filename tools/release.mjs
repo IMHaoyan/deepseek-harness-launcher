@@ -103,6 +103,14 @@ if (existing !== null) {
 }
 
 // ---------- 2. 构建（内置 Node 发行包 + wwwroot 资源 + NSIS 安装包） ----------
+// 先跑单测与打包前校验（require 闭包 / wwwroot 同步 / extraResources 源目录），任一失败即中止，
+// 避免把降级包（缺内置 Node、缺面板产物）发出去。可用 DSHL_SKIP_PRECHECK=1 跳过。
+if (process.env.DSHL_SKIP_PRECHECK === '1') {
+  console.log('跳过发布前检查（DSHL_SKIP_PRECHECK=1）')
+} else {
+  run(npm, ['test'])
+  run(npm, ['run', 'verify'])
+}
 run(process.execPath, ['tools/fetch-node-dist.mjs'])
 run(npm, ['run', 'build:assets'])
 run(npm, ['run', 'dist:win'])
