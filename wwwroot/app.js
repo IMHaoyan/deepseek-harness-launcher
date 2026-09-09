@@ -235,9 +235,12 @@ function render(state) {
   // 状态
   const running = window._running;
   // 启动中/重启中：服务进程已起但端口还没就绪（或看护正在重启）。此时不能显示"已停止"，
-  // 也不能让"启动服务"按钮可点（再点一次会命中 startServer 的 owned 早退 → 误报"服务已就绪"）。
+  // 也不能让"启动服务"按钮可点（再点一次会命中 startServer 的早退 → 误报"服务已就绪"）。
   const phase = state.phase || (running ? 'ready' : 'stopped');
   const stopping = phase === 'stopping';
+  // 交接裁决中（DSH 自重启换新进程）：端口可能还在服务，只是我们暂时说不出 PID —— 不能塌成"已停止"
+  const settling = !!state.settling;
+  const serving = running || (settling && phase === 'ready');
   const starting = phase === 'starting' || phase === 'restarting';
   window._starting = starting;
   window._stopping = stopping;
@@ -254,12 +257,18 @@ function render(state) {
     rowDot.className = 'dot running';
     $('statusRowText').textContent = phase === 'restarting' ? '服务正在自动重启…' : '正在启动服务…';
     $('statusRowText').title = '服务进程已启动，正在等待端口就绪';
-  } else if (running) {
+  } else if (serving) {
     rowWrap.className = 'value strong status-value running';
     rowDot.className = 'dot running';
-    const origin = state.owned ? '由本工具启动' : '接管外部服务';
+    const ORIGIN_TEXT = { owned: '由本工具启动', claimed: '服务自重启后已接管', external: '接管外部服务' };
+    // 缺省按旧字段兜底，兼容面板先于主进程更新的情况
+    const origin = settling && !running ? '正在确认新进程…'
+      : (ORIGIN_TEXT[state.origin] || (state.owned ? '由本工具启动' : '接管外部服务'));
     $('statusRowText').textContent = `运行中（${origin}）`;
-    $('statusRowText').title = '';
+    const ho = state.handover;
+    $('statusRowText').title = settling && !running ? '检测到服务进程更换，正在确认新进程（无需操作）'
+      : state.origin === 'claimed' && ho ? `DSH 内部重启换了新进程（PID ${ho.fromPid} → ${ho.toPid}），启动器已认领并继续看护`
+        : (state.authPending ? '服务在正常运行，只是页面缺少访问凭据：在 DeepSeek Harness 窗口点「重启服务以恢复访问」' : '');
   } else if (state.blocked) {
     // 端口被非 DSH 程序占用：拒绝接管，也不允许启动
     rowWrap.className = 'value strong status-value stopped';
@@ -304,13 +313,14 @@ function render(state) {
 
   // 启动/停止 合一按钮
   const toggle = $('btnToggle');
-  const busy = starting || stopping; // 启动/重启/停止过程中一律禁用，避免重复点击
+  const busy = starting || stopping || settling; // 启动/重启/停止/交接裁决中一律禁用，避免重复点击
   toggle.textContent = stopping ? '停止中…'
     : starting ? (phase === 'restarting' ? '重启中…' : '启动中…')
-      : (running ? '停止服务' : '启动服务');
+      : settling ? '确认中…'
+        : (serving ? '停止服务' : '启动服务');
   toggle.disabled = busy;
-  toggle.classList.toggle('primary', !running && !busy);
-  toggle.classList.toggle('danger', running && !busy);
+  toggle.classList.toggle('primary', !serving && !busy);
+  toggle.classList.toggle('danger', serving && !busy);
 
   // 开关 chip
   renderToggleChip('btnNotify', state.notify !== false, '开启', '关闭');

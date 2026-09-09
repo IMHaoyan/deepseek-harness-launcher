@@ -44,7 +44,7 @@ function loadWhalePath() {
 }
 const whalePath = loadWhalePath()
 
-const COPIED = ['styles.css', 'app.js', 'offline.html', 'browser.html', 'browser.css', 'browser.js']
+const COPIED = ['styles.css', 'app.js', 'offline.html', 'browser.html', 'browser.css', 'browser.js', 'loading.html', 'loading.js']
 
 // ---------- 产物组装（index.html 内联鲸鱼 + 拷贝其余文件；与 build:assets 一致，不含图标） ----------
 function buildAssets() {
@@ -70,7 +70,7 @@ function changedName(prev, cur) {
 }
 
 const UI_FILES = ['index.html', ...COPIED]
-const MAIN_FILES = ['main.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'balance.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'diagnostics.js', 'market.js', 'service-stop-guard.js', 'package.json']
+const MAIN_FILES = ['main.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'balance.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'diagnostics.js', 'market.js', 'service-stop-guard.js', 'service-handover.js', 'package.json']
 
 // ---------- electron 子进程管理 ----------
 const electronExe = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')

@@ -35,6 +35,12 @@ const TEXTS = {
     sub: '', // 由 detail 参数填充（占用原因 + 建议端口）
     btn: '换到空闲端口并启动',
   },
+  auth: {
+    title: '服务已自行重启，页面需要重新连接',
+    sub: 'DeepSeek Harness 服务在正常运行，只是它重启后换了一次访问凭据，启动器拿不到新凭据。'
+      + '点击下方按钮由启动器重启一次服务即可恢复（会中断当前正在跑的会话）；不想中断的话，也可以自己在服务里重新打开页面。',
+    btn: '重启服务以恢复访问',
+  },
 }
 const t = TEXTS[reason] || TEXTS.start
 const subEl = document.getElementById('sub')
@@ -42,7 +48,7 @@ const btnEl = document.getElementById('btnReload')
 document.getElementById('title').textContent = t.title
 subEl.textContent = t.sub
 btnEl.textContent = t.btn
-if (reason === 'failed' || reason === 'offline') document.body.classList.add('failed')
+if (reason === 'failed' || reason === 'offline' || reason === 'auth') document.body.classList.add('failed')
 
 // 端口冲突页：detail 展示冲突原因；suggest 有值 → 一键换端口启动；无值 → 引导打开启动器面板
 const detail = (q.get('detail') || '').slice(0, 500)
@@ -56,6 +62,7 @@ if (reason === 'blocked') {
 document.getElementById('btnReload').addEventListener('click', () => {
   try {
     if (reason === 'blocked' && suggest) window.browserBridge.send('blockSwitch', { port: Number(suggest) })
+    else if (reason === 'auth') window.browserBridge.send('authRestart', { id: pane })
     else window.browserBridge.send('fixPane', { id: pane })
   } catch (e) { /* 桥未就绪忽略 */ }
 })

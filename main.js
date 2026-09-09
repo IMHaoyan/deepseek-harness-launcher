@@ -24,6 +24,7 @@ const health = require('./health')
 const diagnostics = require('./diagnostics')
 const market = require('./market')
 const stopGuard = require('./service-stop-guard')
+const handover = require('./service-handover')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -436,17 +437,55 @@ function serviceStopping() {
   return stopGuard.isStopping()
 }
 
+// DSH 自重启识别（详见 service-handover.js）：我们的 child 退出后，端口可能正被它克隆出的后继持有。
+// 认领窗口分两档：端口空档且没有匹配候选时短等（真崩溃不必拖久），有匹配候选时等够它 bind。
+const HANDOVER_POLL_MS = 300
+const HANDOVER_SETTLE_MS = 3000
+const HANDOVER_MAX_MS = 8000 // 冷启动 DSH 绑端口实测 3.5~4.5s，留余量
+const HANDOVER_SCAN_MS = 600 // 进程表取证节流（PowerShell 单次约 0.7~1s，不能进每轮的轮询）
+const CMDLINE_TIMEOUT_MS = 6000 // PowerShell 冷启动 + AV 扫描实测可到 3~4s，超时会让识别退化成"外部实例"
+const TOKEN_TAIL_MS = 15000 // child 退出后继续读它的 stdout 多久：克隆体可能继承同一根管道
+const TOKEN_GRACE_MS = 1200 // stdout 已到 EOF 时的收尾宽限（确认没有半行 token 卡在缓冲里）
+const ADOPT_DOWN_CONFIRM_MS = 6000 // 端口连续多久没人应答才判定服务消失
+const TRACK_WATCHDOG_MS = 2000 // onTick 周期：非自有世代的存活性采样间隔
+const OWNER_VERIFY_EVERY_TICKS = 10 // 认领/接管世代约每 20s 复核一次端口持有者
+const RESTART_COOLDOWN_MS = 10000
+
 const server = {
   child: null,
   adoptedPid: 0,
   adoptedAlive: false,
+  claimedPid: 0, // DSH 自重启后继：命令行与本轮启动签名一致，已认领
+  claimedAlive: false,
+  launchSig: null, // { script, args }，与实际 spawn argv 同源（认领的唯一判据）
+  authPending: false, // 服务在跑但没拿到本轮访问凭据（token），页面需要一次由启动器发起的重启
+  tokenPending: false, // 认领后的 stdout 尾读窗口内，token 有无尚未定案
+  tailGen: -1, // 尾读窗口所属世代
+  tailOpen: false, // 该世代的 stdout 是否仍在读（克隆体可能继承了管道）
+  settling: false, // 交接裁决中
+  settlingServing: false, // 裁决期间端口是否有人应答（面板据此在"运行中/正在自动重启"之间取舍）
+  handover: null, // 最近一次交接裁决（{ at, fromPid, toPid, verdict, source, elapsedMs }），诊断用
+  handoverPromise: null, // 进行中的裁决：停止/退出路径先等它收敛，避免"停了旧的、活着新的"
+  gen: 0, // 世代号：spawn/接管/停止自增，让过期的尾读与裁决自我作废（认领不换世代）
   stopping: false,
   blockedReason: '',
   suggestedPort: 0,
   launchUrl: null, // 本轮服务 stdout 打印的访问地址（新 DSH 带一次性 token，形如 ?token=xxx）；null=未知/无鉴权
+  expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
-  running() { return this.owned() || (this.adoptedPid !== 0 && this.adoptedAlive) },
-  displayPid() { return this.owned() ? this.child.pid : this.adoptedPid },
+  claimed() { return this.claimedPid !== 0 && this.claimedAlive },
+  // 我们负责的服务 = 自己拉起的 + 认领的后继（两者都会被停止/换端口/健康记账；外部接管实例不算）
+  managed() { return this.owned() || this.claimed() },
+  running() { return this.managed() || (this.adoptedPid !== 0 && this.adoptedAlive) },
+  origin() {
+    if (this.owned()) return 'owned'
+    if (this.claimed()) return 'claimed'
+    return this.adoptedPid ? 'external' : 'none'
+  },
+  displayPid() {
+    if (this.owned()) return this.child.pid
+    return this.claimed() ? this.claimedPid : this.adoptedPid
+  },
 }
 
 // WebUI 应加载的地址：新 DSH（v0.1.2-rc.1 起）每次启动生成一次性 launch token，
@@ -461,6 +500,8 @@ let serverRestarting = false
 function servicePhase() {
   if (server.child && server.child.__starting) return 'starting'
   if (serviceStopping()) return 'stopping'
+  // 交接裁决中不能塌成"已停止"：端口还有人应答就是运行中，否则算自动重启中
+  if (server.settling) return server.running() || server.settlingServing ? 'ready' : 'restarting'
   if (serverRestarting) return 'restarting'
   if (server.running()) return 'ready'
   return 'stopped'
@@ -515,6 +556,47 @@ function findListenPid() {
       })
     }
   })
+}
+
+// 读某 PID 的完整命令行。拿不到一律返回 ''：调用方按"不可判定"处理，绝不凭猜测认领别人的进程。
+async function readCmdline(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return ''
+  if (IS_WIN) {
+    const r = await runPwsh(`(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction SilentlyContinue).CommandLine`, { timeoutMs: CMDLINE_TIMEOUT_MS })
+    return r.ok ? r.stdout.trim() : ''
+  }
+  try {
+    // /proc 以 NUL 分隔 argv，本身没有引号语义：含空格的参数补上引号，交给 splitCmdline 原样还原
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean)
+      .map((t) => (/\s/.test(t) ? `"${t}"` : t)).join(' ')
+  } catch { return '' }
+}
+
+// 可能是"我们这一轮 DSH 的后继"的进程：命令行里出现启动脚本的 node 进程。
+// needle 只用来缩小 POSIX 侧的扫描范围；真正的判定在 matchLaunchSig（逐参数比对）。
+async function dshSuccessorCandidates(needle) {
+  const out = []
+  if (IS_WIN) {
+    const r = await runPwsh('Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.ProcessId);$($_.CommandLine)" }', { timeoutMs: CMDLINE_TIMEOUT_MS })
+    if (!r.ok) return out
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const sep = line.indexOf(';')
+      if (sep < 0) continue
+      const pid = parseInt(line.slice(0, sep), 10)
+      if (Number.isInteger(pid)) out.push({ pid, cmdline: line.slice(sep + 1) })
+    }
+    return out
+  }
+  const text = await new Promise((resolve) => {
+    execFile('ps', ['-eo', 'pid=,args='], { timeout: CMDLINE_TIMEOUT_MS }, (err, stdout) => resolve(err ? '' : String(stdout || '')))
+  })
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\s*(\d+)\s+([\s\S]*)$/)
+    if (!m) continue
+    if (needle && !m[2].includes(needle)) continue
+    out.push({ pid: parseInt(m[1], 10), cmdline: m[2] })
+  }
+  return out
 }
 
 // 定位 node 运行时：macOS 图形进程 PATH 里通常没有 homebrew/nvm，逐个候选探测
@@ -583,34 +665,40 @@ function probeDsh() {
   })
 }
 
+// 端口上已经有服务在跑：先验身份，是 DSH 才接管（外部实例拿不到它的 stdout，只能靠既有 cookie 访问），
+// 否则拒绝并建议空闲端口。启动入口与"自重启交接裁决"共用这一条路径，判定与文案必须一致。
+async function handlePortOccupied(source) {
+  const probe = await probeDsh()
+  if (probe.ok) {
+    server.gen++ // 旧世代的尾读/裁决就此作废
+    clearClaimed()
+    server.adoptedPid = await findListenPid()
+    server.adoptedAlive = server.adoptedPid !== 0
+    server.launchUrl = null
+    server.launchSig = null
+    log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
+    lifecycle.emit('service.adopt', { pid: server.adoptedPid, port: PORT, source: source || 'start' })
+    return true
+  }
+  const pid = await findListenPid()
+  server.adoptedPid = 0
+  server.adoptedAlive = false
+  // 自动找下一个空闲端口作为建议，面板提供"换到该端口并启动"一键入口
+  const suggested = await findFreePort(PORT + 1)
+  server.suggestedPort = suggested
+  server.blockedReason = suggested
+    ? `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；建议切换到空闲端口 ${suggested}（启动器面板可一键切换），或关闭占用程序`
+    : `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；附近端口均被占用，请关闭占用程序后重试`
+  log(server.blockedReason + '；probe=' + (probe.reason || 'fingerprint-mismatch'))
+  lifecycle.emit('service.blocked', { port: PORT, reason: 'port-conflict' })
+  return false
+}
+
 async function startServer() {
-  if (server.owned()) return true
+  if (server.owned() || server.claimed()) return true // 已有我们负责的服务在跑（含认领的自重启后继）
   server.blockedReason = ''
   server.suggestedPort = 0
-  if (await portOpen()) {
-    // 端口被占用：先验证对方身份，是 DSH 才接管
-    const probe = await probeDsh()
-    if (probe.ok) {
-      server.adoptedPid = await findListenPid()
-      server.adoptedAlive = server.adoptedPid !== 0
-      server.launchUrl = null // 外部启动的服务看不到其 stdout，拿不到 launch token，只能靠既有 cookie 访问
-      log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
-      lifecycle.emit('service.adopt', { pid: server.adoptedPid, port: PORT })
-      return true
-    }
-    const pid = await findListenPid()
-    server.adoptedPid = 0
-    server.adoptedAlive = false
-    // 自动找下一个空闲端口作为建议，面板提供"换到该端口并启动"一键入口
-    const suggested = await findFreePort(PORT + 1)
-    server.suggestedPort = suggested
-    server.blockedReason = suggested
-      ? `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；建议切换到空闲端口 ${suggested}（启动器面板可一键切换），或关闭占用程序`
-      : `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；附近端口均被占用，请关闭占用程序后重试`
-    log(server.blockedReason + '；probe=' + (probe.reason || 'fingerprint-mismatch'))
-    lifecycle.emit('service.blocked', { port: PORT, reason: 'port-conflict' })
-    return false
-  }
+  if (await portOpen()) return handlePortOccupied('start')
   server.adoptedPid = 0
   server.adoptedAlive = false
 
@@ -633,13 +721,13 @@ async function startServer() {
   const nodeCmd = plan.nodeCmd
   const env = { ...process.env, DSH_HOME: HOME }
   if (AGENTS_HOME) env.DSH_AGENTS_HOME = AGENTS_HOME
-  // DSH web 应用自 v0.1.0-rc.8 起默认自动打开系统默认浏览器（--no-open 关闭）；
-  // 更早版本不认识该参数（传了会报 unknown option 直接退出），按版本号判断是否传
-  const dshVer = String(plan.dshVersion || '').replace(/^v/, '')
-  const noOpen = (() => { try { return semver.gte(dshVer, '0.1.0-rc.8', { includePrerelease: true }) } catch { return false } })()
-  const spawnArgs = [plan.dshBin, 'web', '--host', HOST, '--port', String(PORT)]
-  if (noOpen) spawnArgs.push('--no-open')
+  const spawnArgs = buildDshArgv(plan)
+  server.gen++ // 新世代：上一轮的尾读与交接裁决一律作废
+  server.handoverPromise = null
+  clearClaimed()
+  const gen = server.gen
   server.launchUrl = null // 新进程的 launch token 只在本轮 stdout 中出现
+  server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
   try {
     child = spawn(nodeCmd, spawnArgs, {
@@ -656,80 +744,105 @@ async function startServer() {
   rotateFileSync(ERR_LOG)
   const outS = fs.createWriteStream(OUT_LOG, { flags: 'a' })
   const errS = fs.createWriteStream(ERR_LOG, { flags: 'a' })
-  // 解析 dsh web 启动时打印的访问地址：新 DSH（v0.1.2-rc.1 起）每次启动生成一次性
-  // launch token（"dsh web: http://127.0.0.1:4399/?token=xxx"），页面须带 token 首次访问
-  // 换取浏览器 cookie（默认 30 天）。捕获后立即刷新 WebUI：首次加载可能早于本行到达而
-  // 停在鉴权页/空白，由 refreshWebUiOnReady 与 did-finish-load 鉴权兜底补上。
-  let launchBuf = ''
-  child.stdout.on('data', (d) => {
-    try { outS.write(d) } catch { /* noop */ }
-    launchBuf = (launchBuf + String(d)).slice(-8192)
-    let nl
-    while ((nl = launchBuf.indexOf('\n')) >= 0) {
-      const line = launchBuf.slice(0, nl).trim()
-      launchBuf = launchBuf.slice(nl + 1)
-      const m = line.match(/dsh web:\s*(https?:\/\/[^\s]+)/)
-      if (!m) continue
-      let launchUrl
-      try {
-        launchUrl = new URL(m[1])
-        const hostOk = launchUrl.hostname === HOST || launchUrl.hostname === 'localhost'
-        const portOk = (launchUrl.port === '' ? (launchUrl.protocol === 'https:' ? '443' : '80') : launchUrl.port) === String(PORT)
-        if (!hostOk || !portOk || !launchUrl.searchParams.has('token')) continue // 只认本机当前端口的带 token 地址
-      } catch { continue }
-      server.launchUrl = launchUrl.href
-      log('captured dsh web launch URL (token auth page)')
-      if (server.running()) void refreshWebUiOnReady(false) // 加载早于本行到达的标签会停在鉴权页/空白，立即补拉
-    }
-  })
-  child.stderr.on('data', (d) => { try { errS.write(d) } catch { /* noop */ } })
-  child.__starting = true
-  child.on('exit', (code, signal) => {
+  // 落盘 + "退出后仍短暂读尾巴"：DSH 自重启的克隆体可能继承同一根 stdout 管道，
+  // 它打印的 dsh web: …?token= 是我们唯一能拿到的新凭据来源（token 每进程随机，别处读不到）。
+  const tail = { closed: false, timer: null }
+  server.tailGen = gen
+  server.tailOpen = true
+  const closeTail = () => {
+    if (tail.closed) return
+    tail.closed = true
+    if (tail.timer) { clearTimeout(tail.timer); tail.timer = null }
     try { outS.end() } catch { /* noop */ }
     try { errS.end() } catch { /* noop */ }
-    if (server.child !== child) return
-    server.child = null
-    server.launchUrl = null // 新一轮服务的 token 只在新一轮 stdout 里，旧 token 作废
-    lifecycle.emit('service.exit', { code, signal, expected: !!server.stopping || !!child.__starting })
-    if (server.stopping) return
-    if (child.__starting) return // 启动阶段退出由 startServer 的等待循环报告失败
-    markHealthFault() // 就绪后异常退出：本次运行不再捕获健康快照
-    log(`DSH exited unexpectedly (code ${code}${signal ? ', signal ' + signal : ''})`)
-    // 页面立即切到"服务正在自动重启…"说明页（文字说明 + 刷新按钮；就绪后由 refreshWebUiOnReady 自动切回）
-    if (!SELF_TEST) {
-      const reason = autoRestartStopped ? 'offline' : (Config.autoRestart ? 'restart' : 'offline')
-      for (const t of webTabs) {
-        const wc = t.view && t.view.webContents
-        if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl(reason, t.id, loadingParams())) } catch { /* noop */ } }
+    try { child.stdout.destroy() } catch { /* noop */ }
+    try { child.stderr.destroy() } catch { /* noop */ }
+    // 尾读窗口关闭仍没等到 token：认领世代确定无法自行恢复页面凭据，交给面板引导一次重启
+    if (server.tailGen === gen) server.tailOpen = false
+    if (server.gen === gen && server.tokenPending) markAuthPending()
+  }
+  // 到点必关：只有关闭方（新认领/停止）之外的路径才需要自己排定时器，否则管道句柄会一直挂着
+  const armTail = () => { if (!tail.closed && !tail.timer) tail.timer = setTimeout(closeTail, TOKEN_TAIL_MS) }
+  // stdout 到 EOF = 克隆体没有继承这根管道，再等也不会有新 token：短宽限后收尾（15s 上限仍兜住继承管道的情况）
+  child.stdout.once('end', () => {
+    if (tail.closed) return
+    if (tail.timer) clearTimeout(tail.timer)
+    tail.timer = setTimeout(closeTail, TOKEN_GRACE_MS)
+  })
+  const writeSafe = (s, d) => { if (!tail.closed) { try { s.write(d) } catch { /* 已 end 的写入异常不该变成 uncaught 噪声 */ } } }
+  // 解析 dsh web 启动时打印的访问地址：新 DSH（v0.1.2-rc.1 起）每次启动生成一次性
+  // launch token，页面须带 token 首次访问换取浏览器 cookie（默认 30 天）。
+  // 捕获后立即刷新 WebUI：首次加载可能早于本行到达而停在鉴权页/空白，由 refreshWebUiOnReady 与鉴权兜底补上。
+  child.__launchBuf = ''
+  const onData = (d) => {
+    writeSafe(outS, d)
+    if (server.gen !== gen) return // 过期世代的输出：不再解读
+    child.__launchBuf = (child.__launchBuf + String(d)).slice(-8192)
+    let nl
+    while ((nl = child.__launchBuf.indexOf('\n')) >= 0) {
+      const line = child.__launchBuf.slice(0, nl).trim()
+      child.__launchBuf = child.__launchBuf.slice(nl + 1)
+      const href = handover.parseDshWebLine(line, { host: HOST, port: PORT }) // 只认本机当前端口的带 token 地址
+      if (!href) continue
+      server.launchUrl = href
+      if (server.tokenPending) {
+        server.tokenPending = false
+        server.authPending = false
+        lifecycle.emit('service.tokenCaptured', { pid: server.displayPid(), port: PORT })
+        log('captured DSH 自重启后的新 launch token，页面凭据已续上')
+      } else {
+        log('captured dsh web launch URL (token auth page)')
       }
-      webPushState()
+      if (server.running()) void refreshWebUiOnReady(false) // 加载早于本行到达的标签会停在鉴权页/空白，立即补拉
     }
-    // 已显式停止自动恢复时不再重复打扰（通知+闪烁只发一次，halt 时已交代）
-    if (!autoRestartStopped) {
-      startFlash()
-      notify('DeepSeek Harness', '服务意外退出', WEB_URL)
+  }
+  child.stdout.on('data', onData)
+  child.stderr.on('data', (d) => { writeSafe(errS, d) })
+  child.__starting = true
+  child.on('exit', (code, signal) => {
+    if (server.child !== child) {
+      // 过期世代（换端口/停止/孩子被后继取代）：还在等 token 就留到尾读窗口，否则立即收尾
+      if (server.tokenPending) armTail(); else closeTail()
+      return
     }
-    broadcastState()
-    void maybeAutoRestart()
+    server.child = null
+    const expected = !!server.stopping || !!child.__starting
+    lifecycle.emit('service.exit', { code, signal, expected })
+    if (server.stopping) { server.launchUrl = null; closeTail(); return }
+    if (child.__starting) { server.launchUrl = null; return } // 启动阶段退出由 startServer 的等待循环报告失败
+    server.launchUrl = null // 旧 token 作废；新进程若继承管道，token 会晚于本行到达并重新填上
+    armTail()
+    if (server.expectCrash) { // 测试/自伤：没有交接可判，直接走崩溃路径
+      server.expectCrash = false
+      handleUnexpectedExit(child.pid, code, signal, 0, 'expected')
+      return
+    }
+    server.handoverPromise = runHandover(child.pid, code, signal).catch((err) => {
+      log('handover 裁决异常（按崩溃处理）：' + (err && err.message ? err.message : String(err)))
+      server.settling = false
+      server.settlingServing = false
+      handleUnexpectedExit(child.pid, code, signal, 0, 'error')
+    })
   })
   server.child = child
   log('starting DSH web (hidden window)')
-  lifecycle.emit('service.start', { port: PORT })
+  lifecycle.emit('service.start', { port: PORT, pid: child.pid })
   broadcastState() // 立刻把 phase=starting 推给面板（否则启动期间面板一直显示上一次的"已停止"）
   const deadline = Date.now() + READY_TIMEOUT_SEC * 1000
   while (Date.now() < deadline) {
     if (server.child !== child) return false // 已被 stop 打断
     if (child.exitCode !== null) return false
     if (await portOpen()) {
-      child.__starting = false
-      log(`DSH ready on ${WEB_URL} (PID ${child.pid})`)
-      lifecycle.emit('service.ready', { pid: child.pid, port: PORT })
-      scheduleHealthyCapture(child.pid) // 存活 120s 兜底；页面加载成功是快路径
-      // 任何一次成功就绪都重新武装看护（手动启动/自动重启同理；清掉"已停止"历史）。
-      // 计数窗口不在这里清空：服务"起来就崩"的循环必须继续累计，否则回退/halt 永远到不了阈值。
-      readySince = Date.now()
-      autoRestartStopped = false
-      return true
+      // 端口有人应答 ≠ 我们的服务起来了。事故里就是这一步把别人的应答当成了就绪，
+      // 于是我们的孩子与后继抢同一端口 → EADDRINUSE 循环。必须核对监听者是谁。
+      const listener = await findListenPid()
+      const verdict = handover.classifyReadiness({ listenerPid: listener, childPid: child.pid, sigMatched: false })
+      if (verdict === 'ready' || verdict === 'ready-unverified') return markReady(child, verdict)
+      const matched = await matchSuccessorPid(listener)
+      claimSuccessor(matched, listener, { fromPid: child.pid, source: 'startup', elapsedMs: 0 })
+      abandonChild(child) // 我们的孩子从没绑上端口：留着只会反复抢端口（异步强杀，不阻塞裁决）
+      if (server.claimed()) return true
+      return handlePortOccupied('ready-refused')
     }
     await sleep(500)
   }
@@ -759,6 +872,185 @@ function killPid(pid, force) {
   })
 }
 
+// ---------- DSH 自重启的识别与交接 ----------
+// 判定逻辑在 service-handover.js（纯函数、可单测），这里只管时序与副作用。
+
+// 我们启动 DSH 的实际 argv —— 唯一来源：spawn 与"后继认领判据"共用，改一处不会漂。
+// DSH web 应用自 v0.1.0-rc.8 起默认自动打开系统默认浏览器（--no-open 关闭）；
+// 更早版本不认识该参数（传了会报 unknown option 直接退出），按版本号判断是否传。
+function buildDshArgv(plan) {
+  const dshVer = String(plan.dshVersion || '').replace(/^v/, '')
+  let noOpen = false
+  try { noOpen = semver.gte(dshVer, '0.1.0-rc.8', { includePrerelease: true }) } catch { noOpen = false }
+  const argv = [plan.dshBin, 'web', '--host', HOST, '--port', String(PORT)]
+  if (noOpen) argv.push('--no-open')
+  return argv
+}
+
+function clearClaimed() {
+  server.claimedPid = 0
+  server.claimedAlive = false
+  server.tokenPending = false
+  server.authPending = false
+}
+
+// 裁决窗口必须显式结束：settling 挂着会让 servicePhase() 永远停在"重启中"，
+// 还会让 onTick 的非自有世代看护一直跳过。
+function endSettling() {
+  server.settling = false
+  server.settlingServing = false
+}
+
+// 尾读窗口已耗尽仍无 token：服务在跑，但页面凭据只能靠一次由启动器发起的重启拿回来。
+// 这是认领 DSH 自重启后继后的常态（token 每进程随机、且新进程的 stdout 不归我们），不是异常。
+function markAuthPending() {
+  server.tokenPending = false
+  server.authPending = true
+  log('DSH 自重启后未拿到新的访问凭据（launch token），页面需要一次重启')
+  lifecycle.emit('service.selfRestartNoToken', { pid: server.claimedPid, port: PORT })
+  if (!SELF_TEST) {
+    for (const t of webTabs) {
+      const wc = t.view && t.view.webContents
+      if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl('auth', t.id, loadingParams())) } catch { /* noop */ } }
+    }
+    webPushState()
+    notify('DeepSeek Harness', '服务已自行重启并正常运行；页面需要一次重新连接，可在启动器面板点「重启服务」')
+  }
+  broadcastState()
+}
+
+// 端口持有者能否被本轮启动签名解释（= 我们的后继）。
+// 已知持有者时只查那一个 PID 的命令行（PowerShell 冷启动慢，全表扫描留给"还没人绑端口"的情况）。
+// 取不到候选或读不到命令行一律返回 0：宁可判成外部实例，绝不误认领。
+async function matchSuccessorPid(listenerPid) {
+  const sig = server.launchSig
+  if (!sig || !sig.script) return 0
+  if (listenerPid) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const cmd = await readCmdline(listenerPid)
+      if (cmd) return handover.matchLaunchSig(cmd, sig).ok ? listenerPid : 0
+      if (attempt === 0) await sleep(300) // 多半是 PowerShell 超时，再给一次机会
+    }
+    return 0
+  }
+  const cands = await dshSuccessorCandidates(path.basename(sig.script))
+  const hit = cands.find((c) => handover.matchLaunchSig(c.cmdline, sig).ok)
+  return hit ? hit.pid : 0
+}
+
+function markReady(child, ownerVerdict) {
+  child.__starting = false
+  log(`DSH ready on ${WEB_URL} (PID ${child.pid}${ownerVerdict === 'ready-unverified' ? '，端口持有者未核验' : ''})`)
+  lifecycle.emit('service.ready', { pid: child.pid, port: PORT, owner: ownerVerdict })
+  scheduleHealthyCapture(child.pid) // 存活 120s 兜底；页面加载成功是快路径
+  // 任何一次成功就绪都重新武装看护（手动启动/自动重启同理；清掉"已停止"历史）。
+  // 计数窗口不在这里清空：服务"起来就崩"的循环必须继续累计，否则回退/halt 永远到不了阈值。
+  readySince = Date.now()
+  autoRestartStopped = false
+  return true
+}
+
+// 端口上的服务不属于我们时，我们那个从没绑上端口的孩子只会反复抢端口：摘句柄后强杀。
+// 先摘 server.child，让它自己的 exit 走"过期世代"分支（不触发崩溃路径，也不误关尾读窗口）。
+function abandonChild(child) {
+  child.__starting = false
+  if (server.child === child) server.child = null
+  server.stopping = true
+  return killPid(child.pid, true).then(() => { server.stopping = false })
+}
+
+// 认领 DSH 自重启的后继：同一个端口、同一份数据，只是换了 PID。
+// 不发通知、不闪烁、不累加崩溃计数（自重启不是故障）；也不清计数窗口（清空需要健康证明）。
+function claimSuccessor(matchedPid, listenerPid, meta) {
+  if (!matchedPid || matchedPid !== listenerPid) return false
+  server.claimedPid = matchedPid
+  server.claimedAlive = true
+  server.tokenPending = true // 尾读窗口内；到点仍无 token → authPending，页面切"需要新凭据"说明页
+  server.authPending = false
+  server.settling = false
+  server.settlingServing = false
+  server.handover = { at: new Date().toISOString(), fromPid: meta.fromPid || 0, toPid: matchedPid, verdict: 'self-restart', source: meta.source || 'handover', elapsedMs: meta.elapsedMs || 0 }
+  cancelRestartRetry()
+  healthFault = false // 新世代：交接空档期里的页面加载失败不该毒化健康门
+  scheduleHealthyCapture(matchedPid) // 认领世代同样要能证明健康（120s 兜底，否则计数窗口永远清不掉）
+  // 尾读窗口已经关过（stdout 早到 EOF）：这一代不可能再拿到 token，立即定案，别把 tokenPending 挂死
+  if (!server.launchUrl && !server.tailOpen) markAuthPending()
+  log(`DSH 自重启已确认：新进程 PID ${matchedPid}（命令行与本轮启动签名一致），不计为崩溃${meta.elapsedMs ? `，交接耗时 ${meta.elapsedMs}ms` : ''}`)
+  lifecycle.emit('service.handover', { fromPid: meta.fromPid || 0, toPid: matchedPid, verdict: 'self-restart', source: meta.source || 'handover', port: PORT, elapsedMs: meta.elapsedMs || 0 })
+  broadcastState()
+  return true
+}
+
+// child 退出后的裁决窗口：端口可能已被后继持有、可能还在 bind、也可能真是崩溃。
+async function runHandover(fromPid, code, signal) {
+  const gen = server.gen
+  const started = Date.now()
+  let listener = 0
+  let matched = 0
+  let lastScan = 0
+  let verdict = 'pending'
+  server.settling = true
+  server.settlingServing = await portOpen()
+  while (true) {
+    listener = await findListenPid()
+    if (Date.now() - lastScan >= HANDOVER_SCAN_MS) {
+      lastScan = Date.now()
+      matched = await matchSuccessorPid(listener)
+    }
+    verdict = handover.classifyHandover({
+      listenerPid: listener,
+      matchedPid: matched,
+      elapsedMs: Date.now() - started,
+      settleMs: HANDOVER_SETTLE_MS,
+      maxMs: HANDOVER_MAX_MS,
+    })
+    server.settlingServing = listener > 0 ? true : await portOpen()
+    // 被停止/新启动/退出打断：裁决作废，交由打断方收尾
+    if (server.gen !== gen || reallyExit || serviceStopping()) { endSettling(); return }
+    broadcastState() // 面板在裁决期也要看到真实状态（不能停在"已停止"）
+    if (verdict !== 'pending') break
+    await sleep(HANDOVER_POLL_MS)
+  }
+  const elapsedMs = Date.now() - started
+  endSettling()
+  if (verdict === 'self-restart') {
+    claimSuccessor(matched, listener, { fromPid, source: 'handover', elapsedMs })
+    return
+  }
+  if (verdict === 'external') {
+    log(`端口 ${PORT} 被另一个进程持有（PID ${listener}），按"已在运行的服务"处理`)
+    await handlePortOccupied('handover')
+    broadcastState()
+    return
+  }
+  handleUnexpectedExit(fromPid, code, signal, elapsedMs)
+}
+
+// 真崩溃路径：语义与改动前保持一致（标故障、切说明页、通知+闪烁、交给看护）
+function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
+  const verdictSource = source || 'handover'
+  markHealthFault()
+  log(`DSH exited unexpectedly (code ${code === null || code === undefined ? '未知' : code}${signal ? ', signal ' + signal : ''})`)
+  server.handover = { at: new Date().toISOString(), fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, elapsedMs: elapsedMs || 0 }
+  lifecycle.emit('service.handover', { fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, port: PORT, elapsedMs: elapsedMs || 0 })
+  // 页面立即切到"服务正在自动重启…"说明页（文字说明 + 刷新按钮；就绪后由 refreshWebUiOnReady 自动切回）
+  if (!SELF_TEST) {
+    const reason = autoRestartStopped ? 'offline' : (Config.autoRestart ? 'restart' : 'offline')
+    for (const t of webTabs) {
+      const wc = t.view && t.view.webContents
+      if (wc && !wc.isDestroyed()) { t.blank = true; try { wc.loadURL(loadingUrl(reason, t.id, loadingParams())) } catch { /* noop */ } }
+    }
+    webPushState()
+  }
+  // 已显式停止自动恢复时不再重复打扰（通知+闪烁只发一次，halt 时已交代）
+  if (!autoRestartStopped) {
+    startFlash()
+    notify('DeepSeek Harness', '服务意外退出', WEB_URL)
+  }
+  broadcastState()
+  void maybeAutoRestart()
+}
+
 // 返回 true = 本次真的执行了停止；false = 已有停止在进行（被防重入挡下）
 async function stopServer() {
   // 诊断：每次进入都记（含调用栈），确认调用次数与来源
@@ -771,7 +1063,13 @@ async function stopServer() {
   }
   broadcastState() // 立刻让面板显示"正在停止服务…"并禁用按钮
   try {
-    if (process.env.DSHL_DEBUG_STOP === '1') log(`stopServer branch owned=${server.owned()} adopted=${server.adoptedPid} child=${server.child ? server.child.pid : 'null'} exitCode=${server.child ? server.child.exitCode : 'n/a'}`)
+    // 交接裁决进行中：等它定案再动手，否则会"停了旧的、活着新的"（用户点停止却停不掉服务）
+    if (server.settling && server.handoverPromise) {
+      await Promise.race([server.handoverPromise.catch(() => {}), sleep(3000)])
+      server.settling = false
+      server.settlingServing = false
+    }
+    if (process.env.DSHL_DEBUG_STOP === '1') log(`stopServer branch owned=${server.owned()} claimed=${server.claimed()} adopted=${server.adoptedPid} child=${server.child ? server.child.pid : 'null'} exitCode=${server.child ? server.child.exitCode : 'n/a'}`)
     if (server.owned()) {
       server.stopping = true
       const child = server.child
@@ -787,6 +1085,17 @@ async function stopServer() {
       server.child = null
       server.stopping = false
       log(`DSH stopped (PID ${pid})`)
+    } else if (server.claimed()) {
+      // 认领的自重启后继是我们这一代服务的一部分：按我们的服务停止它（它没有句柄，只能按 PID + 端口收敛判断）
+      const pid = server.claimedPid
+      cancelRestartRetry()
+      await killPid(pid, false)
+      await sleep(1000)
+      if (await portOpen()) await killPid(pid, true)
+      clearClaimed()
+      server.launchUrl = null
+      server.launchSig = null
+      log(`DSH 自重启进程已停止 (PID ${pid})`)
     } else if (server.adoptedPid !== 0) {
       const pid = server.adoptedPid
       await killPid(pid, false)
@@ -799,12 +1108,25 @@ async function stopServer() {
     return true
   } finally {
     endServiceStop()
+    cancelRestartRetry() // 用户主动停止 = 取消待触的延后重启，看护不得把服务复活
   }
 }
 
-// 端口切换：重启自己拉起的服务到新端口（WEB_URL 已更新），并把所有打开的标签页重载到新地址
+// 认领的自重启后继拿不到新凭据时的恢复入口：由启动器重启一次服务，新进程的 stdout 归我们，
+// token 就能重新捕获。这会切断正在跑的会话，所以只响应用户点击，绝不自动触发。
+async function restartForAuth() {
+  if (!server.authPending && !server.claimed()) { log('restartForAuth ignored（当前无需恢复页面凭据）'); return }
+  log('restartForAuth：由启动器重启服务以恢复页面访问凭据')
+  const stopped = await stopServer()
+  if (!stopped) return
+  const ok = await handleStart()
+  if (ok) void refreshWebUiOnReady(true)
+  broadcastState()
+}
+
+// 端口切换：重启我们负责的服务（自己拉起的或认领的自重启后继）到新端口，并把所有打开的标签页重载到新地址
 async function restartServerOnNewPort() {
-  if (!server.owned()) return false
+  if (!server.managed()) return false
   await stopServer()
   const ok = await startServer()
   if (ok) {
@@ -842,10 +1164,33 @@ function seedRestartAttempts(n) {
   restartWindow = Array.from({ length: Math.max(0, n) }, () => now)
 }
 
+// 冷却/停止中把一次重启请求"吃掉"是看护静默停摆的根因：必须排补偿定时器，不能直接 return
+let restartRetryTimer = null
+
+function cancelRestartRetry() {
+  if (restartRetryTimer) { clearTimeout(restartRetryTimer); restartRetryTimer = null }
+}
+
+function restartRetryPending() {
+  return !!restartRetryTimer
+}
+
+function scheduleRestartRetry(waitMs, reason) {
+  if (restartRetryTimer) return // 已排定：一次待触重启足够，别叠成多个定时器
+  const ms = Math.max(200, Math.round(waitMs))
+  log(`自动重启延后 ${ms}ms（${reason}），已排定补偿定时器`)
+  lifecycle.emit('service.autoRestartDeferred', { waitMs: ms, reason })
+  restartRetryTimer = setTimeout(() => {
+    restartRetryTimer = null
+    void maybeAutoRestart()
+  }, ms)
+}
+
 function clearRestartTracking() {
   restartWindow = []
   lastRestartAt = 0
   readySince = 0
+  cancelRestartRetry() // 计数与冷却一起复位：留着待触定时器会凭空发起一轮重启
 }
 
 function haltAutoRestart() {
@@ -860,13 +1205,16 @@ function haltAutoRestart() {
 async function maybeAutoRestart() {
   if (!Config.autoRestart || reallyExit) return
   if (autoRestartStopped) return // 已显式停止：等待用户人工处理（启动成功后重新武装）
+  if (server.running()) { cancelRestartRetry(); return } // 已在服务（自己拉起/认领后继/接管外部），不需要重启
+  if (serviceStopping()) { scheduleRestartRetry(1000, 'stop in progress'); return }
   // 环境报告可能尚未建立（启动探测未完成/自检路径）：这里兜底探测一次再判断
   if (!envReport) {
     try { envReport = await envDetect.detectEnv(false) } catch { /* 保持 null，按未就绪跳过 */ }
   }
   if (!envReady()) { log('auto-restart skipped: environment not ready'); return }
   const now = Date.now()
-  if (now - lastRestartAt < 10000) return
+  const deferred = handover.planCooldownRetry({ now, lastRestartAt, cooldownMs: RESTART_COOLDOWN_MS })
+  if (deferred) { scheduleRestartRetry(deferred.waitMs, 'cooldown'); return }
   const attempts = restartAttemptsInWindow()
   if (attempts >= RESTART_MAX) {
     if (recoveryDone) {
@@ -907,10 +1255,15 @@ let recoveryDone = false // 本次运行最多一次配置回退
 let lastRestoredSlot = ''
 let lastRecoveryAt = ''
 
-// 健康门判据：服务 owned 且就绪 +（页面加载成功 或 就绪后存活 120s）；两者都满足才允许写健康快照
+// 健康门判据：服务就绪 +（页面加载成功 或 就绪后存活 120s）；两者都满足才允许写健康快照
+// 世代来源含认领的自重启后继（它就是我们这一代服务）；纯接管的外部实例不算（我们无从证明它健康）。
 function maybeCaptureHealthy(reason) {
-  if (healthCaptured || SELF_TEST) return
-  if (!server.owned() || !server.running()) return
+  if (SELF_TEST) return
+  if (!server.running() || !server.managed()) return
+  // 服务已稳定存活（健康门通过）：清空自动重启计数窗口，让"偶发一次崩溃"不累积成崩溃循环。
+  // 必须在 healthCaptured 早退之前：清计数才是这条路径的意义，快照只写一次不影响它。
+  clearRestartTracking()
+  if (healthCaptured) return
   try {
     const r = health.captureHealthy({
       dshlVersion: app.getVersion(),
@@ -922,8 +1275,6 @@ function maybeCaptureHealthy(reason) {
     })
     healthCaptured = true
     if (healthTimer) { clearTimeout(healthTimer); healthTimer = null }
-    // 服务已稳定存活（健康门通过）：清空自动重启计数窗口，让"偶发一次崩溃"不累积成崩溃循环
-    clearRestartTracking()
     if (r.status === 'captured') {
       lifecycle.emit('health.capture', { slotId: r.slotId, reason })
       log(`health: captured slot ${r.slotId} (reason=${reason})`)
@@ -942,8 +1293,8 @@ function scheduleHealthyCapture(pid) {
   if (healthTimer) clearTimeout(healthTimer)
   healthTimer = setTimeout(() => {
     if (healthCaptured) return
-    // 仍是无故障的同一子进程（未被重启/接管/失败覆盖）才算健康
-    if (server.owned() && server.child && server.child.pid === pid && !healthFault) {
+    // 仍是无故障的同一代服务（未被重启/接管/失败覆盖）才算健康；认领的后继同样适用
+    if (server.managed() && server.displayPid() === pid && !healthFault) {
       maybeCaptureHealthy('survived-120s')
     }
   }, RESTART_STABLE_MS)
@@ -1004,7 +1355,12 @@ function buildDiagReport() {
     installState: envInstall.getJob() || {},
     updaterState: safeParseJson(updater.getState()) || {},
     dshUpdateState: dshUpdater.getState() || {},
-    serverState: { running: server.running(), owned: server.owned(), pid: server.displayPid(), port: PORT, blocked: server.blockedReason || '' },
+    serverState: {
+      running: server.running(), owned: server.owned(), origin: server.origin(), managed: server.managed(),
+      pid: server.displayPid(), port: PORT, blocked: server.blockedReason || '',
+      claimed: server.claimed(), authPending: server.authPending, settling: server.settling,
+      hasLaunchToken: !!server.launchUrl, handover: server.handover || null,
+    },
     configRedacted: JSON.stringify(Config, null, 2),
     lastExit: runGuardHandle && runGuardHandle.previousRun ? 'crashed' : 'clean',
     lastCrashAt: (runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt) || '',
@@ -1087,7 +1443,22 @@ async function maybeAutoInstallPluginMarket() {
 }
 
 // ---------- 通知 ----------
+// 同标题 + 同内容在窗口期内只弹一次：崩溃循环/反复重启时不再刷屏（日志仍逐条留证，含被抑制的记录）
+const NOTIFY_DEDUPE_MS = 30000
+const recentNotifies = new Map()
+
 function notify(title, message, url) {
+  const key = title + '\u0000' + message
+  const now = Date.now()
+  const last = recentNotifies.get(key) || 0
+  if (now - last < NOTIFY_DEDUPE_MS) {
+    log(`[notify] suppressed duplicate within ${Math.round(NOTIFY_DEDUPE_MS / 1000)}s: ${title}: ${message}`)
+    return
+  }
+  recentNotifies.set(key, now)
+  if (recentNotifies.size > 64) { // 长期运行不积累：顺手清掉已过期项
+    for (const [k, t] of recentNotifies) if (now - t >= NOTIFY_DEDUPE_MS) recentNotifies.delete(k)
+  }
   if (SELF_TEST) { log('[notify] ' + title + ': ' + message); return } // 自检不弹真实通知
   try {
     if (Notification.isSupported()) {
@@ -1106,6 +1477,7 @@ function notify(title, message, url) {
 
 function notifyStartResult(ok) {
   if (ok && server.owned()) notify('DeepSeek Harness', `服务已就绪：${WEB_URL}`)
+  else if (ok && server.claimed()) notify('DeepSeek Harness', `服务已自行重启并由启动器接管（PID ${server.displayPid()}），不影响正在运行的会话`)
   else if (ok) notify('DeepSeek Harness', `检测到已在运行的服务（PID ${server.displayPid()}），已接管`)
   else if (server.blockedReason) notify('DeepSeek Harness', server.blockedReason + '（启动器面板已打开，可一键切换）')
   else if (envReady()) notify('DeepSeek Harness', '服务启动失败，请打开启动器面板查看日志')
@@ -1483,6 +1855,7 @@ function loadingUrl(reason, tabId, extra) {
 }
 function reasonForPhase(phase) {
   if (server.blockedReason) return 'blocked' // 端口被其他程序占用：说明页直接展示冲突原因与一键换端口
+  if (server.authPending && server.running()) return 'auth' // 自重启后继在服务，但拿不到它的访问凭据
   if (phase === 'starting') return 'start'
   if (phase === 'restarting') return 'restart'
   if (phase === 'ready') return 'failed'
@@ -1551,20 +1924,24 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     try { wc.setZoomFactor(Config.webZoom / 100) } catch { /* noop */ }
     markBlank(false)
     injectPaneOverlay(tab)
-    // 健康门快路径：真实应用页面（非状态说明页）加载成功 = 本代服务健康的最强证据
+    // 健康门快路径：真实应用页面（非状态说明页）加载成功 = 本代服务健康的最强证据。
+    // authPending 时页面只会是 401 凭据页，不算应用真的可用。
     if (!SELF_TEST) {
       const loaded = (() => { try { return wc.getURL() || '' } catch { return '' } })()
-      if (loaded.startsWith(WEB_URL)) maybeCaptureHealthy('page-loaded')
+      if (loaded.startsWith(WEB_URL) && !server.authPending) maybeCaptureHealthy('page-loaded')
     }
-    // 鉴权兜底：新 DSH 的 401 提示页（"dsh web authentication required..."），首屏加载早于
-    // token 捕获时会停在上面 → 换带 token 地址重载换取 cookie（页面较长的正常应用不会命中）
-    if (server.launchUrl) {
+    // 鉴权兜底：新 DSH 的 401 提示页（"dsh web authentication required..."）。
+    // 有 token → 换带 token 地址重载换取 cookie；没有（认领的自重启后继拿不到它的 stdout）
+    // → 标记为需要一次由启动器发起的重启，页面给明确指引，而不是让人对着 401 猜。
+    {
       const url = wc.getURL() || ''
       if ((url.startsWith(WEB_URL) || url === WEB_URL) && !url.includes('token=')) {
         try {
           wc.executeJavaScript("(function(){var b=document.body;return !!(b&&b.innerText.indexOf('authentication required')>=0&&b.innerText.length<300)})()")
             .then((hit) => {
-              if (hit && !wc.isDestroyed()) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } }
+              if (!hit || wc.isDestroyed()) return
+              if (server.launchUrl) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } return }
+              if (server.claimed() && !server.authPending) markAuthPending()
             })
             .catch(() => { /* noop */ })
         } catch { /* noop */ }
@@ -1939,6 +2316,14 @@ function stateJson() {
   return JSON.stringify({
     running: server.running(),
     owned: server.owned(),
+    // 服务来源：owned=本工具拉起 / claimed=认领的 DSH 自重启后继 / external=接管外部实例 / none=未运行
+    origin: server.origin(),
+    managed: server.managed(),
+    settling: server.settling, // 交接裁决中（面板不能塌成"已停止"）
+    authPending: server.authPending, // 服务在跑但缺访问凭据，需要一次由启动器发起的重启
+    hasLaunchToken: !!server.launchUrl,
+    handover: server.handover || null,
+    restartRetryPending: restartRetryPending(),
     phase: servicePhase(), // starting | restarting | ready | stopped（面板"启动中…"状态与按钮禁用依赖它）
     pid: server.displayPid(),
     url: WEB_URL,
@@ -2013,27 +2398,61 @@ function clearStaleNotify() {
   } catch { /* dir missing */ }
 }
 
+// 非自有世代（认领的自重启后继 / 接管的外部实例）看护状态：连续负样本计数 + 持有者复核节流
+let trackedDownTicks = 0
+let ownerCheckTicks = 0
+
+async function watchTrackedService() {
+  const trackedPid = server.claimed() ? server.claimedPid : server.adoptedPid
+  const up = server.claimed() ? server.claimedAlive : server.adoptedAlive
+  if (await portOpen()) {
+    trackedDownTicks = 0
+    if (!up) {
+      if (server.claimed()) server.claimedAlive = true
+      else server.adoptedAlive = true
+      log(`服务重新在线（PID ${trackedPid}）`)
+      void refreshWebUiOnReady() // 错误页/空白页需要一次补拉
+      broadcastState()
+    }
+    // 端口有应答 ≠ 应答者还是原来那个进程：定期复核持有者，否则认领状态会悄悄失真
+    if (++ownerCheckTicks >= OWNER_VERIFY_EVERY_TICKS) {
+      ownerCheckTicks = 0
+      const listener = await findListenPid()
+      if (listener && trackedPid && listener !== trackedPid) {
+        log(`端口持有者已变化（PID ${trackedPid} → ${listener}），重新裁决`)
+        lifecycle.emit('service.handover', { fromPid: trackedPid, toPid: listener, verdict: 'recheck', source: 'watchdog', port: PORT, elapsedMs: 0 })
+        server.settling = false
+        if (server.claimed()) clearClaimed()
+        else { server.adoptedPid = 0; server.adoptedAlive = false }
+        void runHandover(trackedPid, null, null)
+      }
+    }
+    return
+  }
+  // 端口没人应答：先分清"还在交接/正在 bind"与"真的没了"
+  const listener = await findListenPid()
+  if (listener && listener !== trackedPid) {
+    trackedDownTicks = 0
+    server.settling = false
+    if (server.claimed()) clearClaimed()
+    else { server.adoptedPid = 0; server.adoptedAlive = false }
+    void runHandover(trackedPid, null, null)
+    return
+  }
+  if (!handover.shouldDeclareGone({ downStreak: ++trackedDownTicks, tickMs: TRACK_WATCHDOG_MS, confirmMs: ADOPT_DOWN_CONFIRM_MS })) return
+  if (!up) return // 早已判定消失，不重复通知
+  if (server.claimed()) { clearClaimed(); server.handoverPromise = null }
+  else { server.adoptedPid = 0; server.adoptedAlive = false }
+  log(`服务端口连续 ${Math.round(ADOPT_DOWN_CONFIRM_MS / 1000)}s 无人应答（原 PID ${trackedPid || '未知'}），按意外退出处理`)
+  handleUnexpectedExit(trackedPid, null, null, 0, 'watchdog')
+}
+
 function onTick() {
   // 环境未就绪时周期性重测（缓存 30s 节流），用户在外部装好 Node/DSH 后自动就绪
   if (!envReady()) void refreshEnv(false)
   maybeStartDeferred() // 安装完成/启动请求时环境未就绪 → 就绪后自动补启动
-  // 接管的外部实例存活性探测
-  if (server.adoptedPid) {
-    portOpen().then((open) => {
-      if (open !== server.adoptedAlive) {
-        server.adoptedAlive = open
-        if (open) {
-          void refreshWebUiOnReady() // 接管的外部服务恢复在线时，刷新错误页
-        } else {
-          log('adopted DSH exited unexpectedly')
-          startFlash()
-          notify('DeepSeek Harness', '服务意外退出', WEB_URL)
-          void maybeAutoRestart()
-        }
-        broadcastState()
-      }
-    })
-  }
+  // 交接裁决自己驱动状态，不叠第二份探测
+  if (!server.settling && (server.claimed() || server.adoptedPid)) void watchTrackedService()
   scanNotify()
 }
 
@@ -2165,6 +2584,7 @@ function registerIpc() {
         case 'browser:swapPanes': webSwap(); return '{}'
         case 'browser:paneToTab': webPaneToTab(value && value.id); return '{}'
         case 'browser:fixPane': await webReloadPane(value && value.id); return '{}'
+        case 'browser:authRestart': await restartForAuth(); return '{}'
         case 'browser:blockSwitch': await switchToSuggestedPort((value && value.port) || server.suggestedPort); return '{}'
         case 'browser:winMin': if (webWin && !webWin.isDestroyed()) { try { webWin.minimize() } catch { /* noop */ } } return '{}'
         case 'browser:winMax': {
@@ -2269,7 +2689,7 @@ function registerIpc() {
           Config.crashNoticeDismissed = ''
           applyRuntimePort()
           // 端口复位到默认 3080：若自己拉起的服务跑在自定义端口，重启到默认端口并重载页面
-          if (PORT !== portBefore && server.owned()) await restartServerOnNewPort()
+          if (PORT !== portBefore && server.managed()) await restartServerOnNewPort()
           if (!autostartEnabled()) setAutostart(true)
           if (win && !win.isDestroyed()) {
             const [dw, dh] = defaultPanelSize()
@@ -2329,7 +2749,7 @@ function registerIpc() {
           const before = PORT
           applyRuntimePort()
           if (PORT !== before) {
-            if (server.owned()) {
+            if (server.managed()) {
               const ok = await restartServerOnNewPort()
               notify('DeepSeek Harness', ok ? `服务已切换到端口 ${PORT}` : '新端口启动失败，请打开启动器面板查看日志')
             } else if (server.adoptedPid) {
@@ -2485,23 +2905,36 @@ function registerIpc() {
 
 // 退出时的快速停止：强杀进程树，不等待优雅退出（DSH 无内存态需要保留，托盘退出必须秒退）
 async function stopServerFast() {
+  server.settling = false
+  server.settlingServing = false
+  cancelRestartRetry()
   const child = server.child
-  if (!child || child.exitCode !== null) { server.child = null; return }
-  server.stopping = true
-  const pid = child.pid
-  await killPid(pid, true)
+  if (child && child.exitCode === null) {
+    server.stopping = true
+    const pid = child.pid
+    await killPid(pid, true)
+    server.child = null
+    server.stopping = false
+    log(`DSH force-stopped on exit (PID ${pid})`)
+  }
   server.child = null
-  server.stopping = false
-  log(`DSH force-stopped on exit (PID ${pid})`)
+  // 认领的自重启后继同样是我们负责的服务：退出前一并结束，否则留下无人看护的孤儿（下次只能无凭据接管）
+  if (server.claimed()) {
+    const pid = server.claimedPid
+    await killPid(pid, true)
+    clearClaimed()
+    server.launchSig = null
+    log(`DSH 自重启进程已随启动器退出 (PID ${pid})`)
+  }
 }
 
-// ---------- 退出（仅停止自己拉起的服务） ----------
+// ---------- 退出（停止我们负责的服务：自己拉起的 + 认领的自重启后继） ----------
 async function requestExit() {
   if (reallyExit) return
   reallyExit = true
   stopFlash()
   saveWebWindowState() // 退出前落盘独立窗口几何（防抖定时器可能尚未触发）
-  if (server.owned()) await stopServerFast()
+  if (server.managed()) await stopServerFast()
   log('tray exiting')
   try { saveConfig() } catch { /* noop */ }
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* 证据清理失败不阻断退出 */ }
@@ -2511,6 +2944,15 @@ async function requestExit() {
 }
 
 // ---------- 自检（对齐 C# selftest：READY / STOPPED / WEBVIEW OK） ----------
+// killPid 返回时子进程的 exit 事件往往还没派发完：需要轮询等状态跃迁，不能同步读
+async function waitUntil(fn, timeoutMs = 5000, stepMs = 200) {
+  const t0 = Date.now()
+  for (;;) {
+    try { if (fn()) return true } catch { /* 判定失败继续等 */ }
+    if (Date.now() - t0 > timeoutMs) return false
+    await sleep(stepMs)
+  }
+}
 function selftestPrint(line) {
   try { fs.appendFileSync(SELFTEST_RESULT, line + '\n') } catch { /* noop */ }
   try { console.log(line) } catch { /* noop */ }
@@ -2600,18 +3042,122 @@ async function runSelfTest() {
     })
     if (!healed) { selftestPrint('FAILED: webui did not self-heal'); app.exit(2); return }
     selftestPrint('WEBUI OK: self-healed to app page')
-    // 看护自动重启：直接杀死服务进程，应自动拉起
+    // 看护自动重启：直接杀死服务进程，应自动拉起（标记为预期崩溃：跳过交接裁决，专测崩溃路径）
+    server.expectCrash = true
     const deadPid = server.displayPid()
     try { process.kill(deadPid, 'SIGKILL') } catch { /* noop */ }
     const revived = await new Promise((resolve) => {
       const t0 = Date.now()
       const iv = setInterval(() => {
-        if (server.running() && server.displayPid() !== deadPid) { clearInterval(iv); resolve(true) }
+        if (servicePhase() === 'ready' && server.running() && server.displayPid() !== deadPid) { clearInterval(iv); resolve(true) }
         else if (Date.now() - t0 > 25000) { clearInterval(iv); resolve(false) }
       }, 500)
     })
     if (!revived) { selftestPrint('FAILED: auto-restart watchdog did not revive service'); app.exit(2); return }
     selftestPrint('AUTO-RESTART OK (revived PID ' + server.displayPid() + ')')
+    // —— 集成演练：DSH 内「重启服务」= 克隆自己再退出 → 必须认领，不得判成崩溃后抢端口 ——
+    {
+      clearRestartTracking() // 上一轮 AUTO-RESTART 的重启计数会污染"没被当成崩溃"的断言
+      autoRestartStopped = false
+      const sig2 = server.launchSig
+      // 必须是"已经就绪"的自有服务：启动阶段被杀不会被判成交接（那是 startServer 的职责）
+      const readyGen = await waitUntil(() => server.owned() && !server.child.__starting && servicePhase() === 'ready', 30000)
+      const plan2 = envReport && envReport.plan
+      const oldPid2 = server.child ? server.child.pid : server.displayPid()
+      if (!readyGen || !plan2 || !sig2 || !oldPid2) {
+        selftestPrint('FAILED: SELF-RESTART 前置不足（需要自有服务与启动签名）')
+        app.exit(2); return
+      }
+      // 克隆体：argv 与启动签名逐字一致；stdio=ignore → 我们收不到它的 launch token（认领后的真实主路径）
+      const clone = spawn(plan2.nodeCmd, [sig2.script, ...sig2.args], {
+        cwd: plan2.cwd || harnessRoot,
+        env: { ...process.env, DSH_HOME: HOME },
+        stdio: 'ignore',
+        detached: true,
+        windowsHide: true,
+      })
+      clone.unref()
+      // 只看本次演练新增的事件：tail 的固定窗口会把上一轮 AUTO-RESTART 的事件也算进来
+      let lifecycleOffset = 0
+      try { lifecycleOffset = fs.statSync(lifecycle.getPath()).size } catch { /* 取不到就退化为窗口内判定 */ }
+      const readNewEvents = () => {
+        try {
+          const fd = fs.openSync(lifecycle.getPath(), 'r')
+          try {
+            const size = fs.fstatSync(fd).size
+            const len = Math.max(0, size - lifecycleOffset)
+            const buf = Buffer.alloc(len)
+            fs.readSync(fd, buf, 0, len, lifecycleOffset)
+            return String(buf).split(/\r?\n/).filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+          } finally { fs.closeSync(fd) }
+        } catch { return [] }
+      }
+      await killPid(oldPid2, true) // 我们追踪的进程消失，端口由克隆体接管 = 事故现场
+      const claimedOk = await waitUntil(() => server.claimed() && server.displayPid() !== oldPid2, 20000, 400)
+      const events = readNewEvents()
+      const ho = [...events].reverse().find((e) => e.event === 'service.handover')
+      const st = JSON.parse(stateJson())
+      const authOk = await waitUntil(() => server.authPending, 8000)
+      const claimChecks = [
+        claimedOk,
+        !!ho && !events.some((e) => e.event === 'service.autoRestart'),
+        restartAttemptsInWindow() === 0,
+        !!ho && !!(ho.detail && ho.detail.verdict === 'self-restart'),
+        servicePhase() === 'ready',
+        st.origin === 'claimed' && st.managed === true && st.owned === false,
+        authOk,
+      ]
+      const claimPass = claimChecks.every(Boolean)
+      selftestPrint(`SELF-RESTART ${claimPass ? 'OK' : 'FAILED'} (PID ${oldPid2} → ${server.displayPid()}, 崩溃重启次数=${restartAttemptsInWindow()}, authPending=${server.authPending})`)
+      if (!claimPass) {
+        selftestPrint(`FAILED: SELF-RESTART checks=${JSON.stringify(claimChecks)} settling=${server.settling} running=${server.running()} origin=${st.origin}`)
+        await stopServer() // 克隆体还占着自检端口：不清掉会污染下一次 selftest
+        app.exit(2); return
+      }
+      // 认领的服务必须停得掉（否则"面板说属于我们、实际无人管"）
+      await stopServer()
+      const stopPass = !server.claimed() && !server.running() && !(await portOpen())
+      selftestPrint(`SELF-RESTART-STOP ${stopPass ? 'OK' : `FAILED (claimed=${server.claimedPid} portOpen=${await portOpen()})`}`)
+      if (!stopPass) { selftestPrint('FAILED: claimed successor not stopped'); app.exit(2); return }
+    }
+    // —— 集成演练：冷却期内的一次崩溃必须由补偿定时器接住（旧行为=直接 return，看护静默停摆）——
+    {
+      const back = await startServer()
+      if (!back) { selftestPrint('FAILED: RESTART-COOLDOWN 前置启动失败'); app.exit(1); return }
+      server.expectCrash = true
+      lastRestartAt = Date.now() // 伪装"刚刚自动重启过"，让这次退出正好落在冷却窗口里
+      const deadPid3 = server.child.pid
+      await killPid(deadPid3, true)
+      const scheduled = await waitUntil(() => restartRetryPending(), 6000)
+      const revived3 = await waitUntil(() => servicePhase() === 'ready' && server.running() && server.displayPid() !== deadPid3, 25000, 500)
+      // 用户主动停止必须取消待触的延后重启
+      server.expectCrash = true
+      lastRestartAt = Date.now()
+      const deadPid4 = server.displayPid()
+      await killPid(deadPid4, true)
+      const rescheduled = await waitUntil(() => restartRetryPending(), 6000)
+      await stopServer()
+      const cancelled = !restartRetryPending()
+      const coolOk = scheduled && revived3 && rescheduled && cancelled
+      selftestPrint(`RESTART-COOLDOWN ${coolOk ? 'OK' : 'FAILED'} (deferred=${scheduled}, revived=${revived3}, re-deferred=${rescheduled}, cancelledOnStop=${cancelled})`)
+      if (!coolOk) { selftestPrint('FAILED: cooldown retry broken'); app.exit(2); return }
+      clearRestartTracking()
+      autoRestartStopped = false
+    }
+    // —— 通知去重：同标题+同内容在窗口期内只弹一次（崩溃循环不再刷屏）——
+    {
+      const tag = 'dedupe-' + Date.now()
+      notify('SELFTEST', tag)
+      notify('SELFTEST', tag)
+      let text = ''
+      try { text = fs.readFileSync(TRAY_LOG, 'utf8') } catch { /* noop */ }
+      const lines = text.split(/\r?\n/)
+      const shown = lines.filter((l) => l.includes('[notify] SELFTEST: ' + tag)).length
+      const suppressed = lines.filter((l) => l.includes('suppressed duplicate') && l.includes(tag)).length
+      const dedupeOk = shown === 1 && suppressed === 1
+      selftestPrint(`NOTIFY-DEDUPE ${dedupeOk ? 'OK' : 'FAILED'} (shown=${shown}, suppressed=${suppressed})`)
+      if (!dedupeOk) { selftestPrint('FAILED: notify dedupe broken'); app.exit(2); return }
+    }
     const tStop = Date.now()
     await stopServerFast() // 验证退出路径的快速停止（应远小于 1s）
     selftestPrint(`EXIT-STOP FAST: ${Date.now() - tStop}ms`)
@@ -2846,7 +3392,7 @@ function init() {
     onNotify: (title, message) => notify(title, message),
     onFlash: startFlash,
     sendToPanel: (json) => { if (win && !win.isDestroyed()) { try { win.webContents.send('dsh:updater', json) } catch { /* noop */ } } },
-    beforeInstall: async () => { if (server.owned()) await stopServerFast() },
+    beforeInstall: async () => { if (server.managed()) await stopServerFast() },
     onEvent: (event, detail) => lifecycle.emit(event, detail),
   })
   // DSH 更新（dsh-update.js）：检测全自动、更新全手动（主页卡片按钮触发）
@@ -2899,7 +3445,7 @@ function init() {
     await handleStart()
     if (!server.running() && !SELF_TEST) void refreshWebUiPhase() // 启动失败：说明页切换为对应状态（未启动/卡住等）
   })()
-  setInterval(onTick, 2000)
+  setInterval(onTick, TRACK_WATCHDOG_MS)
   // 开发模式热刷新（npm run dev / VS Code F5）：wwwroot 产物变化 → 面板窗口自动重载，无需重启启动器。
   // 面板壳（browser.html）变化时独立窗口壳一并重载（分屏视图挂的是 DSH 页面，不受影响）。
   if (!app.isPackaged) {
