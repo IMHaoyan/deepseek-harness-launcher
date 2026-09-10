@@ -646,7 +646,12 @@ async function updateNow() {
       if (!startOk) log('dsh-update: restart failed (handleStart returned false)')
       if (reloadWebTabs) reloadWebTabs() // 强制重载：新版页面替换旧会话，杜绝残留白屏
     } else if (loadWebTabs) {
-      loadWebTabs('offline') // 更新前服务未在运行：页面切"未启动"状态，而不是停留在"正在更新…"
+      // 更新前服务没在运行：只有"现在也确实没起来"才切"未启动"说明页。
+      // 托管形态走安装引擎，它的 onDone 会无条件拉起服务（更新前停着的也会被拉起来）；
+      // 此时再切"服务未启动"就是在说谎（页面随后由 onDone 的 refreshWebUiOnReady 拉回真实页面）。
+      const runningNow = !!(getServerState && getServerState().running)
+      if (!runningNow) loadWebTabs('offline')
+      else log('dsh-update: service is running after update (was stopped before), keeping page as-is')
     }
     // —— 更新事务校验：服务必须真的跑起来且版本对上，否则自动回滚（仅全局 npm 形态可回滚） ——
     let runningVersion = ''
