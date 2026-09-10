@@ -22,6 +22,7 @@ let refreshEnv = null
 let envInstall = null
 let envDetect = null
 let getServerState = null // () => ({ running, owned })
+let pageCredentialOf = null // () => ({ hasToken })，可选：当前服务是否拿到了本轮页面访问凭据（launch token）
 let stopService = null
 let startService = null
 let loadWebTabs = null // (reason) => 把 WebUI 窗口所有标签切到状态说明页（避免更新期间白屏）
@@ -202,6 +203,37 @@ function decideUpdateTarget(input) {
   return { action: 'install', nonUpgrade: false }
 }
 
+/**
+ * 更新收尾判定（纯函数，便于测试）：只有"服务起来了"且"跑起来的版本就是目标版本"才算更新成功。
+ *
+ * 为什么需要：此前只有 startOk 参与结论，而 decideRollback 检出的版本不符只写日志、照样弹"已更新"；
+ * managed / npx 两个分支更是在校验块之前就 return 了，装不上、起不来、版本没换都报成功。
+ *
+ * @param {{startOk:boolean, runningVersion:string, latest:string, from:string,
+ *          nonUpgrade:boolean, hasToken:boolean}} input
+ * @returns {{ok:true, message:string} | {ok:false, reason:'start-failed'|'version-mismatch', message:string}}
+ */
+function decideUpdateOutcome(input) {
+  const src = input || {}
+  const latest = String(src.latest || '')
+  const runningVersion = String(src.runningVersion || '')
+  const verb = src.nonUpgrade === true ? '已切换到' : '已更新到'
+  if (src.startOk !== true) {
+    return { ok: false, reason: 'start-failed', message: `${verb} v${latest}，但服务未能启动，请打开启动器面板查看日志` }
+  }
+  // 版本不符只在"确实探测到了版本"时才判：探测失败（空）说明不了问题，不能据此报失败
+  if (latest && runningVersion && runningVersion !== latest) {
+    return { ok: false, reason: 'version-mismatch', message: `${verb} v${latest}，但更新后实际运行的是 v${runningVersion}（请查看面板日志）` }
+  }
+  const base = src.nonUpgrade === true ? `已切换到 v${latest}（原 v${src.from || '?'}）` : `已更新到 v${latest}`
+  // 拿不到本轮 launch token（接管的外部实例）时，用户自己开的浏览器页面在服务重启后是死链，
+  // 必须给出可执行的指引——点通知本身就会打开 DSH 窗口/启动器面板（见 main.js 的 notify）。
+  const credNote = src.hasToken === false
+    ? '；页面访问凭据已变化，若页面打不开请点本通知或从启动器面板重新打开'
+    : ''
+  return { ok: true, message: base + credNote }
+}
+
 function initDshUpdater(o) {
   Config = o.Config
   saveConfig = o.saveConfig
@@ -211,6 +243,7 @@ function initDshUpdater(o) {
   envInstall = o.envInstall
   envDetect = o.envDetect
   getServerState = o.getServerState
+  pageCredentialOf = o.getPageCredential || null
   stopService = o.stopService
   startService = o.startService
   loadWebTabs = o.loadWebTabs || null
@@ -235,6 +268,17 @@ function noteChannelChange() {
 
 function pushState() {
   try { if (onState) onState() } catch { /* noop */ }
+}
+
+// 页面访问凭据状态（由主进程注入）。hasToken=false 表示当前服务不是我们拉起的（接管的外部实例），
+// 拿不到本轮 launch token：DSHL 自己的窗口没有凭据可续，用户自己开的浏览器页面在服务重启后也是死链。
+// 未注入或取值异常时按"凭据正常"处理，避免产生无依据的提示。
+function readPageCredential() {
+  if (!pageCredentialOf) return { hasToken: true }
+  try {
+    const v = pageCredentialOf() || {}
+    return { hasToken: v.hasToken !== false }
+  } catch { return { hasToken: true } }
 }
 
 function setState(patch) {
@@ -505,7 +549,6 @@ async function updateNow() {
     // 非升级（用户显式切渠道导致的版本号下降）也要在通知里说清楚，绝不静默
     const nonUpgrade = gate.nonUpgrade === true
     if (nonUpgrade) log(`dsh-update: non-upgrade install allowed by explicit channel choice (v${fromVersion} → v${latest})`)
-    const doneMsg = nonUpgrade ? `已切换到 v${latest}（原 v${fromVersion}）` : `已更新到 v${latest}`
     // 更新事务状态：写入"从哪来"（回滚依据）
     try { writeUpdateState({ kind: plan.kind, from: fromVersion, to: latest, phase: 'start' }) } catch { /* noop */ }
     txInfo = { kind: plan.kind, from: fromVersion, to: latest }
@@ -535,16 +578,9 @@ async function updateNow() {
         setState({ status: 'error', error: err.message })
         return
       }
-      // 成功：安装引擎 onDone 已接好"重新探测 + 启动服务"，这里补配置与通知
-      Config.dshVersion = 'latest' // 自动保持最新语义
-      Config.dshUpdateCheckedAt = Date.now()
-      try { saveConfig() } catch { /* noop */ }
-      notify('DeepSeek Harness', doneMsg)
-      log(`dsh-update: updated to v${latest}`)
-      emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
-      try { clearUpdateState() } catch { /* noop */ }
-      setState({ status: 'updated', current: latest })
-      return
+      // 成功：安装引擎 onDone 已接好"重新探测 + 启动服务"。这里不再直接宣告成功——统一落到下面的
+      // 共享校验块（服务是否真的起来、跑起来的版本是否等于目标），否则"装上了但起不来/版本没换"
+      // 也会报"已更新"。
     }
 
     if (plan.kind === 'global') {
@@ -590,27 +626,14 @@ async function updateNow() {
           throw new Error(r.error)
         }
       }
-      if (!migrated) {
-        // 回退成功：npx 预热后重新探测即可命中缓存新版本
-        try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
-        if (wasRunning) {
-          try { await startService() } catch (err) { log('dsh-update: restart failed: ' + err.message) }
-          if (reloadWebTabs) reloadWebTabs()
-        }
-        Config.dshVersion = 'latest'
-        Config.dshUpdateCheckedAt = Date.now()
-        try { saveConfig() } catch { /* noop */ }
-        notify('DeepSeek Harness', `已更新到 v${latest}`)
-        log(`dsh-update: updated to v${latest} (npx fallback)`)
-        emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: 'npx' })
-        try { clearUpdateState() } catch { /* noop */ }
-        setState({ status: 'updated', current: latest })
-        return
-      }
+      // 迁移成功、或迁移失败但 npx 预热成功，都落到下面的共享校验块：
+      // "npx 预热成功"不等于页面/命令真的用上了新版本，必须靠校验确认（migrated 仅用于日志措辞）。
+      log(`dsh-update: npx path done (migratedToGlobal=${migrated})`)
     } else if (plan.kind === 'source') {
       // 源码安装：不动开发者仓库（UI 已把按钮换成"打开源码目录"，这里只兜底）
       throw new Error('源码安装请手动更新：git pull && pnpm run build（启动器不自动修改源码仓库）')
-    } else {
+    } else if (plan.kind !== 'managed') {
+      // managed 的成功路径不再提前 return，会落到这里继续走更新后校验
       throw new Error(`当前安装形态（${plan.kind}）不支持更新`)
     }
 
@@ -669,18 +692,25 @@ async function updateNow() {
     Config.dshVersion = 'latest'
     Config.dshUpdateCheckedAt = Date.now()
     try { saveConfig() } catch { /* noop */ }
-    // 服务没起来时不再谎报"已更新"（此前的 startOk 恒 true 会让新版启动失败也报成功）
-    if (!startOk) {
-      notify('DeepSeek Harness', `${doneMsg}，但服务未能启动，请打开启动器面板查看日志`)
-      log(`dsh-update: updated to v${latest} but service failed to start`)
-      emitLifecycle('update.dsh', { step: 'updated-start-failed', from: fromVersion, to: latest })
+    const outcome = decideUpdateOutcome({
+      startOk,
+      runningVersion,
+      latest,
+      from: fromVersion,
+      nonUpgrade,
+      hasToken: readPageCredential().hasToken,
+    })
+    if (!outcome.ok) {
+      notify('DeepSeek Harness', outcome.message)
+      log(`dsh-update: reported failure after install (${outcome.reason}, startOk=${startOk}, runningVersion=${runningVersion || '?'}, latest=${latest})`)
+      emitLifecycle('update.dsh', { step: 'updated-start-failed', from: fromVersion, to: latest, kind: plan.kind, startOk, runningVersion })
       try { clearUpdateState() } catch { /* noop */ }
-      setState({ status: 'error', error: `${doneMsg}，但服务未能启动（请查看面板日志）` })
+      setState({ status: 'error', error: outcome.message })
       return
     }
-    notify('DeepSeek Harness', doneMsg)
-    log(`dsh-update: updated to v${latest}`)
-    emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest })
+    notify('DeepSeek Harness', outcome.message)
+    log(`dsh-update: updated to v${latest}${/凭据已变化/.test(outcome.message) ? ' (page credential changed)' : ''}`)
+    emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
     try { clearUpdateState() } catch { /* noop */ }
     setState({ status: 'updated', current: latest })
   } catch (err) {
@@ -694,4 +724,4 @@ async function updateNow() {
   }
 }
 
-module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback, decideUpdateTarget, noteChannelChange, recoverInterruptedUpdate }
+module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback, decideUpdateTarget, decideUpdateOutcome, noteChannelChange, recoverInterruptedUpdate }

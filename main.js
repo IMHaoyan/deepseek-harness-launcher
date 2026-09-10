@@ -3466,6 +3466,9 @@ function init() {
     envInstall,
     envDetect,
     getServerState: () => ({ running: server.running(), owned: server.owned() }),
+    // 页面凭据状态：更新后若拿不到本轮 launch token（服务是被接管的外部实例），
+    // 用户自己开的浏览器页面会停在 401 上，成功通知要给出"重新打开"的指引。
+    getPageCredential: () => ({ hasToken: !!server.launchUrl }),
     stopService: () => stopServer(),
     startService: () => handleStart(),
     loadWebTabs: (reason) => webLoadTabs(reason),
