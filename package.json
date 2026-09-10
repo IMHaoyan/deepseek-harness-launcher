@@ -47,6 +47,7 @@
       "market.js",
       "service-stop-guard.js",
       "service-handover.js",
+      "trust.js",
       "wwwroot/**/*",
       "assets/**/*",
       "!assets/node-dist/**"

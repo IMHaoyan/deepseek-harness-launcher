@@ -25,6 +25,7 @@ const diagnostics = require('./diagnostics')
 const market = require('./market')
 const stopGuard = require('./service-stop-guard')
 const handover = require('./service-handover')
+const trust = require('./trust')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -2571,23 +2572,35 @@ function buildFeedbackPack(text, contact, includeLogs) {
 }
 
 // ---------- IPC 命令桥（Bridge.cs 移植） ----------
-// 来源校验：只有两个"自己人"页面可以调命令——启动器面板（index.html）与独立窗口壳（browser.html）。
-// 其余一律拒绝，尤其是挂在每个页面视图上的 browser-preload 桥：DSH 页面（或用户在其中跳转到的任意
-// 站点）若能在同页拿到 window.browserBridge，就能调 browser:* 改端口/重启服务/关窗口，必须封死。
-function isTrustedSender(event) {
+// 判定规则在 trust.js（纯函数、可单测）；这里只把 event.sender 归类成描述对象。
+// 自己人：启动器面板（index.html）与独立窗口壳（browser.html）——全部命令放行。
+// 必须封死的是挂在每个页面视图上的 browser-preload 桥：DSH 页面（或用户在其中跳转到的任意站点）
+// 若能在同页拿到 window.browserBridge，就能调 browser:* 改端口/重启服务/关窗口。
+// 唯一例外：说明页（loading.html）挂在标签视图里，webContents 不等于面板/窗口壳，它自己那三个
+// 按钮要能用——按"必须是本机 loading.html 且只放行这三条命令"放行（trust.js 的 LOADING_PAGE_COMMANDS）。
+const LOADING_PAGE_URL = pathToFileURL(path.join(WWWROOT, 'loading.html')).href
+
+function senderOf(event) {
   try {
     const wc = event.sender
-    if (win && !win.isDestroyed() && wc === win.webContents) return true
-    if (webWin && !webWin.isDestroyed() && wc === webWin.webContents) return true
-  } catch { /* 取不到按不可信处理 */ }
-  return false
+    if (!wc || wc.isDestroyed()) return { kind: 'none' } // 销毁中的发送方一律按不可信处理
+    if (win && !win.isDestroyed() && wc === win.webContents) return { kind: 'panel' }
+    if (webWin && !webWin.isDestroyed() && wc === webWin.webContents) return { kind: 'shell' }
+    if (webTabs.some((t) => t.view && t.view.webContents === wc)) {
+      let url = ''
+      try { url = wc.getURL() || '' } catch { /* 取不到 URL → 按"不是说明页"处理 */ }
+      return { kind: 'tab', url }
+    }
+    return { kind: 'none' }
+  } catch { return { kind: 'none' } }
 }
 
 function registerIpc() {
   ipcMain.handle('dsh:cmd', async (event, name, value) => {
     try {
-      if (process.env.DSHL_DEBUG_STOP === '1' && name !== 'getState') log(`ipc: ${name} (trusted=${isTrustedSender(event)})`)
-      if (!isTrustedSender(event)) {
+      const verdict = trust.decideCommand(senderOf(event), LOADING_PAGE_URL, name)
+      if (process.env.DSHL_DEBUG_STOP === '1' && name !== 'getState') log(`ipc: ${name} (trusted=${verdict === 'allow'})`)
+      if (verdict !== 'allow') {
         log('bridge: rejected command from untrusted sender (' + String(name) + ')')
         return '{}'
       }
