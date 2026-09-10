@@ -934,10 +934,12 @@ function renderDshUpdate(u) {
     }
   }
 
-  // 悬停"检查更新"按钮：已有更新/更新中/失败重试时隐藏；检查中显示"检查中…"并禁用
+  // 悬停"检查更新"按钮：已有更新/更新中时隐藏；检查中显示"检查中…"并禁用
+  // 失败态（error）保留这个按钮：更新被拦下（目标版本低于当前/缓存已作废）时，用户需要一条"重新检查"的路，
+  // 否则失败态下只剩「重试」，而重试走的是同一条被拦下的判定。
   const hoverCheck = $('btnDshCheckHover');
   if (hoverCheck) {
-    hoverCheck.style.display = (status === 'available' || status === 'updating' || status === 'error') ? 'none' : '';
+    hoverCheck.style.display = (status === 'available' || status === 'updating') ? 'none' : '';
     hoverCheck.disabled = status === 'checking';
     hoverCheck.textContent = status === 'checking' ? '检查中…' : '检查更新';
   }
