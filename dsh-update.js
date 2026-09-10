@@ -373,10 +373,13 @@ async function checkOnce(reason, force) {
       setState(force ? { status: 'error', error: '检查失败：' + (lastFetchError || '无法获取最新版本（网络错误）') } : { status: 'idle' })
       return
     }
+    // prevLatest 必须在 setState 之前取：setState 之后 state.latest 已经是新版本，
+    // 再比就成了死比较（恒为 false），prewarmed 永远停在 true，新版本再也不会被预热。
+    const prevLatest = state.latest
     setState({ current, latest: latest.version, kind: plan.kind })
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
       log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, reason=${reason || 'timer'})`)
-      const newVersionSeen = state.latest !== latest.version
+      const newVersionSeen = prevLatest !== latest.version
       setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false } : {}))
       // 后台预热缓存（不阻塞检测）：点"立即更新"时依赖树已在 npm/npx 缓存里，秒级完成
       if (!state.prewarmed) void warmLatest(latest.version, plan.nodeCmd, plan.kind)
