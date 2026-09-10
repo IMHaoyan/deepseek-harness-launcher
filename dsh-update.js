@@ -34,6 +34,7 @@ const state = {
   status: 'idle', // idle | checking | available | updating | updated | error
   current: '',
   latest: '',
+  latestChannel: '', // latest 这个版本号是从哪个渠道取来的（缓存与渠道同源；换渠道必须作废）
   kind: '', // 当前安装形态（source | managed | global | npx）：source 不支持自动更新，UI 按此区分
   error: '',
   prewarmed: false, // 新版完整依赖树是否已预热进 npm/npx 缓存（点击"立即更新"可秒级完成）
@@ -45,6 +46,10 @@ let warming = null // 当前预热任务（防重入）
 let lastNotifiedVersion = '' // 同一新版本只提示一次
 let rollbackUsed = false // 每次更新周期最多一次回滚
 let lastFetchError = '' // 最近一次取版本失败的原因（用于给用户可读的检查失败提示）
+// 用户本次会话显式选过的渠道（面板上的渠道 chip）。显式选择本身就可能是一次版本号下降
+// （latest→alpha：预发布版按 semver 优先级小于同版本正式版），那是意图内的，不该被降级闸拦掉。
+// 只在用户切换渠道时写入，不随"一次安装尝试"消费 —— 否则安装失败后重试会被自己的闸拦死。
+let userSwitchedChannel = ''
 
 // 更新渠道：latest（默认，跟随 npm latest）/ alpha（跟随 npm alpha，提前拿预览版）
 function channelOf() {
@@ -143,6 +148,60 @@ function decideRollback(input) {
   return { action: 'none' }
 }
 
+/**
+ * 更新目标准入判定（纯函数，便于测试；错误文本不参与决策）。
+ *
+ * 为什么需要：`state.latest` 只是"上一次成功检查"的缓存，而 updateNow 允许从 status='error' 进入
+ * ——面板上那个「重试」按钮走的就是这条路。缓存一旦与实际安装的版本脱节（例如用户在终端里自己
+ * 升过 dsh、或切过渠道），点「重试」就会照着缓存装，把用户从更高版本"更新"回更低版本；而更新后
+ * 校验拦不住它（decideRollback 只比"跑起来的 == 目标"）。
+ *
+ * @param {{target:string, installed:string, targetChannel:string, currentChannel:string,
+ *          userChoseChannel:boolean}} input
+ *   target           缓存里的待安装版本号
+ *   installed        当前实际安装的版本号（环境探测所得）
+ *   targetChannel    缓存里的版本号来自哪个渠道
+ *   currentChannel   当前配置的渠道
+ *   userChoseChannel 用户本次会话是否显式选过"当前这个"渠道
+ * @returns {{action:'install', nonUpgrade:boolean} | {action:'block', code:string, reason:string}}
+ */
+function decideUpdateTarget(input) {
+  const src = input || {}
+  const target = String(src.target || '')
+  const installed = String(src.installed || '')
+  const targetChannel = String(src.targetChannel || '')
+  const currentChannel = String(src.currentChannel || '')
+  if (!semver.valid(target)) {
+    return { action: 'block', code: 'no-target', reason: '没有待更新的版本（缓存已作废）：请先检查更新' }
+  }
+  // 缓存与渠道同源：切了渠道之后，旧缓存里的版本号不再代表"现在该装什么"
+  if (targetChannel !== currentChannel) {
+    return {
+      action: 'block',
+      code: 'channel-mismatch',
+      reason: `待安装的 v${target} 来自 ${targetChannel || '未知'} 渠道，当前渠道为 ${currentChannel}：请先检查更新`,
+    }
+  }
+  if (installed && semver.valid(installed)) {
+    if (semver.eq(target, installed)) {
+      return { action: 'block', code: 'same-version', reason: `当前已是 v${installed}，无需更新` }
+    }
+    if (semver.lt(target, installed)) {
+      // 目标比当前低：只有"用户显式选过这个渠道"才算意图内（latest→alpha 而 alpha 指向同版本的
+      // 预发布版就是这种情况）。其余一律判为缓存过期，拒绝静默降级。
+      if (!src.userChoseChannel) {
+        return {
+          action: 'block',
+          code: 'downgrade',
+          reason: `待安装的 v${target} 低于当前安装的 v${installed}（缓存可能已过期）：请先检查更新`,
+        }
+      }
+      return { action: 'install', nonUpgrade: true }
+    }
+  }
+  return { action: 'install', nonUpgrade: false }
+}
+
 function initDshUpdater(o) {
   Config = o.Config
   saveConfig = o.saveConfig
@@ -163,6 +222,15 @@ function initDshUpdater(o) {
 
 function getState() {
   return Object.assign({}, state, { channel: channelOf() })
+}
+
+// 面板切换更新渠道时调用（必须在 Config.dshChannel 已更新之后）：作废缓存里的版本号。
+// 缓存与渠道同源，切了渠道它就不再可信；若不作废，"重试"会照着旧渠道的缓存装
+// （由 decideUpdateTarget 的 channel-mismatch / no-target 兜底拦下，但这里直接从源头清掉）。
+// 同时记下"用户显式选过这个渠道"，供降级闸区分"意图内的下降"与"缓存过期"。
+function noteChannelChange() {
+  userSwitchedChannel = channelOf()
+  setState({ status: 'idle', error: '', latest: '', latestChannel: '', prewarmed: false })
 }
 
 function pushState() {
@@ -376,7 +444,7 @@ async function checkOnce(reason, force) {
     // prevLatest 必须在 setState 之前取：setState 之后 state.latest 已经是新版本，
     // 再比就成了死比较（恒为 false），prewarmed 永远停在 true，新版本再也不会被预热。
     const prevLatest = state.latest
-    setState({ current, latest: latest.version, kind: plan.kind })
+    setState({ current, latest: latest.version, kind: plan.kind, latestChannel: latest.channel || channelOf() })
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
       log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, reason=${reason || 'timer'})`)
       const newVersionSeen = prevLatest !== latest.version
@@ -418,8 +486,26 @@ async function updateNow() {
     if (!report || !report.plan) throw new Error('运行环境未就绪，无法更新')
     const plan = report.plan
     const latest = state.latest || ''
-    if (!latest) throw new Error('没有待更新的版本')
     const fromVersion = plan.dshVersion || ''
+    // 准入判定必须在写更新事务状态之前：被拦下就不能留下 phase:'start'，
+    // 否则下次启动会被 recoverInterruptedUpdate 当成"未完成的更新"重装一遍。
+    const gate = decideUpdateTarget({
+      target: latest,
+      installed: fromVersion,
+      targetChannel: state.latestChannel || '',
+      currentChannel: channelOf(),
+      userChoseChannel: userSwitchedChannel !== '' && userSwitchedChannel === channelOf(),
+    })
+    if (gate.action === 'block') {
+      log(`dsh-update: update blocked (${gate.code}): ${gate.reason}`)
+      emitLifecycle('update.dsh', { step: 'blocked', reason: gate.code, from: fromVersion, to: latest })
+      setState({ status: 'error', error: gate.reason })
+      return
+    }
+    // 非升级（用户显式切渠道导致的版本号下降）也要在通知里说清楚，绝不静默
+    const nonUpgrade = gate.nonUpgrade === true
+    if (nonUpgrade) log(`dsh-update: non-upgrade install allowed by explicit channel choice (v${fromVersion} → v${latest})`)
+    const doneMsg = nonUpgrade ? `已切换到 v${latest}（原 v${fromVersion}）` : `已更新到 v${latest}`
     // 更新事务状态：写入"从哪来"（回滚依据）
     try { writeUpdateState({ kind: plan.kind, from: fromVersion, to: latest, phase: 'start' }) } catch { /* noop */ }
     txInfo = { kind: plan.kind, from: fromVersion, to: latest }
@@ -453,7 +539,7 @@ async function updateNow() {
       Config.dshVersion = 'latest' // 自动保持最新语义
       Config.dshUpdateCheckedAt = Date.now()
       try { saveConfig() } catch { /* noop */ }
-      notify('DeepSeek Harness', `已更新到 v${latest}`)
+      notify('DeepSeek Harness', doneMsg)
       log(`dsh-update: updated to v${latest}`)
       emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
       try { clearUpdateState() } catch { /* noop */ }
@@ -585,14 +671,14 @@ async function updateNow() {
     try { saveConfig() } catch { /* noop */ }
     // 服务没起来时不再谎报"已更新"（此前的 startOk 恒 true 会让新版启动失败也报成功）
     if (!startOk) {
-      notify('DeepSeek Harness', `已更新到 v${latest}，但服务未能启动，请打开启动器面板查看日志`)
+      notify('DeepSeek Harness', `${doneMsg}，但服务未能启动，请打开启动器面板查看日志`)
       log(`dsh-update: updated to v${latest} but service failed to start`)
       emitLifecycle('update.dsh', { step: 'updated-start-failed', from: fromVersion, to: latest })
       try { clearUpdateState() } catch { /* noop */ }
-      setState({ status: 'error', error: `已更新到 v${latest}，但服务未能启动（请查看面板日志）` })
+      setState({ status: 'error', error: `${doneMsg}，但服务未能启动（请查看面板日志）` })
       return
     }
-    notify('DeepSeek Harness', `已更新到 v${latest}`)
+    notify('DeepSeek Harness', doneMsg)
     log(`dsh-update: updated to v${latest}`)
     emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest })
     try { clearUpdateState() } catch { /* noop */ }
@@ -608,4 +694,4 @@ async function updateNow() {
   }
 }
 
-module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback, recoverInterruptedUpdate }
+module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback, decideUpdateTarget, noteChannelChange, recoverInterruptedUpdate }

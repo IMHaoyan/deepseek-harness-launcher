@@ -2755,6 +2755,7 @@ function registerIpc() {
             Config.dshUpdateCheckedAt = 0 // 换渠道后立刻重新检查，不必等 24h 节流
             saveConfig()
             log('dsh-update: channel switched to ' + ch)
+            dshUpdater.noteChannelChange() // 作废旧渠道的版本缓存：否则「重试」会照着旧渠道的缓存装
             void dshUpdater.checkOnce('manual', true)
           }
           broadcastState()
