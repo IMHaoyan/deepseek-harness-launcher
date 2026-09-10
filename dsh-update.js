@@ -209,16 +209,25 @@ async function runNpm(args, opts = {}) {
     const real = await execPathOf(nodeBin)
     if (real) npmCli = npmCliFor(real)
   }
+  // 关键：把 Node 可执行文件所在目录注入子进程 PATH（与 env-install.js 的 runNpmInstall 同源）。
+  // 无系统 Node 的干净机器上，koffi/node-pty 等原生包的生命周期脚本以 `cmd /c node xxx.js` 执行，
+  // npm 不会把"当前运行的 node 目录"加进生命周期 PATH，找不到 node 就报 "'node' 不是内部或外部命令"
+  // → npm 退出码 1：更新失败，回滚走同一个 runNpm 也会一起失败。
+  // 只在 nodeBin 是绝对路径时注入：裸 'node' 靠 PATH 自己解析，dirname 会得到 '.'（不该把当前目录塞进 PATH）。
+  const nodeDir = nodeBin && path.isAbsolute(String(nodeBin)) ? path.dirname(String(nodeBin)) : ''
+  const env = nodeDir
+    ? Object.assign({}, process.env, { PATH: nodeDir + path.delimiter + (process.env.PATH || '') })
+    : process.env
   return new Promise((resolve) => {
     let child = null
     try {
       if (npmCli) {
-        child = spawn(nodeBin, [npmCli, ...fullArgs], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+        child = spawn(nodeBin, [npmCli, ...fullArgs], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env })
       } else if (process.platform === 'win32') {
         const cmdLine = ['npm', ...fullArgs].map(quoteArg).join(' ')
-        child = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+        child = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env })
       } else {
-        child = spawn('npm', fullArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
+        child = spawn('npm', fullArgs, { stdio: ['ignore', 'pipe', 'pipe'], env })
       }
     } catch (err) {
       return resolve({ ok: false, error: err.message, stdout: '', stderr: '' })
