@@ -87,6 +87,28 @@ function classifyHandover(state) {
 }
 
 /**
+ * 端口被占时的"占有者裁决"：防止把自家正在启动的后继误判成外部程序抢端口。
+ *
+ * 事故现场：DSH 自重启 → 旧进程退出、后继刚 bind 但还没开始应答 → HTTP 指纹必然不命中，
+ * 只看指纹就会得出"端口被其他程序占用"，进而误换端口、起出第二个实例（实测：3080 上并存两个 dsh）。
+ *
+ * 判据优先级：命令行签名（进程一创建就能读到，最可靠）→ HTTP 指纹 → 等待（端口有人但没应答）→ 冲突。
+ * @param {{hasListener:boolean, sigMatched:boolean, probeOk:boolean, probeReason:string,
+ *          waitedMs:number, budgetMs:number}} state
+ * @returns {'retry-start'|'adopt'|'wait'|'conflict'}
+ */
+function classifyOccupant(state) {
+  const s = state || {}
+  if (s.hasListener !== true) return 'retry-start' // 端口又空了：交给启动器自己拉起
+  if (s.sigMatched === true) return 'adopt' // 命令行逐参数一致 = 我们的后继
+  if (s.probeOk === true) return 'adopt' // 指纹命中 = 已在运行的 DSH（外部实例）
+  if (s.probeReason === 'fingerprint') return 'conflict' // 明确回了非 DSH 内容：确实是别人的程序
+  const waited = Number(s.waitedMs) || 0
+  const budget = Number(s.budgetMs) || 0
+  return waited >= budget ? 'conflict' : 'wait'
+}
+
+/**
  * 就绪判定：端口有人应答不等于"我们的进程起来了"。
  * @param {{listenerPid:number, childPid:number, sigMatched:boolean}} state
  * @returns {'ready'|'claim'|'not-ours'|'ready-unverified'}
@@ -132,6 +154,7 @@ module.exports = {
   splitCmdline,
   matchLaunchSig,
   classifyHandover,
+  classifyOccupant,
   classifyReadiness,
   planCooldownRetry,
   shouldDeclareGone,

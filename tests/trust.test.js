@@ -9,20 +9,20 @@ const AUTH_PAGE = LOADING_URL + '?reason=auth&pane=t1'
 const DSH_PAGE = 'http://127.0.0.1:3080/'
 const OTHER_SITE = 'https://example.com/'
 
-const panel = { kind: 'panel' }
+const consoleSender = { kind: 'console' }
 const shell = { kind: 'shell' }
 const tab = (url) => ({ kind: 'tab', url })
 const none = { kind: 'none' }
 
-test('自己人页面（面板/窗口壳）任何命令都放行', () => {
+test('自己人页面（控制台/窗口壳）任何命令都放行', () => {
   for (const name of ['getState', 'stop', 'start', 'resetDefaults', 'browser:winClose', 'setPort']) {
-    assert.equal(trust.decideCommand(panel, LOADING_URL, name), 'allow', `panel 应放行 ${name}`)
+    assert.equal(trust.decideCommand(consoleSender, LOADING_URL, name), 'allow', `console 应放行 ${name}`)
     assert.equal(trust.decideCommand(shell, LOADING_URL, name), 'allow', `shell 应放行 ${name}`)
   }
 })
 
-test('说明页的三条命令放行（含带 query 的真实地址）', () => {
-  for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart']) {
+test('说明页的白名单命令放行（含带 query 的真实地址）', () => {
+  for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart', 'browser:consoleToggle']) {
     assert.equal(trust.decideCommand(tab(AUTH_PAGE), LOADING_URL, name), 'allow', `说明页应放行 ${name}`)
   }
   // loadingUrl() 生成的一律是 `…loading.html?reason=…`；裸地址与 hash 也算说明页
@@ -38,7 +38,7 @@ test('DSH 页面拿不到 browser:* 的信任（这是本文件存在的理由�
   }
 })
 
-test('标签视图里只有这三条命令放行，其余（改端口/关窗口/停服务）一律拒绝', () => {
+test('标签视图里只有说明页白名单放行，其余（改端口/关窗口/停服务）一律拒绝', () => {
   for (const name of [
     'browser:tabNew', 'browser:tabClose', 'browser:splitToggle', 'browser:splitRatio',
     'browser:closePane', 'browser:swapPanes', 'browser:paneToTab', 'browser:winClose',
@@ -63,8 +63,8 @@ test('非我们视图的发送方（含取不到发送方）一律拒绝', () =>
   }
 })
 
-test('判定表本身：说明页白名单恰好三条，不多不少', () => {
-  assert.deepEqual([...trust.LOADING_PAGE_COMMANDS].sort(), ['browser:authRestart', 'browser:blockSwitch', 'browser:fixPane'])
+test('判定表本身：说明页白名单恰好四条，不多不少', () => {
+  assert.deepEqual([...trust.LOADING_PAGE_COMMANDS].sort(), ['browser:authRestart', 'browser:blockSwitch', 'browser:consoleToggle', 'browser:fixPane'])
 })
 
 test('isLoadingPageUrl：参数非法/空值不抛错且判否', () => {

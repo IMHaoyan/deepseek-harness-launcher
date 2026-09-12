@@ -10,6 +10,8 @@
   --brand-hover: #5686FE;
   --ghost-hover: rgba(38, 49, 72, 0.06);
   --ghost-active: rgba(38, 49, 72, 0.1);
+  --danger: #B42318;
+  --danger-soft: #FEE4E2;
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   --ratio: 0.5;
 }
@@ -26,6 +28,8 @@
     --brand-hover: #679EFE;
     --ghost-hover: rgba(255, 255, 255, 0.08);
     --ghost-active: rgba(255, 255, 255, 0.14);
+    --danger: #FF9C94;
+    --danger-soft: rgba(255, 108, 96, 0.18);
   }
 }
 
@@ -82,6 +86,17 @@ body:not(.ready) #tabbar { visibility: hidden; }
 }
 
 .title-only.hidden { display: none; }
+
+/* 悬停看 DSH 版本：文字块必须脱离窗口拖拽区 —— 拖拽区在非客户区，鼠标事件到不了渲染层，
+   原生 tooltip 永远不会弹（这就是"鼠标移上去没反应"的原因）。代价：拖窗口时别抓这几个字，
+   标题周边留白与右侧 drag-space 仍是拖拽区。 */
+.title-only .title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
 
 #tabs {
   display: flex;
@@ -164,17 +179,30 @@ body:not(.ready) #tabbar { visibility: hidden; }
 
 .bar-btn.hidden { display: none; }
 
-/* 刷新按钮：常显中性（仅符号 ↻）；页面空白时琥珀警示 */
-.bar-btn.fix {
-  font-size: 15px;
+/* 刷新 / 重启：统一「图标 + 文字」（图标 13px 描边，文案 12.5px；间距 6px） */
+.bar-btn.fix,
+.bar-btn.restart {
+  gap: 6px;
+  padding: 0 12px;
+  font-size: 12.5px;
   line-height: 1;
   -webkit-app-region: no-drag;
 }
+.bar-btn.fix svg,
+.bar-btn.restart svg { flex: none; display: block; }
+
+/* 刷新按钮：页面空白时琥珀警示 */
 .bar-btn.fix.warn {
   color: #B45309;
   font-weight: 600;
 }
 .bar-btn.fix.warn:hover { background: #FEF3C7; }
+
+/* 重启 DSH：与控制台同源的动作（停 → 起 → 刷新窗口）。进行中禁用；失败短暂红字（5s 后回状态文案） */
+.bar-btn.restart:disabled { opacity: 0.55; cursor: default; }
+.bar-btn.restart:disabled:hover { background: transparent; }
+.bar-btn.restart.failed { color: var(--danger); font-weight: 600; }
+.bar-btn.restart.failed:hover { background: var(--danger-soft); }
 
 /* 窗口按钮组：贴右缘、彼此无间距、全高直角（Edge 式） */
 .win-group {
@@ -205,6 +233,25 @@ body:not(.ready) #tabbar { visibility: hidden; }
 
 .win-btn:hover { background: var(--ghost-hover); }
 .win-btn.close:hover { background: #EC1313; color: #FFFFFF; }
+
+/* 控制台开关：图标 + 文字（右侧窗口按钮组里唯一的带字按钮），激活时高亮为品牌色 */
+.win-btn.console-btn {
+  width: auto;
+  flex: none;
+  gap: 6px;
+  padding: 0 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.win-btn.console-btn:hover { color: var(--text-primary); }
+.win-btn.console-btn.active { color: var(--brand); background: var(--ghost-active); }
+.console-btn-label { line-height: 1; white-space: nowrap; }
+
+/* 窄窗口下优先保住窗口按钮组的可用宽度：标题栏空间不够时收起「控制台」二字 */
+@media (max-width: 760px) {
+  .console-btn-label { display: none; }
+  .win-btn.console-btn { width: 46px; padding: 0; gap: 0; }
+}
 
 /* ---------- 分隔条（位于两个原生视图之间的缝隙，壳在此接收拖拽） ---------- */
 

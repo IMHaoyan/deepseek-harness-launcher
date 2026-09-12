@@ -8,12 +8,35 @@
 </head>
 <body>
   <div id="tabbar">
-    <div id="titleOnly" class="title-only hidden" title="DeepSeek Harness">DeepSeek Harness</div>
+    <div id="titleOnly" class="title-only hidden"><span id="titleText" class="title-text">DeepSeek Harness</span></div>
     <div id="tabs"></div>
-    <button id="btnReload" class="bar-btn fix" title="刷新当前页 (F5)">↻</button>
+    <button id="btnReload" class="bar-btn fix" title="刷新当前页 (F5)">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="23 4 23 10 17 10"/>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+      </svg>
+      <span id="btnReloadLabel">刷新</span>
+    </button>
+    <button id="btnRestart" class="bar-btn restart" title="重启 DSH 服务（停止 → 启动 → 刷新窗口）">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+        <line x1="12" y1="2" x2="12" y2="12"/>
+      </svg>
+      <span id="btnRestartLabel">重启</span>
+    </button>
     <button id="btnNew" class="bar-btn" title="新建标签页">＋</button>
     <div class="drag-space"></div>
     <div class="win-group">
+      <button id="btnConsole" class="bar-btn win-btn console-btn" title="打开启动器控制台" aria-label="打开启动器控制台" aria-pressed="false">
+        <!-- 控制台图标：两行滑杆（控制/调整面板语义）。早前的「>_」会被误读成"打开终端"，见需求记录。 -->
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 8h18"/>
+          <circle cx="9" cy="8" r="2.6" fill="currentColor" stroke="none"/>
+          <path d="M3 16h18"/>
+          <circle cx="15" cy="16" r="2.6" fill="currentColor" stroke="none"/>
+        </svg>
+        <span class="console-btn-label">控制台</span>
+      </button>
       <button id="btnSplit" class="bar-btn" title="左右分屏 (Ctrl+\)">分屏</button>
       <button id="btnMin" class="bar-btn win-btn" title="最小化">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1"><line x1="1.5" y1="6" x2="10.5" y2="6"/></svg>

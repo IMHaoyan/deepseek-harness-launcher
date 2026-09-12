@@ -19,6 +19,7 @@ process.env.DSHL_USER_NODE_DIR = path.join(base, 'Programs', 'nodejs')
 process.env.DSHL_NPM_GLOBAL_ROOT = path.join(base, 'npm-global')
 process.env.DSHL_SKIP_PATH = '1'
 process.env.DSHL_FRESH_TEST = '1'
+process.env.COREPACK_HOME = path.join(base, 'corepack-home')
 
 const envInstall = require('../env-install')
 const envDetect = require('../env-detect')
@@ -29,7 +30,7 @@ function line(s) { console.log(`[${ts()}] ${s}`) }
 let lastPct = -1
 envInstall.initInstaller({
   HOME: home,
-  Config: { nodeMajor: 22, dshVersion: '0.1.0-rc.6', npmRegistry: '' },
+  Config: { nodeMajor: 22, dshVersion: '0.1.0-rc.6', pnpmVersion: '11.8.0', npmRegistry: '' },
   ASSETS_DIR: path.join(__dirname, '..', 'assets'),
   log: line,
   onPush: (p) => {
@@ -52,10 +53,10 @@ envInstall.initInstaller({
 })
 
 async function detect(tag) {
-  envDetect.initEnv({ realHome: home, Config: { harnessRoot: '', nodePath: '' }, log: () => {} })
+  envDetect.initEnv({ realHome: home, Config: { harnessRoot: '', nodePath: '', pnpmVersion: '11.8.0' }, log: () => {} })
   const r = await envDetect.detectEnv(true)
   const s = envDetect.envSummary(r)
-  line(`${tag}环境探测 → node=${s.node.status}${s.node.version ? '/' + s.node.version : ''}(${s.node.source || '-'}) dsh=${s.dsh.status}/${s.dsh.kind}/${s.dsh.version || '-'} plugin=${s.plugin.status} ready=${s.ready}`)
+  line(`${tag}环境探测 → node=${s.node.status}${s.node.version ? '/' + s.node.version : ''}(${s.node.source || '-'}) pnpm=${s.pnpm ? s.pnpm.status + (s.pnpm.version ? '/' + s.pnpm.version : '') : '?'} dsh=${s.dsh.status}/${s.dsh.kind}/${s.dsh.version || '-'} plugin=${s.plugin.status} ready=${s.ready}`)
   return r
 }
 
@@ -65,8 +66,13 @@ async function afterInstall() {
   finished = true
   try {
     const r = await detect('安装后')
+    if (!r.pnpmReady) {
+      line('❌ pnpm 未就绪：' + (r.pnpm ? (r.pnpm.detail || r.pnpm.status) : '未检测到'))
+      process.exit(1)
+    }
     line('--- 安装落点 ---')
     line(`用户级 Node  : ${process.env.DSHL_USER_NODE_DIR}`)
+    line(`用户级 pnpm  : ${r.pnpm && r.pnpm.path ? r.pnpm.path : '(未检测到)'}`)
     line(`npm 全局根   : ${process.env.DSHL_NPM_GLOBAL_ROOT}`)
     line(`全局 DSH 目录: ${path.join(process.env.DSHL_NPM_GLOBAL_ROOT, 'node_modules', '@deepseek-ai', 'dsh')}`)
     line(`通知插件     : ${path.join(home, 'plugins', 'dsh-notify', 'dsh-notify.mjs')}`)
@@ -99,7 +105,7 @@ void (async () => {
   line(`隔离根：${base}`)
   line('==============================================================')
   await detect('安装前')
-  line('--- 开始一键安装（node → dsh → plugin）---')
+  line('--- 开始一键安装（node → pnpm → dsh → plugin）---')
   try {
     envInstall.startInstall(['node', 'dsh', 'plugin'])
   } catch (e) {

@@ -15,11 +15,14 @@ const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
 const { spawn, execFile } = require('child_process')
+const semver = require('semver')
+const envDetect = require('./env-detect') // 复用 engines 判据（Node 版本就绪范围），保证与探测侧单一事实源
 
 const IS_WIN = process.platform === 'win32'
+const DEFAULT_PNPM_VERSION = '11.8.0'
 
 let HOME = path.join(os.homedir(), '.dsh')
-let Config = { nodeMajor: 22, dshVersion: 'latest', npmRegistry: '' }
+let Config = { nodeMajor: 22, dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, npmRegistry: '' }
 let ASSETS_DIR = ''
 let logFn = () => {}
 let onPushFn = () => {}
@@ -42,6 +45,17 @@ function log(message) {
 
 function runtimeBase() {
   return path.join(HOME, 'dshl-runtime')
+}
+
+// 仅修改 DSHL 当前进程的 PATH：让后续探测/子进程立即看到刚装好的工具，不等新终端。
+// 用户全局可见性仍由 HKCU PATH + addToUserPath 负责。
+function prependProcessPath(dirs) {
+  const key = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') || 'PATH'
+  const current = process.env[key] || ''
+  const normalized = current.split(path.delimiter).map((p) => p.trim().toLowerCase())
+  const additions = (dirs || []).filter((d) => d && !normalized.includes(String(d).toLowerCase()))
+  if (!additions.length) return
+  process.env[key] = additions.join(path.delimiter) + (current ? path.delimiter + current : '')
 }
 
 // 用户级 Node 安装目录（官方 zip 解压落位；免管理员；可用环境变量覆盖，测试用）。
@@ -176,17 +190,44 @@ function electronNet() {
   try { return require('electron').net } catch { return null }
 }
 
+// 下载停滞看门狗：代理/连接假死（连上但不发数据、也不关闭）时事件永远不来、Promise 永不 settle，
+// 安装任务就会永久卡在 running（只能手动取消）。这里按"多久没收到任何数据"判停滞，超时即失败，
+// 控制台出现「重试」入口。默认 60s，DSHL_DL_STALL_MS 可覆盖（测试用）。
+const DEFAULT_DL_STALL_MS = 60000
+function downloadStallMs() {
+  const v = Number(process.env.DSHL_DL_STALL_MS)
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_DL_STALL_MS
+}
+
 function downloadToFile(url, dest, onProgress, abortRef) {
   return new Promise((resolve, reject) => {
     const httpMod = (() => { try { return require(url.startsWith('https:') ? 'https' : 'http') } catch { return null } })()
-    const done = (err, bytes) => { if (err) reject(err); else resolve({ bytes }) }
+    const stallMs = downloadStallMs()
+    let settled = false
+    let stallTimer = null
+    let current = null
+    const clearStall = () => { if (stallTimer) { clearTimeout(stallTimer); stallTimer = null } }
+    const done = (err, bytes) => {
+      if (settled) return
+      settled = true
+      clearStall()
+      if (err) reject(err); else resolve({ bytes })
+    }
     const fail = (err) => {
+      clearStall()
       try { fs.unlinkSync(dest) } catch { /* noop */ }
       done(err)
     }
     const abort = () => { try { if (current) current.destroy ? current.destroy() : current.abort() } catch { /* noop */ } }
     abortRef.onAbort = abort
-    let current = null
+    // 收到任何数据都重置计时；到点还没数据 = 停滞（含"连上但首字节不来"）
+    const armStall = () => {
+      clearStall()
+      stallTimer = setTimeout(() => {
+        fail(new Error(`下载停滞：${Math.round(stallMs / 1000)} 秒没有收到数据（${url}）`))
+        abort()
+      }, stallMs)
+    }
     const netMod = electronNet()
     if (netMod) {
       current = netMod.request(url)
@@ -195,6 +236,8 @@ function downloadToFile(url, dest, onProgress, abortRef) {
         const loc = res.headers.location && String(res.headers.location[0] || res.headers.location)
         if ([301, 302, 303, 307, 308].includes(code) && loc) {
           try { res.resume() } catch { /* noop */ }
+          clearStall()
+          settled = true // 结果由内层下载决定
           abortRef.onAbort = null
           resolve(downloadToFile(new URL(loc, url).toString(), dest, onProgress, abortRef))
           return
@@ -204,17 +247,20 @@ function downloadToFile(url, dest, onProgress, abortRef) {
         let got = 0
         const ws = fs.createWriteStream(dest)
         ws.on('error', (e) => fail(e))
-        res.on('data', (chunk) => { got += chunk.length; try { ws.write(chunk) } catch { /* noop */ } if (onProgress) onProgress(got, total) })
+        res.on('data', (chunk) => { got += chunk.length; armStall(); try { ws.write(chunk) } catch { /* noop */ } if (onProgress) onProgress(got, total) })
         res.on('end', () => { try { ws.end(() => done(null, got)) } catch { done(null, got) } })
         res.on('error', (e) => { try { ws.destroy() } catch { /* noop */ } fail(e) })
       })
       current.on('error', (e) => fail(e))
+      armStall() // 连接/首字节也计入停滞窗口
       current.end()
     } else if (httpMod) {
       current = httpMod.get(url, { headers: { 'user-agent': 'dshl-installer/1.0' } }, (res) => {
         const code = res.statusCode
         if ([301, 302, 303, 307, 308].includes(code) && res.headers.location) {
           try { res.resume() } catch { /* noop */ }
+          clearStall()
+          settled = true // 结果由内层下载决定
           abortRef.onAbort = null
           resolve(downloadToFile(new URL(res.headers.location, url).toString(), dest, onProgress, abortRef))
           return
@@ -224,11 +270,12 @@ function downloadToFile(url, dest, onProgress, abortRef) {
         let got = 0
         const ws = fs.createWriteStream(dest)
         ws.on('error', (e) => fail(e))
-        res.on('data', (chunk) => { got += chunk.length; try { ws.write(chunk) } catch { /* noop */ } if (onProgress) onProgress(got, total) })
+        res.on('data', (chunk) => { got += chunk.length; armStall(); try { ws.write(chunk) } catch { /* noop */ } if (onProgress) onProgress(got, total) })
         res.on('end', () => { try { ws.end(() => done(null, got)) } catch { done(null, got) } })
         res.on('error', (e) => { try { ws.destroy() } catch { /* noop */ } fail(e) })
       })
       current.on('error', (e) => fail(e))
+      armStall() // 连接/首字节也计入停滞窗口
     } else {
       return fail(new Error('no http client available'))
     }
@@ -558,6 +605,168 @@ async function installDshGlobal(job, nodeBin, globalRoot) {
   throw lastErr || new Error('npm install -g 失败')
 }
 
+// ---------- pnpm 安装（用户全局；Corepack 优先对齐，失败回退 npm 全局） ----------
+
+function readPackageVersion(pkgDir, name) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+    return pkg && pkg.name === name && pkg.version ? String(pkg.version) : ''
+  } catch { return '' }
+}
+
+function corepackCliFor(nodeBin) {
+  const cli = path.join(path.dirname(nodeBin), 'node_modules', 'corepack', 'dist', 'corepack.js')
+  return fs.existsSync(cli) ? cli : null
+}
+
+function parsePnpmVersionText(text) {
+  const m = /(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(String(text || ''))
+  return m ? m[1] : ''
+}
+
+function pnpmEntryFor(pkgDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+    const bin = pkg && pkg.bin && typeof pkg.bin.pnpm === 'string' ? pkg.bin.pnpm : 'bin/pnpm.mjs'
+    return path.join(pkgDir, bin)
+  } catch {
+    return path.join(pkgDir, 'bin', 'pnpm.mjs')
+  }
+}
+
+async function runPnpmEntryVersion(job, nodeBin, pnpmEntry) {
+  const res = await runExec(nodeBin, [pnpmEntry, '--version'], { timeout: 30000, onAbort: job.setAbort })
+  return parsePnpmVersionText(res.stdout)
+}
+
+// 用 Node 自带的 Corepack 对齐/安装固定版本；enableShim 只在 PATH 上还没有 pnpm shim 时使用。
+async function alignPnpmWithCorepack(job, nodeBin, expectedVersion, enableShim) {
+  const corepackCli = corepackCliFor(nodeBin)
+  if (!corepackCli) return false
+  try {
+    if (enableShim) {
+      const nodeDir = path.dirname(nodeBin)
+      job.logLine('Corepack：在 ' + nodeDir + ' 启用 pnpm shim')
+      await runExec(nodeBin, [corepackCli, 'enable', '--install-directory', nodeDir, 'pnpm'], { timeout: 60000, onAbort: job.setAbort })
+    }
+    job.logLine('Corepack：把 pnpm 对齐到 v' + expectedVersion)
+    await runExec(nodeBin, [corepackCli, 'install', '-g', 'pnpm@' + expectedVersion], { timeout: 300000, onAbort: job.setAbort })
+    prependProcessPath([path.dirname(nodeBin)])
+    return true
+  } catch (e) {
+    job.logLine('Corepack 对齐失败：' + e.message)
+    return false
+  }
+}
+
+// npm 全局安装 pnpm 到用户 PATH 上的全局根（与 DSH 使用同一个 root）。
+async function installPnpmGlobal(job, nodeBin, globalRoot, expectedVersion) {
+  const pkgDir = path.join(globalRoot, 'node_modules', 'pnpm')
+  const pnpmEntry = pnpmEntryFor(pkgDir)
+  if (readPackageVersion(pkgDir, 'pnpm') === expectedVersion && fs.existsSync(pnpmEntry)) {
+    const got = await runPnpmEntryVersion(job, nodeBin, pnpmEntry)
+    if (got === expectedVersion) {
+      job.logLine('全局 npm 已安装 pnpm v' + expectedVersion + '（' + pkgDir + '），跳过安装')
+      return globalRoot
+    }
+  }
+  try {
+    const probe = path.join(globalRoot, '.dshl-write-test-' + Date.now())
+    fs.mkdirSync(globalRoot, { recursive: true })
+    fs.writeFileSync(probe, '')
+    fs.unlinkSync(probe)
+  } catch (e) {
+    throw new Error('npm 全局目录不可写：' + globalRoot + '（' + e.message + '）')
+  }
+  let npmCli = npmCliFor(nodeBin)
+  if (!npmCli && nodeBin) {
+    try {
+      const res = await runExec(nodeBin, ['-p', 'process.execPath'], { timeout: 10000 })
+      const real = String(res.stdout || '').trim()
+      if (real) npmCli = npmCliFor(real)
+    } catch { /* 忽略，走 cmd.exe 兜底 */ }
+  }
+  if (!npmCli) job.logLine('警告：所选 Node 未内置 npm，回退到 PATH 中的 npm 命令')
+  const registries = Config.npmRegistry ? [Config.npmRegistry] : ['https://registry.npmmirror.com', null]
+  let lastErr = null
+  for (const registry of registries) {
+    if (job.aborted) throw job.cancelledError()
+    const args = ['install', '-g', '--prefix', globalRoot, '--no-audit', '--no-fund', '--loglevel=info']
+    if (registry) args.push('--registry', registry)
+    args.push('pnpm@' + expectedVersion)
+    job.logLine('npm install -g（registry=' + (registry || '默认') + '）：pnpm@' + expectedVersion + ' → ' + globalRoot)
+    try {
+      await runNpmInstall(job, nodeBin, npmCli, args)
+      if (!fs.existsSync(pnpmEntry)) throw new Error('安装后未找到 ' + pnpmEntry)
+      const got = await runPnpmEntryVersion(job, nodeBin, pnpmEntry)
+      if (got !== expectedVersion) throw new Error('pnpm 版本校验失败：期望 ' + expectedVersion + '，实际 ' + (got || '空'))
+      job.logLine('pnpm 全局安装完成：' + pkgDir)
+      prependProcessPath([globalRoot])
+      return globalRoot
+    } catch (e) {
+      lastErr = e
+      job.logLine('npm install -g pnpm 失败（registry=' + (registry || '默认') + '）：' + e.message + (registry ? '，回退官方源重试' : ''))
+    }
+  }
+  throw lastErr || new Error('npm install -g pnpm 失败')
+}
+
+async function ensureNodeBin(job, nodeBin) {
+  if (nodeBin) return nodeBin
+  const { detectEnv } = require('./env-detect')
+  const report = await detectEnv(false)
+  if (!report.node || report.node.status !== 'ok' || !report.node.path) throw new Error('需要先安装 Node.js')
+  // node 可能是 PATH 上的裸命令；先解析成绝对路径，Corepack/npm 解析才可靠。
+  try {
+    const res = await runExec(report.node.path, ['-p', 'process.execPath'], { timeout: 10000 })
+    const real = String(res.stdout || '').trim()
+    if (real) return real
+  } catch { /* 保留探测路径 */ }
+  return report.node.path
+}
+
+// 安装/对齐 pnpm：先看 PATH 上是否已命中期望版本；Corepack 可用时优先对齐，否则回退 npm 全局安装。
+async function installPnpm(job, nodeBin, preferredGlobalRoot) {
+  const expectedVersion = (job.opts && job.opts.pnpmVersion) || Config.pnpmVersion || DEFAULT_PNPM_VERSION
+  const envDetect = require('./env-detect')
+  let detected = await envDetect.detectPnpm({ expectedVersion })
+  if (detected.status === 'ok') {
+    job.logLine('pnpm 已就绪：v' + detected.version + '（' + (detected.source || 'path') + (detected.path ? ' · ' + detected.path : '') + '）')
+    return { globalRoot: preferredGlobalRoot, detected }
+  }
+  job.logLine('pnpm 未就绪：' + detected.detail + (detected.path ? ' · ' + detected.path : ''))
+
+  if (detected.source === 'corepack') {
+    // 版本读不出来通常说明 shim 目标已失效；此时需要重新生成 shim，而不仅是切版本。
+    const repairShim = !detected.version
+    if (await alignPnpmWithCorepack(job, nodeBin, expectedVersion, repairShim)) {
+      detected = await envDetect.detectPnpm({ expectedVersion })
+      if (detected.status === 'ok') {
+        job.logLine('pnpm 已通过 Corepack 对齐：v' + detected.version)
+        return { globalRoot: preferredGlobalRoot, detected }
+      }
+    }
+  } else if (!detected.path && corepackCliFor(nodeBin)) {
+    if (await alignPnpmWithCorepack(job, nodeBin, expectedVersion, true)) {
+      detected = await envDetect.detectPnpm({ expectedVersion })
+      if (detected.status === 'ok') {
+        job.logLine('pnpm 已通过 Corepack 安装并启用：v' + detected.version)
+        return { globalRoot: preferredGlobalRoot, detected }
+      }
+    }
+  }
+
+  const globalRoot = preferredGlobalRoot || await resolveGlobalRoot(nodeBin)
+  await installPnpmGlobal(job, nodeBin, globalRoot, expectedVersion)
+  detected = await envDetect.detectPnpm({ expectedVersion })
+  if (detected.status !== 'ok') {
+    job.logLine('警告：pnpm 已安装，但当前 PATH 命中的不是期望版本（' + detected.detail + (detected.path ? ' · ' + detected.path : '') + '）')
+  } else {
+    job.logLine('pnpm 已就绪：v' + detected.version + '（' + (detected.source || 'path') + (detected.path ? ' · ' + detected.path : '') + '）')
+  }
+  return { globalRoot, detected }
+}
+
 // 已装全局 DSH 版本（npm i -g 落点）
 function readInstalledVersion(pkgDir) {
   try {
@@ -614,9 +823,9 @@ async function installDshManaged(job, nodeBin) {
 }
 
 // DSH 安装主入口：优先全局 npm（统一渠道）；失败回退托管目录（旧逻辑兜底）
-async function installDsh(job, nodeBin) {
+async function installDsh(job, nodeBin, resolvedGlobalRoot) {
   try {
-    const globalRoot = await resolveGlobalRoot(nodeBin)
+    const globalRoot = resolvedGlobalRoot || await resolveGlobalRoot(nodeBin)
     return await installDshGlobal(job, nodeBin, globalRoot)
   } catch (e) {
     job.logLine(`全局 npm 安装失败（回退托管目录）：${e.message}`)
@@ -654,7 +863,7 @@ const KIND_LABELS = { source: '源码版', global: '全局 npm 安装', npx: 'np
 // 真实耗时会在每台机器上持续学习（EWMA 平滑），首装之后即贴近本机真实水平
 const NPM_STAGE_ESTIMATE_MS = 240000
 // 各阶段名义耗时（与 buildStages 权重一致；Node 内置包解压秒级 → 名义 10s；dsh-npm 用学习值）
-const STAGE_NOMINAL_MS = { 'node-dl': 10000, 'node-ex': 10000, 'dsh-npm': NPM_STAGE_ESTIMATE_MS, 'dsh-verify': 5000, 'plugin': 3000 }
+const STAGE_NOMINAL_MS = { 'node-dl': 10000, 'node-ex': 10000, 'pnpm': 30000, 'dsh-npm': NPM_STAGE_ESTIMATE_MS, 'dsh-verify': 5000, 'plugin': 3000 }
 
 // 进度展示缓动：当前为纯线性（EASE_MIX=0，显示=真实进度）。
 //   历史实验：'in'（加速冲线）/ 'inout'（两头慢）均因体感与剩余时间不一致被否——线性最诚实。
@@ -701,14 +910,23 @@ function learnNpmDuration(actualMs) {
 const STAGE_LABELS = {
   'node-dl': '准备 Node.js',
   'node-ex': '校验并解压 Node.js',
+  pnpm: '安装 pnpm（用户全局）',
   'dsh-npm': '安装 DeepSeek Harness 主程序',
   'dsh-verify': '验证 DeepSeek Harness',
   plugin: '安装桌面通知',
 }
+// 安装项归一化：安装 Node/DSH 时自动带上 pnpm；单独安装 pnpm 时复用当前已就绪的 Node。
+function normalizeInstallItems(items) {
+  const valid = ['node', 'pnpm', 'dsh', 'plugin']
+  const list = [...new Set((items || []).filter((i) => valid.includes(i)))]
+  if ((list.includes('node') || list.includes('dsh')) && !list.includes('pnpm')) list.push('pnpm')
+  return list
+}
 function buildStages(items) {
-  const order = ['node-dl', 'node-ex', 'dsh-npm', 'dsh-verify', 'plugin']
+  const order = ['node-dl', 'node-ex', 'pnpm', 'dsh-npm', 'dsh-verify', 'plugin']
   const wanted = order.filter((id) => {
     if (id === 'node-dl' || id === 'node-ex') return items.includes('node')
+    if (id === 'pnpm') return items.includes('pnpm')
     if (id === 'dsh-npm' || id === 'dsh-verify') return items.includes('dsh')
     return items.includes('plugin')
   })
@@ -771,8 +989,7 @@ function startInstall(items, opts = {}) {
     e.alreadyRunning = true
     throw e
   }
-  const valid = ['node', 'dsh', 'plugin']
-  const list = [...new Set((items || []).filter((i) => valid.includes(i)))]
+  const list = normalizeInstallItems(items)
   if (!list.length) throw new Error('没有需要安装的项目')
   const stageDefs = buildStages(list)
   const stats = loadInstallStats()
@@ -861,10 +1078,41 @@ function startInstall(items, opts = {}) {
   return job
 }
 
+// 复用用户级 Node 之前先验版本：目录里有 node.exe ≠ 能用
+// （用户可能把 Node 18 装在那儿，旧版启动器也可能留下过旧版本）。
+// 判据与 env-detect 同源（DEFAULT_ENGINE_RANGE = ^22.19.0 || >=24.0.0）。
+// 探测失败（拿不到版本）一律不复用：重装一次的成本远低于"装完仍报版本过低、重试无效"。
+function decideUserNodeReuse(input) {
+  const o = input || {}
+  if (!o.exists) return { reuse: false, reason: 'no-existing' }
+  if (typeof o.version !== 'string') return { reuse: false, reason: 'unknown' } // 非字符串一律当"拿不到版本"
+  const clean = o.version.trim().replace(/^v/i, '')
+  if (!clean) return { reuse: false, reason: 'unknown' }
+  try {
+    if (semver.satisfies(clean, o.range || envDetect.DEFAULT_ENGINE_RANGE, { includePrerelease: true })) {
+      return { reuse: true, reason: 'ok' }
+    }
+  } catch { /* 版本串解析失败：按不可用处理 */ }
+  return { reuse: false, reason: 'too-old' }
+}
+
+async function probeUserNodeVersion(nodeBin, job) {
+  try {
+    // runExec 解析成 { stdout, stderr }（不是裸字符串）——别再拼成 "[object Object]"
+    const out = await runExec(nodeBin, ['-v'], { timeout: 15000 })
+    const text = typeof out === 'string' ? out : (out && typeof out.stdout === 'string' ? out.stdout : '')
+    return text.trim()
+  } catch (e) {
+    if (job) job.logLine('用户级 Node.js 版本探测失败：' + (e && e.message ? e.message : String(e)))
+    return ''
+  }
+}
+
 async function runJob(job) {
   const stageIdx = (id) => job.stages.findIndex((s) => s.id === id)
   let nodeBin = null
   let nodeDest = null
+  let globalRoot = null
   try {
     if (job.items.includes('node')) {
       job.enterStage(stageIdx('node-dl'))
@@ -874,21 +1122,38 @@ async function runJob(job) {
         // 已存在时直接复用（重复迁移/重试不重复下载）。
         const dest = userNodeDir()
         const existing = path.join(dest, IS_WIN ? 'node.exe' : 'node')
-        if (fs.existsSync(existing)) {
-          job.logLine(`用户级 Node.js 已存在：${dest}，跳过下载/解压`)
+        const hasExisting = fs.existsSync(existing)
+        const probeFn = typeof job.nodeVersionProbe === 'function' ? job.nodeVersionProbe
+          : (job.opts && typeof job.opts.nodeVersionProbe === 'function' ? job.opts.nodeVersionProbe : null)
+        const probed = hasExisting ? (probeFn ? await probeFn(existing) : await probeUserNodeVersion(existing, job)) : ''
+        const verdict = decideUserNodeReuse({ exists: hasExisting, version: probed })
+        if (verdict.reuse) {
+          job.logLine(`用户级 Node.js 已存在且版本可用（${probed}）：${dest}，跳过下载/解压`)
           nodeBin = existing
           nodeDest = null
           job.finishStage()
           job.enterStage(stageIdx('node-ex'))
           job.finishStage()
         } else {
+          if (verdict.reason === 'too-old') job.logLine(`用户级 Node.js ${probed} 不满足 ${envDetect.DEFAULT_ENGINE_RANGE}：忽略旧版本并重新安装`)
+          else if (verdict.reason === 'unknown') job.logLine('用户级 Node.js 版本无法确认：不复用，重新安装')
+          let backup = ''
+          if (fs.existsSync(dest)) {
+            backup = dest + '.old-' + Date.now()
+            try { fs.renameSync(dest, backup); job.logLine('旧 Node 目录已移到备份：' + backup) }
+            catch (e) { backup = ''; job.logLine('旧 Node 目录备份失败（继续覆盖安装）：' + (e && e.message ? e.message : String(e))) }
+          }
           try {
             nodeBin = await installNode(job, dest, () => {
               job.finishStage()
               job.enterStage(stageIdx('node-ex'))
             })
             nodeDest = null
-          } catch (e) { throw e }
+          } catch (e) {
+            if (backup) job.logLine('安装失败：旧目录保留在 ' + backup)
+            throw e
+          }
+          if (backup) { try { fs.rmSync(backup, { recursive: true, force: true }) } catch { /* noop */ } }
           job.finishStage()
         }
         job.logLine(`Node.js 就绪：${nodeBin}`)
@@ -909,23 +1174,24 @@ async function runJob(job) {
         job.logLine(`Node.js 就绪：${nodeBin}`)
       }
     }
+    if (nodeBin) prependProcessPath([path.dirname(nodeBin), npmGlobalRoot()])
+    if (job.items.includes('pnpm')) {
+      job.enterStage(stageIdx('pnpm'))
+      nodeBin = await ensureNodeBin(job, nodeBin)
+      globalRoot = await resolveGlobalRoot(nodeBin)
+      const pnpmResult = await installPnpm(job, nodeBin, globalRoot)
+      if (pnpmResult && pnpmResult.globalRoot) globalRoot = pnpmResult.globalRoot
+      job.finishStage()
+    }
     if (job.items.includes('dsh')) {
       job.enterStage(stageIdx('dsh-npm'))
-      if (!nodeBin) {
-        // 未装 Node：用探测到的系统 Node（其 npm 可能缺失，runNpmInstall 有兜底）
-        const { detectEnv } = require('./env-detect')
-        const report = await detectEnv(false)
-        if (!report.node || report.node.status !== 'ok' || !report.node.path) {
-          throw new Error('需要先安装 Node.js')
-        }
-        nodeBin = report.node.path
-      }
+      nodeBin = await ensureNodeBin(job, nodeBin)
       // 阶段时钟按本机预估耗时渐近爬升（CAP 98.5% 封顶，永不冻结），npm 真正完成时 finishStage 跳到阶段终点
       const npmT0 = Date.now()
       const clock = job.startStageClock(job.estimateNpmMs)
       let prefix
       try {
-        prefix = await installDsh(job, nodeBin)
+        prefix = await installDsh(job, nodeBin, globalRoot)
       } finally {
         job.stopStageClock(clock)
       }
@@ -1016,4 +1282,10 @@ module.exports = {
   userNodeDir,
   npmGlobalRoot,
   resolveGlobalRoot,
+  normalizeInstallItems,
+  buildStages,
+  DEFAULT_PNPM_VERSION,
+  downloadToFile,
+  decideUserNodeReuse,
+  DEFAULT_DL_STALL_MS,
 }

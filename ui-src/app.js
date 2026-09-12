@@ -1,7 +1,21 @@
-// DSHL 启动器面板脚本：Electron IPC 桥 + 状态渲染
+// DSHL 控制台脚本：Electron IPC 桥 + 状态渲染
 'use strict';
 
 const $ = (id) => document.getElementById(id);
+
+let consoleToastTimer = null;
+function showConsoleToast(text) {
+  const el = $('consoleToast');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.remove('hidden');
+  requestAnimationFrame(() => el.classList.add('show'));
+  clearTimeout(consoleToastTimer);
+  consoleToastTimer = setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.classList.add('hidden'), 200);
+  }, 2600);
+}
 
 // Electron 桥（preload 暴露 dshBridge；invoke 异步返回 JSON 字符串）
 async function cmd(name, value) {
@@ -182,13 +196,61 @@ function applyTheme(mode) {
   document.documentElement.dataset.theme = mode; // system|light|dark（CSS 处理 system+系统暗色）
 }
 
+const CONSOLE_PAGE_LABELS = { general: '通用', plugins: '预装插件', env: '运行环境', logs: '日志与反馈', wizard: '首次设置' };
+// env 是「通用 → 服务与更新」里的二级页：导航高亮仍落在通用上
+const CONSOLE_NAV_IDS = { general: 'navGeneral', plugins: 'navPlugins', env: 'navGeneral', logs: 'navLog' };
+// 旧名兼容：概览/设置已合并成「通用」（主进程很多入口还在推 main）；服务与诊断已合并进「日志与反馈」
+const CONSOLE_PAGE_ALIASES = { main: 'general', settings: 'general', recovery: 'logs', service: 'logs', log: 'logs' };
+
+function updateConsoleChrome(state) {
+  const dot = $('consoleServiceDot');
+  const text = $('consoleServiceText');
+  const version = $('consoleVersion');
+  if (version) version.textContent = state && state.version ? `DSHL v${state.version}` : 'DSHL';
+  if (!dot || !text) return;
+  const phase = (state && state.phase) || (state && state.running ? 'ready' : 'stopped');
+  dot.className = 'dot';
+  if (phase === 'stopping') {
+    text.textContent = '服务停止中…';
+  } else if (phase === 'starting' || phase === 'restarting') {
+    dot.classList.add('running');
+    text.textContent = phase === 'restarting' ? '服务重启中…' : '服务启动中…';
+  } else if (state && (state.running || state.settling)) {
+    dot.classList.add('running');
+    text.textContent = '服务运行中';
+  } else if (state && state.blocked) {
+    dot.classList.add('stopped');
+    text.textContent = '端口被占用';
+  } else {
+    dot.classList.add('stopped');
+    text.textContent = '服务已停止';
+  }
+}
+
 function showPage(name) {
-  $('pageMain').classList.toggle('hidden', name !== 'main');
-  $('pageSettings').classList.toggle('hidden', name !== 'settings');
-  $('pageLog').classList.toggle('hidden', name !== 'log');
+  name = CONSOLE_PAGE_ALIASES[name] || name;
+  const activeNav = CONSOLE_NAV_IDS[name] || '';
+  document.querySelectorAll('#consoleNav .console-nav-item').forEach((el) => {
+    el.classList.toggle('active', el.id === activeNav);
+  });
+  document.title = 'DSHL 控制台 · ' + (CONSOLE_PAGE_LABELS[name] || '通用');
+  const content = $('consoleContent');
+  if (content) content.scrollTop = 0;
+  $('pageGeneral').classList.toggle('hidden', name !== 'general');
+  $('pagePlugins').classList.toggle('hidden', name !== 'plugins');
+  $('pageLog').classList.toggle('hidden', name !== 'logs');
   $('pageEnv').classList.toggle('hidden', name !== 'env');
-  $('pageBalance').classList.toggle('hidden', name !== 'balance');
   $('pageWizard').classList.toggle('hidden', name !== 'wizard');
+  if (name === 'logs') {
+    // 进入合并页（运行日志 + 服务与诊断）先拉一次最新状态（检查点列表主进程侧有 5s 缓存）
+    void cmd('getState').then((s) => { if (s) render(s); });
+  }
+  if (name === 'plugins') {
+    // 打开插件页：先拉一次最新插件状态，避免设置/恢复页操作后卡片状态滞后
+    void cmd('pluginsGetState').then((s) => { if (s) renderPlugins(s, true); });
+    // 再查一次 npm 最新版（主进程有 10 分钟 TTL 缓存；断网只返回空版本，不弹错）
+    void cmd('pluginCheckUpdates').then((s) => { if (s) renderPlugins(s, true); });
+  }
   if (name === 'env') {
     // 打开环境页：拉取安装任务快照 + 强制重新检测
     void cmd('envGetState').then((s) => { if (s) renderEnvSnapshot(s); });
@@ -214,6 +276,8 @@ function showPage(name) {
 }
 
 function render(state) {
+  updateConsoleChrome(state);
+  window._lastState = state;
   window._running = !!state.running;
   window._firstRun = !!state.firstRun;
 
@@ -266,14 +330,14 @@ function render(state) {
     rowWrap.className = 'value strong status-value running';
     rowDot.className = 'dot running';
     const ORIGIN_TEXT = { owned: '由本工具启动', claimed: '服务自重启后已接管', external: '接管外部服务' };
-    // 缺省按旧字段兜底，兼容面板先于主进程更新的情况
+    // 缺省按旧字段兜底，兼容控制台先于主进程更新的情况
     const origin = settling && !running ? '正在确认新进程…'
       : (ORIGIN_TEXT[state.origin] || (state.owned ? '由本工具启动' : '接管外部服务'));
     $('statusRowText').textContent = `运行中（${origin}）`;
     const ho = state.handover;
     $('statusRowText').title = settling && !running ? '检测到服务进程更换，正在确认新进程（无需操作）'
       : state.origin === 'claimed' && ho ? `DSH 内部重启换了新进程（PID ${ho.fromPid} → ${ho.toPid}），启动器已认领并继续看护`
-        : (state.authPending ? '服务在正常运行，只是页面缺少访问凭据：在 DeepSeek Harness 窗口点「重启服务以恢复访问」' : '');
+        : (state.authPending ? '服务在正常运行，但窗口没有有效登录凭据：先在 DeepSeek Harness 窗口点「刷新页面」，仍不行再点「重启服务以恢复访问」' : '');
   } else if (state.blocked) {
     // 端口被非 DSH 程序占用：拒绝接管，也不允许启动
     rowWrap.className = 'value strong status-value stopped';
@@ -297,35 +361,66 @@ function render(state) {
   $('urlText').textContent = state.url || '-';
   window._currentUrl = state.url || '';
 
-  // 稳定性提示：上次未正常退出 / 已自动回退配置（可关闭；同一次崩溃关掉后不再重复提示）
+  // 稳定性提示（分级展示）：
+  //   info   —— 单次异常退出、无影响：中性一行，主按钮「知道了」，不推恢复、不弹通知（大多数强杀/断电属于这档）
+  //   notice —— 24 小时内第 2 次：中性提示"近期连续异常退出 N 次"
+  //   alert  —— 配置已回退 / 自动恢复已停止 / 24 小时内 ≥3 次：红卡 + 「打开恢复」主按钮（这档才真需要处理）
   const crashEl = $('crashNote');
   if (crashEl) {
     const notes = [];
+    const severity = state.crashSeverity || 'none';
+    const alert = severity === 'alert';
+    const streak = Number(state.crashStreak) || 0;
+    const when = (iso) => fmtLocalTime(iso) || '未知时间';
     // crashNotice 由主进程按「该次崩溃是否已被关闭」下发；缺省时按 lastExit 兜底（兼容旧状态）
     const showCrash = state.crashNotice !== undefined ? !!state.crashNotice : state.lastExit === 'crashed';
     if (showCrash && state.lastExit === 'crashed') {
-      notes.push(`上次启动器未正常退出（最近一次启动 ${state.lastCrashAt || '未知时间'}），诊断报告已保存到日志目录`);
+      if (alert) notes.push(`上次启动器未正常退出（${when(state.lastCrashAt)}），诊断报告已保存到日志目录`);
+      else if (severity === 'notice') notes.push(`启动器近期连续异常退出 ${streak} 次（最近一次 ${when(state.lastCrashAt)}）：不影响 DSH 使用，诊断报告已自动保存`);
+      else notes.push(`上次启动器异常退出（${when(state.lastCrashAt)}），不影响使用：服务已由启动器重新接管，诊断报告已自动保存`);
     }
     if (state.recoveredAt) {
-      notes.push(`服务反复启动失败，已自动回退到上一个正常配置（${state.recoveredAt}）`);
+      notes.push(`服务反复启动失败，已自动回退到上一个正常配置（${when(state.recoveredAt)}）`);
     }
+    // 自动恢复已停止：服务不会再被自动拉起 —— 这条才是真需要用户处理的
+    if (state.autoRestartStopped) {
+      notes.push('自动恢复已停止，服务保持停止状态');
+    }
+    crashEl.classList.toggle('env-warning', alert); // 非 alert 用普通卡片样式，不再红色告警
     crashEl.classList.toggle('hidden', notes.length === 0);
     if (notes.length) {
       const t = $('crashNoteText');
-      if (t) t.textContent = '⚠ ' + notes.join('；');
+      if (t) {
+        t.textContent = (alert ? '⚠ ' : '') + notes.join('；');
+        t.classList.toggle('muted', !alert); // 中性：次要色、常规字重
+      }
     }
+    // 按钮主次随分级变化：非 alert 时「知道了」是主按钮，恢复入口降级为「查看恢复页」，
+    // 同时收起「导出诊断」（诊断报告本就自动生成，"导出"是给需要提交问题的人用的，放在恢复页里）
+    const recoverBtn = $('btnCrashNoteRecover');
+    const diagBtn = $('btnCrashNoteDiag');
+    const closeBtn = $('btnCrashNoteClose');
+    if (recoverBtn) {
+      recoverBtn.textContent = alert ? '打开恢复' : '查看恢复页';
+      recoverBtn.classList.toggle('primary', alert);
+    }
+    if (diagBtn) diagBtn.classList.toggle('hidden', !alert);
+    if (closeBtn) closeBtn.classList.toggle('primary', !alert);
   }
 
-  // 启动/停止 合一按钮
+  // 启动/重启 合一按钮：运行中 = 重启 DSH（停 → 起 → 刷新独立窗口），未运行 = 启动 DSH。
+  // 单纯的"停止"只留在恢复页：日常停一下没有出口（停了还得手动起、窗口停在未启动说明页），不如一键重启。
   const toggle = $('btnToggle');
   const busy = starting || stopping || settling; // 启动/重启/停止/交接裁决中一律禁用，避免重复点击
   toggle.textContent = stopping ? '停止中…'
     : starting ? (phase === 'restarting' ? '重启中…' : '启动中…')
       : settling ? '确认中…'
-        : (serving ? '停止服务' : '启动服务');
+        : (serving ? '重启 DSH' : '启动 DSH');
   toggle.disabled = busy;
   toggle.classList.toggle('primary', !serving && !busy);
-  toggle.classList.toggle('danger', serving && !busy);
+  toggle.title = serving
+    ? '停止并重新启动服务，然后刷新独立窗口（会中断正在运行的会话）'
+    : '启动服务；环境未就绪时会引导到环境页';
 
   // 开关 chip
   renderToggleChip('btnNotify', state.notify !== false, '开启', '关闭');
@@ -348,8 +443,14 @@ function render(state) {
     }
   }
 
-  // 插件市场（dshmarket）：已安装 → 按钮变「卸载」，未安装 → 「安装」；操作中禁用
-  renderPluginMarket(state.pluginMarket);
+  // 插件页：卡片完全由 state.plugins 驱动；新增插件不需要改这里
+  renderPlugins(state.plugins);
+  renderInstallAll(state.pluginInstallAll);
+  renderPendingRestart(state.pluginPendingRestart);
+
+  // 通知分类开关（设置页）+ 恢复页（检查点/回退记录/服务操作）
+  renderNotifyCategories(state.notifyCategories);
+  renderRecovery(state);
 
   // 缩放微调按钮（拖动/双击输入；值变化时应用）
   zoomWidgets.launcher.setFromState(state.zoom);
@@ -367,9 +468,11 @@ function render(state) {
     applyTheme(state.theme);
   }
 
-  // 日志
-  const logEl = $('log');
-  if (logEl.textContent !== state.log) logEl.textContent = state.log || '暂无日志';
+  // 日志：控制台里唯一的日志区（原「服务与诊断」的最近日志已合并进来）
+  for (const id of ['logFull']) {
+    const el = $(id);
+    if (el && el.textContent !== state.log) el.textContent = state.log || '暂无日志';
+  }
 }
 
 // ---------- 运行环境（检测结果 + 一键安装向导） ----------
@@ -406,6 +509,7 @@ function missingEnvItems(env) {
   const items = [];
   if (!env) return items;
   if (env.node && env.node.status !== 'ok') items.push('node');
+  if (env.pnpm && env.pnpm.status !== 'ok') items.push('pnpm');
   if (env.dsh && env.dsh.status !== 'ok') items.push('dsh');
   if (env.plugin && env.plugin.status !== 'ok') items.push('plugin');
   return items;
@@ -415,14 +519,14 @@ function renderEnvSummary(env) {
   window._envSummary = env;
   // 主页面警示卡
   const warnCard = $('envWarnCard');
-  if (env && !env.ready) {
+  if (env && (!env.ready || !env.pnpmReady)) {
     warnCard.classList.remove('hidden');
     // 详情 = 具体问题列表 + 原始状态速览（node/dsh/plugin/ready），排查时一眼定位
     const issues = (env.issues && env.issues.length) ? env.issues.join('；') : '检测到运行环境缺失';
-    const raw = `[node=${env.node ? env.node.status : '?'}, dsh=${env.dsh ? env.dsh.status + '/' + env.dsh.kind : '?'}, plugin=${env.plugin ? env.plugin.status : '?'}, ready=${env.ready}]`;
+    const raw = `[node=${env.node ? env.node.status : '?'}, pnpm=${env.pnpm ? env.pnpm.status + '/' + (env.pnpm.version || '-') : '?'}, dsh=${env.dsh ? env.dsh.status + '/' + env.dsh.kind : '?'}, plugin=${env.plugin ? env.plugin.status : '?'}, ready=${env.ready}]`;
     $('envWarnDetail').textContent = issues + ' ' + raw;
-    // 首次检测到未就绪：自动进入新手向导（欢迎屏有"跳过向导，手动配置"入口；仅自动一次，不打断用户后续操作）
-    if (!window._envAutoShown) {
+    // 仅首次运行自动进入新手向导；已有用户的运行环境缺失由启动流程打开环境页，"新手向导"仍可从环境页手动进入。
+    if (!window._envAutoShown && window._firstRun) {
       window._envAutoShown = true;
       window._wizardActive = true;
       showPage('wizard');
@@ -454,6 +558,18 @@ function renderEnvSummary(env) {
       : n.status === 'tooOld' ? `版本过低（需要 ${env.engineRange || '22.19+/24+'}）${n.path ? ' · ' + n.path : ''}`
       : n.path ? `配置的路径不可用：${n.path}` : '未检测到 Node.js';
     cards.push({ badge, name: 'Node.js', version, detail, item: 'node', btnLabel: n.status === 'ok' ? '' : '安装 Node.js（用户级）' });
+  }
+
+  {
+    const p = env.pnpm;
+    const badge = p && p.status === 'ok' ? 'ok' : p && p.status === 'mismatch' ? 'warn' : 'bad';
+    const version = p && p.version ? `v${p.version}` : '';
+    const detail = p && p.status === 'ok'
+      ? (p.source === 'corepack' ? 'Corepack 管理' : p.source === 'npm-global' ? 'npm 全局安装' : 'PATH 安装') + (p.path ? ` · ${p.path}` : '')
+      : p && p.status === 'mismatch'
+        ? `版本不匹配：当前 v${p.version}，期望 v${p.expectedVersion}（dsh plugin / 插件市场需要）${p.path ? ` · ${p.path}` : ''}`
+        : '未检测到 pnpm（dsh plugin / 插件市场需要）';
+    cards.push({ badge, name: 'pnpm', version, detail, item: 'pnpm', btnLabel: p && p.status === 'ok' ? '' : '安装/对齐 pnpm' });
   }
   {
     const d = env.dsh;
@@ -729,7 +845,13 @@ $('btnWizardStart').addEventListener('click', () => {
   if (items.length) void cmd('envInstall', { items });
   else if (window._envSummary && window._envSummary.ready) showWizardScreen('done');
 });
-$('btnWizardSkip').addEventListener('click', () => {
+$('btnWizardSkip').addEventListener('click', async () => {
+  const ok = await confirmDialog({
+    title: '跳过向导？',
+    body: '跳过向导需要你手动安装 Node / npm / pnpm / DSH；建议先试自动安装（约 3-5 分钟，已装好的组件会自动跳过）。',
+    confirmText: '仍要跳过',
+  });
+  if (!ok) return;
   window._wizardActive = false;
   stopWizardTimer();
   showPage('env');
@@ -785,6 +907,231 @@ function refreshEnvLog() {
   if ($('envLogAuto').checked) el.scrollTop = el.scrollHeight;
 }
 
+// ---------- 轻量确认框（危险操作统一入口） ----------
+// 不用 window.confirm：沙箱渲染进程里它可能被忽略。Esc=取消，默认焦点在「取消」。
+function confirmDialog(opts) {
+  const o = opts || {};
+  return new Promise((resolve) => {
+    const overlay = $('confirmOverlay');
+    const okBtn = $('btnConfirmOk');
+    const cancelBtn = $('btnConfirmCancel');
+    $('confirmTitle').textContent = o.title || '确认';
+    $('confirmBody').textContent = o.body || '';
+    okBtn.textContent = o.confirmText || '确定';
+    okBtn.className = 'btn ' + (o.danger ? 'danger' : 'primary');
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      overlay.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      overlay.removeEventListener('mousedown', onBackdrop);
+      window.removeEventListener('keydown', onKey, true);
+      resolve(v);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onBackdrop = (e) => { if (e.target === overlay) finish(false) };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); finish(false) } };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    overlay.addEventListener('mousedown', onBackdrop);
+    window.addEventListener('keydown', onKey, true);
+    overlay.classList.remove('hidden');
+    try { cancelBtn.focus() } catch { /* noop */ } // 默认焦点在取消：危险操作不能一键误触
+  });
+}
+
+// ---------- 通知分类开关（设置页 · 提醒内容） ----------
+const NOTIFY_CATEGORY_VALUES = [
+  { key: 'service', label: '服务异常' },
+  { key: 'recovery', label: '服务恢复' },
+  { key: 'update', label: '更新提醒' },
+];
+
+function renderNotifyCategories(cats) {
+  const box = $('notifyCategoryChips');
+  if (!box) return;
+  const c = cats && typeof cats === 'object' ? cats : {};
+  const sig = JSON.stringify(NOTIFY_CATEGORY_VALUES.map((i) => c[i.key] !== false));
+  if (box.dataset.sig === sig) return; // 值没变就不重建，避免打断点击
+  box.dataset.sig = sig;
+  box.textContent = '';
+  for (const item of NOTIFY_CATEGORY_VALUES) {
+    const on = c[item.key] !== false;
+    const chip = document.createElement('button');
+    chip.className = 'chip' + (on ? ' checked' : '');
+    chip.textContent = item.label;
+    chip.title = (on ? '已开启' : '已关闭') + '：点击切换（关闭后该类系统通知不再弹出，日志仍逐条记录）';
+    chip.addEventListener('click', () => { void cmd('setNotifyCategory', { key: item.key, value: !on }) });
+    box.appendChild(chip);
+  }
+}
+
+// ---------- 恢复与诊断页 ----------
+const RECOVERY_REASON_LABELS = {
+  'page-loaded': '页面加载成功',
+  'survived-120s': '稳定运行 2 分钟',
+  'recovery-drill': '自检演练',
+  selftest: '自检',
+  'selftest-2': '自检',
+};
+
+function fmtLocalTime(iso) {
+  const t = Date.parse(iso || '');
+  return Number.isFinite(t) ? new Date(t).toLocaleString('sv-SE', { hour12: false }) : String(iso || '');
+}
+
+function setRecoverySlotStatus(text, kind) {
+  const el = $('recoverySlotStatus');
+  if (el) {
+    el.textContent = text || '';
+    el.className = 'recovery-hint' + (kind ? ' ' + kind : '');
+  }
+}
+
+function setRecoveryDiagStatus(text, kind) {
+  const el = $('recoveryDiagStatus');
+  if (el) {
+    el.textContent = text || '';
+    el.className = 'recovery-hint' + (kind ? ' ' + kind : '');
+  }
+}
+
+// 单个检查点：紧凑一行（名字 · 时间/环境 · 目录 / 回退并重启），不再是一整张卡
+function recoverySlotEl(s) {
+  const el = document.createElement('div');
+  el.className = 'recovery-row';
+
+  const name = document.createElement('span');
+  name.className = 'recovery-row-name' + (s.valid ? '' : ' muted');
+  name.textContent = s.slotId + (s.valid ? '' : (s.exists ? ' · 损坏' : ' · 为空'));
+
+  const meta = document.createElement('span');
+  meta.className = 'recovery-row-meta';
+  meta.textContent = s.valid
+    ? ([
+      fmtLocalTime(s.capturedAt),
+      s.dshVersion ? 'DSH v' + s.dshVersion : '',
+      s.port ? '端口 ' + s.port : '',
+      RECOVERY_REASON_LABELS[s.reason] || s.reason || '',
+    ].filter(Boolean).join(' · ') || '配置快照可用')
+    : (s.exists ? '快照损坏或不完整，无法回退' : '还没有快照（服务正常启动后会自动记录）');
+
+  const actions = document.createElement('span');
+  actions.className = 'recovery-row-actions';
+  const openBtn = document.createElement('button');
+  openBtn.className = 'btn sm';
+  openBtn.textContent = '目录';
+  openBtn.title = '打开该检查点的目录';
+  openBtn.addEventListener('click', () => { void cmd('openHealthSnapshot', { slotId: s.slotId }) });
+  const restoreBtn = document.createElement('button');
+  restoreBtn.className = 'btn sm danger';
+  restoreBtn.textContent = '回退并重启';
+  restoreBtn.disabled = !s.valid;
+  restoreBtn.addEventListener('click', () => { void doRestoreSlot(s) });
+  actions.appendChild(openBtn);
+  actions.appendChild(restoreBtn);
+
+  el.appendChild(name);
+  el.appendChild(meta);
+  el.appendChild(actions);
+  return el;
+}
+async function doRestoreSlot(s) {
+  const ok = await confirmDialog({
+    title: '回退到 ' + s.slotId + '？',
+    body: '会中断正在运行的会话；当前配置会先备份为 .broken-* 文件（日志目录可查），不会丢东西。回退后启动器会自动重启服务。',
+    confirmText: '回退并重启',
+    danger: true,
+  });
+  if (!ok) return;
+  setRecoverySlotStatus('正在回退并重启服务…', '');
+  const r = await cmd('healthRestore', { slotId: s.slotId });
+  if (r && r.ok) {
+    setRecoverySlotStatus('✓ 已回退到 ' + s.slotId + (r.backupFile ? '，原配置备份为 ' + r.backupFile : '') + '，服务已重新启动', 'ok');
+  } else {
+    setRecoverySlotStatus('✕ ' + ((r && r.error) || '回退失败，请查看日志'), 'error');
+  }
+  const st = await cmd('getState');
+  if (st) render(st);
+}
+
+function renderRecovery(state) {
+  const r = (state && state.recovery) || {};
+
+  // 需要注意的情况：有异常才用警示配色，正常时就一行"一切正常"
+  const notes = [];
+  if (r.lastExit === 'crashed') {
+    notes.push('上次启动器未正常退出（最近一次启动 ' + (fmtLocalTime(r.lastCrashAt) || '未知时间') + '），诊断报告已保存到日志目录');
+  }
+  if (r.recoveredAt) {
+    notes.push('已回退到健康配置（' + fmtLocalTime(r.recoveredAt) + '）' + (r.backupFile ? '，原配置已备份为 ' + r.backupFile : ''));
+  }
+  if (r.autoRestartStopped) {
+    notes.push('自动恢复已停止：服务连续启动失败，请查看日志后手动处理');
+  }
+  const noteRow = $('recoveryStatusRow');
+  if (noteRow) noteRow.classList.toggle('warn', notes.length > 0);
+  const iconEl = $('recoveryStatusIcon');
+  if (iconEl) iconEl.textContent = notes.length ? '⚠' : '✓';
+  const detailEl = $('recoveryStatusDetail');
+  if (detailEl) {
+    detailEl.textContent = notes.length ? notes.join('；') : '没有未处理的异常。服务反复启动失败时，可用下面的检查点回退配置。';
+  }
+
+  // 健康检查点：紧凑行（最新在上；主进程侧有 5s 缓存）
+  const wrap = $('recoverySlots');
+  const slots = Array.isArray(r.checkpoints) ? r.checkpoints : [];
+  if (wrap) {
+    const sig = JSON.stringify(slots);
+    if (wrap.dataset.sig !== sig) {
+      wrap.dataset.sig = sig;
+      wrap.textContent = '';
+      if (!slots.length) {
+        const empty = document.createElement('div');
+        empty.className = 'recovery-hint';
+        empty.textContent = '还没有检查点：服务正常启动一次后会自动记录。';
+        wrap.appendChild(empty);
+      } else {
+        for (const s of slots) wrap.appendChild(recoverySlotEl(s));
+      }
+    }
+  }
+
+  // 服务状态 + 操作按钮
+  const phase = (state && state.phase) || (state && state.running ? 'ready' : 'stopped');
+  const busy = phase === 'starting' || phase === 'stopping' || phase === 'restarting' || !!(state && state.settling);
+  const sState = $('recoveryServiceState');
+  if (sState) {
+    sState.textContent = state && state.running ? '运行中（PID ' + (state.pid || '-') + '）'
+      : phase === 'starting' ? '正在启动…' : phase === 'stopping' ? '正在停止…' : '已停止';
+  }
+  const dot = $('diagServiceDot');
+  if (dot) dot.className = 'dot' + (state && state.running ? ' running' : ' stopped');
+  const bStart = $('btnRecoveryStart');
+  const bStop = $('btnRecoveryStop');
+  const bRestart = $('btnRecoveryRestart');
+  if (bStart) bStart.disabled = !!(state && state.running) || busy;
+  if (bStop) bStop.disabled = !(state && state.running) || busy;
+  if (bRestart) bRestart.disabled = busy;
+}
+$('btnRecoveryRefresh').addEventListener('click', () => {
+  void cmd('getState').then((s) => { if (s) render(s) });
+});
+$('btnRecoveryStart').addEventListener('click', () => { void cmd('start') });
+$('btnRecoveryStop').addEventListener('click', () => { void cmd('stop') });
+// 与主页按钮同一入口：停 → 起 → 刷新独立窗口（服务未运行时就退化为单纯启动）
+$('btnRecoveryRestart').addEventListener('click', () => { void cmd('restartDsh') });
+$('btnRecoveryDiag').addEventListener('click', async () => {
+  setRecoveryDiagStatus('正在生成诊断报告…', '');
+  const r = await cmd('diagnosticNow');
+  if (r && r.ok) setRecoveryDiagStatus('✓ 诊断报告已保存到诊断目录（保留最近 3 份）', 'ok');
+  else setRecoveryDiagStatus('✕ 生成失败，请查看日志', 'error');
+});
+$('btnRecoveryDiagDir').addEventListener('click', () => { void cmd('openDiagnosticsDir') });
+
 // ---------- 事件绑定 ----------
 
 $('btnOpen').addEventListener('click', () => {
@@ -798,29 +1145,99 @@ $('urlText').addEventListener('click', () => {
 });
 // DSH 版本行：点击打开 npm 官方页面
 $('dshVersion').addEventListener('click', () => cmd('openNpmDsh'));
-$('btnToggle').addEventListener('click', () => cmd(window._running ? 'stop' : 'start'));
+// 启动/停止：启动失败不再静默 —— 按主进程回传的原因跳页或就地提示 8 秒
+let toggleHintTimer = null;
+function showToggleHint(text, kind) {
+  const el = $('toggleHint');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'recovery-hint' + (kind ? ' ' + kind : '');
+  if (toggleHintTimer) clearTimeout(toggleHintTimer);
+  toggleHintTimer = setTimeout(() => {
+    const now = $('toggleHint');
+    if (now) now.classList.add('hidden');
+  }, 8000);
+}
+$('btnToggle').addEventListener('click', async () => {
+  const btn = $('btnToggle');
+  const wasServing = !!window._running; // 运行中点击 = 重启；未运行 = 启动（主进程同一入口，语义一致）
+  btn.disabled = true;
+  const r = await cmd('restartDsh');
+  btn.disabled = false;
+  if (r && r.ok) return;
+  const reason = (r && r.reason) || 'start-failed';
+  if (reason === 'env-not-ready') {
+    // 环境未就绪：把用户直接送到"运行环境"页（那里就是一键安装入口）
+    showToggleHint('运行环境未就绪：先完成环境安装，装好后会自动启动服务', 'error');
+    showPage('env');
+  } else if (reason === 'blocked') {
+    showToggleHint((r && r.error) || '端口被其他程序占用：按上方警示卡一键换端口，或关闭占用程序', 'error');
+  } else if (reason === 'busy') {
+    showToggleHint('服务正在停止或交接中：请稍候再试', 'error');
+  } else {
+    showToggleHint(wasServing ? '重启失败，服务已停止：请查看日志后重试' : '服务启动失败：请查看日志（详细原因已写入 dshl.log）', 'error');
+  }
+});
 // 崩溃提示卡「知道了」：主进程记账后立即隐藏（同一次崩溃不再重复提示）
 $('btnCrashNoteClose').addEventListener('click', async () => {
   await cmd('ackCrashNotice');
   const el = $('crashNote');
   if (el) el.classList.add('hidden');
 });
+$('btnCrashNoteRecover').addEventListener('click', () => showPage('recovery'));
+$('btnCrashNoteDiag').addEventListener('click', async () => {
+  const btn = $('btnCrashNoteDiag');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '导出中…';
+  const r = await cmd('diagnosticNow');
+  btn.textContent = r && r.ok ? '已导出 ✓' : '导出失败';
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 3000);
+});
 $('btnTest').addEventListener('click', () => cmd('testNotify'));
 $('btnLogs').addEventListener('click', () => showPage('log'));
-$('btnBack').addEventListener('click', () => showPage('main'));
-$('btnSettings').addEventListener('click', () => showPage('settings'));
-$('btnSettingsBack').addEventListener('click', () => showPage('main'));
+
+$('btnConsoleReturn').addEventListener('click', () => { void cmd('consoleClose'); });
+document.querySelectorAll('#consoleNav .console-nav-item').forEach((el) => {
+  el.addEventListener('click', () => showPage(el.dataset.page));
+});
 $('btnOpenLogsDir').addEventListener('click', () => cmd('openLogs'));
+
+
+// 日志与反馈页：复制全部日志 / 清空显示（只清界面，不动日志文件）
+$('btnLogCopyAll').addEventListener('click', async () => {
+  const btn = $('btnLogCopyAll');
+  const text = $('logFull').textContent || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = '已复制 ✓';
+  } catch {
+    btn.textContent = '复制失败';
+  }
+  setTimeout(() => { btn.textContent = '复制'; }, 2000);
+});
+
+$('btnLogClear').addEventListener('click', () => {
+  $('logFull').textContent = '（已清空显示，新日志会继续追加）';
+});
 $('btnAuto').addEventListener('click', () => cmd('toggleAutostart'));
 $('btnNotify').addEventListener('click', () => {
   const chip = $('btnNotify');
   cmd('setNotify', !chip.classList.contains('checked'));
 });
 $('btnOpenEnv').addEventListener('click', () => showPage('env'));
-$('btnReset').addEventListener('click', () => cmd('resetDefaults'));
+$('btnEnvBack').addEventListener('click', () => showPage('settings'));
+$('btnReset').addEventListener('click', async () => {
+  const ok = await confirmDialog({
+    title: '恢复默认设置？',
+    body: '会重置缩放、主题、端口、更新渠道与通知开关，并把窗口恢复为默认尺寸；已安装的 Node / pnpm / DSH 与 DSH 自己的数据不受影响。',
+    confirmText: '恢复默认',
+    danger: true,
+  });
+  if (ok) void cmd('resetDefaults');
+});
 
 // 运行环境页
-$('btnEnvBack').addEventListener('click', () => showPage('main'));
 $('btnEnvFix').addEventListener('click', () => showPage('env'));
 $('btnEnvOpen').addEventListener('click', () => showPage('env'));
 $('btnPortSwitch').addEventListener('click', () => {
@@ -970,164 +1387,341 @@ $('btnDshUpdateNow').addEventListener('click', () => {
 // 主页面"DSH版本"行：悬停"检查更新"按钮
 $('btnDshCheckHover').addEventListener('click', () => void cmd('dshCheckNow'));
 
-// ---------- 余额（cc-switch 风格：主页只显示金额 + ↻ + ⚙；⚙ 进入设置页测试并保存） ----------
-const BALANCE_INTERVAL_MS = 3 * 60 * 1000
-let balanceTimer = null
-
-async function refreshBalanceConfig() {
-  const s = await cmd('balanceGet')
-  if (!s) return
-  window._balanceCfg = s
-  const keyEl = $('balanceKey')
-  keyEl.value = s.key || '' // 明文显示当前生效的密钥（已保存或 DSH 配置）
-  keyEl.placeholder = s.key ? '' : 'sk-...（未找到密钥：请填入，或配置 DSH 的 DEEPSEEK_API_KEY）'
-  const urlEl = $('balanceBaseUrl')
-  if (!s.baseUrl) {
-    urlEl.value = ''
-    urlEl.placeholder = s.dshBaseUrl ? `自动：DSH 配置（${s.dshBaseUrl}）` : '自动：官方 api.deepseek.com'
-  } else {
-    urlEl.value = s.baseUrl
-  }
-  const hint = $('balanceCurrentHint')
-  if (s.keySource === 'saved') hint.textContent = '当前：已保存的自定义设置' + (s.baseUrl ? ` · ${s.baseUrl}` : ' · 官方接口')
-  else if (s.keySource === 'dsh') hint.textContent = `当前：自动读取 DSH 配置${s.dshBaseUrl ? ' · ' + s.dshBaseUrl : ''}`
-  else hint.textContent = '当前：未找到密钥（请填写，或配置 DSH 的 DEEPSEEK_API_KEY）'
+// ---------- 插件页：state.plugins 数据驱动，新增插件无需改渲染逻辑 ----------
+function pluginMatches(p, filter, query) {
+  if (filter === 'installed' && !(p.installed || p.enabled)) return false;
+  if (filter === 'available' && (p.installed || p.enabled)) return false;
+  if (!query) return true;
+  return [p.name, p.subtitle, p.description, p.id, p.category].some((v) => String(v || '').toLowerCase().includes(query));
 }
 
-function renderBalanceResult(r) {
-  const valueEl = $('balanceValue')
-  if (!r || !r.ok) {
-    valueEl.className = 'value strong status-value stopped'
-    valueEl.textContent = '查询失败'
-    valueEl.title = (r && r.error) || '未知错误'
-    return
+function pluginCardEl(p) {
+  const card = document.createElement('article');
+  card.className = 'plugin-card' + (p.busy ? ' busy' : '');
+  card.dataset.pluginId = p.id;
+
+  // 标题行：名称 + 版本（参考「设置 → 插件」的排版）
+  const head = document.createElement('div'); head.className = 'plugin-card-head';
+  const name = document.createElement('span'); name.className = 'plugin-name'; name.textContent = p.name || p.id;
+  const ver = String(p.version || '').trim();
+  const nameText = ver ? (p.name || p.id) + ' v' + ver : (p.name || p.id);
+  name.textContent = nameText;
+  head.appendChild(name);
+
+  // 包名（等宽字体，长名自动换行不撑破卡片）；默认代装的插件在后面缀上来源说明
+  const subtitle = document.createElement('div'); subtitle.className = 'plugin-subtitle';
+  const autoLabel = String(p.autoInstallLabel || '');
+  subtitle.textContent = p.subtitle || p.id;
+  if (autoLabel && autoLabel !== '手动安装') {
+    // 「预装 (推荐开启)」渲染成绿色标签，其余来源说明保持灰色文本
+    const sep = document.createElement('span'); sep.textContent = ' · ';
+    subtitle.appendChild(sep);
+    const tag = document.createElement('span');
+    if (p.autoInstall && autoLabel === '预装 (推荐开启)') tag.className = 'plugin-badge-preinstall';
+    tag.textContent = autoLabel;
+    subtitle.appendChild(tag);
   }
-  const d = r.data
-  const fmt = (n) => (n == null ? '-' : Number(n).toFixed(2))
-  const first = d.balance_infos[0]
-  const total = first && first.total != null ? fmt(first.total) : null
-  const avail = d.is_available
-  valueEl.className = 'value strong status-value ' + (avail ? 'running' : 'stopped')
-  valueEl.textContent = total != null ? `¥${total}` : '--'
-  valueEl.title = `${avail ? '可用' : '不可用（余额不足）'} · ${d.balance_infos.map((i) => `${i.currency} 总额 ${fmt(i.total)}（充值 ${fmt(i.toppedUp)} / 赠送 ${fmt(i.granted)}）`).join('；')} · 接口 ${d.endpoint}`
+
+  const desc = document.createElement('div'); desc.className = 'plugin-description'; desc.textContent = p.description || '';
+
+  // 备注：只读展示 + 点击后在原位编辑（保存到 DSHL 配置，不影响 DSH）
+  const note = document.createElement('div'); note.className = 'plugin-note';
+  const noteText = document.createElement('textarea');
+  noteText.className = 'text-input plugin-note-input';
+  noteText.rows = 2;
+  noteText.maxLength = 500;
+  noteText.placeholder = '给这个插件写点备注，例如为什么装、给谁用…';
+  noteText.value = p.note || '';
+  note.appendChild(noteText);
+  const noteSave = document.createElement('button');
+  noteSave.className = 'btn plugin-note-save';
+  noteSave.dataset.pluginNoteSave = '1';
+  noteSave.textContent = '保存备注';
+  note.appendChild(noteSave);
+
+  // 备注入口放标题行右端：省掉一整行，卡片更紧凑（编辑器仍在下方按需展开）
+  const noteToggle = document.createElement('button');
+  noteToggle.className = 'btn plugin-note-toggle';
+  noteToggle.dataset.pluginNoteToggle = '1';
+  noteToggle.textContent = p.note ? '编辑备注' : '添加备注';
+  head.appendChild(noteToggle);
+
+  // 底部：启用开关 + 版本说明 + 操作按钮
+  const footer = document.createElement('div'); footer.className = 'plugin-card-footer';
+  const active = !!(p.installed || p.enabled);
+
+  // 真实启停：手机连接走装/卸，npm 插件走 user patch layer（不卸载、可直接热切换）。
+  // 不能识别加载项的插件仍退化为只读状态胶囊，避免出现点了没反应的开关。
+  const switchWrap = document.createElement('label'); switchWrap.className = 'plugin-switch';
+  const switchInput = document.createElement('input');
+  switchInput.type = 'checkbox';
+  switchInput.checked = !!p.enabled;
+  switchInput.disabled = !!p.busy;
+  if (p.toggleAction) switchInput.dataset.pluginAction = p.toggleAction;
+  switchInput.dataset.pluginId = p.id;
+  switchInput.title = p.busy ? '处理中…' : (p.enabled ? '关闭' : '开启');
+  switchInput.setAttribute('aria-label', switchInput.title);
+  const switchTrack = document.createElement('span'); switchTrack.className = 'plugin-switch-track';
+  const switchThumb = document.createElement('span'); switchThumb.className = 'plugin-switch-thumb';
+  switchTrack.appendChild(switchThumb);
+  switchWrap.appendChild(switchInput); switchWrap.appendChild(switchTrack);
+
+  // 只读状态胶囊：无法识别加载项、未安装或操作中时展示状态
+  const statePill = document.createElement('span');
+  statePill.className = 'plugin-state-pill ' + ((p.status && p.status.tone) || 'muted');
+  statePill.textContent = (p.status && p.status.label) || (active ? '已启用' : '未安装');
+
+  const actions = document.createElement('div'); actions.className = 'plugin-actions';
+  // 版本提示：只有拿到 npm 侧最新版时才显示，避免「已是最新」是伪结论
+  const latestKnown = !!(p.latestVersion && p.version && p.latestVersion === p.version);
+  if (p.outdated && p.latestVersion) {
+    const latest = document.createElement('span'); latest.className = 'plugin-latest';
+    latest.textContent = '可更新到 v' + p.latestVersion;
+    actions.appendChild(latest);
+  } else if (latestKnown) {
+    const latest = document.createElement('span'); latest.className = 'plugin-latest'; latest.textContent = '已是最新';
+    actions.appendChild(latest);
+  }
+  const list = Array.isArray(p.actions) ? p.actions : [];
+  if (!list.length && p.busy) {
+    const wait = document.createElement('span'); wait.className = 'plugin-action-hint'; wait.textContent = '正在处理…'; actions.appendChild(wait);
+  }
+  for (const act of list) {
+    const btn = document.createElement('button');
+    btn.className = 'btn ' + (act.tone === 'primary' ? 'primary ' : act.tone === 'danger' ? 'danger ' : '') + 'plugin-action-btn';
+    btn.dataset.pluginId = p.id;
+    btn.dataset.pluginAction = act.action;
+    if (act.confirmTitle) btn.dataset.confirmTitle = act.confirmTitle;
+    if (act.confirmBody) btn.dataset.confirmBody = act.confirmBody;
+    btn.textContent = act.label || act.action;
+    if (p.busy) btn.disabled = true;
+    actions.appendChild(btn);
+  }
+  footer.appendChild(p.toggleAction ? switchWrap : statePill); footer.appendChild(actions);
+
+  const feedback = document.createElement('div'); feedback.className = 'plugin-feedback';
+  const feedbackText = p.error ? '✕ ' + p.error : (p.lastChange ? '✓ ' + p.lastChange : '');
+  feedback.textContent = feedbackText;
+  feedback.classList.toggle('hidden', !feedbackText);
+
+  card.appendChild(head); card.appendChild(subtitle); card.appendChild(desc);
+  card.appendChild(note); card.appendChild(footer); card.appendChild(feedback);
+  return card;
+}
+function renderPlugins(plugins, force) {
+  const list = Array.isArray(plugins) ? plugins : [];
+  const cards = $('pluginCards');
+  if (!cards) return;
+  window._plugins = list;
+  const sig = JSON.stringify(list);
+  if (!force && sig === window._lastPluginsJson) return;
+  window._lastPluginsJson = sig;
+
+  const query = ($('pluginSearch') && $('pluginSearch').value ? $('pluginSearch').value : '').trim().toLowerCase();
+  const filter = window._pluginFilter || 'all';
+  const visible = list.filter((p) => pluginMatches(p, filter, query));
+  const installedCount = list.filter((p) => p.installed).length;
+  const summary = $('pluginSummary');
+  const installAll = window._pluginInstallAll;
+  const summaryError = installAll && installAll.error ? ' · 上次一键安装有失败项' : '';
+  if (summary) summary.textContent = list.length + ' 个插件 · ' + installedCount + ' 个已安装' + summaryError;
+  cards.textContent = '';
+  for (const p of visible) cards.appendChild(pluginCardEl(p));
+  const empty = $('pluginEmpty');
+  if (empty) empty.classList.toggle('hidden', visible.length > 0);
+  renderInstallAll(installAll);
 }
 
-async function queryBalance() {
-  const valueEl = $('balanceValue')
-  valueEl.className = 'value strong status-value'
-  valueEl.textContent = '…'
-  const r = await cmd('balanceQuery', {
-    key: $('balanceKey').value.trim(),
-    baseUrl: $('balanceBaseUrl').value.trim(),
-  })
-  renderBalanceResult(r)
-}
-
-// ---------- 插件市场（dshmarket）：安装 / 卸载（主进程走 dsh plugin --profile web add|remove） ----------
-function renderPluginMarket(m) {
-  const stateEl = $('pluginMarketState');
-  const btn = $('btnPluginMarket');
-  const detail = $('pluginMarketDetail');
-  if (!stateEl || !btn) return;
-  const info = m || { installed: false, busy: '', error: '' };
-  const busy = info.busy === 'installing' || info.busy === 'uninstalling';
-  stateEl.textContent = info.installed ? `已安装${info.version ? ' v' + String(info.version).replace(/^[^\d]*/, '') : ''}` : '未安装';
-  stateEl.title = info.installed ? (info.bundle ? '已启用（dsh.profile.bundles）' : '已装依赖但未在 bundles 中启用') : 'DSH 内的可视化插件市场（dshmarket）';
-  btn.textContent = busy ? (info.busy === 'installing' ? '安装中…' : '卸载中…') : (info.installed ? '卸载' : '安装');
-  btn.disabled = busy;
-  btn.classList.toggle('danger', info.installed && !busy);
-  btn.classList.toggle('primary', !info.installed && !busy);
-  if (detail) {
-    const lines = [];
-    if (info.error) lines.push('✕ ' + info.error);
-    else if (info.lastChange) lines.push('✓ ' + info.lastChange);
-    detail.textContent = lines.join(' ');
-    detail.title = info.error || info.lastChange || '';
-    const row = $('pluginMarketDetailRow');
-    if (row) row.classList.toggle('hidden', lines.length === 0);
+/**
+ * 插件变更提示条：装了/卸了插件但还没重启时，内容区顶部常驻一条提醒 + 「立即重启生效」。
+ * 状态由主进程持久化在配置里，所以关掉控制台再打开、甚至重启启动器都还在。
+ */
+function renderPendingRestart(info) {
+  const bar = $('pendingRestartBar');
+  if (!bar) return;
+  const count = (info && info.count) || 0;
+  const names = (info && Array.isArray(info.names)) ? info.names : [];
+  bar.classList.toggle('hidden', !count);
+  const content = $('consoleContent');
+  if (content) content.classList.toggle('with-pending-bar', !!count);
+  const text = $('pendingRestartText');
+  const hint = $('pendingRestartHint');
+  const btn = $('btnApplyRestart');
+  if (hint) hint.textContent = '重启后才会生效';
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = '立即重启生效';
+    btn.title = '立即重启 DSH 服务并刷新页面';
+  }
+  if (!count) return;
+  if (text) {
+    const what = names.length ? names.join('、') : (count + ' 个插件');
+    text.textContent = '插件已变更，需要重启服务：' + what;
   }
 }
 
-// 二次确认（内联，不用 window.confirm——沙箱渲染进程里 confirm 可能被忽略）：
-// 第一次点击把按钮变成「确认安装/卸载？」，5 秒内再点才真正执行。
-let pluginMarketArmed = null;
-
-$('btnPluginMarket').addEventListener('click', async () => {
-  const btn = $('btnPluginMarket');
-  const s = await cmd('marketGetState');
-  const installed = !!(s && s.installed);
-  const verb = installed ? '卸载' : '安装';
-  if (pluginMarketArmed !== verb) {
-    pluginMarketArmed = verb;
-    btn.textContent = `确认${verb}？`;
-    btn.classList.add('danger');
-    setTimeout(() => {
-      if (pluginMarketArmed !== verb) return;
-      pluginMarketArmed = null;
-      void cmd('marketGetState').then((x) => renderPluginMarket(x));
-    }, 5000);
-    return;
-  }
-  pluginMarketArmed = null;
+// 生效按钮：停服务 → 起服务 → 刷新窗口。
+$('btnApplyRestart').addEventListener('click', async () => {
+  const btn = $('btnApplyRestart');
+  const old = btn.textContent;
   btn.disabled = true;
-  btn.textContent = verb + '中…';
-  const r = await cmd(installed ? 'marketUninstall' : 'marketInstall');
-  if (r && r.ok) await cmd('marketDecline', installed); // 主动卸载 → 不再自动装回来
-  const fresh = await cmd('marketGetState');
-  renderPluginMarket(fresh || { installed: !installed });
+  btn.textContent = '重启中…';
+  const r = await cmd('pluginsApplyRestart');
   if (!r || !r.ok) {
-    const d = $('pluginMarketDetail');
-    const row = $('pluginMarketDetailRow');
-    if (d) d.textContent = '✕ ' + ((r && r.error) || '操作失败，请查看日志');
-    if (row) row.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = old;
   }
 });
 
-function startBalanceTimer() {
-  if (balanceTimer) clearInterval(balanceTimer)
-  balanceTimer = setInterval(() => void queryBalance(), BALANCE_INTERVAL_MS)
+function renderInstallAll(info) {
+  window._pluginInstallAll = info || null;
+  const btn = $('btnPluginsInstallAll');
+  if (!btn) return;
+  const running = !!(info && info.running);
+  const total = (info && info.target) || 0;
+  const done = (info && info.done) || 0;
+  if (running) {
+    const current = info && info.current ? ' · ' + info.current : '';
+    btn.textContent = '安装中 (' + done + '/' + total + ')' + current + '…';
+    btn.disabled = true;
+    return;
+  }
+  btn.textContent = '一键全部安装';
+  btn.disabled = false;
 }
 
-$('btnBalanceRefresh').addEventListener('click', () => void queryBalance())
-// 设置页"余额接口设置"入口：刷新配置快照后进入余额设置页
-$('btnBalanceOpenSettings').addEventListener('click', () => {
-  $('balanceTestStatus').className = 'balance-test-status'
-  $('balanceTestStatus').textContent = ''
-  void refreshBalanceConfig()
-  showPage('balance')
-})
-// 主页面"充值"按钮：打开 DeepSeek 开放平台充值页
-$('btnRecharge').addEventListener('click', () => void cmd('openRecharge'))
-$('btnBalanceBack').addEventListener('click', () => showPage('main'))
-$('btnBalanceTest').addEventListener('click', async () => {
-  const st = $('balanceTestStatus')
-  st.className = 'balance-test-status'
-  st.textContent = '测试中…'
-  const key = $('balanceKey').value.trim()
-  const baseUrl = $('balanceBaseUrl').value.trim()
-  const r = await cmd('balanceQuery', { key, baseUrl })
-  if (r && r.ok) {
-    await cmd('balanceSave', { key, baseUrl }) // 连通（正确获取到余额）→ 自动保存
-    const fmt = (n) => (n == null ? '-' : Number(n).toFixed(2))
-    const first = r.data.balance_infos[0]
-    const total = first && first.total != null ? fmt(first.total) : '-'
-    st.className = 'balance-test-status ok'
-    st.textContent = `✓ 连接成功，已自动保存：余额 ¥${total}（${r.data.is_available ? '可用' : '不可用'}）`
-    void refreshBalanceConfig()
-  } else {
-    st.className = 'balance-test-status error'
-    st.textContent = '✕ ' + ((r && r.error) || '测试失败')
+function setPluginFilter(filter) {
+  window._pluginFilter = filter;
+  document.querySelectorAll('#pluginFilters [data-plugin-filter]').forEach((el) => {
+    el.classList.toggle('checked', el.dataset.pluginFilter === filter);
+  });
+  renderPlugins(window._plugins || [], true);
+}
+
+// 卡片内所有交互走这里：操作按钮 / 备注开关 / 开关式插件的启停
+$('pluginCards').addEventListener('click', async (e) => {
+  const noteSave = e.target.closest('button[data-plugin-note-save]');
+  if (noteSave) {
+    const card = noteSave.closest('.plugin-card');
+    const id = card && card.dataset.pluginId;
+    const input = card && card.querySelector('.plugin-note-input');
+    noteSave.disabled = true;
+    noteSave.textContent = '保存中…';
+    const r = await cmd('pluginSetNote', { id, text: input ? input.value : '' });
+    const fresh = await cmd('pluginsGetState');
+    if (fresh) renderPlugins(fresh, true);
+    if (!r || !r.ok) {
+      noteSave.textContent = '保存失败';
+      noteSave.disabled = false;
+    }
+    return;
   }
-})
-$('btnBalanceClear').addEventListener('click', async () => {
-  await cmd('balanceClear')
-  $('balanceKey').value = ''
-  $('balanceBaseUrl').value = ''
-  $('balanceTestStatus').className = 'balance-test-status'
-  $('balanceTestStatus').textContent = ''
-  void refreshBalanceConfig() // 清除后自动回显 DSH 配置（若有）
-  void queryBalance()
-})
+
+  const noteToggle = e.target.closest('button[data-plugin-note-toggle]');
+  if (noteToggle) {
+    const card = noteToggle.closest('.plugin-card');
+    if (card) card.classList.toggle('note-open');
+    const input = card && card.querySelector('.plugin-note-input');
+    if (input && card.classList.contains('note-open')) input.focus();
+    return;
+  }
+
+  const btn = e.target.closest('button[data-plugin-action]');
+  if (!btn) return;
+  const id = btn.dataset.pluginId;
+  const action = btn.dataset.pluginAction;
+  if (btn.dataset.confirmTitle) {
+    const ok = await confirmDialog({
+      title: btn.dataset.confirmTitle,
+      body: btn.dataset.confirmBody || '',
+      confirmText: btn.textContent,
+      danger: btn.classList.contains('danger'),
+    });
+    if (!ok) return;
+  }
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '处理中…';
+  const r = await cmd('pluginAction', { id, action });
+  const fresh = await cmd('pluginsGetState');
+  if (fresh) renderPlugins(fresh, true);
+  if (!r || !r.ok) {
+    const card = btn.closest('.plugin-card');
+    const feedback = card && card.querySelector('.plugin-feedback');
+    if (feedback) {
+      feedback.textContent = '✕ ' + ((r && r.error) || '操作失败，请查看日志');
+      feedback.classList.remove('hidden');
+    }
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+});
+
+// 开关式插件（如手机连接）：勾选即开启、取消即关闭并卸载
+$('pluginCards').addEventListener('change', async (e) => {
+  const input = e.target.closest('input[data-plugin-action]');
+  if (!input) return;
+  const id = input.dataset.pluginId;
+  const turnOn = input.checked;
+  const action = turnOn ? 'enable' : 'disable';
+  input.disabled = true;
+  const r = await cmd('pluginAction', { id, action });
+  if (r && r.ok) {
+    const verb = turnOn ? '已开启' : '已关闭';
+    showConsoleToast(r.restartPending ? `插件${verb}；点顶部「立即重启生效」后生效` : `插件${verb}`);
+  }
+  const fresh = await cmd('pluginsGetState');
+  if (fresh) renderPlugins(fresh, true);
+  if (!r || !r.ok) {
+    input.checked = !turnOn;
+    input.disabled = false;
+    const card = input.closest('.plugin-card');
+    const feedback = card && card.querySelector('.plugin-feedback');
+    if (feedback) {
+      feedback.textContent = '✕ ' + ((r && r.error) || '操作失败，请查看日志');
+      feedback.classList.remove('hidden');
+    }
+  }
+});
+
+$('btnPluginsRefresh').addEventListener('click', async () => {
+  const btn = $('btnPluginsRefresh');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '检查中…';
+  try {
+    const fresh = await cmd('pluginCheckUpdates');
+    if (fresh) renderPlugins(fresh, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+});
+
+// 一键全部安装：只装未安装的插件，进度由主进程 state 推送驱动
+$('btnPluginsInstallAll').addEventListener('click', async () => {
+  const btn = $('btnPluginsInstallAll');
+  const ok = await confirmDialog({
+    title: '一键安装全部插件？',
+    body: '会依次装好所有尚未安装的插件；中途不重启，装完后点顶部「立即重启生效」一次性生效。',
+    confirmText: '开始安装',
+  });
+  if (!ok) return;
+  btn.disabled = true;
+  btn.textContent = '启动中…';
+  const r = await cmd('pluginsInstallAll');
+  if (!r || !r.ok) {
+    btn.textContent = (r && r.error) || '启动失败';
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = '一键全部安装'; }, 2500);
+  }
+});
+
+
+$('pluginSearch').addEventListener('input', () => renderPlugins(window._plugins || [], true));
+document.querySelectorAll('#pluginFilters [data-plugin-filter]').forEach((el) => {
+  el.addEventListener('click', () => setPluginFilter(el.dataset.pluginFilter));
+});
 // 状态卡上的单项安装按钮（事件委托：卡片由 render 重建）
 $('envCards').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-env-item]');
@@ -1143,17 +1737,17 @@ function showFeedbackStatus(text, kind) {
   el.textContent = text;
   el.className = 'modal-status' + (kind ? ' ' + kind : '');
 }
+// 反馈表单已从弹窗搬进「日志与反馈」页：入口只负责跳页并聚焦
 function openFeedback() {
+  showPage('logs');
   showFeedbackStatus('', '');
-  $('feedbackOverlay').classList.remove('hidden');
-  $('feedbackText').focus();
+  const box = $('feedbackText');
+  if (box) {
+    box.focus();
+    box.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
 }
-function closeFeedback() { $('feedbackOverlay').classList.add('hidden'); }
 $('btnFeedback').addEventListener('click', openFeedback);
-$('btnFeedbackCancel').addEventListener('click', closeFeedback);
-$('feedbackOverlay').addEventListener('mousedown', (e) => {
-  if (e.target === $('feedbackOverlay')) closeFeedback();
-});
 $('btnFeedbackCopy').addEventListener('click', async () => {
   const text = $('feedbackText').value.trim();
   if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
@@ -1182,7 +1776,9 @@ $('btnFeedbackSend').addEventListener('click', async () => {
   showFeedbackStatus(r.error || '提交失败', 'error');
 });
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('feedbackOverlay').classList.contains('hidden')) closeFeedback();
+  if (e.key !== 'Escape') return;
+  if (!$('confirmOverlay').classList.contains('hidden')) return; // 确认框的捕获监听器优先处理
+  void cmd('consoleClose');
 });
 
 // 主进程 → JS 状态推送
@@ -1200,6 +1796,14 @@ window.dshBridge.onEnv((json) => {
   } catch (err) { console.error('[dshl] env push error:', err); }
 });
 
+// 主进程 → 控制台定向跳页（托盘「恢复…」等入口）
+window.dshBridge.onConsolePage((json) => {
+  try {
+    const p = JSON.parse(json);
+    if (p && p.page) showPage(p.page);
+  } catch (err) { console.error('[dshl] console page push error:', err); }
+});
+
 // 主进程 → 自动更新状态推送
 window.dshBridge.onUpdater((json) => {
   try { renderUpdater(JSON.parse(json)); } catch (err) { console.error('[dshl] updater push error:', err); }
@@ -1212,8 +1816,5 @@ $('envLogAuto').addEventListener('change', () => refreshEnvLog());
   try {
     render(await cmd('getState'));
     renderUpdater(await cmd('updaterGetState'));
-    await refreshBalanceConfig();
-    startBalanceTimer();
-    void queryBalance(); // 面板加载即查询一次，此后每 3 分钟自动刷新
   } catch (err) { console.error('[dshl] initial state failed:', err); }
 })();

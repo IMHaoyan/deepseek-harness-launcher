@@ -12,4 +12,6 @@ contextBridge.exposeInMainWorld('dshBridge', {
   onEnv: (cb) => ipcRenderer.on('dsh:env', (_event, json) => { try { cb(json) } catch { /* noop */ } }),
   // 自动更新状态推送（JSON 字符串）
   onUpdater: (cb) => ipcRenderer.on('dsh:updater', (_event, json) => { try { cb(json) } catch { /* noop */ } }),
+  // 控制台定向跳页推送（JSON 字符串：{page}）——托盘「恢复…」等入口
+  onConsolePage: (cb) => ipcRenderer.on('console:page', (_event, json) => { try { cb(json) } catch { /* noop */ } }),
 })

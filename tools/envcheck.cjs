@@ -20,8 +20,9 @@ envDetect.initEnv({
 envDetect.detectEnv(true)
   .then((report) => {
     const summary = envDetect.envSummary(report)
-    console.log(JSON.stringify({ ready: summary.ready, ...summary, plan: report.plan }, null, 2))
-    process.exit(report.ready ? 0 : 1)
+    const allReady = summary.ready && summary.pnpmReady
+    console.log(JSON.stringify({ ...summary, ready: allReady, serviceReady: summary.ready, pnpmReady: summary.pnpmReady, plan: report.plan }, null, 2))
+    process.exit(allReady ? 0 : 1)
   })
   .catch((err) => {
     console.error('envcheck failed: ' + (err && err.stack ? err.stack : err))

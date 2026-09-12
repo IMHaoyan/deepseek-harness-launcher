@@ -1,9 +1,10 @@
-// env-detect.js — 环境探测：Node.js 运行时 / DSH 安装形态（源码、全局、npx 缓存、托管）/ 通知插件
+// env-detect.js — 环境探测：Node.js / pnpm 运行时 / DSH 安装形态（源码、全局、npx 缓存、托管）/ 通知插件
 //
-// 探测结果被 startServer 直接消费（plan.spawn 参数），也供面板"运行环境"页展示。
+// 探测结果被 startServer 直接消费（plan.spawn 参数），也供控制台"运行环境"页展示。
 // 优先级（第一个可用者胜出）：
 //   Node：Config.nodePath → PATH node → 用户级目录（%LOCALAPPDATA%\Programs\nodejs）→ 托管目录 → macOS 常见路径
 //   DSH ：显式/默认源码仓库（E:\deepseek-harness、~/deepseek-harness）→ 全局 npm 目录 → 托管目录 → npx 缓存
+//   pnpm：PATH 上最终生效的 pnpm（Corepack / npm 全局 / 其他 PATH 安装）
 'use strict'
 
 const fs = require('fs')
@@ -14,12 +15,13 @@ const { execFile } = require('child_process')
 
 // DSH 仓库 engines：node ^22.19.0 || >=24.0.0；已安装的 DSH 包自带 engines.node 时以它为准
 const DEFAULT_ENGINE_RANGE = '^22.19.0 || >=24.0.0'
+const DEFAULT_PNPM_VERSION = '11.8.0'
 const CACHE_MS = 30000
 
 const IS_WIN = process.platform === 'win32'
 
 let HOME = path.join(os.homedir(), '.dsh') // 始终为真实用户 HOME（安装物/插件都落在真实 HOME）
-let Config = { harnessRoot: '', nodePath: '', dshVersion: 'latest', nodeMajor: 22 }
+let Config = { harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, nodeMajor: 22 }
 let logFn = () => {}
 let FRESH_TEST = false // DSHL_FRESH_TEST=1：模拟全新机器（无视系统级 node/源码仓库/全局/npx 缓存，只认托管安装）
 
@@ -70,6 +72,84 @@ function runNode(c, args, timeout = 8000) {
       })
     } catch { resolve(null) }
   })
+}
+
+function runText(cmd, args, timeout = 8000) {
+  return new Promise((resolve) => {
+    try {
+      execFile(cmd, args, { windowsHide: true, timeout }, (err, stdout) => {
+        resolve(err ? '' : String(stdout || '').trim())
+      })
+    } catch { resolve('') }
+  })
+}
+
+// 查找 PATH 上所有同名可执行文件；Windows 使用 where.exe，POSIX 使用 which -a。
+async function executableCandidates(name) {
+  const finder = IS_WIN ? 'where.exe' : 'which'
+  const args = IS_WIN ? [name] : ['-a', name]
+  const out = await runText(finder, args)
+  return out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+}
+
+// Windows 上命令实际优先由 .cmd/.exe/.bat 提供；POSIX 取第一个。
+function preferredPnpmCandidate(candidates) {
+  if (!candidates.length) return ''
+  if (!IS_WIN) return candidates[0]
+  return candidates.find((p) => /\.(cmd|exe|bat)$/i.test(p)) || candidates[0]
+}
+
+function readTextSafe(file) {
+  try { return fs.readFileSync(file, 'utf8') } catch { return '' }
+}
+
+// 判断 PATH 上这个 pnpm 的来源：Corepack shim / npm 全局 / 其他 PATH 安装。
+function classifyPnpmCommand(file, content) {
+  if (String(content || '').toLowerCase().includes('corepack')) return 'corepack'
+  const normalized = path.resolve(file || '').toLowerCase()
+  const roots = []
+  if (IS_WIN) {
+    if (process.env.APPDATA) roots.push(path.join(process.env.APPDATA, 'npm'))
+    if (process.env.ProgramData) roots.push(path.join(process.env.ProgramData, 'npm'))
+  } else {
+    roots.push('/usr/local', '/usr/lib')
+  }
+  const inRoot = roots.some((root) => {
+    const r = path.resolve(root).toLowerCase()
+    return normalized === r || normalized.startsWith(r.endsWith(path.sep) ? r : r + path.sep)
+  })
+  return inRoot ? 'npm-global' : 'path'
+}
+
+function parsePnpmVersion(output) {
+  const match = /(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(String(output || ''))
+  return match ? match[1] : ''
+}
+
+async function readEffectivePnpmVersion() {
+  const output = IS_WIN
+    ? await runText('cmd.exe', ['/d', '/s', '/c', 'pnpm --version'])
+    : await runText('pnpm', ['--version'])
+  return parsePnpmVersion(output)
+}
+
+// 探测 PATH 上最终生效的 pnpm，并给出路径/版本/来源；不修改任何环境。
+async function detectPnpm(options = {}) {
+  const expectedVersion = options.expectedVersion || Config.pnpmVersion || DEFAULT_PNPM_VERSION
+  const candidates = await executableCandidates('pnpm')
+  const pnpmPath = preferredPnpmCandidate(candidates)
+  const version = await readEffectivePnpmVersion()
+  const source = pnpmPath ? classifyPnpmCommand(pnpmPath, readTextSafe(pnpmPath)) : ''
+  if (!pnpmPath && !version) {
+    return { status: 'missing', version: '', path: '', source: '', expectedVersion, detail: '未检测到 pnpm' }
+  }
+  const status = version && version === expectedVersion ? 'ok' : version ? 'mismatch' : 'missing'
+  const detail = status === 'ok'
+    ? (source === 'corepack' ? 'Corepack 管理' : source === 'npm-global' ? 'npm 全局安装' : 'PATH 安装')
+    : version
+      ? `当前 v${version}，期望 v${expectedVersion}`
+      : 'pnpm 存在但无法读取版本'
+  return { status, version, path: pnpmPath, source, expectedVersion, detail }
 }
 
 function readDshPackage(pkgFile) {
@@ -300,6 +380,7 @@ async function buildReport() {
   const range = (dsh && dsh.engines) || DEFAULT_ENGINE_RANGE
   const node = await detectNode(range)
   const plugin = detectPlugin()
+  const pnpm = await detectPnpm({ expectedVersion: Config.pnpmVersion || DEFAULT_PNPM_VERSION })
 
   const issues = []
   if (node.status === 'missing') issues.push('未检测到 Node.js 运行时')
@@ -314,6 +395,8 @@ async function buildReport() {
     const label = dsh.kind === 'managed' ? '托管安装' : dsh.kind === 'global' ? '全局 npm 安装' : 'npx 缓存'
     issues.push(`当前将使用${label}的 DSH（v${dsh.version || '?'}），源码版构建完成后自动优先使用源码版`)
   }
+  if (pnpm.status === 'missing') issues.push('未检测到 pnpm（dsh plugin / 插件市场需要）')
+  else if (pnpm.status === 'mismatch') issues.push(`pnpm 版本不匹配：当前 v${pnpm.version}，期望 v${pnpm.expectedVersion}（dsh plugin / 插件市场使用）`)
   if (plugin.status === 'missing') issues.push('通知插件缺失（会话完成/提问将无法弹出托盘通知）')
   if (dsh && dsh.built && (dsh.kind === 'managed' || dsh.kind === 'npx')) {
     issues.push(`检测到 ${dsh.kind === 'managed' ? '托管' : 'npx'} 形态的 DSH（v${dsh.version || '?'}），将自动迁移到全局 npm 安装（迁移失败不影响当前使用）`)
@@ -334,6 +417,8 @@ async function buildReport() {
       engines: dsh.engines,
     } : { status: 'missing', kind: 'none', version: '', dir: null, binPath: null, built: false },
     source: { found: !!sourceEntry, built: !!(sourceEntry && sourceEntry.built), dir: (sourceEntry && sourceEntry.dir) || null, version: (sourceEntry && sourceEntry.version) || '' },
+    pnpm,
+    pnpmReady: pnpm.status === 'ok',
     plugin,
     alternatives: dshAlternatives.map((e) => ({ kind: e.kind, version: e.version || '', dir: e.dir })),
     plan,
@@ -367,7 +452,7 @@ async function detectEnv(force = false) {
   return inFlight
 }
 
-// 面板展示用摘要（含路径，供 UI 展示；避免暴露过多内部结构）
+// 控制台展示用摘要（含路径，供 UI 展示；避免暴露过多内部结构）
 function envSummary(report) {
   if (!report) return null
   return {
@@ -375,6 +460,8 @@ function envSummary(report) {
     engineRange: report.engineRange,
     node: { status: report.node.status, version: report.node.version, path: report.node.path, source: report.node.source },
     dsh: { status: report.dsh.status, kind: report.dsh.kind, version: report.dsh.version, built: report.dsh.built, dir: report.dsh.dir },
+    pnpm: report.pnpm,
+    pnpmReady: !!report.pnpmReady,
     source: report.source,
     plugin: { status: report.plugin.status, path: report.plugin.path },
     issues: report.issues,
@@ -383,9 +470,13 @@ function envSummary(report) {
 
 module.exports = {
   DEFAULT_ENGINE_RANGE,
+  DEFAULT_PNPM_VERSION,
   initEnv,
   detectEnv,
   envSummary,
+  detectPnpm,
+  classifyPnpmCommand,
+  parsePnpmVersion,
   runtimeBase,
   managedNodeDir,
   managedDshDir,

@@ -31,7 +31,7 @@ test('服务没起来 → 判失败，并给出可执行指引', () => {
   assert.equal(r.ok, false)
   assert.equal(r.reason, 'start-failed')
   assert.match(r.message, /服务未能启动/)
-  assert.match(r.message, /启动器面板/)
+  assert.match(r.message, /DSHL 控制台/)
 })
 
 test('startOk 缺失/非布尔真值一律按失败处理（不把"忘了传"当成功）', () => {

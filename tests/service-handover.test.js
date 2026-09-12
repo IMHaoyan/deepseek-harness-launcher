@@ -119,3 +119,34 @@ test('parseDshWebLine：localhost 与默认端口写法都要认', () => {
   assert.equal(handover.parseDshWebLine('dsh web: http://127.0.0.1/?token=x', { host: '127.0.0.1', port: 80 }),
     'http://127.0.0.1/?token=x')
 })
+
+test('classifyOccupant：端口空了 → 交给启动器自己拉起', () => {
+  assert.equal(handover.classifyOccupant({ hasListener: false }), 'retry-start')
+  assert.equal(handover.classifyOccupant({}), 'retry-start')
+})
+
+test('classifyOccupant：命令行签名命中优先于指纹（后继刚 bind、还没开始应答）', () => {
+  assert.equal(handover.classifyOccupant({
+    hasListener: true, sigMatched: true, probeOk: false, probeReason: 'timeout', waitedMs: 600, budgetMs: 8000,
+  }), 'adopt')
+})
+
+test('classifyOccupant：指纹命中（已在运行的 DSH 外部实例）也接管', () => {
+  assert.equal(handover.classifyOccupant({
+    hasListener: true, sigMatched: false, probeOk: true, probeReason: 'fingerprint', waitedMs: 300, budgetMs: 8000,
+  }), 'adopt')
+})
+
+test('classifyOccupant：明确回了非 DSH 内容 → 立刻判冲突，不白等预算', () => {
+  assert.equal(handover.classifyOccupant({
+    hasListener: true, sigMatched: false, probeOk: false, probeReason: 'fingerprint', waitedMs: 100, budgetMs: 8000,
+  }), 'conflict')
+})
+
+test('classifyOccupant：端口有人但没应答 → 等到预算用完才判冲突（这就是误报的修法）', () => {
+  const base = { hasListener: true, sigMatched: false, probeOk: false, probeReason: 'timeout' }
+  assert.equal(handover.classifyOccupant(Object.assign({}, base, { waitedMs: 1000, budgetMs: 8000 })), 'wait')
+  assert.equal(handover.classifyOccupant(Object.assign({}, base, { waitedMs: 7999, budgetMs: 8000 })), 'wait')
+  assert.equal(handover.classifyOccupant(Object.assign({}, base, { waitedMs: 8000, budgetMs: 8000 })), 'conflict')
+  assert.equal(handover.classifyOccupant(Object.assign({}, base, { probeReason: 'connect', waitedMs: 9000, budgetMs: 8000 })), 'conflict')
+})

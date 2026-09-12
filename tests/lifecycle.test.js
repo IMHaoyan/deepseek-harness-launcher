@@ -68,3 +68,13 @@ test('emit 永不抛错（目录不可写时）', (t) => {
   lifecycle.initLifecycle({ dir: bad, log: () => {} })
   assert.doesNotThrow(() => lifecycle.emit('app.started', {}))
 })
+test('手动回退事件在白名单内（health.restore.manual 不被静默丢弃）', (t) => {
+  const dir = tmpDir(t)
+  lifecycle.initLifecycle({ dir })
+  lifecycle.emit('health.restore.manual', { slotId: 'slot-1', backup: 'config.json.broken-x.json' })
+  const lines = lifecycle.tail(10)
+  assert.equal(lines.length, 1)
+  const e = JSON.parse(lines[0])
+  assert.equal(e.event, 'health.restore.manual')
+  assert.equal(e.detail.slotId, 'slot-1')
+})

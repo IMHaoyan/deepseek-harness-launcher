@@ -1,9 +1,11 @@
-// market.js — 插件市场（单一插件：dshmarket）
-// 定位：不做目录浏览，只负责「把 dshmarket 这个插件装进 DSH 的 web profile」这一件事。
+// market.js — npm 分发插件的通用安装器（dshmarket / dsh-better-sidebar / dsh-chat-import / …）
+// 定位：不做目录浏览，只负责「把某个 npm 分发的 DSH 插件装进 DSH 的 web profile」。
+//   - dshmarket 仍是默认插件：install()/uninstall()/getState() 保持旧签名；
+//   - 其余插件走 installByName(name)/uninstallByName(name)/stateOf(name)，按包名各自记账。
 // 机制（与 DSH 官方 CLI 完全一致，不自造安装器）：
-//   - 安装：`<dshBin> plugin --profile web add dshmarket` —— 该命令是 pnpm 的薄封装，
+//   - 安装：`<dshBin> plugin --profile web add <包名>@<精确版本>` —— 该命令是 pnpm 的薄封装，
 //     会在 profile 目录执行 pnpm add，并自动把插件写进 `dsh.profile.bundles`（reconcilePlugins）。
-//     dsh CLI 自带编译版 pnpm，用户机器无需预装 pnpm。
+//     dsh CLI 需要 PATH 上有 pnpm；DSHL 负责把固定版本的 pnpm 安装/对齐到用户全局路径。
 //   - 卸载：`<dshBin> plugin --profile web remove dshmarket`（对称）。
 //   - 状态：永远以 profile 的 package.json 为准（dependencies + dsh.profile.bundles），不维护安装回执。
 // 安全/稳健：
@@ -28,13 +30,16 @@ let HOME = ''
 let envDetect = null
 let logFn = () => {}
 
-const state = {
-  installed: false,
-  version: '',
-  bundle: false,
-  busy: '', // '' | 'installing' | 'uninstalling'
-  error: '',
-  lastChange: '',
+// 按包名分别记账：一个插件在装/卸时不影响另一个插件的状态展示。
+// 每个进程内只保留瞬时状态；「是否已安装」永远以 profile 的 package.json 为准。
+const states = new Map()
+function stateOf(name = PLUGIN_NAME) {
+  let s = states.get(name)
+  if (!s) {
+    s = { installed: false, version: '', bundle: false, busy: '', error: '', lastChange: '' }
+    states.set(name, s)
+  }
+  return s
 }
 
 function initMarket(opts = {}) {
@@ -84,19 +89,35 @@ function installed() {
   return pluginStateOf(readProfileManifest())
 }
 
-function getState() {
-  const cur = installed()
-  state.installed = cur.installed && cur.bundle
-  state.version = cur.version
-  state.bundle = cur.bundle
+/**
+ * 读 profile 里实际物化安装的版本（node_modules 里的 package.json）。
+ * manifest 里的 dependencies 记的是「依赖范围」（如 ^1.2.6 / file:…），不是真实版本，
+ * 卡片上要展示真实版本，所以以 node_modules 为准；读不到返回空串由调用方兜底。
+ */
+function installedPackageVersion(name) {
+  try {
+    const pkgPath = path.join(profileDir(), 'node_modules', ...String(name || '').split('/'), 'package.json')
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+    return (pkg && typeof pkg.version === 'string') ? pkg.version : ''
+  } catch { return '' }
+}
+
+/** 单个插件的状态。name 省略时等于 dshmarket（兼容旧调用）。 */
+function getState(name = PLUGIN_NAME) {
+  const cur = pluginStateOf(readProfileManifest(), name)
+  const s = stateOf(name)
+  s.installed = cur.installed && cur.bundle
+  s.version = cur.version
+  s.bundle = cur.bundle
   return {
-    installed: state.installed,
-    version: state.version,
-    bundle: state.bundle,
-    busy: state.busy,
-    error: state.error,
-    lastChange: state.lastChange,
-    plugin: PLUGIN_NAME,
+    installed: s.installed,
+    version: s.version,
+    installedPackageVersion: s.installed ? installedPackageVersion(name) : '',
+    bundle: s.bundle,
+    busy: s.busy,
+    error: s.error,
+    lastChange: s.lastChange,
+    plugin: name,
   }
 }
 
@@ -167,20 +188,38 @@ async function verifyNpmPackage(name) {
   return verifyNpmManifestShape(raw, name)
 }
 
-// ---------- 执行 dsh plugin（CLI 薄封装，自带 pnpm） ----------
+// ---------- 执行 dsh plugin（DSHL 保证 PATH 上的 pnpm 可用） ----------
+
+function pnpmReady(env) {
+  return !!(env && env.pnpm && env.pnpm.status === 'ok')
+}
+
+function withToolchainPath(baseEnv, dirs) {
+  const env = Object.assign({}, baseEnv)
+  const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH') || 'PATH'
+  const prefix = dirs.filter(Boolean).join(path.delimiter)
+  env[pathKey] = prefix ? prefix + path.delimiter + (env[pathKey] || '') : (env[pathKey] || '')
+  return env
+}
 
 async function runCli(args) {
   if (!envDetect) throw new Error('market: envDetect 未初始化')
   const env = await envDetect.detectEnv(false)
   if (!env || !env.plan) throw new Error('运行环境未就绪，无法安装插件')
+  if (!pnpmReady(env)) {
+    const detail = env.pnpm ? (env.pnpm.detail || '未就绪') : '未检测到 pnpm'
+    throw new Error('pnpm 未就绪：' + detail + '。请先在运行环境页安装/修复 pnpm。')
+  }
   const { nodeCmd, dshBin } = env.plan
   if (!fs.existsSync(dshBin)) throw new Error('DSH 入口不存在：' + dshBin)
+  const nodeDir = nodeCmd.includes(path.sep) || nodeCmd.includes('/') ? path.dirname(nodeCmd) : ''
+  const pnpmDir = env.pnpm && env.pnpm.path ? path.dirname(env.pnpm.path) : ''
   return new Promise((resolve, reject) => {
     let child
     try {
       child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...args], {
         cwd: profileDir(),
-        env: Object.assign({}, process.env, { DSH_HOME: HOME }),
+        env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
@@ -210,65 +249,86 @@ async function runCli(args) {
 
 // ---------- 安装 / 卸载 ----------
 
-/** 安装 dshmarket：npm 校验 → dsh plugin add → 校验 profile → 重启服务生效。 */
-async function install() {
-  if (state.busy) return { ok: false, error: '已有插件操作正在进行' }
-  state.busy = 'installing'
-  state.error = ''
+/**
+ * 安装（或更新）任意 npm 分发的 DSH 插件：
+ * npm 身份校验 → dsh plugin add <包名>@<精确版本> → 二次校验 profile。
+ * force=true 时即使已装也重新解析版本并覆盖安装（用于「更新到最新」）。
+ */
+async function installByName(name, opts = {}) {
+  const pkg = String(name || '')
+  if (!pkg) return { ok: false, error: '插件名不能为空' }
+  const s = stateOf(pkg)
+  if (s.busy) return { ok: false, error: '该插件已有操作正在进行' }
+  s.busy = 'installing'
+  s.error = ''
   try {
-    const before = installed()
-    if (before.installed && before.bundle) {
-      state.busy = ''
+    const before = pluginStateOf(readProfileManifest(), pkg)
+    if (before.installed && before.bundle && !opts.force) {
+      s.busy = ''
       return { ok: true, already: true, version: before.version }
     }
-    const verified = await verifyNpmPackage(PLUGIN_NAME)
-    log(`installing ${PLUGIN_NAME}@${verified.version}（npm 官方源校验通过）…`)
+    const verified = await verifyNpmPackage(pkg)
+    log('installing ' + pkg + '@' + verified.version + '（npm 官方源校验通过）…')
     // -w：profile 目录本身是一个 pnpm workspace 根（pnpm-workspace.yaml），
     // 新版本 pnpm 拒绝在 workspace 根加依赖，除非显式 -w/--workspace-root。
-    await runCli(['add', `${PLUGIN_NAME}@${verified.version}`, '-w'])
-    const after = installed()
+    // --config.minimumReleaseAge=0：pnpm 11.7 起默认带 24h「新版本观察期」，刚发布的版本会被策略拦下
+    // （The lockfile contains entries that the active policies reject），还会把 profile 留在
+    // 「node_modules 已是新版、dependencies 仍是旧版」的半成品状态。dshmarket 等同类插件管理器
+    // 对「用户点名安装的精确版本」也是显式关掉该策略，这里对齐。
+    await runCli(['add', '--config.minimumReleaseAge=0', pkg + '@' + verified.version, '-w'])
+    const after = pluginStateOf(readProfileManifest(), pkg)
     if (!after.installed || !after.bundle) {
       throw new Error('安装后 profile 未正确记录该插件（dependencies/bundles 缺一）')
     }
-    state.lastChange = `已安装 ${PLUGIN_NAME}@${after.version}`
-    log(`installed ${PLUGIN_NAME}@${after.version}`)
-    state.busy = ''
+    s.lastChange = '已安装 ' + pkg + '@' + after.version
+    log('installed ' + pkg + '@' + after.version)
+    s.busy = ''
     return { ok: true, version: after.version }
   } catch (e) {
-    state.error = (e && e.message) || String(e)
-    state.busy = ''
-    log('install failed: ' + state.error)
-    return { ok: false, error: state.error }
+    s.error = (e && e.message) || String(e)
+    s.busy = ''
+    log('install failed: ' + pkg + '：' + s.error)
+    return { ok: false, error: s.error }
   }
 }
 
-/** 卸载 dshmarket：dsh plugin remove → 校验 profile 已移除 → 重启服务生效。 */
-async function uninstall() {
-  if (state.busy) return { ok: false, error: '已有插件操作正在进行' }
-  state.busy = 'uninstalling'
-  state.error = ''
+/** 卸载任意 npm 分发的 DSH 插件：dsh plugin remove → 校验 profile 已移除。 */
+async function uninstallByName(name) {
+  const pkg = String(name || '')
+  if (!pkg) return { ok: false, error: '插件名不能为空' }
+  const s = stateOf(pkg)
+  if (s.busy) return { ok: false, error: '该插件已有操作正在进行' }
+  s.busy = 'uninstalling'
+  s.error = ''
   try {
-    const before = installed()
+    const before = pluginStateOf(readProfileManifest(), pkg)
     if (!before.installed && !before.bundle) {
-      state.busy = ''
+      s.busy = ''
       return { ok: true, already: true }
     }
-    await runCli(['remove', PLUGIN_NAME, '-w'])
-    const after = installed()
+    await runCli(['remove', pkg, '-w'])
+    const after = pluginStateOf(readProfileManifest(), pkg)
     if (after.installed || after.bundle) {
       throw new Error('卸载后 profile 仍记录该插件')
     }
-    state.lastChange = `已卸载 ${PLUGIN_NAME}`
-    log(`uninstalled ${PLUGIN_NAME}`)
-    state.busy = ''
+    s.lastChange = '已卸载 ' + pkg
+    log('uninstalled ' + pkg)
+    s.busy = ''
     return { ok: true }
   } catch (e) {
-    state.error = (e && e.message) || String(e)
-    state.busy = ''
-    log('uninstall failed: ' + state.error)
-    return { ok: false, error: state.error }
+    s.error = (e && e.message) || String(e)
+    s.busy = ''
+    log('uninstall failed: ' + pkg + '：' + s.error)
+    return { ok: false, error: s.error }
   }
 }
+
+/**
+ * 安装/卸载 dshmarket（默认插件）——保留旧签名给既有调用点。
+ * opts.force=true：即使已安装也重新解析版本并覆盖安装（卡片上的「重新安装」）。
+ */
+function install(opts) { return installByName(PLUGIN_NAME, opts) }
+function uninstall() { return uninstallByName(PLUGIN_NAME) }
 
 module.exports = {
   initMarket,
@@ -276,10 +336,15 @@ module.exports = {
   installed,
   install,
   uninstall,
+  // 任意 npm 插件（控制台「插件」页的推荐插件用）
+  installByName,
+  uninstallByName,
+  installedPackageVersion,
   verifyNpmPackage,
   // 纯函数（测试用）
   pluginStateOf,
   verifyNpmManifestShape,
+  pnpmReady,
   PLUGIN_NAME,
   PROFILE_NAME,
   NPM_REGISTRY_ORIGIN,

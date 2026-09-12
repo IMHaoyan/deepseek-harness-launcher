@@ -74,7 +74,8 @@ function initUpdater(opts = {}) {
     if (onEvent) { try { onEvent('update.launcher', { status: 'downloaded', latest: info.version }) } catch { /* noop */ } }
     if (onFlash) { try { onFlash() } catch { /* noop */ } }
     if (onNotify) {
-      onNotify('DeepSeek Harness Launcher', `新版本 v${info.version} 已下载完成：点设置页"更新到 v${info.version}"立即安装（退出重启也会自动安装）`)
+      // 第三参数带上版本号：主进程据此做"同一版本只提醒一次"的跨重启去重
+      onNotify('DeepSeek Harness Launcher', `新版本 v${info.version} 已下载完成：点设置页"更新到 v${info.version}"立即安装（退出重启也会自动安装）`, { version: info.version })
     }
   })
   autoUpdater.on('error', (err) => {

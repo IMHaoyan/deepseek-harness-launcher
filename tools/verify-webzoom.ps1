@@ -17,7 +17,7 @@ cmd /c mklink /J "$dshHome\profiles\web" "$env:USERPROFILE\.dsh\profiles\web" | 
 Log ("profile junction=" + (Test-Path (Join-Path $dshHome 'profiles\web\package.json')))
 
 # config.json WITHOUT BOM (JSON.parse must succeed for webZoom to load)
-$cfg = '{"port":4398,"useSystemBrowser":false,"autoRestart":true'
+$cfg = '{"port":4398,"autoRestart":true'
 if ($WebZoom -ge 0) { $cfg += ',"webZoom":' + $WebZoom }
 $cfg += '}'
 [System.IO.File]::WriteAllText((Join-Path $dshHome 'dshl\config.json'), $cfg, [System.Text.UTF8Encoding]::new($false))
@@ -25,7 +25,7 @@ Log ("config=" + $cfg)
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = Join-Path $repo 'node_modules\electron\dist\electron.exe'
-$psi.Arguments = ". --port 4398 --user-data-dir=`"$userData`" --remote-debugging-port=$cdpPort"
+$psi.Arguments = ". --console --port 4398 --user-data-dir=`"$userData`" --remote-debugging-port=$cdpPort"
 $psi.WorkingDirectory = $repo
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
@@ -77,19 +77,19 @@ Start-Sleep -Seconds 2
 $dpr = Cdp-Eval $tabTarget.webSocketDebuggerUrl "JSON.stringify({dpr:window.devicePixelRatio,vs:(window.visualViewport?window.visualViewport.scale:-1),href:location.href})"
 Log ("tab dpr=" + $dpr)
 
-# panel widget should show persisted webZoom after state push
-$panel = $null
-foreach ($t in $list) { if ($t.url -match 'index\.html') { $panel = $t; break } }
-if ($panel) {
+# console widget should show persisted webZoom after state push
+$consoleView = $null
+foreach ($t in $list) { if ($t.url -match 'index\.html') { $consoleView = $t; break } }
+if ($consoleView) {
   $txt = ''
   for ($i = 0; $i -lt 20; $i++) {
-    $txt = Cdp-Eval $panel.webSocketDebuggerUrl "document.getElementById('btnWebZoom')?document.getElementById('btnWebZoom').textContent:'missing'"
+    $txt = Cdp-Eval $consoleView.webSocketDebuggerUrl "document.getElementById('btnWebZoom')?document.getElementById('btnWebZoom').textContent:'missing'"
     if ($txt -match '\d+%') { break }
     Start-Sleep -Milliseconds 500
   }
-  Log ("panel btnWebZoom=" + $txt)
+  Log ("console btnWebZoom=" + $txt)
 } else {
-  Log 'panel target not found'
+  Log 'console target not found'
 }
 
 Start-Sleep -Seconds 1

@@ -4,21 +4,68 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
-  <title>DeepSeek Harness Launcher 启动器面板</title>
+  <title>DSHL 控制台</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="console.css">
 </head>
-<body>
-  <!-- 主页面 -->
-  <div id="pageMain" class="page">
-    <header class="header">
-      <svg class="whale" viewBox="0 0 23.16 17.04" width="24" aria-hidden="true">
-        <path fill="currentColor" d="__WHALE_PATH__"/>
-      </svg>
-      <div class="titles">
-        <h1>DeepSeek Harness Launcher</h1>
+<body class="console-surface">
+  <!-- 控制台导航（宽屏主入口；旧的独立控制台窗口已迁移到这里） -->
+  <aside id="consoleNav">
+    <div class="console-brand">
+      <div class="console-brand-mark" aria-hidden="true">🐳</div>
+      <div class="console-brand-copy">
+        <div class="console-brand-title">DSHL</div>
+        <div class="console-brand-sub">DeepSeek Harness Launcher</div>
       </div>
-      <button class="btn header-btn" id="btnSettings" title="设置">⚙ 设置</button>
-    </header>
+    </div>
+    <nav class="console-nav" aria-label="控制台导航">
+      <button class="console-nav-item active" id="navGeneral" data-page="general" title="通用">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span>通用</span>
+      </button>
+      <button class="console-nav-item" id="navPlugins" data-page="plugins" title="预装插件">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 3h4v3.2a2 2 0 1 0 4 0V9h3v5h-3.2a2 2 0 1 0 0 4H21v3h-5v-3.2a2 2 0 1 0-4 0V21H7v-5H3.8a2 2 0 1 0 0-4H7V7h3z"/></svg>
+        <span>预装插件</span>
+      </button>
+      <button class="console-nav-item" id="navLog" data-page="logs" title="日志与反馈">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z"/><path d="M8 8.5h8M8 12h5"/></svg>
+        <span>日志与反馈</span>
+      </button>
+    </nav>
+    <div class="console-nav-foot">
+      <div class="console-status">
+        <span class="dot" id="consoleServiceDot"></span>
+        <span id="consoleServiceText">状态检测中…</span>
+      </div>
+      <div class="console-version" id="consoleVersion">-</div>
+      <button class="console-return" id="btnConsoleReturn" title="关闭控制台，返回 DSH">
+        <span aria-hidden="true">←</span>
+        <span>返回 DeepSeek Harness</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- 插件变更提示条：装了/卸了插件但还没重启时显示，点右侧按钮立即重启生效 -->
+  <div id="pendingRestartBar" class="pending-bar hidden" role="status">
+    <span class="pending-bar-dot" aria-hidden="true"></span>
+    <span class="pending-bar-text" id="pendingRestartText"></span>
+    <span class="pending-bar-hint" id="pendingRestartHint">重启后才会生效</span>
+    <button class="btn primary sm" id="btnApplyRestart" title="立即重启 DSH 服务并刷新页面">立即重启生效</button>
+  </div>
+
+  <div id="consoleToast" class="console-toast hidden" role="status" aria-live="polite"></div>
+
+  <main id="consoleContent">
+  <!-- 主页面 -->
+  <!-- 鲸鱼路径占位符：构建时由 tools/build-assets.mjs 内联为真实 path（品牌区在左侧导航） -->
+  <svg class="brand-anchor" width="0" height="0" aria-hidden="true" focusable="false"><path fill="currentColor" d="__WHALE_PATH__"/></svg>
+
+  <!-- 通用页 = 原「概览」+ 原「设置」：上半状态与主操作，下半偏好设置分组 -->
+  <div id="pageGeneral" class="page">
+    <div class="page-header">
+      <span class="page-title">通用</span>
+      <span class="page-subtitle" id="mainSubtitle">DeepSeek Harness Launcher</span>
+    </div>
 
     <!-- 运行状态卡：状态 / 地址 / 启动器版本 / DSH版本 统一标签列左对齐 -->
     <section class="card" id="statusCard">
@@ -48,10 +95,14 @@
       </div>
     </section>
 
-    <!-- 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示，可关闭） -->
+    <!-- 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示；可跳恢复页，也可关闭） -->
     <section class="card env-warning hidden" id="crashNote">
       <div class="crash-note-row">
         <div class="env-warn-title" id="crashNoteText"></div>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="btnCrashNoteRecover">打开恢复</button>
+        <button class="btn" id="btnCrashNoteDiag">导出诊断</button>
         <button class="btn sm" id="btnCrashNoteClose" title="关闭提示（同一次崩溃不再重复提醒）">知道了</button>
       </div>
     </section>
@@ -60,9 +111,10 @@
     <section class="card main-actions">
       <button class="btn primary" id="btnOpen">打开 DeepSeek Harness</button>
       <div class="actions-row">
-        <button class="btn primary" id="btnToggle">启动服务</button>
+        <button class="btn primary" id="btnToggle" title="启动服务；环境未就绪时会引导到环境页">启动 DSH</button>
         <button class="btn" id="btnLogs">查看日志</button>
       </div>
+      <div class="recovery-hint hidden" id="toggleHint"></div>
     </section>
 
     <!-- 环境未就绪警示（检测到缺失/版本过低时显示） -->
@@ -81,29 +133,76 @@
       <div class="env-warn-detail" id="portWarnDetail"></div>
       <div class="actions">
         <button class="btn primary hidden" id="btnPortSwitch">换到端口并启动</button>
-        <button class="btn" id="btnPortOpenSettings">打开设置改端口</button>
+        <button class="btn" id="btnPortOpenSettings">打开通用页改端口</button>
       </div>
     </section>
 
-    <!-- 余额卡（单独一张，位于底端链接上方）：数值留在标签列右侧，操作小按钮靠右 -->
-    <section class="card" id="balanceCard">
+
+    <!-- 偏好设置（原「设置」页）：与状态/主操作同页，宽屏下两列分组 -->
+    <div class="settings-groups">
+    <section class="card settings-group">
+      <div class="group-title">界面与使用</div>
+      <!-- 启动器缩放已隐藏（控制台固定跟随系统缩放）；元素保留以免自检断言失效 -->
+      <div class="row hidden">
+        <span class="label">启动器缩放</span>
+        <div class="chips">
+          <button class="chip checked zoom-widget" id="btnZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
+        </div>
+      </div>
       <div class="row">
-        <span class="label">余额</span>
-        <span class="value strong status-value" id="balanceValue">--</span>
-        <div class="chips balance-chips">
-          <button class="btn sm" id="btnBalanceRefresh" title="立即查询余额（自动每 3 分钟查询一次）">↻</button>
-          <button class="btn sm" id="btnBalanceOpenSettings" title="余额接口设置（API Key / 查询接口）">⚙</button>
-          <button class="btn sm" id="btnRecharge" title="打开 DeepSeek 开放平台充值页">充值 / 用量查询</button>
+        <span class="label">对话界面缩放</span>
+        <div class="chips">
+          <button class="chip checked zoom-widget" id="btnWebZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="label">主题</span>
+        <div class="chips" id="themeChips"></div>
+      </div>
+      <div class="row">
+        <span class="label">消息提醒</span>
+        <div class="chips">
+          <button class="chip" id="btnNotify">开启</button>
+          <button class="btn sm" id="btnTest">测试通知</button>
+        </div>
+      </div>
+      <div class="row long-label" title="关闭某类后该类的系统通知不再弹出（日志仍逐条记录）；关闭上面的「消息提醒」则全部静默。">
+        <span class="label">提醒内容</span>
+        <div class="chips" id="notifyCategoryChips"></div>
+      </div>
+      <div class="row">
+        <span class="label">开机自启</span>
+        <div class="chips">
+          <button class="chip" id="btnAuto">开启</button>
         </div>
       </div>
     </section>
-
-    <!-- 底端：项目链接 + 反馈入口（三个普通按钮等宽均分） -->
-    <section class="card main-footer">
-      <button class="btn" id="btnGithub">Github地址</button>
-      <button class="btn" id="btnChangelog">更新日志</button>
-      <button class="btn" id="btnFeedback">反馈问题</button>
+    <section class="card settings-group">
+      <div class="group-title">服务与更新</div>
+      <div class="row long-label">
+        <span class="label">服务端口</span>
+        <div class="chips">
+          <button class="chip" id="btnPort" title="双击输入新端口（1024–65535），保存后服务自动切换到新端口">3080</button>
+        </div>
+      </div>
+      <div class="row" title="检测 Node / pnpm / DSH 并支持一键安装缺失环境">
+        <span class="label">运行环境</span>
+        <div class="chips">
+          <button class="btn sm" id="btnOpenEnv">打开运行环境</button>
+        </div>
+      </div>
+      <div class="row" title="latest：跟随 npm latest（默认）；alpha：跟随 npm alpha，可提前拿到预览版。切换后立即按新渠道重新检查。">
+        <span class="label">DSH 更新渠道</span>
+        <div class="chips" id="dshChannelChips"></div>
+      </div>
+      <div class="row">
+        <span class="label">恢复默认</span>
+        <div class="chips">
+          <button class="btn sm danger" id="btnReset">恢复默认设置</button>
+        </div>
+      </div>
     </section>
+    </div>
   </div>
 
   <!-- 新手安装向导（首装引导：欢迎 → 极简进度 → 完成/失败；高级用户可跳过进"运行环境"页） -->
@@ -162,10 +261,10 @@
   <!-- 运行环境页面（检测 + 一键安装向导） -->
   <div id="pageEnv" class="page hidden">
     <div class="page-header">
-      <button class="btn" id="btnEnvBack">← 返回</button>
+      <button class="btn sm" id="btnEnvBack" title="返回通用">← 返回通用</button>
       <span class="page-title">运行环境</span>
       <button class="btn sm" id="btnEnvWizard">新手向导</button>
-      <button class="btn" id="btnEnvCopyDiag">复制诊断信息</button>
+      <button class="btn sm" id="btnEnvCopyDiag">复制诊断信息</button>
       <button class="btn" id="btnEnvRecheck">重新检测</button>
     </div>
 
@@ -195,7 +294,8 @@
         <div class="env-manual-title">手动安装指引（官方方式）</div>
         <div class="env-manual-body">
           <p><b>Node.js</b>：到 nodejs.org 下载 LTS 安装包（需 22.19+ 或 24+）。</p>
-          <p><b>DeepSeek Harness</b>：安装 Node.js 后执行 <span class="env-code">npm i -g @deepseek-ai/dsh</span>（国内网络可在末尾加 <span class="env-code">--registry https://registry.npmmirror.com</span>），再执行 <span class="env-code">dsh web</span>；或克隆仓库 <span class="env-code">git clone https://github.com/deepseek-ai/deepseek-harness.git</span> 后 <span class="env-code">pnpm install &amp;&amp; pnpm run build</span>。</p>
+          <p><b>pnpm</b>：执行 <span class="env-code">npm i -g pnpm@11.8.0</span>；若系统已有 Corepack pnpm，也可执行 <span class="env-code">corepack install -g pnpm@11.8.0</span>。<code>dsh plugin</code> 需要它在 PATH 上。</p>
+          <p><b>DeepSeek Harness</b>：安装 Node.js 与 pnpm 后执行 <span class="env-code">npm i -g @deepseek-ai/dsh</span>（国内网络可在末尾加 <span class="env-code">--registry https://registry.npmmirror.com</span>），再执行 <span class="env-code">dsh web</span>；或克隆仓库 <span class="env-code">git clone https://github.com/deepseek-ai/deepseek-harness.git</span> 后 <span class="env-code">pnpm install &amp;&amp; pnpm run build</span>。</p>
           <p>安装完成后回到本页点击"重新检测"。</p>
         </div>
       </div>
@@ -203,136 +303,114 @@
   </div>
 
   <!-- 设置页面 -->
-  <div id="pageSettings" class="page hidden">
+  <!-- 预装插件页面：卡片完全由 state.plugins 驱动，新增插件只需在主进程注册表补条目 -->
+  <div id="pagePlugins" class="page hidden">
     <div class="page-header">
-      <button class="btn" id="btnSettingsBack">← 返回</button>
-      <span class="page-title">设置</span>
+      <span class="page-title">预装插件</span>
+      <span class="plugin-page-summary" id="pluginSummary">-</span>
     </div>
 
-    <section class="card">
-      <!-- 启动器缩放已隐藏（面板固定跟随系统缩放）；元素保留以免自检断言失效 -->
-      <div class="row hidden">
-        <span class="label">启动器缩放</span>
-        <div class="chips">
-          <button class="chip checked zoom-widget" id="btnZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
-        </div>
+    <!-- 页面定位：这里只是启动器精选的预装清单，完整的插件管理在 DSH 内置插件市场 -->
+    <div class="plugin-page-intro">
+      <div>
+        <div class="plugin-page-heading">本页是 DSHL 精选的预装插件，不是插件管理器</div>
+        <div class="plugin-page-subtitle">要浏览、安装和管理更多插件，请使用 DSH 窗口内的「插件市场」。DSHL 只负责随启动器代装和维护这几个插件。</div>
       </div>
-      <div class="row">
-        <span class="label">对话界面缩放</span>
-        <div class="chips">
-          <button class="chip checked zoom-widget" id="btnWebZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
-        </div>
-      </div>
-      <div class="row">
-        <span class="label">主题</span>
-        <div class="chips" id="themeChips"></div>
-      </div>
-      <div class="row">
-        <span class="label">消息提醒</span>
-        <div class="chips">
-          <button class="chip" id="btnNotify">开启</button>
-          <button class="btn sm" id="btnTest">测试通知</button>
-        </div>
-      </div>
-      <div class="row">
-        <span class="label">开机自启</span>
-        <div class="chips">
-          <button class="chip" id="btnAuto">开启</button>
-        </div>
-      </div>
-      <div class="row long-label">
-        <span class="label">服务端口</span>
-        <div class="chips">
-          <button class="chip" id="btnPort" title="双击输入新端口（1024–65535），保存后服务自动切换到新端口">3080</button>
-        </div>
-      </div>
-      <div class="row">
-        <span class="label">运行环境</span>
-        <div class="chips">
-          <button class="btn sm" id="btnOpenEnv">环境详情 / 诊断</button>
-        </div>
-      </div>
-      <div class="row long-label">
-        <span class="label">插件市场</span>
-        <div class="chips">
-          <span class="value" id="pluginMarketState">-</span>
-          <button class="btn sm" id="btnPluginMarket">安装</button>
-        </div>
-      </div>
-      <div class="row" id="pluginMarketDetailRow">
-        <span class="label" id="pluginMarketDetail"></span>
-      </div>
-      <div class="row" title="latest：跟随 npm latest（默认）；alpha：跟随 npm alpha，可提前拿到预览版。切换后立即按新渠道重新检查。">
-        <span class="label">DSH 更新渠道</span>
-        <div class="chips" id="dshChannelChips"></div>
-      </div>
-      <div class="row">
-        <span class="label">恢复默认</span>
-        <div class="chips">
-          <button class="btn sm danger" id="btnReset">恢复默认设置</button>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <!-- 余额设置页面（主页面余额卡片 ⚙ 进入；测试连通成功后自动保存） -->
-  <div id="pageBalance" class="page hidden">
-    <div class="page-header">
-      <button class="btn" id="btnBalanceBack">← 返回</button>
-      <span class="page-title">余额设置</span>
     </div>
-    <section class="card">
-      <div class="row stack">
-        <span class="label">API Key（明文显示；留空 = 自动读取 DSH 配置）</span>
-        <input class="text-input" type="text" id="balanceKey" placeholder="sk-...">
+
+    <div class="plugin-toolbar">
+      <input class="text-input plugin-search" id="pluginSearch" type="search" placeholder="搜索插件，例如：侧边栏、计费、导入…" />
+      <div class="plugin-filters" id="pluginFilters">
+        <button class="chip checked" data-plugin-filter="all">全部</button>
+        <button class="chip" data-plugin-filter="installed">已安装</button>
+        <button class="chip" data-plugin-filter="available">未安装</button>
       </div>
-      <div class="row stack">
-        <span class="label">查询接口（留空 = 自动：DSH 配置 → 官方 api.deepseek.com）</span>
-        <input class="text-input" type="text" id="balanceBaseUrl" placeholder="https://api.deepseek.com">
+      <div class="plugin-toolbar-actions">
+        <button class="btn" id="btnPluginsRefresh" title="重新读取插件状态并检查更新">刷新</button>
+        <button class="btn primary" id="btnPluginsInstallAll" title="安装所有尚未安装的插件">一键全部安装</button>
       </div>
-      <div class="row">
-        <span class="label" id="balanceCurrentHint">-</span>
-      </div>
-      <div class="balance-test-status" id="balanceTestStatus"></div>
-      <div class="actions">
-        <button class="btn primary" id="btnBalanceTest">测试并保存</button>
-        <button class="btn sm danger" id="btnBalanceClear">清除已保存</button>
-      </div>
-    </section>
-    <section class="card">
-      <div class="env-manual">
-        <div class="env-manual-title">说明</div>
-        <div class="env-manual-body">
-          <p><b>默认无需配置</b>：自动读取 DSH 配置（`~/.dsh/.credentials.yaml` 的 `DEEPSEEK_API_KEY` 与 `~/.dsh/settings.yaml` 的 `llm-deepseek.baseURL`），打开面板即自动查询余额（每 3 分钟自动刷新）。</p>
-          <p><b>自定义</b>：在此页填写 API Key / 查询接口后点"测试并保存"——连通（正确获取到余额）即自动保存并立即生效；查询接口需实现 DeepSeek 余额 API（`GET {接口}/user/balance`）。</p>
-          <p><b>清除</b>：清空已保存的自定义设置，回到自动读取 DSH 配置。</p>
-        </div>
-      </div>
-    </section>
+    </div>
+
+    <div id="pluginCards" class="plugin-grid"></div>
+    <div id="pluginEmpty" class="plugin-empty hidden">没有匹配的插件</div>
   </div>
 
-  <!-- 日志页面 -->
+  <!-- 日志与反馈：原「服务与诊断」（状态 / 服务操作 / 健康检查点 / 诊断）+ 运行日志 + 问题反馈合并为一页 -->
   <div id="pageLog" class="page hidden">
     <div class="page-header">
-      <button class="btn" id="btnBack">← 返回</button>
-      <span class="page-title">运行日志</span>
-      <button class="btn" id="btnOpenLogsDir">打开日志文件夹</button>
+      <span class="page-title">日志与反馈</span>
+      <button class="btn sm" id="btnRecoveryRefresh" title="重新读取服务状态与健康检查点">刷新</button>
+      <button class="btn sm" id="btnLogCopyAll">复制日志</button>
+      <button class="btn sm" id="btnLogClear">清空显示</button>
     </div>
-    <pre id="log"></pre>
-  </div>
 
-  <!-- 反馈问题对话框 -->
-  <div id="feedbackOverlay" class="modal-overlay hidden">
-    <div class="modal">
-      <div class="modal-title">反馈问题</div>
-      <textarea id="feedbackText" rows="5" placeholder="描述你遇到的问题、复现步骤、期望行为…（提交时会自动附带版本、环境与日志信息）"></textarea>
+    <!-- 服务状态 + 服务操作 + 健康检查点 + 诊断操作：压成一张紧凑卡片 -->
+    <section class="card diag-card" id="recoveryCheckpointsCard">
+      <div class="diag-head">
+        <div class="diag-state">
+          <span class="dot" id="diagServiceDot"></span>
+          <span class="diag-state-text" id="recoveryServiceState">状态检测中…</span>
+        </div>
+        <div class="diag-ops">
+          <button class="btn sm primary" id="btnRecoveryStart">启动服务</button>
+          <button class="btn sm" id="btnRecoveryRestart">重启服务</button>
+          <button class="btn sm danger" id="btnRecoveryStop">停止服务</button>
+        </div>
+      </div>
+
+      <div class="diag-note" id="recoveryStatusRow">
+        <span class="diag-note-icon" id="recoveryStatusIcon">✓</span>
+        <span class="diag-note-text" id="recoveryStatusDetail">没有未处理的异常。</span>
+      </div>
+
+      <div class="diag-slots-head">
+        <span class="diag-label" title="服务每次正常启动都会记录一份配置快照；服务反复启动失败时可回退到最近的正常配置。回退会先备份当前配置，不会丢东西。">健康检查点</span>
+        <div class="diag-tools">
+          <button class="btn sm" id="btnRecoveryDiag">生成诊断报告</button>
+          <button class="btn sm" id="btnRecoveryDiagDir">打开诊断目录</button>
+          <button class="btn sm" id="btnOpenLogsDir">打开日志文件夹</button>
+        </div>
+      </div>
+      <div id="recoverySlots" class="recovery-slots"></div>
+      <div class="recovery-hint" id="recoverySlotStatus"></div>
+      <div class="recovery-hint" id="recoveryDiagStatus"></div>
+    </section>
+
+    <section class="card logs-card">
+      <div class="logs-head">
+        <span class="recovery-title">运行日志</span>
+        <span class="recovery-hint" id="logHint">显示最近 60 行；更早的日志见「打开日志文件夹」</span>
+      </div>
+      <pre id="logFull"></pre>
+    </section>
+
+    <section class="card feedback-card">
+      <div class="recovery-title">问题反馈</div>
+      <div class="recovery-hint">提交时会自动附带版本、运行环境与日志（日志已脱敏）。</div>
+      <textarea id="feedbackText" rows="5" placeholder="描述你遇到的问题、复现步骤、期望行为…"></textarea>
       <input id="feedbackContact" type="text" maxlength="200" placeholder="联系方式（可选）：邮箱 / 飞书号 / QQ 等，方便作者回访你" />
       <label class="env-log-opt"><input type="checkbox" id="feedbackLogs" checked>附带诊断信息与日志</label>
       <div class="modal-status" id="feedbackStatus"></div>
       <div class="actions">
         <button class="btn primary" id="btnFeedbackSend">提交反馈</button>
         <button class="btn" id="btnFeedbackCopy">复制全部</button>
-        <button class="btn" id="btnFeedbackCancel">取消</button>
+      </div>
+      <div class="feedback-links">
+        <span class="recovery-hint">项目入口</span>
+        <button class="btn sm" id="btnGithub">GitHub 地址</button>
+        <button class="btn sm" id="btnChangelog">更新日志</button>
+        <button class="btn sm" id="btnFeedback">反馈问题</button>
+      </div>
+    </section>
+  </div>
+  <!-- 轻量确认框（跳过向导 / 回退配置 / 卸载插件 / 恢复默认设置）：Esc=取消，默认焦点在取消 -->
+  <div id="confirmOverlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-title" id="confirmTitle">确认</div>
+      <div class="modal-body" id="confirmBody"></div>
+      <div class="actions">
+        <button class="btn" id="btnConfirmCancel">取消</button>
+        <button class="btn primary" id="btnConfirmOk">确定</button>
       </div>
     </div>
   </div>

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.dev-user-data/
 *.log
 dshl-selftest-*
 .DS_Store
@@ -16,3 +17,8 @@ assets/feishu-webhook.txt
 assets/node-dist/
 # 本地分析克隆（dsh-desktop 等临时参照，不进仓库）
 .analysis/
+# 本地 agent / 自动化产物（技能笔记、远端附件、浏览器录制），不进仓库
+.claude/
+.codex/
+.codex-remote-attachments/
+.playwright-cli/

@@ -39,6 +39,7 @@ const EVENTS = new Set([
   'update.launcher',
   'update.dsh',
   'recovery.restore',
+  'health.restore.manual',
   'health.capture',
   'diagnostics.saved',
 ])

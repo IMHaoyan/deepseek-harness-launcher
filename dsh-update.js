@@ -18,6 +18,7 @@ let Config = null
 let saveConfig = null
 let log = () => {}
 let notify = () => {}
+let claimAvailableNotice = null // (version) => boolean：跨重启的"新版本可用"去重（缺省回退内存去重）
 let refreshEnv = null
 let envInstall = null
 let envDetect = null
@@ -26,6 +27,7 @@ let pageCredentialOf = null // () => ({ hasToken })，可选：当前服务是�
 let stopService = null
 let startService = null
 let loadWebTabs = null // (reason) => 把 WebUI 窗口所有标签切到状态说明页（避免更新期间白屏）
+let markProgress = null // (key) => 推进说明页步骤（'install' 等；主进程未接就当没有）
 let reloadWebTabs = null // () => 强制重载 WebUI 所有标签（新版页面替换旧会话）
 let onState = null // 状态变化回调（main 里接 broadcastState）
 let lifecycleEmit = null // (event, detail) => void（可选：生命周期事件）
@@ -47,7 +49,7 @@ let warming = null // 当前预热任务（防重入）
 let lastNotifiedVersion = '' // 同一新版本只提示一次
 let rollbackUsed = false // 每次更新周期最多一次回滚
 let lastFetchError = '' // 最近一次取版本失败的原因（用于给用户可读的检查失败提示）
-// 用户本次会话显式选过的渠道（面板上的渠道 chip）。显式选择本身就可能是一次版本号下降
+// 用户本次会话显式选过的渠道（控制台上的渠道 chip）。显式选择本身就可能是一次版本号下降
 // （latest→alpha：预发布版按 semver 优先级小于同版本正式版），那是意图内的，不该被降级闸拦掉。
 // 只在用户切换渠道时写入，不随"一次安装尝试"消费 —— 否则安装失败后重试会被自己的闸拦死。
 let userSwitchedChannel = ''
@@ -119,7 +121,7 @@ async function recoverInterruptedUpdate() {
   if (!ok) {
     // 标记为已处理，避免每次启动都重试一遍失败的安装
     try { writeUpdateState({ kind, from, to, phase: 'repair-failed' }) } catch { /* noop */ }
-    notify('DeepSeek Harness', `自动修复失败：请手动执行 npm i -g @deepseek-ai/dsh@${to}，或在面板「运行环境」页重装`)
+    notify('DeepSeek Harness', `自动修复失败：请手动执行 npm i -g @deepseek-ai/dsh@${to}，或在控制台「运行环境」页重装`)
     log('dsh-update: 中断修复失败，已标记 repair-failed')
     emitLifecycle('update.dsh', { step: 'interrupted-repair-failed', from, to, kind })
     return { recovered: false, reason: 'failed' }
@@ -153,7 +155,7 @@ function decideRollback(input) {
  * 更新目标准入判定（纯函数，便于测试；错误文本不参与决策）。
  *
  * 为什么需要：`state.latest` 只是"上一次成功检查"的缓存，而 updateNow 允许从 status='error' 进入
- * ——面板上那个「重试」按钮走的就是这条路。缓存一旦与实际安装的版本脱节（例如用户在终端里自己
+ * ——控制台上那个「重试」按钮走的就是这条路。缓存一旦与实际安装的版本脱节（例如用户在终端里自己
  * 升过 dsh、或切过渠道），点「重试」就会照着缓存装，把用户从更高版本"更新"回更低版本；而更新后
  * 校验拦不住它（decideRollback 只比"跑起来的 == 目标"）。
  *
@@ -219,17 +221,17 @@ function decideUpdateOutcome(input) {
   const runningVersion = String(src.runningVersion || '')
   const verb = src.nonUpgrade === true ? '已切换到' : '已更新到'
   if (src.startOk !== true) {
-    return { ok: false, reason: 'start-failed', message: `${verb} v${latest}，但服务未能启动，请打开启动器面板查看日志` }
+    return { ok: false, reason: 'start-failed', message: `${verb} v${latest}，但服务未能启动，请打开DSHL 控制台查看日志` }
   }
   // 版本不符只在"确实探测到了版本"时才判：探测失败（空）说明不了问题，不能据此报失败
   if (latest && runningVersion && runningVersion !== latest) {
-    return { ok: false, reason: 'version-mismatch', message: `${verb} v${latest}，但更新后实际运行的是 v${runningVersion}（请查看面板日志）` }
+    return { ok: false, reason: 'version-mismatch', message: `${verb} v${latest}，但更新后实际运行的是 v${runningVersion}（请查看控制台日志）` }
   }
   const base = src.nonUpgrade === true ? `已切换到 v${latest}（原 v${src.from || '?'}）` : `已更新到 v${latest}`
   // 拿不到本轮 launch token（接管的外部实例）时，用户自己开的浏览器页面在服务重启后是死链，
-  // 必须给出可执行的指引——点通知本身就会打开 DSH 窗口/启动器面板（见 main.js 的 notify）。
+  // 必须给出可执行的指引——点通知本身就会打开 DSH 窗口/DSHL 控制台（见 main.js 的 notify）。
   const credNote = src.hasToken === false
-    ? '；页面访问凭据已变化，若页面打不开请点本通知或从启动器面板重新打开'
+    ? '；页面访问凭据已变化，若页面打不开请点本通知或从DSHL 控制台重新打开'
     : ''
   return { ok: true, message: base + credNote }
 }
@@ -239,6 +241,7 @@ function initDshUpdater(o) {
   saveConfig = o.saveConfig
   log = o.log || log
   notify = o.notify || notify
+  claimAvailableNotice = typeof o.claimAvailableNotice === 'function' ? o.claimAvailableNotice : null
   refreshEnv = o.refreshEnv
   envInstall = o.envInstall
   envDetect = o.envDetect
@@ -247,6 +250,7 @@ function initDshUpdater(o) {
   stopService = o.stopService
   startService = o.startService
   loadWebTabs = o.loadWebTabs || null
+  markProgress = o.markProgress || null
   reloadWebTabs = o.reloadWebTabs || null
   onState = o.onState || null
   lifecycleEmit = o.lifecycleEmit || null
@@ -257,7 +261,7 @@ function getState() {
   return Object.assign({}, state, { channel: channelOf() })
 }
 
-// 面板切换更新渠道时调用（必须在 Config.dshChannel 已更新之后）：作废缓存里的版本号。
+// 控制台切换更新渠道时调用（必须在 Config.dshChannel 已更新之后）：作废缓存里的版本号。
 // 缓存与渠道同源，切了渠道它就不再可信；若不作废，"重试"会照着旧渠道的缓存装
 // （由 decideUpdateTarget 的 channel-mismatch / no-target 兜底拦下，但这里直接从源头清掉）。
 // 同时记下"用户显式选过这个渠道"，供降级闸区分"意图内的下降"与"缓存过期"。
@@ -495,11 +499,15 @@ async function checkOnce(reason, force) {
       setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false } : {}))
       // 后台预热缓存（不阻塞检测）：点"立即更新"时依赖树已在 npm/npx 缓存里，秒级完成
       if (!state.prewarmed) void warmLatest(latest.version, plan.nodeCmd, plan.kind)
-      if (lastNotifiedVersion !== latest.version) {
-        lastNotifiedVersion = latest.version
-        notify('DeepSeek Harness', plan.kind === 'source'
-          ? `新版本 v${latest.version} 可用：当前为源码安装，请打开启动器面板点"手动更新"（git pull && pnpm run build）`
-          : `新版本 v${latest.version} 可用：打开启动器面板点"立即更新"即可升级（npm 安装约 2-5 分钟）`)
+      // 手动检查不弹通知（控制台行内已有提示）；自动检查按版本跨重启去重：同一版本只提醒一次
+      if (reason !== 'manual') {
+        const claimed = claimAvailableNotice ? claimAvailableNotice(latest.version) : lastNotifiedVersion !== latest.version
+        if (claimed) {
+          lastNotifiedVersion = latest.version
+          notify('DeepSeek Harness', plan.kind === 'source'
+            ? `新版本 v${latest.version} 可用：当前为源码安装，请打开DSHL 控制台点"手动更新"（git pull && pnpm run build）`
+            : `新版本 v${latest.version} 可用：打开DSHL 控制台点"立即更新"即可升级（npm 安装约 2-5 分钟）`)
+        }
       }
     } else {
       log(`dsh-update: v${current} 已是最新（latest v${latest.version}）`)
@@ -566,6 +574,7 @@ async function updateNow() {
         try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
       }
       try {
+        if (markProgress) markProgress('install')
         envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
         const status = await waitForJob()
         if (status !== 'done') throw new Error(`更新任务未完成（${status}）`)
@@ -594,6 +603,7 @@ async function updateNow() {
       }
       const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
       globalRootForRollback = globalRoot
+      if (markProgress) markProgress('install')
       const r = await runGlobalUpdate(plan.nodeCmd, globalRoot, latest)
       if (!r.ok) {
         if (wasRunning) {
@@ -611,6 +621,7 @@ async function updateNow() {
       }
       let migrated = false
       try {
+        if (markProgress) markProgress('install')
         envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
         const status = await waitForJob()
         if (status !== 'done') throw new Error(`迁移任务未完成（${status}）`)
@@ -677,7 +688,7 @@ async function updateNow() {
           Config.dshVersion = fromVersion
           Config.dshUpdateCheckedAt = Date.now()
           try { saveConfig() } catch { /* noop */ }
-          notify('DeepSeek Harness', `新版本 v${latest} 启动失败，已自动回滚到 v${fromVersion}（原配置不受影响；如仍异常请查看面板日志）`)
+          notify('DeepSeek Harness', `新版本 v${latest} 启动失败，已自动回滚到 v${fromVersion}（原配置不受影响；如仍异常请查看控制台日志）`)
           log(`dsh-update: rolled back to v${fromVersion}`)
           emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest })
           setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}` })
@@ -687,7 +698,7 @@ async function updateNow() {
         log('dsh-update: rollback failed: ' + (rb.error || ''))
         emitLifecycle('update.dsh', { step: 'rollback-failed', from: fromVersion, to: latest })
         notify('DeepSeek Harness', `DSH v${latest} 启动失败，回滚到 v${fromVersion} 也未成功；请手动执行：npm i -g --prefix "${globalRootForRollback}" @deepseek-ai/dsh@${fromVersion}，然后重新启动服务`)
-        setState({ status: 'error', error: `v${latest} 启动失败，回滚也未成功（请查看面板日志）` })
+        setState({ status: 'error', error: `v${latest} 启动失败，回滚也未成功（请查看控制台日志）` })
         try { clearUpdateState() } catch { /* noop */ }
         return
       }

@@ -2,6 +2,7 @@
 // 用法：node tools/install-smoke.cjs plugin   （快：仅插件拷贝，验证状态机/日志/回调）
 //       node tools/install-smoke.cjs node     （中：真实下载 Node 官方发行包，校验 sha256 + 解压落位到用户级目录）
 //       node tools/install-smoke.cjs dsh      （慢：真实 npm install -g @deepseek-ai/dsh 到临时全局根）
+//       node tools/install-smoke.cjs pnpm     （中：真实安装/对齐 pnpm@11.8.0 到临时环境）
 // 退出码：0 = 通过；1 = 失败
 'use strict'
 
@@ -15,6 +16,7 @@ const tmpHome = path.join(os.tmpdir(), `dshl-smoke-${mode}-${Date.now()}`)
 process.env.DSHL_USER_NODE_DIR = path.join(tmpHome, 'user-node')
 process.env.DSHL_NPM_GLOBAL_ROOT = path.join(tmpHome, 'npm-global')
 process.env.DSHL_SKIP_PATH = '1'
+process.env.COREPACK_HOME = path.join(tmpHome, 'corepack-home')
 
 const envInstall = require('../env-install')
 const envDetect = require('../env-detect')
@@ -22,7 +24,7 @@ const envDetect = require('../env-detect')
 envDetect.initEnv({ realHome: path.join(os.homedir(), '.dsh'), Config: { harnessRoot: '', nodePath: '' }, log: () => {} })
 envInstall.initInstaller({
   HOME: tmpHome,
-  Config: { nodeMajor: 22, dshVersion: '0.1.0-rc.6', npmRegistry: '' },
+  Config: { nodeMajor: 22, dshVersion: '0.1.0-rc.6', pnpmVersion: '11.8.0', npmRegistry: '' },
   ASSETS_DIR: path.join(__dirname, '..', 'assets'),
   log: (l) => console.error('[install] ' + l),
   onPush: (p) => {
@@ -56,6 +58,20 @@ function finish(code) {
       console.log('node bin exists:', ok)
       if (!ok) code = 1
     }
+    if (mode === 'pnpm') {
+      const { execFileSync } = require('child_process')
+      try {
+        const out = process.platform === 'win32'
+          ? execFileSync('cmd.exe', ['/d', '/s', '/c', 'pnpm --version'], { encoding: 'utf8', env: process.env })
+          : execFileSync('pnpm', ['--version'], { encoding: 'utf8', env: process.env })
+        const version = String(out).trim()
+        console.log('effective pnpm version:', version)
+        if (version !== '11.8.0') code = 1
+      } catch (e) {
+        console.log('effective pnpm version check failed:', e.message)
+        code = 1
+      }
+    }
     console.log('tmpHome:', tmpHome)
     process.exit(code)
   }, 300)
@@ -67,8 +83,9 @@ timer.unref()
 try {
   if (mode === 'plugin') envInstall.startInstall(['plugin'])
   else if (mode === 'node') envInstall.startInstall(['node'])
+  else if (mode === 'pnpm') envInstall.startInstall(['node', 'pnpm'])
   else if (mode === 'dsh') envInstall.startInstall(['dsh'])
-  else { console.error('usage: install-smoke.cjs plugin|node|dsh'); process.exit(2) }
+  else { console.error('usage: install-smoke.cjs plugin|node|pnpm|dsh'); process.exit(2) }
 } catch (err) {
   console.error('startInstall threw:', err)
   finish(1)

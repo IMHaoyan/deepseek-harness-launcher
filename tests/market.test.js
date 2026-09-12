@@ -1,4 +1,5 @@
-// tests/market.test.js — 插件市场（dshmarket）纯函数测试：profile 状态判定 + npm manifest 校验
+// tests/market.test.js — npm 分发插件安装器纯函数测试：
+//   profile 状态判定（任意包名）+ npm manifest 校验 + 按包名记账的瞬时状态
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -63,4 +64,35 @@ test('getState()：字段形状稳定（面板依赖这些字段）', () => {
     assert.ok(k in s, '缺少字段 ' + k)
   }
   assert.equal(s.plugin, NAME)
+})
+
+test('pluginStateOf：能判定任意包名（推荐插件复用同一套 profile 判定）', () => {
+  const other = 'dsh-better-sidebar'
+  const s = market.pluginStateOf(manifestWith({ [other]: '^0.19.1' }, [other]), other)
+  assert.deepEqual(s, { installed: true, version: '^0.19.1', bundle: true })
+  assert.equal(market.pluginStateOf(manifestWith({}, []), other).installed, false)
+})
+
+test('安装器暴露按包名操作的入口（控制台插件页依赖）', () => {
+  for (const fn of ['installByName', 'uninstallByName', 'getState', 'verifyNpmPackage']) {
+    assert.equal(typeof market[fn], 'function', '缺少入口 ' + fn)
+  }
+})
+
+test('installByName：空包名直接拒绝；按包名各自记账', async () => {
+  const r = await market.installByName('')
+  assert.equal(r.ok, false)
+  assert.match(r.error, /不能为空/)
+  const other = market.getState('dsh-chat-import')
+  assert.equal(other.plugin, 'dsh-chat-import')
+  assert.equal(other.installed, false)
+  assert.equal(other.busy, '')
+})
+
+test('安装走 pnpm 时显式关掉新版本观察期（否则刚发布的版本会被策略拒绝）', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'market.js'), 'utf8')
+  assert.match(src, /runCli\(\['add', '--config\.minimumReleaseAge=0'/, 'installByName 必须带 --config.minimumReleaseAge=0（对齐 dshmarket）')
+  assert.match(src, /minimumReleaseAge[\s\S]{0,400}await runCli/, '关闭策略处应有原因注释')
 })

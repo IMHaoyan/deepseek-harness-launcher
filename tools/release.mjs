@@ -123,10 +123,15 @@ for (const f of [exePath, blockmapPath, latestYml]) {
 // ---------- 4. 创建 Release 并上传（说明经 --notes-file 传文件，避免换行/引号被 shell 拆散） ----------
 const notesFile = join(root, 'dist', '.release-notes.md')
 writeFileSync(notesFile, notes, 'utf8')
+// 预发布号（含 '-'，如 1.2.1-rc.1）必须发成 GitHub prerelease 且不占用 Latest：
+// 否则正式用户（updater.js 里 allowPrerelease=false）会把尚未验证的版本当成正式更新拉走。
+const prereleaseArgs = version.includes('-') ? ['--prerelease', '--latest=false'] : []
 try {
-  run('gh', ['release', 'create', tag, exePath, blockmapPath, latestYml, '--title', tag, '--notes-file', notesFile])
+  run('gh', ['release', 'create', tag, exePath, blockmapPath, latestYml, '--title', tag, '--notes-file', notesFile, ...prereleaseArgs])
 } finally {
   try { unlinkSync(notesFile) } catch { /* noop */ }
 }
 console.log(`发布完成：https://github.com/IMHaoyan/deepseek-harness-launcher/releases/tag/${tag}`)
-console.log('已安装旧版本的用户将收到自动更新（依据 latest.yml）。')
+console.log(version.includes('-')
+  ? '这是预发布版本（GitHub prerelease，不占 Latest）：正式版用户不会收到它，只有手动安装的机器会用它。'
+  : '已安装旧版本的用户将收到自动更新（依据 latest.yml）。')
