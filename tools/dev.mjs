@@ -10,7 +10,7 @@
 //   3. electron 崩溃   → 2 秒后自动重启
 //
 // 注意单实例锁：启动前请先托盘右键「退出」正在运行的启动器，否则本脚本拉起的实例会立刻退出。
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync, statSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -44,7 +44,10 @@ function loadWhalePath() {
 }
 const whalePath = loadWhalePath()
 
-const COPIED = ['styles.css', 'console.css', 'app.js', 'offline.html', 'browser.html', 'browser.css', 'browser.js', 'loading.html', 'loading.js']
+// 页面文件自动发现：新增 ui-src/*.html/.css/.js 时不必改这里（index.html 由 buildAssets 单独生成）
+const COPIED = readdirSync(uiSrc)
+  .filter((n) => n !== 'index.html' && /\.(html|css|js)$/u.test(n) && statSync(join(uiSrc, n)).isFile())
+  .sort()
 
 // ---------- 产物组装（index.html 内联鲸鱼 + 拷贝其余文件；与 build:assets 一致，不含图标） ----------
 function buildAssets() {
@@ -70,7 +73,7 @@ function changedName(prev, cur) {
 }
 
 const UI_FILES = ['index.html', ...COPIED]
-const MAIN_FILES = ['main.js', 'console-surface.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'diagnostics.js', 'market.js', 'bridge.js', 'notify-policy.js', 'crash-note.js', 'start-progress.js', 'service-stop-guard.js', 'service-handover.js', 'package.json']
+const MAIN_FILES = ['main.js', 'console-surface.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'diagnostics.js', 'market.js', 'bridge.js', 'update-window.js', 'changelog.js', 'notify-policy.js', 'crash-note.js', 'start-progress.js', 'service-stop-guard.js', 'service-handover.js', 'package.json']
 
 // ---------- electron 子进程管理 ----------
 const electronExe = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')

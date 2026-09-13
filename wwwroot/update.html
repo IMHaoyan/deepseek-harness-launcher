@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- CSP：全本地（更新内容由主进程 changelog.js 取，页面不发任何网络请求，所以不需要 connect-src） -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <title>DSHL 更新</title>
+  <!-- 令牌来自 styles.css（与主窗口同一套主题变量），update.css 只写本窗口布局 -->
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="update.css">
+</head>
+<body>
+  <header class="upd-head">
+    <div class="upd-brand">
+      <div class="upd-brand-mark" aria-hidden="true">🐳</div>
+      <div class="upd-brand-copy">
+        <div class="upd-brand-title">DSHL 更新</div>
+        <div class="upd-brand-sub">DeepSeek Harness Launcher</div>
+      </div>
+    </div>
+    <button class="upd-icon-btn" id="btnUpdRefresh" title="重新检查更新" aria-label="重新检查更新">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="23 4 23 10 17 10"/>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+      </svg>
+    </button>
+  </header>
+
+  <main class="upd-body">
+    <!-- 版本与更新动作：口径与「通用」页那两行一致（启动器版本 / DSH 版本） -->
+    <section class="upd-card">
+      <div class="upd-row">
+        <span class="upd-label">启动器版本</span>
+        <span class="upd-value" id="updLauncherVersion">-</span>
+        <span class="upd-actions" id="updLauncherActions"></span>
+      </div>
+      <div class="upd-row">
+        <span class="upd-label">DSH 版本</span>
+        <span class="upd-value" id="updDshVersion">-</span>
+        <span class="upd-actions" id="updDshActions"></span>
+      </div>
+      <div class="upd-hint hidden" id="updOrderHint"></div>
+    </section>
+
+    <section class="upd-card upd-changelog-card">
+      <div class="upd-changelog-head">
+        <span class="upd-changelog-title">更新内容</span>
+        <span class="upd-changelog-sub" id="updChangelogStatus">加载中…</span>
+      </div>
+      <div class="upd-changelog" id="updChangelog">
+        <div class="upd-empty">正在从 GitHub Releases 读取各版本更新内容…</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="update.js"></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-launcher",
   "productName": "DeepSeek Harness Launcher",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "DeepSeek Harness Launcher（DSHL）—— Windows 托盘启动器/看护工具",
   "main": "main.js",
   "private": true,
@@ -50,6 +50,8 @@
       "plugin-switch.js",
       "bridge.js",
       "console-surface.js",
+      "update-window.js",
+      "changelog.js",
       "service-stop-guard.js",
       "service-handover.js",
       "trust.js",

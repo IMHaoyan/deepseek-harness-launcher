@@ -1408,43 +1408,21 @@ function pluginCardEl(p) {
   name.textContent = nameText;
   head.appendChild(name);
 
-  // 包名（等宽字体，长名自动换行不撑破卡片）；默认代装的插件在后面缀上来源说明
+  // 包名（等宽字体，长名自动换行不撑破卡片）
   const subtitle = document.createElement('div'); subtitle.className = 'plugin-subtitle';
-  const autoLabel = String(p.autoInstallLabel || '');
   subtitle.textContent = p.subtitle || p.id;
+
+  // 来源/代装说明放在标题行右端（原「添加备注」入口位置）：字号比标题大一号，
+  // 「预装 (推荐开启)」用绿色强调，其余（已关闭自动安装 / 已关闭 / payload 不可用）保持中性灰字。
+  const autoLabel = String(p.autoInstallLabel || '');
   if (autoLabel && autoLabel !== '手动安装') {
-    // 「预装 (推荐开启)」渲染成绿色标签，其余来源说明保持灰色文本
-    const sep = document.createElement('span'); sep.textContent = ' · ';
-    subtitle.appendChild(sep);
     const tag = document.createElement('span');
-    if (p.autoInstall && autoLabel === '预装 (推荐开启)') tag.className = 'plugin-badge-preinstall';
+    tag.className = 'plugin-badge-preinstall' + (p.autoInstall && autoLabel === '预装 (推荐开启)' ? '' : ' muted');
     tag.textContent = autoLabel;
-    subtitle.appendChild(tag);
+    head.appendChild(tag);
   }
 
   const desc = document.createElement('div'); desc.className = 'plugin-description'; desc.textContent = p.description || '';
-
-  // 备注：只读展示 + 点击后在原位编辑（保存到 DSHL 配置，不影响 DSH）
-  const note = document.createElement('div'); note.className = 'plugin-note';
-  const noteText = document.createElement('textarea');
-  noteText.className = 'text-input plugin-note-input';
-  noteText.rows = 2;
-  noteText.maxLength = 500;
-  noteText.placeholder = '给这个插件写点备注，例如为什么装、给谁用…';
-  noteText.value = p.note || '';
-  note.appendChild(noteText);
-  const noteSave = document.createElement('button');
-  noteSave.className = 'btn plugin-note-save';
-  noteSave.dataset.pluginNoteSave = '1';
-  noteSave.textContent = '保存备注';
-  note.appendChild(noteSave);
-
-  // 备注入口放标题行右端：省掉一整行，卡片更紧凑（编辑器仍在下方按需展开）
-  const noteToggle = document.createElement('button');
-  noteToggle.className = 'btn plugin-note-toggle';
-  noteToggle.dataset.pluginNoteToggle = '1';
-  noteToggle.textContent = p.note ? '编辑备注' : '添加备注';
-  head.appendChild(noteToggle);
 
   // 底部：启用开关 + 版本说明 + 操作按钮
   const footer = document.createElement('div'); footer.className = 'plugin-card-footer';
@@ -1505,7 +1483,7 @@ function pluginCardEl(p) {
   feedback.classList.toggle('hidden', !feedbackText);
 
   card.appendChild(head); card.appendChild(subtitle); card.appendChild(desc);
-  card.appendChild(note); card.appendChild(footer); card.appendChild(feedback);
+  card.appendChild(footer); card.appendChild(feedback);
   return card;
 }
 function renderPlugins(plugins, force) {
@@ -1598,34 +1576,8 @@ function setPluginFilter(filter) {
   renderPlugins(window._plugins || [], true);
 }
 
-// 卡片内所有交互走这里：操作按钮 / 备注开关 / 开关式插件的启停
+// 卡片内所有交互走这里：操作按钮 + 开关式插件的启停
 $('pluginCards').addEventListener('click', async (e) => {
-  const noteSave = e.target.closest('button[data-plugin-note-save]');
-  if (noteSave) {
-    const card = noteSave.closest('.plugin-card');
-    const id = card && card.dataset.pluginId;
-    const input = card && card.querySelector('.plugin-note-input');
-    noteSave.disabled = true;
-    noteSave.textContent = '保存中…';
-    const r = await cmd('pluginSetNote', { id, text: input ? input.value : '' });
-    const fresh = await cmd('pluginsGetState');
-    if (fresh) renderPlugins(fresh, true);
-    if (!r || !r.ok) {
-      noteSave.textContent = '保存失败';
-      noteSave.disabled = false;
-    }
-    return;
-  }
-
-  const noteToggle = e.target.closest('button[data-plugin-note-toggle]');
-  if (noteToggle) {
-    const card = noteToggle.closest('.plugin-card');
-    if (card) card.classList.toggle('note-open');
-    const input = card && card.querySelector('.plugin-note-input');
-    if (input && card.classList.contains('note-open')) input.focus();
-    return;
-  }
-
   const btn = e.target.closest('button[data-plugin-action]');
   if (!btn) return;
   const id = btn.dataset.pluginId;

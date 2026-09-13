@@ -246,6 +246,22 @@ body:not(.ready) #tabbar { visibility: hidden; }
 .win-btn.console-btn:hover { color: var(--text-primary); }
 .win-btn.console-btn.active { color: var(--brand); background: var(--ghost-active); }
 .console-btn-label { line-height: 1; white-space: nowrap; }
+/* 「有更新」徽标：位于控制台按钮左边，绿色实底 + 白字（对齐 .plugin-badge-preinstall 的绿）。
+   只在 DSHL 或 DSH 有新版本时显示；无更新时由 .hidden 整颗隐藏，不占位。 */
+.win-btn.update-badge {
+  width: auto;
+  flex: none;
+  margin-right: 6px;
+  padding: 0 12px;
+  border-radius: 999px;
+  color: #FFFFFF;
+  background: #16A34A;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.win-btn.update-badge:hover { background: #15803D; color: #FFFFFF; }
+.update-badge-label { line-height: 1; white-space: nowrap; }
 
 /* 窄窗口下优先保住窗口按钮组的可用宽度：标题栏空间不够时收起「控制台」二字 */
 @media (max-width: 760px) {

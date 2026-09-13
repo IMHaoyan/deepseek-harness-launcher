@@ -35,13 +35,19 @@ test('预装插件页：定位说明 + 绿色「预装 (推荐开启)」标签',
   assert.doesNotMatch(app, /btnOpenDshMarket/, '渲染层不应再有跳转按钮接线')
   assert.match(main, /'预装 \(推荐开启\)'/, '默认代装标签应为「预装 (推荐开启)」')
   assert.match(main, /bridgePayloadReady \? '预装 \(推荐开启\)' : 'payload 不可用'/, '手机连接（远程连接）也要标预装')
-  assert.match(app, /plugin-badge-preinstall/, '预装标签应渲染成绿色样式')
-  assert.match(css, /\.plugin-badge-preinstall \{ color: #15803D/, '预装标签应有绿色样式')
-  // 卡片紧凑版契约：自适应列宽 + 说明最多两行 + 小一档的按钮 + 备注入口在标题行
+  assert.match(app, /plugin-badge-preinstall/, '来源/代装标签应渲染绿色胶囊')
+  assert.match(css, /\.plugin-badge-preinstall \{\n  flex: none;/, '标签应是标题行右端的胶囊（不再跟在包名后面）')
+  assert.match(css, /\.plugin-badge-preinstall \{[^}]*font-size: 15px;/, '标签字号应比标题（14.5px）大一号')
+  assert.match(css, /\.plugin-badge-preinstall\.muted/, '非「预装 (推荐开启)」的状态说明应有中性灰样式')
+  // 卡片紧凑版契约：自适应列宽 + 说明最多两行 + 小一档的按钮 + 标签挂在标题行
   assert.match(css, /repeat\(auto-fill, minmax\(320px, 1fr\)\)/, '卡片网格应按最小 320px 自适应列宽')
   assert.match(css, /-webkit-line-clamp: 2/, '插件说明最多两行（长描述不撑高卡片）')
   assert.match(css, /\.plugin-action-btn \{ height: 30px;/, '操作按钮比全局 .btn 小一档')
-  assert.match(app, /head\.appendChild\(noteToggle\)/, '备注入口应在标题行，不再独占一行')
+  assert.match(app, /head\.appendChild\(tag\)/, '来源标签应挂在标题行右端')
+  // 备注编辑已按用户要求整体移除，避免留下点不到的入口
+  assert.doesNotMatch(app, /plugin-note-toggle/, '渲染层不应再有备注入口')
+  assert.doesNotMatch(app, /pluginSetNote/, '渲染层不应再调用备注保存命令')
+  assert.doesNotMatch(css, /plugin-note/, '样式表不应残留备注样式')
 })
 
 test('插件卡片由 state.plugins 数据驱动', () => {
@@ -53,12 +59,9 @@ test('插件卡片由 state.plugins 数据驱动', () => {
   assert.match(app, /cmd\('pluginAction', \{ id, action \}\)/, '卡片动作应走通用 pluginAction')
 })
 
-test('插件卡片：备注 + 状态/开关 + 一键安装契约', () => {
-  assert.match(main, /pluginNotes: \{\}/, '配置应有插件备注容器')
-  assert.match(main, /function setManagedPluginNote\(id, text\)/, '主进程应有备注保存逻辑')
+test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.match(main, /async function installAllManagedPlugins\(\)/, '主进程应有一键安装逻辑')
   assert.match(main, /case 'pluginsInstallAll'/, '应有一键安装命令')
-  assert.match(main, /case 'pluginSetNote'/, '应有备注保存命令')
   assert.match(main, /pluginInstallAll: \{/, 'state 应下发一键安装进度')
   assert.match(main, /toggleAction: 'toggle'/, '手机连接开关应有真实启停语义')
   assert.match(main, /require\('\.\/plugin-switch'\)/, '主进程应加载 user patch layer 启停模块')
@@ -78,7 +81,6 @@ test('插件卡片：备注 + 状态/开关 + 一键安装契约', () => {
   assert.match(app, /'立即重启生效'/, '按钮文案统一为立即重启生效')
   assert.match(main, /toggleAction: toggle \? 'toggle' : ''/, '可识别的 npm 插件安装后应显示真实开关')
   assert.match(app, /function renderInstallAll\(info\)/, '控制台应渲染一键安装进度')
-  assert.match(app, /data-plugin-note-toggle/, '卡片应支持备注编辑入口')
 })
 
 test('按钮形态统一：未安装 1 个、已安装 2 个（走主进程同一份推导）', () => {

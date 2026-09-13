@@ -27,6 +27,8 @@ const stopGuard = require('./service-stop-guard')
 const handover = require('./service-handover')
 const trust = require('./trust')
 const { createConsoleSurface } = require('./console-surface')
+const { createUpdateWindow } = require('./update-window')
+const changelog = require('./changelog')
 const notifyPolicy = require('./notify-policy')
 const crashNote = require('./crash-note')
 const startProgress = require('./start-progress')
@@ -99,6 +101,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
+let updateWindowHandle = null
 const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
@@ -2862,6 +2865,7 @@ function showConsole(page) {
   if (webWin.isMinimized()) webWin.restore()
   try { webWin.show(); webWin.focus(); webWin.moveTop() } catch { /* noop */ }
   if (consoleSurfaceHandle) consoleSurfaceHandle.show(page || '')
+  pushUpdateState()
   webLayout()
   broadcastState()
 }
@@ -2884,6 +2888,69 @@ function showConsolePage(page) {
 function toggleConsole(page) {
   if (consoleIsOpen()) hideConsole()
   else showConsole(page)
+}
+
+// ---------- 更新窗口（导航栏「有更新」按钮 → 独立窗口；双击逻辑与托盘一致） ----------
+function updateStateSnapshot() {
+  let launcher = {}
+  let dsh = {}
+  try { launcher = JSON.parse(updater.getState() || '{}') } catch { /* noop */ }
+  try { dsh = dshUpdater.getState() || {} } catch { /* noop */ }
+  return {
+    launcher: {
+      current: launcher.current || app.getVersion(),
+      latest: launcher.latest || '',
+      status: launcher.status || 'idle',
+      percent: launcher.percent || 0,
+      error: launcher.error || '',
+    },
+    dsh: {
+      current: (envReport && envReport.dsh && envReport.dsh.version) || '',
+      latest: dsh.latest || '',
+      status: dsh.status || 'idle',
+      channel: dsh.channel || '',
+      error: dsh.error || '',
+    },
+  }
+}
+
+function updateWindowIsOpen() {
+  return !!(updateWindowHandle && updateWindowHandle.isOpen())
+}
+
+/** 打开（或聚焦）更新窗口；页面内容与按钮状态全部由 update-window.js 自行渲染。 */
+function showUpdateWindow() {
+  stopFlash()
+  if (!updateWindowHandle) {
+    updateWindowHandle = createUpdateWindow({
+      htmlPath: path.join(WWWROOT, 'update.html'),
+      preloadPath: path.join(__dirname, 'preload.js'),
+      icon: path.join(ASSETS_DIR, 'ds.ico'),
+      onError: (err) => log('update window: ' + ((err && err.message) || String(err))),
+      onClosed: () => {
+        updateWindowHandle = null
+        webPushState()
+      },
+    })
+  }
+  updateWindowHandle.show()
+  pushUpdateState()
+  // 窗口刚创建时页面还在加载，首帧可能拿到空状态；加载完成后补推一次，保证一打开就有版本号
+  const target = updateWindowHandle.window()
+  if (target) {
+    const wc = target.webContents
+    const onceReady = () => {
+      setTimeout(() => pushUpdateState(), 120)
+    }
+    try {
+      if (wc.isLoading()) wc.once('did-finish-load', onceReady)
+      else onceReady()
+    } catch { /* noop */ }
+  }
+}
+
+function pushUpdateState() {
+  if (updateWindowHandle) updateWindowHandle.send('dsh:update', JSON.stringify(updateStateSnapshot()))
 }
 
 // ---------- DeepSeek Harness 窗口（Edge 式原生分屏：WebContentsView 由主进程挂载定位，无 DOM 搬移、零闪烁） ----------
@@ -2990,7 +3057,33 @@ function webPushState() {
     launcherVersion: app.getVersion(),
     service: servicePhase(),
     dshVersionText: dshTitleTooltipVersion(), // 标题栏悬停提示（'' = 还没探测到，壳就只显示标题）
+    // 「有更新」徽标：两者任一有更新就显示；壳只读，不在这里判断逻辑
+    update: (() => {
+      const lu = launcherUpdateInfo()
+      return {
+        launcher: { latest: lu.latest, ready: lu.ready },
+        dsh: { latest: dshUpdateInfo().latest },
+        windowOpen: updateWindowIsOpen(),
+      }
+    })(),
   })
+}
+
+/** 启动器更新摘要（徽标 + 更新窗口共用同一份口径）。 */
+function launcherUpdateInfo() {
+  try {
+    const u = JSON.parse(updater.getState() || '{}')
+    const has = (u.status === 'downloading' || u.status === 'downloaded') && !!u.latest
+    return { latest: has ? u.latest : '', ready: u.status === 'downloaded' }
+  } catch { return { latest: '', ready: false } }
+}
+
+/** DSH 更新摘要。 */
+function dshUpdateInfo() {
+  try {
+    const d = dshUpdater.getState() || {}
+    return { latest: d.status === 'available' ? (d.latest || '') : '' }
+  } catch { return { latest: '' } }
 }
 
 // 布局：仅把展示中的 1-2 个视图挂到 contentView 并 setBounds（原生合成器，切换零闪烁）
@@ -3505,6 +3598,8 @@ function openWebUi(opts = {}) {
   webWin.on('closed', () => {
     if (consoleSurfaceHandle) { try { consoleSurfaceHandle.dispose() } catch { /* noop */ } }
     consoleSurfaceHandle = null
+    if (updateWindowHandle) { try { updateWindowHandle.dispose() } catch { /* noop */ } }
+    updateWindowHandle = null
     webWin = null
     webTabs = []
     webActiveId = null
@@ -3877,7 +3972,32 @@ function senderOf(event) {
 }
 
 function registerIpc() {
-  ipcMain.handle('dsh:cmd', async (event, name, value) => {
+    // 更新窗口专用通道：与 dsh:cmd 完全分开，避免把「内部工具窗口」塞进信任表
+  // （trust.decideCommand 对无法归类的发送方一律 deny，这是有测试守护的安全不变量）。
+  // 放行条件三重且 fail-closed：窗口得是我们自己创建的、发送方必须是那个 webContents、命令名必须在白名单里。
+  ipcMain.handle('update:cmd', async (event, name, value) => {
+    try {
+      const win = updateWindowHandle && updateWindowHandle.window()
+      const wc = win && !win.isDestroyed() ? win.webContents : null
+      if (!wc || wc.isDestroyed() || event.sender !== wc) {
+        log('update bridge: rejected command from untrusted sender (' + String(name) + ')')
+        return JSON.stringify({ ok: false, error: '不可信的调用方' })
+      }
+      if (name === 'changelogGet') {
+        try {
+          const r = await changelog.getReleases(!!(value && value.force))
+          log('[changelog] 取到 ' + r.releases.length + ' 个版本（cached=' + r.cached + (r.error ? ', error=' + r.error : '') + '）')
+          return JSON.stringify({ ok: true, releases: r.releases, cached: r.cached, at: r.at, error: r.error || '' })
+        } catch (err) {
+          return JSON.stringify({ ok: false, error: (err && err.message) || String(err) })
+        }
+      }
+      return JSON.stringify({ ok: false, error: '未知命令：' + String(name) })
+    } catch (err) {
+      return JSON.stringify({ ok: false, error: (err && err.message) || String(err) })
+    }
+  })
+ipcMain.handle('dsh:cmd', async (event, name, value) => {
     try {
       const verdict = trust.decideCommand(senderOf(event), LOADING_PAGE_URL, name)
       if (process.env.DSHL_DEBUG_STOP === '1' && name !== 'getState') log(`ipc: ${name} (trusted=${verdict === 'allow'})`)
@@ -3889,6 +4009,8 @@ function registerIpc() {
         case 'getState': return stateJson()
         case 'browserInit': return JSON.stringify({ url: WEB_URL })
         case 'browser:consoleToggle': toggleConsole(value && value.page); return JSON.stringify({ open: consoleIsOpen() })
+      case 'browser:updateOpen': showUpdateWindow(); return JSON.stringify({ open: updateWindowIsOpen() })
+
         case 'browser:tabNew': if (Config.tabsEnabled) webCreateTab(); return '{}'
         case 'browser:tabActivate': webActivateTab(value && value.id); return '{}'
         case 'browser:tabClose': webCloseTab(value && value.id); return '{}'
@@ -4365,6 +4487,46 @@ async function runSelfTest() {
     // 卡片清单一并写进自检结果：新增/丢失插件时一眼能看出是哪一个
     const pluginIds = await consoleWc.executeJavaScript("[...document.querySelectorAll(\"#pluginCards .plugin-card\")].map(function (el) { return el.dataset.pluginId }).join(\",\")").catch(function () { return '' })
     selftestPrint('PLUGINS PAGE OK: ' + pluginCardCount + ' cards | ' + pluginIds)
+    // 更新窗口（导航栏「有更新」徽标点开）：能开、DOM 完整、更新内容区能拉到 GitHub Releases。
+    showUpdateWindow()
+    const updateWc = await new Promise((resolve) => {
+      const t0 = Date.now()
+      const iv = setInterval(() => {
+        const w = updateWindowHandle && updateWindowHandle.window()
+        if (w && !w.webContents.isDestroyed() && !w.webContents.isLoading()) { clearInterval(iv); resolve(w.webContents) }
+        else if (Date.now() - t0 > 15000) { clearInterval(iv); resolve(null) }
+      }, 200)
+    })
+    if (!updateWc) { selftestPrint('FAILED: update window not created'); app.exit(2); return }
+    const updateOk = await updateWc.executeJavaScript(
+      "typeof window.dshBridge !== 'undefined' && typeof window.dshBridge.onUpdate === 'function' && document.getElementById('updLauncherVersion') !== null && document.getElementById('updLauncherActions') !== null && document.getElementById('updDshVersion') !== null && document.getElementById('updDshActions') !== null && document.getElementById('updChangelog') !== null && document.getElementById('btnUpdRefresh') !== null ? 'update-ok' : 'update-missing'",
+    )
+    if (updateOk !== 'update-ok') { selftestPrint('FAILED: update window DOM incomplete'); app.exit(2); return }
+    const launcherShown = await updateWc.executeJavaScript(`(async () => {
+      const t0 = Date.now()
+      while (Date.now() - t0 < 8000) {
+        const t = (document.getElementById('updLauncherVersion') || {}).textContent || ''
+        if (t && t !== '-') return t
+        await new Promise(function (r) { setTimeout(r, 150) })
+      }
+      return (document.getElementById('updLauncherVersion') || {}).textContent || ''
+    })()`).catch(() => '')
+    // 更新内容要等主进程拉完 GitHub Releases（首个窗口打开时通常是冷请求），轮询到「加载中」结束为止
+    const changelog = await updateWc.executeJavaScript(`(async () => {
+      const t0 = Date.now()
+      while (Date.now() - t0 < 20000) {
+        const status = (document.getElementById('updChangelogStatus') || {}).textContent || ''
+        const n = document.querySelectorAll('#updChangelog .upd-release').length
+        if (n > 0 || (status && status !== '加载中…')) return n
+        await new Promise(function (r) { setTimeout(r, 200) })
+      }
+      return document.querySelectorAll('#updChangelog .upd-release').length
+    })()`).catch(() => 0)
+    const changelogStatus = await updateWc.executeJavaScript("(document.getElementById('updChangelogStatus') || {}).textContent || ''").catch(() => '')
+    selftestPrint('UPDATE WINDOW OK: 启动器 ' + launcherShown + ' | 更新内容 ' + changelog + ' 个版本 | 内容状态：' + changelogStatus)
+    if (launcherShown.indexOf('v') !== 0) { selftestPrint('FAILED: update window 未显示启动器版本'); app.exit(2); return }
+    // 更新内容来自网络（GitHub API）：能取到就写进结果，取不到不判失败（离线自检不应红）
+    if (!changelog) selftestPrint('WARN: 更新内容未取到（离线或 GitHub 不可达），窗口本身正常')
     // 控制台开关不得重载 DSH 页面：给页面埋一个内存探针，切换视图后仍是同一份文档。
     await wc.executeJavaScript('window.__dshlConsoleProbe = 42').catch(() => { /* noop */ })
     hideConsole()
@@ -4981,6 +5143,8 @@ function init() {
     onFlash: startFlash,
     sendToPanel: (json) => {
       if (consoleSurfaceHandle) consoleSurfaceHandle.send('dsh:updater', json)
+      webPushState() // 壳「有更新」徽标跟随（status/latest 变化时自动显隐）
+      pushUpdateState() // 更新窗口若开着，进度与按钮状态同步刷新
       scheduleTrayRebuild() // 托盘"下载中 / 已就绪"行跟随更新状态
     },
     beforeInstall: async () => { if (server.managed()) await stopServerFast() },
@@ -5012,7 +5176,10 @@ function init() {
     loadWebTabs: (reason) => webLoadTabs(reason),
     reloadWebTabs: () => { void refreshWebUiOnReady(true) },
     markProgress: (key) => markLoadingProgress(key),
-    onState: () => broadcastState(),
+    onState: () => {
+      broadcastState()
+      pushUpdateState() // DSH 检测到新版本/更新完成时，更新窗口内容同步
+    },
     lifecycleEmit: (event, detail) => lifecycle.emit(event, detail),
     statePath: path.join(HOME, 'dshl', 'dsh-update-state.json'),
   })

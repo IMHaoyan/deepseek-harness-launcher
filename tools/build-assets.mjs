@@ -14,7 +14,7 @@
 //   wwwroot/styles.css / app.js          —— ui-src 拷贝
 //
 // 运行：node tools/build-assets.mjs（sharp 优先从 DSH profile 解析，缺失时提示安装）
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -151,14 +151,15 @@ let html = readFileSync(join(uiSrc, 'index.html'), 'utf8')
 if (!html.includes('__WHALE_PATH__')) { console.error('placeholder not found in ui-src/index.html'); process.exit(1) }
 html = html.replace('__WHALE_PATH__', whalePath)
 writeFileSync(join(wwwroot, 'index.html'), html)
-copyFileSync(join(uiSrc, 'styles.css'), join(wwwroot, 'styles.css'))
-copyFileSync(join(uiSrc, 'console.css'), join(wwwroot, 'console.css'))
-copyFileSync(join(uiSrc, 'app.js'), join(wwwroot, 'app.js'))
-copyFileSync(join(uiSrc, 'offline.html'), join(wwwroot, 'offline.html'))
-copyFileSync(join(uiSrc, 'browser.html'), join(wwwroot, 'browser.html'))
-copyFileSync(join(uiSrc, 'browser.css'), join(wwwroot, 'browser.css'))
-copyFileSync(join(uiSrc, 'browser.js'), join(wwwroot, 'browser.js'))
-copyFileSync(join(uiSrc, 'loading.html'), join(wwwroot, 'loading.html'))
-copyFileSync(join(uiSrc, 'loading.js'), join(wwwroot, 'loading.js'))
-console.log('wwwroot written (index.html + styles.css + console.css + app.js + offline.html + browser.* + loading.*)')
+// 其余页面文件自动发现并同步：新增 ui-src/*.html/.css/.js 时不必再改这里
+// （index.html 例外：它由上面的鲸鱼路径内联生成，不参与逐字节拷贝）
+const copied = []
+for (const name of readdirSync(uiSrc)) {
+  if (name === 'index.html') continue
+  if (!/\.(html|css|js)$/u.test(name)) continue
+  if (!statSync(join(uiSrc, name)).isFile()) continue
+  copyFileSync(join(uiSrc, name), join(wwwroot, name))
+  copied.push(name)
+}
+console.log('wwwroot written (index.html + ' + copied.sort().join(' + ') + ')')
 console.log('ALL OK')

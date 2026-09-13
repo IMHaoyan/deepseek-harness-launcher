@@ -4,7 +4,7 @@
 const $ = (id) => document.getElementById(id);
 const send = (name, payload) => window.browserBridge.send(name, payload);
 
-let state = { tabs: [], activeId: null, rightId: null, splitOn: false, splitRatio: 0.5, maximized: false, tabsEnabled: false, consoleOpen: false };
+let state = { tabs: [], activeId: null, rightId: null, splitOn: false, splitRatio: 0.5, maximized: false, tabsEnabled: false, consoleOpen: false, update: null };
 let restartErrTimer = null; // 重启失败的红字提示窗口：期间 render 不覆盖按钮文案
 
 function render() {
@@ -36,6 +36,21 @@ function render() {
   $('tabs').style.display = tabsEnabled ? '' : 'none';
   $('btnNew').style.display = tabsEnabled ? '' : 'none';
   $('btnSplit').style.display = tabsEnabled ? '' : 'none';
+  // 「有更新」徽标：DSHL 或 DSH 任一新版本可用即显示（无更新时整颗隐藏，不占位）
+  const upd = state.update || {};
+  const updLatest = (upd.launcher && upd.launcher.latest) || (upd.dsh && upd.dsh.latest) || '';
+  const btnUpdateNotice = $('btnUpdateNotice');
+  if (btnUpdateNotice) {
+    btnUpdateNotice.classList.toggle('hidden', !updLatest);
+    if (updLatest) {
+      const parts = [];
+      if (upd.launcher && upd.launcher.latest) parts.push('DSHL v' + upd.launcher.latest + (upd.launcher.ready ? '（已下载，点安装）' : ''));
+      if (upd.dsh && upd.dsh.latest) parts.push('DSH v' + upd.dsh.latest);
+      const title = '有新版本：' + parts.join('，') + '。点击查看更新内容';
+      btnUpdateNotice.title = title;
+      btnUpdateNotice.setAttribute('aria-label', title);
+    }
+  }
 
   // 控制台打开时隐藏刷新/重启：控制台内部有自己的操作；关闭后恢复 DSH 快捷动作。
   const active = state.tabs.find((t) => t.id === state.activeId);
@@ -177,6 +192,7 @@ $('btnRestart').addEventListener('click', async () => {
   if (r && r.ok === false) flashRestartError(r.reason);
 });
 $('btnConsole').addEventListener('click', () => send('consoleToggle'));
+$('btnUpdateNotice').addEventListener('click', () => send('updateOpen'));
 $('btnMin').addEventListener('click', () => send('winMin'));
 $('btnMax').addEventListener('click', () => send('winMax'));
 $('btnClose').addEventListener('click', () => send('winClose'));

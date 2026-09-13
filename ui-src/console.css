@@ -679,9 +679,24 @@ body.console-surface {
   white-space: nowrap;
 }
 
-/* 「预装 (推荐开启)」：默认代装插件的绿色标签（颜色对齐 .plugin-status-ok） */
-.plugin-badge-preinstall { color: #15803D; font-weight: 600; }
+/* 标题行右端的来源/代装标签（原「添加备注」入口位置）：字号比 .plugin-name 大一号 */
+.plugin-badge-preinstall {
+  flex: none;
+  padding: 3px 12px;
+  border-radius: 999px;
+  color: #15803D;
+  background: rgba(34, 197, 94, 0.13);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
 [data-theme="dark"] .plugin-badge-preinstall { color: #4ADE80; }
+
+/* 非「预装 (推荐开启)」的状态说明（已关闭自动安装 / 已关闭 / payload 不可用）：中性灰，不用绿色 */
+.plugin-badge-preinstall.muted { color: var(--text-secondary); background: var(--ghost-hover); }
+[data-theme="dark"] .plugin-badge-preinstall.muted { color: var(--text-tertiary); }
 
 /* 说明最多两行：长描述不再把卡片撑高 */
 .plugin-description {
@@ -703,42 +718,6 @@ body.console-surface {
 .plugin-actions .plugin-latest { margin-right: auto; }
 /* 操作按钮比全局 .btn 小一档，配合紧凑卡片 */
 .plugin-action-btn { height: 30px; padding: 0 10px; border-radius: 15px; font-size: 12.5px; }
-
-/* 标题行右端的备注入口：小号、低对比，不抢标题 */
-.plugin-note-toggle {
-  flex: none;
-  height: 24px;
-  padding: 0 8px;
-  border-radius: 7px;
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-}
-
-.plugin-note-toggle:hover { color: var(--text-primary); }
-
-.plugin-note { display: none; flex-direction: column; gap: 8px; margin-top: 4px; }
-.plugin-card.note-open .plugin-note { display: flex; }
-
-.plugin-note-input {
-  flex: none;
-  width: 100%;
-  min-width: 0;
-  height: auto;
-  min-height: 56px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text-primary);
-  background: var(--card);
-  font-family: var(--font);
-  font-size: 12.5px;
-  line-height: 18px;
-  resize: vertical;
-  outline: none;
-}
-
-.plugin-note-input:focus { border-color: var(--brand); }
-.plugin-note-save { align-self: flex-start; height: 28px; font-size: 12px; }
 
 .plugin-card-footer {
   display: flex;
@@ -832,8 +811,7 @@ body.console-surface {
 
 /* 卡片操作按钮统一外观：描边胶囊（默认中性 / 主操作品牌色 / 危险项红色）
    与 DSH「设置 → 插件」的卸载按钮一致，overlap 掉基础 .btn 的透明无边框样式 */
-.plugin-action-btn,
-.plugin-note-toggle {
+.plugin-action-btn {
   height: 30px;
   padding: 0 14px;
   border: 1px solid var(--border);
@@ -843,8 +821,7 @@ body.console-surface {
   font-size: 12.5px;
 }
 
-.plugin-action-btn:hover,
-.plugin-note-toggle:hover { background: var(--ghost-hover); }
+.plugin-action-btn:hover { background: var(--ghost-hover); }
 
 .plugin-action-btn.primary {
   border-color: var(--brand);
@@ -861,14 +838,6 @@ body.console-surface {
 }
 
 .plugin-action-btn.danger:hover { background: var(--danger-hover); }
-
-.plugin-note-save {
-  height: 30px;
-  padding: 0 14px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: 12.5px;
-}
 
 .plugin-feedback { margin-top: 0; }
 
@@ -893,7 +862,6 @@ body.console-surface {
   margin: 16px 0 14px;
   background: var(--border-soft);
 }
-
 
 .log-preview-head {
   align-items: center;
@@ -983,8 +951,6 @@ body.console-surface {
 .pending-bar-text { font-weight: 600; }
 .pending-bar-hint { color: var(--text-secondary); }
 .pending-bar .btn { margin-left: auto; flex: none; }
-
-
 
 [data-theme="dark"] .pending-bar { background: rgba(245, 158, 11, 0.16); }
 /* 插件开关反馈：启停后 DSH 页面会延迟 1s 自动刷新，先给用户一个短提示。 */

@@ -27,6 +27,11 @@
     <button id="btnNew" class="bar-btn" title="新建标签页">＋</button>
     <div class="drag-space"></div>
     <div class="win-group">
+      <!-- 有更新徽标：DSHL 或 DSH 任一新版本可用时显示（绿色，位置在控制台按钮左边）。
+           点击打开独立的「更新」窗口；无更新时整颗隐藏，不留空位。 -->
+      <button id="btnUpdateNotice" class="bar-btn win-btn update-badge hidden" title="有新版本可更新" aria-label="有新版本可更新">
+        <span class="update-badge-label">有更新</span>
+      </button>
       <button id="btnConsole" class="bar-btn win-btn console-btn" title="打开启动器控制台" aria-label="打开启动器控制台" aria-pressed="false">
         <!-- 控制台图标：两行滑杆（控制/调整面板语义）。早前的「>_」会被误读成"打开终端"，见需求记录。 -->
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

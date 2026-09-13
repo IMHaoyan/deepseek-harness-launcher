@@ -1,0 +1,278 @@
+/* update.css — DSHL 更新窗口样式。
+   令牌全部复用 styles.css 的 CSS 变量（与主窗口同一套明暗主题），
+   这里只写这个窗口特有的布局：顶部品牌条 + 两张卡片（版本与更新动作 / 更新内容）。 */
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  color: var(--text-primary);
+  background: var(--bg);
+  font-family: var(--font);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- 顶部 ---------- */
+
+.upd-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--card);
+}
+
+.upd-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.upd-brand-mark {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--ghost-hover);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.upd-brand-title {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 19px;
+}
+
+.upd-brand-sub {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upd-icon-btn {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.upd-icon-btn:hover { color: var(--text-primary); background: var(--ghost-hover); }
+.upd-icon-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ---------- 内容区 ---------- */
+
+.upd-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 14px 18px 18px;
+  overflow: hidden;
+}
+
+.upd-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+}
+
+/* 版本行：两行 + 右侧按钮，与「通用」页那两行的口径一致 */
+.upd-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 46px;
+  padding: 8px 14px;
+}
+
+.upd-row + .upd-row { border-top: 1px solid var(--border-soft); }
+
+.upd-label {
+  flex: none;
+  width: 76px;
+  color: var(--text-secondary);
+}
+
+.upd-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upd-value .upd-new {
+  margin-left: 8px;
+  color: #15803D;
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.upd-value .upd-new-pending { color: var(--brand); }
+
+[data-theme="dark"] .upd-value .upd-new { color: #4ADE80; }
+[data-theme="dark"] .upd-value .upd-new-pending { color: var(--brand-hover); }
+
+.upd-actions { display: flex; flex: none; align-items: center; gap: 8px; }
+
+.upd-btn {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-primary);
+  background: transparent;
+  font-family: var(--font);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.upd-btn:hover { background: var(--ghost-hover); }
+.upd-btn.primary { border-color: var(--brand); color: #FFFFFF; background: var(--brand); }
+.upd-btn.primary:hover { background: var(--brand-hover); }
+.upd-btn:disabled { opacity: 0.6; cursor: default; }
+.upd-btn:disabled:hover { background: transparent; }
+.upd-btn.primary:disabled:hover { background: var(--brand); }
+
+.upd-note {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.upd-note.ok { color: #15803D; }
+[data-theme="dark"] .upd-note.ok { color: #4ADE80; }
+
+/* 顺序建议（两者都有更新时才出现） */
+.upd-hint {
+  padding: 9px 14px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* ---------- 更新内容 ---------- */
+
+.upd-changelog-card {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.upd-changelog-head {
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.upd-changelog-title { font-size: 13.5px; font-weight: 650; }
+
+.upd-changelog-sub {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upd-changelog {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 14px 14px;
+  overflow-y: auto;
+}
+
+.upd-release { padding: 12px 0; }
+.upd-release + .upd-release { border-top: 1px solid var(--border-soft); }
+
+.upd-release-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.upd-release-ver {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.upd-release-tag {
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: #15803D;
+  background: rgba(34, 197, 94, 0.13);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+[data-theme="dark"] .upd-release-tag { color: #4ADE80; }
+
+.upd-release-date {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+
+.upd-release-body {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 19px;
+}
+
+.upd-release-body p { margin: 0 0 6px; }
+.upd-release-body strong { color: var(--text-primary); font-weight: 650; }
+.upd-release-body ul { margin: 4px 0 8px; padding-left: 18px; }
+.upd-release-body li { margin: 2px 0; }
+.upd-release-body a { color: var(--brand); }
+.upd-release-body code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--ghost-hover);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.upd-empty {
+  padding: 20px 4px;
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  line-height: 19px;
+}
+
+.upd-empty.error { color: var(--text-secondary); }
