@@ -4001,16 +4001,25 @@ function registerIpc() {
         log('update bridge: rejected command from untrusted sender (' + String(name) + ')')
         return JSON.stringify({ ok: false, error: '不可信的调用方' })
       }
-      if (name === 'changelogGet') {
-        try {
-          const r = await changelog.getReleases(!!(value && value.force))
-          log('[changelog] 取到 ' + r.releases.length + ' 个版本（cached=' + r.cached + (r.error ? ', error=' + r.error : '') + '）')
-          return JSON.stringify({ ok: true, releases: r.releases, cached: r.cached, at: r.at, error: r.error || '' })
-        } catch (err) {
-          return JSON.stringify({ ok: false, error: (err && err.message) || String(err) })
+      switch (name) {
+        case 'changelogGet': {
+          try {
+            const r = await changelog.getReleases(!!(value && value.force))
+            log('[changelog] 取到 ' + r.releases.length + ' 个版本（cached=' + r.cached + (r.error ? ', error=' + r.error : '') + '）')
+            return JSON.stringify({ ok: true, releases: r.releases, cached: r.cached, at: r.at, error: r.error || '' })
+          } catch (err) {
+            return JSON.stringify({ ok: false, error: (err && err.message) || String(err) })
+          }
         }
+        // 更新窗口是内部工具窗口，不能进 dsh:cmd 的信任域；这里只放行它确实需要的动作。
+        case 'getState': return stateJson()
+        case 'updaterGetState': return updater.getState()
+        case 'updaterCheck': void updater.check(); return updater.getState()
+        case 'updaterInstall': void updater.installNow(); return updater.getState()
+        case 'dshCheckNow': void dshUpdater.checkOnce('manual', true); return '{}'
+        case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
+        default: return JSON.stringify({ ok: false, error: '未知命令：' + String(name) })
       }
-      return JSON.stringify({ ok: false, error: '未知命令：' + String(name) })
     } catch (err) {
       return JSON.stringify({ ok: false, error: (err && err.message) || String(err) })
     }

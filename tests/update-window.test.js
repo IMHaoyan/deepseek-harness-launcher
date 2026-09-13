@@ -42,10 +42,22 @@ test('更新窗口：动作走既有更新命令，不新造更新逻辑', () =>
   assert.match(js, /cmd\('updaterCheck'\)/, '启动器检查应调 updaterCheck')
   assert.match(js, /cmd\('dshCheckNow'\)/, 'DSH 检查应调 dshCheckNow')
   assert.match(js, /cmd\('dshUpdateNow'\)/, 'DSH 更新应调 dshUpdateNow')
+  assert.match(js, /window\.dshBridge\.upd\(name, value\)/, '更新窗口所有动作必须走 update:cmd')
+  assert.doesNotMatch(js, /window\.dshBridge\.cmd\(/, '更新窗口动作不得再走 dsh:cmd')
   // 主进程侧：窗口只开一次、复用同一个，重复点「有更新」不许叠出多个窗口
   assert.match(mainJs, /function showUpdateWindow\(\)/, '主进程应有 showUpdateWindow')
   assert.match(mainJs, /if \(!updateWindowHandle\) \{/, '窗口应复用（已存在就只聚焦）')
   assert.match(mainJs, /createUpdateWindow\(\{/, '应通过 update-window.js 创建窗口')
+})
+
+test('更新窗口：update:cmd 放行且只放行窗口需要的动作', () => {
+  const start = mainJs.indexOf("ipcMain.handle('update:cmd'")
+  const end = mainJs.indexOf("ipcMain.handle('dsh:cmd'", start)
+  assert.ok(start > 0 && end > start, '找不到 update:cmd 处理器边界')
+  const block = mainJs.slice(start, end)
+  for (const name of ['changelogGet', 'getState', 'updaterGetState', 'updaterCheck', 'updaterInstall', 'dshCheckNow', 'dshUpdateNow']) {
+    assert.match(block, new RegExp(`case '${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`), `update:cmd 应处理 ${name}`)
+  }
 })
 
 test('更新窗口：状态推送链路完整（main → preload → 页面）', () => {
@@ -130,11 +142,13 @@ test('安全边界：更新窗口走专用通道，不进 dsh:cmd 的信任表',
   const trust = require('../trust')
   // 不变量本身：无法归类的发送方一律拒绝（更新窗口若走通用通道就是这个下场）
   assert.equal(trust.decideCommand({ kind: 'none' }, 'x', 'changelogGet'), 'deny', '无法归类的发送方必须被拒')
-  // 回归护栏：changelogGet 不得再出现在 gated 的 dsh:cmd switch 里
-  const switchStart = mainJs.indexOf("switch (name) {")
-  assert.ok(switchStart > 0, '找不到 dsh:cmd 的 switch')
-  const gateStart = mainJs.indexOf('trust.decideCommand(senderOf(event)')
-  assert.ok(gateStart > 0, '应有信任判定')
+  // 回归护栏：更新窗口动作不得再出现在 gated 的 dsh:cmd switch 里
+  const dshHandler = mainJs.indexOf("ipcMain.handle('dsh:cmd'")
+  assert.ok(dshHandler > 0, '找不到 dsh:cmd 处理器')
+  const switchStart = mainJs.indexOf("switch (name) {", dshHandler)
+  assert.ok(switchStart > dshHandler, '找不到 dsh:cmd 的 switch')
+  const gateStart = mainJs.indexOf('trust.decideCommand(senderOf(event)', dshHandler)
+  assert.ok(gateStart > dshHandler, '应有信任判定')
   assert.ok(gateStart < switchStart, '信任判定必须在 switch 之前（先判后执行）')
   // 通用 switch 段里不应再有 changelogGet
   const nextHandler = mainJs.indexOf("ipcMain.handle('dsh:state'", switchStart)

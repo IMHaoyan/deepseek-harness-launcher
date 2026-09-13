@@ -1,10 +1,11 @@
 // update.js — DSHL 更新窗口渲染。
 //
-// 数据来源全部走既有的 dshBridge（preload.js 已暴露，不需要新开 IPC 通道）：
+// 数据来源全部走更新窗口专用 dshBridge：
 //   - 主进程推送：onUpdate → { launcher, dsh }
 //   - 首帧兜底：cmd('updaterGetState') / cmd('getState')，避免推送到达前空白
 //   - 动作：cmd('updaterCheck' | 'updaterInstall' | 'dshCheckNow' | 'dshUpdateNow')
 //   - 更新内容：cmd('changelogGet') 走主进程（changelog.js → GitHub Releases，带缓存）
+//   - 所有 cmd 都走 update:cmd；此窗口不属于 dsh:cmd 的 console/shell 信任域
 //
 // 版本与更新动作的口径与「通用」页那两行完全一致：启动器负责 DSHL 自身，DSH 更新全手动。
 'use strict'
@@ -18,8 +19,8 @@ const MAX_VERSIONS = 30
 const busy = { launcher: false, dsh: false }
 const released = { launcher: false, dsh: false }
 
-/** 更新窗口专用命令（独立通道 update:cmd）：只有 changelogGet 会走到主进程的专用处理器。 */
-async function cmdUpd(name, value) {
+/** 更新窗口的所有命令都走独立通道 update:cmd；主进程只放行该窗口需要的一组动作。 */
+async function cmd(name, value) {
   try {
     const result = await window.dshBridge.upd(name, value)
     return result ? JSON.parse(result) : null
@@ -28,15 +29,7 @@ async function cmdUpd(name, value) {
     return null
   }
 }
-async function cmd(name, value) {
-  try {
-    const result = await window.dshBridge.cmd(name, value)
-    return result ? JSON.parse(result) : null
-  } catch (err) {
-    console.error('[update] bridge error:', err)
-    return null
-  }
-}
+const cmdUpd = cmd
 
 // ---------- 主题：跟随系统（窗口不带主题设置，控制台的主题开关也不影响这里） ----------
 try {
