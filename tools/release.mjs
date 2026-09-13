@@ -9,6 +9,7 @@
 // 用法：
 //   npm run release                                  —— 说明自动取"上一 tag 以来的提交列表"
 //   npm run release "v1.0.7 更新内容：\n- 第一条\n- 第二条"  —— 字面 \n 表示换行（真实换行会被批处理截断）
+//   npm run release -- --notes-file <文件路径>        —— 从文件读取说明（中文/多行/特殊字符最稳，推荐）
 import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -61,7 +62,31 @@ function notesFromCommits() {
   } catch { return '- 维护性更新' }
 }
 
-const rawNotes = process.argv.slice(2).join(' ').trim().replace(/\\n/g, '\n')
+// 说明优先级：--notes-file 指向的文件 > 命令行字面文本 > 按提交自动生成。
+// 为什么优先文件：中文与多行说明经 npm/cmd 传递会被拆散或截断，走文件最稳。
+const argv = process.argv.slice(2)
+const notesFileArg = argv.findIndex((a) => a === '--notes-file' || a.startsWith('--notes-file='))
+let rawNotes = ''
+if (notesFileArg >= 0) {
+  const inline = argv[notesFileArg].startsWith('--notes-file=') ? argv[notesFileArg].slice('--notes-file='.length) : ''
+  const fileArg = inline || argv[notesFileArg + 1] || ''
+  if (!fileArg) {
+    console.error('--notes-file 需要一个文件路径')
+    process.exit(1)
+  }
+  const filePath = join(root, fileArg)
+  if (!existsSync(filePath)) {
+    console.error('找不到说明文件：' + filePath)
+    process.exit(1)
+  }
+  rawNotes = readFileSync(filePath, 'utf8').trim()
+  if (!rawNotes) {
+    console.error('说明文件是空的：' + filePath)
+    process.exit(1)
+  }
+} else {
+  rawNotes = argv.filter((a) => !a.startsWith('--')).join(' ').trim().replace(/\\n/g, '\n')
+}
 const body = rawNotes || notesFromCommits()
 const notes = `${header()}\n\n${body}\n`
 console.log('--- 发布说明 ---\n' + notes + '----------------')
