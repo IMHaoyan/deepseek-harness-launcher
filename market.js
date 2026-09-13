@@ -188,6 +188,11 @@ async function verifyNpmPackage(name) {
   return verifyNpmManifestShape(raw, name)
 }
 
+// pnpm 11 起默认带 24h「新版本观察期」：lockfile 里只要有一个刚发布不久的版本，
+// 之后任何 add/remove 都会在动手前被整体拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。
+// 用户点名安装/卸载时显式关掉该策略，与 dshmarket 的 RELEASE_AGE_OVERRIDE 保持一致。
+const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
+
 // ---------- 执行 dsh plugin（DSHL 保证 PATH 上的 pnpm 可用） ----------
 
 function pnpmReady(env) {
@@ -200,6 +205,15 @@ function withToolchainPath(baseEnv, dirs) {
   const prefix = dirs.filter(Boolean).join(path.delimiter)
   env[pathKey] = prefix ? prefix + path.delimiter + (env[pathKey] || '') : (env[pathKey] || '')
   return env
+}
+
+/** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。 */
+function withReleaseAgeOverride(args) {
+  const list = Array.isArray(args) ? args : []
+  const command = list[0]
+  if (command !== 'add' && command !== 'remove') return list
+  if (list.includes(RELEASE_AGE_OVERRIDE)) return list
+  return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
 }
 
 async function runCli(args) {
@@ -217,7 +231,7 @@ async function runCli(args) {
   return new Promise((resolve, reject) => {
     let child
     try {
-      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...args], {
+      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...withReleaseAgeOverride(args)], {
         cwd: profileDir(),
         env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
         windowsHide: true,
@@ -271,11 +285,9 @@ async function installByName(name, opts = {}) {
     log('installing ' + pkg + '@' + verified.version + '（npm 官方源校验通过）…')
     // -w：profile 目录本身是一个 pnpm workspace 根（pnpm-workspace.yaml），
     // 新版本 pnpm 拒绝在 workspace 根加依赖，除非显式 -w/--workspace-root。
-    // --config.minimumReleaseAge=0：pnpm 11.7 起默认带 24h「新版本观察期」，刚发布的版本会被策略拦下
-    // （The lockfile contains entries that the active policies reject），还会把 profile 留在
-    // 「node_modules 已是新版、dependencies 仍是旧版」的半成品状态。dshmarket 等同类插件管理器
-    // 对「用户点名安装的精确版本」也是显式关掉该策略，这里对齐。
-    await runCli(['add', '--config.minimumReleaseAge=0', pkg + '@' + verified.version, '-w'])
+    // 放行「新版本观察期」的策略由 runCli 统一注入（见 RELEASE_AGE_OVERRIDE）：
+    // 否则 lockfile 里任何一个刚发布的版本都会让本次 add/remove 在动手前被整体拒绝。
+    await runCli(['add', pkg + '@' + verified.version, '-w'])
     const after = pluginStateOf(readProfileManifest(), pkg)
     if (!after.installed || !after.bundle) {
       throw new Error('安装后 profile 未正确记录该插件（dependencies/bundles 缺一）')
@@ -345,6 +357,7 @@ module.exports = {
   pluginStateOf,
   verifyNpmManifestShape,
   pnpmReady,
+  withReleaseAgeOverride,
   PLUGIN_NAME,
   PROFILE_NAME,
   NPM_REGISTRY_ORIGIN,

@@ -89,10 +89,13 @@ test('installByName：空包名直接拒绝；按包名各自记账', async () =
   assert.equal(other.busy, '')
 })
 
-test('安装走 pnpm 时显式关掉新版本观察期（否则刚发布的版本会被策略拒绝）', () => {
+test('pnpm 视图：add/remove 都注入一次新版本观察期放行参数（对齐 dshmarket）', () => {
   const fs = require('node:fs')
   const path = require('node:path')
   const src = fs.readFileSync(path.join(__dirname, '..', 'market.js'), 'utf8')
-  assert.match(src, /runCli\(\['add', '--config\.minimumReleaseAge=0'/, 'installByName 必须带 --config.minimumReleaseAge=0（对齐 dshmarket）')
-  assert.match(src, /minimumReleaseAge[\s\S]{0,400}await runCli/, '关闭策略处应有原因注释')
+  assert.match(src, /const RELEASE_AGE_OVERRIDE = '--config\.minimumReleaseAge=0'/, '放行参数应集中声明并说明原因')
+  assert.match(src, /withReleaseAgeOverride\(args\)/, 'runCli 必须统一注入放行参数')
+  assert.deepEqual(market.withReleaseAgeOverride(['add', 'pkg@1.0.0', '-w']), ['add', '--config.minimumReleaseAge=0', 'pkg@1.0.0', '-w'])
+  assert.deepEqual(market.withReleaseAgeOverride(['remove', 'pkg', '-w']), ['remove', '--config.minimumReleaseAge=0', 'pkg', '-w'])
+  assert.deepEqual(market.withReleaseAgeOverride(['list']), ['list'])
 })

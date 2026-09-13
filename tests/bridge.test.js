@@ -69,6 +69,27 @@ test('needsInstall：未装/未启用/指向别处 → 需要安装', () => {
   assert.equal(bridge.needsInstall(ok, want), false)
 })
 
+test('satisfied：payload 升版但 tgz 同名时按已物化版本判定（否则老构建常驻）', () => {
+  const cur = bridge.pluginStateOf(manifestWith({ [NAME]: 'file:C:/old/bridge-next.tgz' }, [NAME]))
+  const want = { version: '0.1.0-dev.1', spec: 'file:C:/new/bridge-next.tgz' }
+  assert.equal(bridge.satisfied(cur, want, '0.1.0-dev.1'), true)
+  assert.equal(bridge.satisfied(cur, want, '0.1.0-dev.0'), false)
+  assert.equal(bridge.satisfied(cur, want, ''), false)
+  assert.equal(bridge.needsInstall(cur, want, '0.1.0-dev.0'), true)
+  assert.equal(bridge.needsInstall(cur, want, '0.1.0-dev.1'), false)
+  // 不声明版本（历史调用方式）时保持旧的「同名即满足」语义
+  assert.equal(bridge.satisfied(cur, { spec: 'file:C:/new/bridge-next.tgz' }, ''), true)
+})
+
+test('withReleaseAgeOverride：只在 add/remove 注入一次 pnpm 观察期放行参数', () => {
+  assert.deepEqual(bridge.withReleaseAgeOverride(['add', 'pkg@1.0.0', '-w']), ['add', '--config.minimumReleaseAge=0', 'pkg@1.0.0', '-w'])
+  assert.deepEqual(bridge.withReleaseAgeOverride(['remove', 'pkg', '-w']), ['remove', '--config.minimumReleaseAge=0', 'pkg', '-w'])
+  const already = ['add', '--config.minimumReleaseAge=0', 'pkg@1.0.0']
+  assert.deepEqual(bridge.withReleaseAgeOverride(already), already)
+  assert.deepEqual(bridge.withReleaseAgeOverride(['install', '--frozen-lockfile']), ['install', '--frozen-lockfile'])
+  assert.deepEqual(bridge.withReleaseAgeOverride(null), [])
+})
+
 test('verifyPluginManifest：合法 manifest 返回身份', () => {
   const pkg = { name: NAME, version: '0.1.0-dev.0', dsh: { bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } } }
   assert.deepEqual(bridge.verifyPluginManifest(pkg), { name: NAME, version: '0.1.0-dev.0' })

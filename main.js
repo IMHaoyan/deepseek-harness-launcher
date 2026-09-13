@@ -1917,11 +1917,11 @@ async function maybeAutoInstallBridge() {
   if (bridgeAutoInstalling) return
   if (!Config.remoteConnect || !Config.remoteConnect.enabled) return
   if (bridgeAutoTriedFor === app.getVersion()) return
-  const payloadReady = bridge.getState().payloadReady
-  if (!payloadReady) return
-  const already = bridge.installed()
-  // 已装且已启用：不去动正在运行的服务，并记账避免每次 onTick 都重复读 profile
-  if (already.installed && already.bundle) { bridgeAutoTriedFor = app.getVersion(); return }
+  const snap = bridge.getState()
+  if (!snap.payloadReady) return
+  // 已装、启用，且物化版本就是当前 payload 的版本：不去动正在运行的服务，并记账避免每次 onTick 都重复读 profile。
+  // 启动器升级带了新的 payload（tgz 文件名不变、包版本变了）时 snap.outdated=true，这里会走一次重装。
+  if (snap.installed && !snap.outdated) { bridgeAutoTriedFor = app.getVersion(); return }
   if (!server.running()) return // 等页面加载成功后由 noteBridgeRuntime 再次驱动
   if (!envReady()) return
   if (!envReport || !envReport.pnpm || envReport.pnpm.status !== 'ok') {
@@ -2535,7 +2535,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       order: 20,
       name: '手机连接',
       subtitle: 'DSH Bridge Next · 远程连接',
-      description: '在 DSH 左侧边栏提供「手机连接」，支持手机扫码、云端登录和本机会话管理。',
+      description: '在 DSH 设置页提供「手机连接」分区，支持手机扫码、云端登录和本机会话管理。',
       icon: '📱',
       category: '远程连接',
       sourceLabel: '随启动器分发',

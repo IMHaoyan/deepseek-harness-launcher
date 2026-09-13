@@ -27,6 +27,10 @@ const { spawn } = require('child_process')
 const PLUGIN_NAME = '@agents-anywhere/dsh-bridge-next'
 const PROFILE_NAME = 'web'
 const BUNDLE_PATCH = './cordis.patch.yml'
+// pnpm 11 起默认带 24h「新版本观察期」：lockfile 里只要有一个刚发布不久的版本，
+// 之后任何 add/remove 都会在动手前被整体拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。
+// 用户点名安装/卸载时显式关掉该策略，与 dshmarket 的 RELEASE_AGE_OVERRIDE 保持一致。
+const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
 const PROFILE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CLI_TIMEOUT_MS = 15 * 60 * 1000 // 首次安装要拉依赖树，给足时间
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024
@@ -168,13 +172,19 @@ function specBaseName(spec) {
   return path.basename(String(spec || '').replace(/^file:/u, '').replace(/^link:/u, '').replace(/[\\/]+$/u, ''))
 }
 
-/** 纯函数：profile 里的状态是否已经是「本 payload 装的」。 */
-function satisfied(cur, want) {
+/**
+ * 纯函数：profile 里的状态是否已经是「本 payload 装的」。
+ * materializedVersion 是 node_modules 里实际物化的版本：payload 升版时 tgz 文件名不变
+ * （file: 规格相同），只有它能区分「老构建」和「新 payload」，否则老构建会一直留在 profile 里。
+ */
+function satisfied(cur, want, materializedVersion = '') {
   if (!cur || !cur.installed || !cur.bundle) return false
   if (!want || !want.spec) return false
   const ref = String(cur.spec || '')
   if (!ref.startsWith('file:') && !ref.startsWith('link:')) return false
-  return specBaseName(ref) === specBaseName(want.spec)
+  if (specBaseName(ref) !== specBaseName(want.spec)) return false
+  if (!want.version) return true
+  return materializedVersion === want.version
 }
 
 function getState() {
@@ -273,6 +283,15 @@ function withToolchainPath(baseEnv, dirs) {
   return env
 }
 
+/** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。 */
+function withReleaseAgeOverride(args) {
+  const list = Array.isArray(args) ? args : []
+  const command = list[0]
+  if (command !== 'add' && command !== 'remove') return list
+  if (list.includes(RELEASE_AGE_OVERRIDE)) return list
+  return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
+}
+
 async function runCli(args) {
   if (!envDetect) throw new Error('bridge: envDetect 未初始化')
   const env = await envDetect.detectEnv(false)
@@ -288,7 +307,7 @@ async function runCli(args) {
   return new Promise((resolve, reject) => {
     let child
     try {
-      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...args], {
+      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...withReleaseAgeOverride(args)], {
         cwd: profileDir(),
         env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
         windowsHide: true,
@@ -321,9 +340,9 @@ async function runCli(args) {
 // ---------- 安装 / 卸载 ----------
 
 /** 纯函数：判断是否需要安装 —— want.spec 为空（payload 不可用）时永不自动动 profile。 */
-function needsInstall(cur, want) {
+function needsInstall(cur, want, materializedVersion = '') {
   if (!want || !want.spec) return false
-  return !satisfied(cur, want)
+  return !satisfied(cur, want, materializedVersion)
 }
 
 /**
@@ -339,7 +358,7 @@ async function install(opts = {}) {
     if (!verifyPayload()) throw new Error(payloadError || 'payload 校验失败')
     const want = { version: payload.version, spec: expectedSpec() }
     const before = installed()
-    if (!opts.force && !needsInstall(before, want)) {
+    if (!opts.force && !needsInstall(before, want, readInstalledPackageVersion())) {
       state.busy = ''
       return { ok: true, already: true, version: payload.version }
     }
@@ -403,6 +422,7 @@ module.exports = {
   // 纯函数（测试用）
   pluginStateOf,
   needsInstall,
+  withReleaseAgeOverride,
   satisfied,
   verifyPluginManifest,
   readPackageFromTarball,
