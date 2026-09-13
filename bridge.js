@@ -2,14 +2,16 @@
 // 定位：只负责「把随启动器分发的 DSH Bridge Next 装进 DSH 的 web profile」这一件事，
 // 与 market.js 同构：不做目录浏览、不维护安装回执，状态永远以 profile 的 package.json 为准。
 //
-// 机制：完全复用 DSH 官方 CLI 语义 —— `dsh plugin --profile web add <file:tgz>` /
+// 机制：完全复用 DSH 官方 CLI 语义 —— `dsh plugin --profile web add <link:dir>` /
 // `... remove <包名>`。该命令在 profile 目录执行 pnpm，并把声明了 `dsh.bundle.patch`
 // 的依赖自动写进 `dsh.profile.bundles`（reconcilePlugins）。
 //
-// 为什么用随包 tgz 而不是源码 link：
+// 为什么先把随包 tgz 解到启动器缓存，再以 link: 安装：
 //   - 插件未发布 npm，上游多包 devDeps 存在版本漂移（typecheck 在 0.1.5-rc.1 上已失败），
 //     终端用户机器上现场构建不可复现；启动器只分发「已构建产物」。
-//   - tarball 用 file: 方式由 pnpm 装进 profile（内容快照，源码目录移动/删除无影响）。
+//   - file: 依赖会被 pnpm 在每次 profile 变更时重新 import；Windows 下若 DSH 正在运行，
+//     重命名 stage 覆盖正式目录会 EPERM，pnpm 的删除回退可能只删掉部分文件（本仓库事故）。
+//   - link: 依赖是稳定目录的符号链接，市场在 DSH 运行中装别的插件时不会重写目标内容。
 //
 // 安全/稳健：
 //   - payload 经 SHA256 校验（version.json 声明）；
@@ -35,11 +37,14 @@ const PROFILE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CLI_TIMEOUT_MS = 15 * 60 * 1000 // 首次安装要拉依赖树，给足时间
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024
 const MAX_TARBALL_BYTES = 32 * 1024 * 1024
+const MAX_EXTRACTED_BYTES = 64 * 1024 * 1024
+// 末段保持 bridge-next.tgz：兼容 1.4.0 已安装实例的 satisfied()（它只比较 spec 基名）。
+const PAYLOAD_LINK_BASENAME = 'bridge-next.tgz'
 
 let HOME = ''
 let envDetect = null
 let payloadRoot = ''
-let payload = null // { version, sha256, tgzPath, pkg }
+let payload = null // { version, sha256, tgzPath, pkg, linkDir }
 let payloadError = ''
 let logFn = () => {}
 
@@ -83,7 +88,7 @@ function loadPayload() {
     if (!st.isFile() || st.size === 0 || st.size > MAX_TARBALL_BYTES) throw new Error('payload tgz 不存在或大小异常')
     const pkg = readPackageFromTarball(tgzPath)
     verifyPluginManifest(pkg, { version: meta.version })
-    payload = { version: meta.version, sha256: meta.sha256, tgzPath, pkg }
+    payload = { version: meta.version, sha256: meta.sha256, tgzPath, pkg, linkDir: payloadLinkDir(meta.version, meta.sha256) }
   } catch (e) {
     payloadError = (e && e.message) || String(e)
     log('payload 不可用：' + payloadError)
@@ -114,6 +119,107 @@ function verifyPayload() {
     payloadError = 'payload 读取失败：' + ((e && e.message) || String(e))
     log(payloadError)
     return false
+  }
+}
+
+function payloadLinkDir(version, sha256) {
+  const key = `${version}-${String(sha256).slice(0, 12)}`.replace(/[^A-Za-z0-9._-]/gu, '_')
+  return path.join(HOME, 'dshl', 'bridge-payloads', key, PAYLOAD_LINK_BASENAME)
+}
+
+function isMaterializedPayloadValid(dir) {
+  if (!payload || !dir) return false
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+    verifyPluginManifest(pkg, { version: payload.version })
+    const st = fs.statSync(path.join(dir, BUNDLE_PATCH.replace(/^\.\//u, '')))
+    return st.isFile()
+  } catch { return false }
+}
+
+function ensureJunction(link, target) {
+  try {
+    const st = fs.lstatSync(link)
+    if (!st.isSymbolicLink()) return
+    let cur = ''
+    try { cur = path.resolve(fs.realpathSync(link)) } catch { /* 悬空链接：下面删掉重建 */ }
+    if (cur === path.resolve(target)) return
+    fs.unlinkSync(link)
+  } catch { /* 不存在：下面创建 */ }
+  fs.mkdirSync(path.dirname(link), { recursive: true })
+  fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir')
+}
+
+function resolveFallbackPackage(name) {
+  const roots = []
+  // DSH 注入包在 profiles/node_modules 里由 DSH 自己维护，比 profile 依赖树稳定；
+  // 市场操作会剪掉 profile/node_modules，因此 @deepseek-ai/* 必须先查共享 fallback。
+  if (String(name).startsWith('@deepseek-ai/')) roots.push(path.join(HOME, 'profiles', 'node_modules'))
+  roots.push(path.join(profileDir(), 'node_modules'), path.join(HOME, 'profiles', 'node_modules'))
+  for (const root of [...new Set(roots)]) {
+    const dir = path.join(root, ...name.split('/'))
+    try {
+      if (fs.statSync(path.join(dir, 'package.json')).isFile()) return dir
+    } catch { /* 继续找下一个 root */ }
+  }
+  return ''
+}
+
+/**
+ * Node 从真实路径解析 ESM 依赖；缓存目录在 profile 外，parent 链里没有
+ * $DSH_HOME/profiles/node_modules，所以把 Bridge 的直接依赖/peer 以 junction
+ * 合并进缓存目录自己的 node_modules。
+ */
+function ensurePayloadRuntimeDeps(target) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8'))
+  const names = new Set([
+    ...Object.keys(pkg.dependencies || {}),
+    ...Object.keys(pkg.optionalDependencies || {}),
+    ...Object.keys(pkg.peerDependencies || {}),
+  ])
+  // DSH runtime 注入的 @deepseek-ai/* 不一定写在 peerDependencies；
+  // 把共享 fallback scope 整组镜像进来，避免宿主启动时才逐个 ENOENT。
+  const injectedScope = path.join(HOME, 'profiles', 'node_modules', '@deepseek-ai')
+  try {
+    for (const entry of fs.readdirSync(injectedScope, { withFileTypes: true })) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) names.add('@deepseek-ai/' + entry.name)
+    }
+  } catch { /* 没有共享 fallback 时按声明的依赖处理 */ }
+  const modulesDir = path.join(path.dirname(target), 'node_modules')
+  try {
+    const st = fs.lstatSync(modulesDir)
+    if (st.isSymbolicLink()) fs.unlinkSync(modulesDir)
+  } catch { /* 不存在 */ }
+  fs.mkdirSync(modulesDir, { recursive: true })
+  for (const name of names) {
+    const found = resolveFallbackPackage(name)
+    if (found) ensureJunction(path.join(modulesDir, ...name.split('/')), found)
+  }
+}
+
+/** 把已验证的 tgz 解到内容寻址缓存目录；link: 让 pnpm 永不原地重写该目录。 */
+function materializePayload() {
+  if (!payload) throw new Error('远程连接插件 payload 不可用：' + (payloadError || '未知原因'))
+  const target = payload.linkDir
+  if (isMaterializedPayloadValid(target)) {
+    ensurePayloadRuntimeDeps(target)
+    return target
+  }
+  const parent = path.dirname(target)
+  fs.mkdirSync(parent, { recursive: true })
+  const tmp = fs.mkdtempSync(path.join(parent, '.tmp-'))
+  try {
+    extractPackageFromTarball(payload.tgzPath, tmp)
+    if (!isMaterializedPayloadValid(tmp)) throw new Error('payload 解包后缺少 package.json 或 cordis.patch.yml')
+    if (fs.existsSync(target)) {
+      if (isMaterializedPayloadValid(target)) return target
+      fs.rmSync(target, { recursive: true, force: true })
+    }
+    fs.renameSync(tmp, target)
+    ensurePayloadRuntimeDeps(target)
+    return target
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }) } catch { /* noop */ }
   }
 }
 
@@ -153,23 +259,49 @@ function installed() {
   return pluginStateOf(readProfileManifest())
 }
 
-/** 读 profile 里已物化安装的插件版本（node_modules 里的 package.json）；读不到返回 ''。 */
-function readInstalledPackageVersion() {
+/**
+ * 读 profile 里已物化安装的插件状态（node_modules 里的 package.json）。
+ * patchReady 检查 manifest 声明的 bundle patch 是否真的落盘：pnpm 中断或原子替换失败时，
+ * package.json / lib 可能还在，但 cordis.patch.yml 缺失；DSH 启动会直接 ENOENT。
+ * 读取失败一律按未就绪处理，避免把残缺安装误判成可用。
+ */
+function readMaterializedPackageState() {
+  const packageDir = path.join(profileDir(), 'node_modules', ...PLUGIN_NAME.split('/'))
   try {
-    const p = path.join(profileDir(), 'node_modules', ...PLUGIN_NAME.split('/'), 'package.json')
-    const pkg = JSON.parse(fs.readFileSync(p, 'utf8'))
-    return (pkg && typeof pkg.version === 'string') ? pkg.version : ''
-  } catch { return '' }
+    const pkg = JSON.parse(fs.readFileSync(path.join(packageDir, 'package.json'), 'utf8'))
+    const version = (pkg && typeof pkg.version === 'string') ? pkg.version : ''
+    const declared = pkg && pkg.dsh && pkg.dsh.bundle ? pkg.dsh.bundle.patch : ''
+    let patchReady = false
+    if (declared === BUNDLE_PATCH) {
+      try {
+        const st = fs.statSync(path.join(packageDir, BUNDLE_PATCH.replace(/^\.\//u, '')))
+        patchReady = st.isFile()
+      } catch { /* 缺文件/读不到都按未就绪 */ }
+    }
+    return { version, patchReady }
+  } catch { return { version: '', patchReady: false } }
+}
+
+function readInstalledPackageVersion() {
+  return readMaterializedPackageState().version
 }
 
 function expectedSpec() {
-  // pnpm 的 file: 规格统一用正斜杠（Windows 下反斜杠会解析失败）
-  return payload ? ('file:' + payload.tgzPath.replace(/\\/gu, '/')) : ''
+  // pnpm 的 link: 规格统一用正斜杠（Windows 下反斜杠会解析失败）
+  return payload ? ('link:' + payload.linkDir.replace(/\\/gu, '/')) : ''
 }
 
 /** 纯函数：去掉 file:/link: 前缀后取规格里的目标名（tgz 文件名 / 目录名）。 */
 function specBaseName(spec) {
   return path.basename(String(spec || '').replace(/^file:/u, '').replace(/^link:/u, '').replace(/[\\/]+$/u, ''))
+}
+
+function normalizeSpec(spec) {
+  return String(spec || '').replace(/\\/gu, '/')
+}
+
+function sameSpec(a, b) {
+  return normalizeSpec(a) === normalizeSpec(b)
 }
 
 /**
@@ -193,13 +325,19 @@ function getState() {
   state.version = cur.version
   state.bundle = cur.bundle
   state.spec = cur.spec
-  const materialized = readInstalledPackageVersion()
-  // 已装但与随包 payload 版本不一致 → 控制台提示可更新
-  const outdated = state.installed && !!payload && materialized !== '' && materialized !== payloadInstalledVersion()
+  const materialized = readMaterializedPackageState()
+  const want = payload ? { version: payloadInstalledVersion(), spec: expectedSpec() } : null
+  const specMatchesPayload = state.installed && !!want && sameSpec(state.spec, want.spec)
+    && satisfied(cur, want, materialized.version)
+  // 已装但版本/patch/规格与随包 payload 不一致 → 控制台提示可更新/修复
+  const outdated = state.installed && !!payload
+    && (!materialized.patchReady || materialized.version === '' || materialized.version !== payloadInstalledVersion() || !specMatchesPayload)
   return {
     installed: state.installed,
     version: state.version,
-    installedPackageVersion: materialized,
+    installedPackageVersion: materialized.version,
+    materializedPatchReady: materialized.patchReady,
+    specMatchesPayload,
     bundle: state.bundle,
     spec: state.spec,
     busy: state.busy,
@@ -255,6 +393,65 @@ function readPackageFromTarball(tgzPath, { maxBytes = MAX_TARBALL_BYTES } = {}) 
   throw new Error('tarball 内缺少 package/package.json')
 }
 
+/** 把 tar 内的 package/... 路径规范化成安全相对路径；拒绝绝对路径和 ..。 */
+function normalizePackageEntryName(name) {
+  const raw = String(name || '').replace(/\\/gu, '/').replace(/^\.\//u, '')
+  const prefix = 'package/'
+  if (!raw.startsWith(prefix)) throw new Error('tar 条目不在 package/ 下：' + raw)
+  const rel = raw.slice(prefix.length)
+  if (!rel) return ''
+  if (rel.startsWith('/') || /^[A-Za-z]:/u.test(rel)) throw new Error('tar 条目路径非法：' + raw)
+  const parts = rel.split('/')
+  if (parts.some((part) => !part || part === '.' || part === '..' || part.includes(':'))) {
+    throw new Error('tar 条目路径非法：' + raw)
+  }
+  return parts.join(path.sep)
+}
+
+/** 解出 npm pack 的 package/ 内容；只接受普通文件，拒绝链接条目。 */
+function extractPackageFromTarball(tgzPath, destDir) {
+  const raw = fs.readFileSync(tgzPath)
+  if (raw.length === 0 || raw.length > MAX_TARBALL_BYTES) throw new Error('tarball 大小异常')
+  const tar = zlib.gunzipSync(raw, { maxOutputLength: MAX_EXTRACTED_BYTES })
+  const root = path.resolve(destDir)
+  const rootPrefix = root + path.sep
+  let offset = 0
+  let pendingLongName = ''
+  let extractedBytes = 0
+  let sawPackageJson = false
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512)
+    offset += 512
+    if (header.every((b) => b === 0)) break
+    const type = String.fromCharCode(header[156])
+    const sizeField = tarString(header, 124, 12)
+    const size = sizeField ? parseInt(sizeField, 8) : 0
+    if (!Number.isInteger(size) || size < 0 || offset + size > tar.length) throw new Error('tar 条目尺寸异常')
+    const body = tar.subarray(offset, offset + size)
+    offset += Math.ceil(size / 512) * 512
+    if (type === 'L') { pendingLongName = body.toString('utf8').replace(/\0.*$/su, ''); continue }
+    const name = pendingLongName || tarString(header, 0, 100)
+    pendingLongName = ''
+    if (type === 'x' || type === 'g' || type === '5') continue
+    if (type !== '0' && type !== '\0' && type !== '') throw new Error('tar 包含不支持条目：' + name)
+    const rel = normalizePackageEntryName(name)
+    if (!rel) continue
+    extractedBytes += body.length
+    if (extractedBytes > MAX_EXTRACTED_BYTES) throw new Error('payload 解包后超过大小上限')
+    const out = path.resolve(root, rel)
+    if (!out.startsWith(rootPrefix)) throw new Error('tar 条目路径越界：' + name)
+    fs.mkdirSync(path.dirname(out), { recursive: true })
+    fs.writeFileSync(out, body)
+    if (path.basename(rel) === 'package.json' && path.dirname(rel) === '.') sawPackageJson = true
+    const modeField = tarString(header, 100, 8)
+    const mode = modeField ? parseInt(modeField, 8) : 0
+    if (process.platform !== 'win32' && Number.isInteger(mode) && mode > 0) {
+      try { fs.chmodSync(out, mode & 0o777) } catch { /* noop */ }
+    }
+  }
+  if (!sawPackageJson) throw new Error('tarball 内缺少 package/package.json')
+}
+
 /** 纯函数：校验插件 manifest 身份（包名 / 版本 / bundle patch / client 声明）。 */
 function verifyPluginManifest(pkg, expected = {}) {
   if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) throw new Error('插件 manifest 非法')
@@ -292,28 +489,8 @@ function withReleaseAgeOverride(args) {
   return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
 }
 
-async function runCli(args) {
-  if (!envDetect) throw new Error('bridge: envDetect 未初始化')
-  const env = await envDetect.detectEnv(false)
-  if (!env || !env.plan) throw new Error('运行环境未就绪，无法安装远程连接插件')
-  if (!pnpmReady(env)) {
-    const detail = env.pnpm ? (env.pnpm.detail || '未就绪') : '未检测到 pnpm'
-    throw new Error('pnpm 未就绪：' + detail + '。请先在运行环境页安装/修复 pnpm。')
-  }
-  const { nodeCmd, dshBin } = env.plan
-  if (!fs.existsSync(dshBin)) throw new Error('DSH 入口不存在：' + dshBin)
-  const nodeDir = nodeCmd.includes(path.sep) || nodeCmd.includes('/') ? path.dirname(nodeCmd) : ''
-  const pnpmDir = env.pnpm && env.pnpm.path ? path.dirname(env.pnpm.path) : ''
+function captureProcess(child, label) {
   return new Promise((resolve, reject) => {
-    let child
-    try {
-      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...withReleaseAgeOverride(args)], {
-        cwd: profileDir(),
-        env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-    } catch (e) { return reject(e) }
     const chunks = []
     let bytes = 0
     const cap = (d) => {
@@ -332,9 +509,130 @@ async function runCli(args) {
       clearTimeout(timer)
       const output = chunks.join('').trimEnd()
       if (code === 0) resolve({ code, output })
-      else reject(new Error('dsh plugin 退出码 ' + code + (output ? '：' + output.slice(-400) : '')))
+      else reject(new Error(label + ' 退出码 ' + code + (output ? '：' + output.slice(-400) : '')))
     })
   })
+}
+
+async function runCli(args) {
+  if (!envDetect) throw new Error('bridge: envDetect 未初始化')
+  const env = await envDetect.detectEnv(false)
+  if (!env || !env.plan) throw new Error('运行环境未就绪，无法安装远程连接插件')
+  if (!pnpmReady(env)) {
+    const detail = env.pnpm ? (env.pnpm.detail || '未就绪') : '未检测到 pnpm'
+    throw new Error('pnpm 未就绪：' + detail + '。请先在运行环境页安装/修复 pnpm。')
+  }
+  const { nodeCmd, dshBin } = env.plan
+  if (!fs.existsSync(dshBin)) throw new Error('DSH 入口不存在：' + dshBin)
+  const nodeDir = nodeCmd.includes(path.sep) || nodeCmd.includes('/') ? path.dirname(nodeCmd) : ''
+  const pnpmDir = env.pnpm && env.pnpm.path ? path.dirname(env.pnpm.path) : ''
+  let child
+  try {
+    child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...withReleaseAgeOverride(args)], {
+      cwd: profileDir(),
+      env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (e) { throw e }
+  return captureProcess(child, 'dsh plugin')
+}
+
+function resolvePnpmScript(pnpmCmd) {
+  const lower = String(pnpmCmd || '').toLowerCase()
+  if (lower.endsWith('.js') || lower.endsWith('.cjs') || lower.endsWith('.mjs')) return pnpmCmd
+  const dir = path.dirname(pnpmCmd || '')
+  const candidates = [
+    path.join(dir, 'node_modules', 'corepack', 'dist', 'pnpm.js'),
+    path.join(dir, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
+  ]
+  return candidates.find((candidate) => fs.existsSync(candidate)) || ''
+}
+
+async function runPnpm(args, cwd) {
+  if (!envDetect) throw new Error('bridge: envDetect 未初始化')
+  const env = await envDetect.detectEnv(false)
+  if (!env || !env.plan) throw new Error('运行环境未就绪，无法准备远程连接插件依赖')
+  if (!pnpmReady(env)) {
+    const detail = env.pnpm ? (env.pnpm.detail || '未就绪') : '未检测到 pnpm'
+    throw new Error('pnpm 未就绪：' + detail + '。请先在运行环境页安装/修复 pnpm。')
+  }
+  const pnpmCmd = env.pnpm && env.pnpm.path
+  if (!pnpmCmd || !fs.existsSync(pnpmCmd)) throw new Error('pnpm 入口不存在：' + (pnpmCmd || '(空)'))
+  const nodeCmd = env.plan.nodeCmd
+  const pnpmScript = resolvePnpmScript(pnpmCmd)
+  if (!pnpmScript) throw new Error('无法定位 pnpm 脚本入口：' + pnpmCmd)
+  const nodeDir = nodeCmd.includes(path.sep) || nodeCmd.includes('/') ? path.dirname(nodeCmd) : ''
+  const pnpmDir = path.dirname(pnpmCmd)
+  let child
+  try {
+    child = spawn(nodeCmd, [pnpmScript, ...args], {
+      cwd,
+      env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (e) { throw e }
+  return captureProcess(child, 'pnpm')
+}
+
+function directDependencyNames() {
+  return payload && payload.pkg && payload.pkg.dependencies && typeof payload.pkg.dependencies === 'object'
+    ? Object.keys(payload.pkg.dependencies)
+    : []
+}
+
+function directDependencyReady(dir, name) {
+  const roots = [path.join(dir, 'node_modules'), path.join(path.dirname(dir), 'node_modules')]
+  for (const root of roots) {
+    try {
+      if (fs.statSync(path.join(root, ...name.split('/'), 'package.json')).isFile()) return true
+    } catch { /* 继续找下一个 root */ }
+  }
+  return false
+}
+
+/** link: 不会让 pnpm 安装被链接包自己的 dependencies；在不可变缓存里单独准备它们。 */
+async function installPayloadDependencies() {
+  if (!payload) return
+  const dir = payload.linkDir
+  const missing = directDependencyNames().filter((name) => !directDependencyReady(dir, name))
+  if (missing.length === 0) return
+  log('准备远程连接插件依赖：' + missing.join('、'))
+  const depsDir = path.join(path.dirname(dir), 'deps')
+  const modulesDir = path.join(depsDir, 'node_modules')
+  const localModules = path.join(dir, 'node_modules')
+  fs.mkdirSync(depsDir, { recursive: true })
+  fs.writeFileSync(path.join(depsDir, 'package.json'), JSON.stringify({
+    name: 'dsh-bridge-next-deps',
+    private: true,
+    dependencies: payload.pkg.dependencies || {},
+  }, null, 2) + '\n')
+  fs.writeFileSync(path.join(depsDir, 'pnpm-workspace.yaml'), 'packages:\n  - .\nnodeLinker: hoisted\nautoInstallPeers: false\n')
+  await runPnpm([
+    'install',
+    '--prod',
+    '--ignore-scripts',
+    '--config.auto-install-peers=false',
+    '--config.minimumReleaseAge=0',
+    '--config.node-linker=hoisted',
+  ], depsDir)
+  const stillMissing = directDependencyNames().filter((name) => !fs.existsSync(path.join(modulesDir, ...name.split('/'), 'package.json')))
+  if (stillMissing.length > 0) throw new Error('远程连接插件依赖安装不完整：' + stillMissing.join('、'))
+  try {
+    const st = fs.lstatSync(localModules)
+    if (st.isSymbolicLink() && path.resolve(fs.realpathSync(localModules)) === path.resolve(modulesDir)) return
+  } catch { /* 不存在：下面创建 */ }
+  try { fs.rmSync(localModules, { recursive: true, force: true }) } catch { /* noop */ }
+  ensureJunction(localModules, modulesDir)
+}
+
+/** 启动前自愈：重建被市场操作剪掉/悬空的 runtime dependency junction。 */
+async function ensureRuntimeDeps() {
+  if (!payload) return false
+  materializePayload()
+  await installPayloadDependencies()
+  return true
 }
 
 // ---------- 安装 / 卸载 ----------
@@ -356,9 +654,12 @@ async function install(opts = {}) {
   try {
     if (!payload) throw new Error('远程连接插件 payload 不可用：' + (payloadError || '未知原因'))
     if (!verifyPayload()) throw new Error(payloadError || 'payload 校验失败')
+    materializePayload()
+    await installPayloadDependencies()
     const want = { version: payload.version, spec: expectedSpec() }
     const before = installed()
-    if (!opts.force && !needsInstall(before, want, readInstalledPackageVersion())) {
+    const materialized = readMaterializedPackageState()
+    if (!opts.force && materialized.patchReady && sameSpec(before.spec, want.spec) && !needsInstall(before, want, materialized.version)) {
       state.busy = ''
       return { ok: true, already: true, version: payload.version }
     }
@@ -372,6 +673,9 @@ async function install(opts = {}) {
     const after = installed()
     if (!after.installed || !after.bundle) {
       throw new Error('安装后 profile 未正确记录该插件（dependencies/bundles 缺一）')
+    }
+    if (!readMaterializedPackageState().patchReady) {
+      throw new Error('安装后插件缺少 dsh.bundle.patch 文件')
     }
     state.lastChange = `已安装远程连接插件 v${payload.version}`
     log('installed ' + payload.version)
@@ -426,6 +730,11 @@ module.exports = {
   satisfied,
   verifyPluginManifest,
   readPackageFromTarball,
+  readMaterializedPackageState,
+  materializePayload,
+  ensureRuntimeDeps,
+  expectedSpec,
+  sameSpec,
   pnpmReady,
   PLUGIN_NAME,
   PROFILE_NAME,

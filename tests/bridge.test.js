@@ -4,6 +4,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const bridge = require('../bridge')
@@ -104,6 +105,95 @@ test('verifyPluginManifest：包名/版本段数/patch/client 任一项不符 �
   assert.throws(() => bridge.verifyPluginManifest({ ...base, dsh: { bundle: { patch: './cordis.patch.yml' } } }), /client/)
   assert.throws(() => bridge.verifyPluginManifest({ ...base, dsh: { bundle: { patch: './cordis.patch.yml' }, client: { platform: 'node' } } }), /client/)
   assert.throws(() => bridge.verifyPluginManifest(null), /manifest/)
+})
+
+test('readMaterializedPackageState：bundle patch 缺失不算可用，补回后才 ready', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-bridge-'))
+  const tmpRoot = path.resolve(os.tmpdir()) + path.sep
+  t.after(() => {
+    if (path.resolve(home).startsWith(tmpRoot)) fs.rmSync(home, { recursive: true, force: true })
+  })
+  const profile = path.join(home, 'profiles', 'web')
+  const packageDir = path.join(profile, 'node_modules', ...NAME.split('/'))
+  fs.mkdirSync(packageDir, { recursive: true })
+  bridge.initBridge({ home, payloadRoot: PAYLOAD_DIR, log: () => {} })
+  fs.writeFileSync(path.join(profile, 'package.json'), JSON.stringify(manifestWith({ [NAME]: bridge.expectedSpec() }, [NAME])))
+  fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
+    name: NAME,
+    version: '0.1.0-dev.1',
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+  }))
+  try {
+    assert.deepEqual(bridge.readMaterializedPackageState(), { version: '0.1.0-dev.1', patchReady: false })
+    const before = bridge.getState()
+    assert.equal(before.installed, true)
+    assert.equal(before.materializedPatchReady, false)
+    assert.equal(before.specMatchesPayload, true)
+    assert.equal(before.outdated, true)
+
+    fs.writeFileSync(path.join(packageDir, 'cordis.patch.yml'), '- insert: []\n')
+    const after = bridge.getState()
+    assert.equal(after.materializedPatchReady, true)
+    assert.equal(after.specMatchesPayload, true)
+    assert.equal(after.outdated, false)
+  } finally {
+    bridge.initBridge({})
+  }
+})
+
+test('materializePayload：tgz 解到 link: 缓存目录，末段保持 bridge-next.tgz', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-bridge-'))
+  const tmpRoot = path.resolve(os.tmpdir()) + path.sep
+  t.after(() => {
+    if (path.resolve(home).startsWith(tmpRoot)) fs.rmSync(home, { recursive: true, force: true })
+  })
+  bridge.initBridge({ home, payloadRoot: PAYLOAD_DIR, log: () => {} })
+  try {
+    const dir = bridge.materializePayload()
+    const again = bridge.materializePayload()
+    assert.equal(dir, again)
+    assert.equal(path.basename(dir), 'bridge-next.tgz')
+    assert.equal(fs.existsSync(path.join(dir, 'package.json')), true)
+    assert.equal(fs.existsSync(path.join(dir, 'cordis.patch.yml')), true)
+    assert.equal(bridge.expectedSpec(), 'link:' + dir.replace(/\\/gu, '/'))
+    assert.equal(bridge.sameSpec(bridge.expectedSpec(), 'link:' + dir.replace(/\\/gu, '/')), true)
+  } finally {
+    bridge.initBridge({})
+  }
+})
+
+test('ensureRuntimeDeps：悬空 junction 会重连到稳定的 profiles fallback', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-bridge-'))
+  const tmpRoot = path.resolve(os.tmpdir()) + path.sep
+  t.after(() => {
+    if (path.resolve(home).startsWith(tmpRoot)) fs.rmSync(home, { recursive: true, force: true })
+  })
+  const stable = path.join(home, 'profiles', 'node_modules', '@deepseek-ai', 'dsh-typert-protocol')
+  fs.mkdirSync(stable, { recursive: true })
+  fs.writeFileSync(path.join(stable, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-typert-protocol', version: '0.0.0' }))
+  bridge.initBridge({ home, payloadRoot: PAYLOAD_DIR, log: () => {} })
+  try {
+    const dir = bridge.materializePayload()
+    const link = path.join(path.dirname(dir), 'node_modules', '@deepseek-ai', 'dsh-typert-protocol')
+    fs.unlinkSync(link)
+    const gone = path.join(home, 'gone-target')
+    fs.mkdirSync(gone)
+    fs.symlinkSync(gone, link, process.platform === 'win32' ? 'junction' : 'dir')
+    fs.rmSync(gone, { recursive: true, force: true })
+    assert.equal(fs.existsSync(path.join(link, 'package.json')), false, '先制造悬空 junction')
+
+    bridge.materializePayload()
+    assert.equal(fs.existsSync(path.join(link, 'package.json')), true)
+    assert.equal(fs.realpathSync(link), fs.realpathSync(stable))
+  } finally {
+    bridge.initBridge({})
+  }
+})
+
+test('satisfied：link 缓存目录与旧 file: tgz 基名兼容，旧 DSHL 不会把 link 改回 file', () => {
+  const cur = { installed: true, bundle: true, spec: 'link:C:/cache/bridge-next.tgz' }
+  const want = { version: '0.1.0-dev.1', spec: 'file:C:/app/resources/bridge-next/bridge-next.tgz' }
+  assert.equal(bridge.satisfied(cur, want, '0.1.0-dev.1'), true)
 })
 
 test('initBridge：payload 不可用时只记账、不抛错', () => {

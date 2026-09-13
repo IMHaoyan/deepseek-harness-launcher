@@ -909,6 +909,24 @@ async function startServer(occupantRetry = 0) {
     if (plan.kind === 'source') log('（源码版需要先构建：在仓库运行 pnpm install && pnpm run build）')
     return false
   }
+  // Bridge Next 是 profile 的 bundle 层。市场改 profile 时可能剪掉 Bridge 依赖的
+  // DSH 注入包，缓存里的 junction 会悬空；每次启动先自愈，再判断是否需要重装插件本体。
+  try {
+    await bridge.ensureRuntimeDeps()
+  } catch (err) {
+    log('bridge: 启动前运行依赖自愈失败：' + ((err && err.message) || String(err)))
+  }
+  try {
+    const bridgeSnap = bridge.getState()
+    if (bridgeSnap.installed && bridgeSnap.payloadReady && (!bridgeSnap.materializedPatchReady || !bridgeSnap.specMatchesPayload)) {
+      log('bridge: 远程连接插件安装内容不完整（缺少 bundle patch），启动前修复 …')
+      const repaired = await bridge.install()
+      if (repaired.ok) log('bridge: 启动前修复完成 v' + (repaired.version || bridgeSnap.payloadVersion))
+      else log('bridge: 启动前修复失败：' + (repaired.error || '未知原因'))
+    }
+  } catch (err) {
+    log('bridge: 启动前完整性检查失败：' + ((err && err.message) || String(err)))
+  }
   const nodeCmd = plan.nodeCmd
   const env = { ...process.env, DSH_HOME: HOME }
   if (AGENTS_HOME) env.DSH_AGENTS_HOME = AGENTS_HOME

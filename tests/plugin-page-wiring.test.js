@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const root = path.resolve(__dirname, '..')
-const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8')
+const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n?/gu, '\n')
 const html = read('ui-src/index.html')
 const app = read('ui-src/app.js')
 const main = read('main.js')
