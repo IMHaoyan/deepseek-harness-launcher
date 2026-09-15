@@ -67,7 +67,7 @@
 - **真实启停**：关闭只在该 profile 的 patch 层禁用、不卸载，重新打开也不用重装。
 - **变更不打断会话**：装 / 卸 / 启停都只改 profile 与 patch 层，控制台顶部常驻「需要重启服务」提示条 —— 装完所有插件点一次「立即重启生效」即可，不必装一个重启一次（DSH 的 client 模块由服务端组装，整页刷新卸载不掉已注册的 UI 入口，所以启停也走重启）。
 - **一键全部安装**：依次补齐所有尚未安装的插件；已安装的不动，不做静默升级。
-- **默认代装**：插件市场（`dshmarket`）、手机连接（DSH Bridge Next，随安装包分发，入口在 DSH 设置页「手机连接」分区）默认开启；增强侧边栏（`dsh-better-sidebar`）、用量与计费（`@kenz1117/dsh-ui-usage-billing`）在首次运行或升级后自动补装一次 —— 用户手动卸载过就不再装回，手动装回后恢复自动维护。Codex 风格界面（`@michengai/dsh-codex-ui`）、会话导入（`dsh-chat-import`）保持手动安装。
+- **默认代装**：插件市场（`dshmarket`）、手机连接（DSH Bridge Next，随安装包分发，入口在 DSH 设置页「手机连接」分区）默认开启；增强侧边栏（`dsh-better-sidebar`）、用量与计费（`@kenz1117/dsh-ui-usage-billing`）、技能管理（`@michengai/dsh-skills-manager`）、会话归档（`@michengai/dsh-archive-manager`）、划线提问（`dsh-sidebar-qa`）、对话回退（`dsh-rewind-plugin`）、MCP Lens（`dsh-mcp-lens`）在首次运行或升级后自动补装一次 —— 用户手动卸载过就不再装回，手动装回后恢复自动维护。Codex 风格界面（`@michengai/dsh-codex-ui`）、会话导入（`dsh-chat-import`）保持手动安装。划线提问依赖增强侧边栏（前者未装时它只是不显示入口，不会报错）。
 - **与 DSH 插件市场同源**：在 DSH 内置市场里的启停会同步到同一份 patch 层；carrier 插件（如 Codex 风格界面）被关闭时会一并恢复它对外层侧栏 / 设置行的覆盖，不会留下「侧栏消失」的状态。
 
 ### 更新
@@ -139,8 +139,8 @@ tools/                构建、开发、发布与校验脚本
 **推荐插件（npm 分发，最常见）**：
 
 1. 在 `main.js` 的 `MANAGED_NPM_PLUGINS` 里补一条描述（`id` / `order` / `npm` 包名 / 名称 / 说明 / 图标 / 分类；要默认代装再加 `autoInstall: true`）；
-2. 在 `runManagedPluginAction()` 的 npm 分支里放行该 `id`（`install` / `uninstall` / `update` / `enable` / `disable` 已通用）；
-3. 执行 `npm run build:assets`。安装、卸载、更新检查、启停开关、状态卡片全部由通用逻辑生成，无需改 `ui-src/app.js`，也不需要新写安装器模块（启停要求 bundle patch 使用标准的 `insert:` 行；若 bundle 还带有对别的插件的 `disabled: true`（carrier），DSHL 会自动写反向覆盖并在关闭时恢复那些行）。
+2. 动作分支不用改：`runManagedPluginAction()` 按 `id` 在注册表里查表，`install` / `uninstall` / `update` / `reinstall` / `enable` / `disable` 全部通用（插件市场与手机连接是另两张固定卡片，见下）；
+3. 只加插件条目不需要重建产物（`wwwroot` 由 `ui-src` 生成，注册表在主进程）；改了 `ui-src` 才要执行 `npm run build:assets`。安装、卸载、更新检查、启停开关、状态卡片全部由通用逻辑生成，无需改 `ui-src/app.js`，也不需要新写安装器模块（启停要求 bundle patch 使用标准的 `insert:` 行；若 bundle 还带有对别的插件的 `disabled: true`（carrier），DSHL 会自动写反向覆盖并在关闭时恢复那些行）。
 
 **随启动器分发或需要专用逻辑的插件**：在 `buildPluginCatalog()` 中补一条描述，并在 `runManagedPluginAction()` 中补对应动作分支（如现有的 `dshmarket`、`bridge-next`）。
 

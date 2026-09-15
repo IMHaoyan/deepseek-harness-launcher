@@ -162,9 +162,19 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
   assert.equal(result.pendingRestart, true, '结果应标记「待重启生效」')
 })
 
-test('推荐插件注册表：四个 npm 插件 + 通用动作/更新检查', () => {
+test('推荐插件注册表：九个 npm 插件 + 通用动作/更新检查', () => {
   assert.match(main, /const MANAGED_NPM_PLUGINS = \[/, '主进程应有推荐插件注册表')
-  for (const npm of ['dsh-better-sidebar', '@michengai/dsh-codex-ui', '@kenz1117/dsh-ui-usage-billing', 'dsh-chat-import']) {
+  for (const npm of [
+    'dsh-better-sidebar',
+    '@michengai/dsh-codex-ui',
+    '@kenz1117/dsh-ui-usage-billing',
+    'dsh-chat-import',
+    '@michengai/dsh-skills-manager',
+    '@michengai/dsh-archive-manager',
+    'dsh-sidebar-qa',
+    'dsh-rewind-plugin',
+    'dsh-mcp-lens',
+  ]) {
     assert.ok(main.includes("'" + npm + "'"), '注册表缺少 ' + npm)
   }
   assert.match(main, /market\.installByName\(descriptor\.npm/, '推荐插件应复用通用 npm 安装器')
@@ -174,6 +184,116 @@ test('推荐插件注册表：四个 npm 插件 + 通用动作/更新检查', ()
   assert.match(main, /\.\.\.npmEntries,/, '推荐插件条目应进入 state.plugins 目录')
   assert.match(main, /case 'pluginCheckUpdates'/, '应有 npm 最新版检查命令')
   assert.match(app, /cmd\('pluginCheckUpdates'\)/, '插件页应触发最新版检查')
+})
+
+test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装筛选（不是抄一份实现）', async () => {
+  // 1. 取真实注册表字面量（纯数据，无外部引用）
+  const regStart = main.indexOf('const MANAGED_NPM_PLUGINS = [')
+  const regEnd = main.indexOf('\n]\n', regStart) + 3
+  assert.ok(regStart > 0 && regEnd > regStart, '找不到 MANAGED_NPM_PLUGINS 字面量')
+  const registry = new Function(main.slice(regStart, regEnd) + '; return MANAGED_NPM_PLUGINS')()
+
+  // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
+  assert.equal(registry.length, 9, '推荐插件（npm 分发）应为 9 个')
+  assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
+  assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
+  for (const d of registry) {
+    for (const field of ['id', 'order', 'npm', 'name', 'subtitle', 'description', 'icon', 'category']) {
+      assert.ok(String(d[field] === undefined ? '' : d[field]).trim() !== '', `${d.id} 缺少字段 ${field}`)
+    }
+    assert.match(d.npm, /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u, `${d.id} 的 npm 包名不合法：${d.npm}`)
+  }
+
+  // 3. 真 buildPluginCatalog + 真 pluginCardActions：每个注册项都必须渲染成一张卡片
+  const sliceFn = (signature, TailMarker) => {
+    const start = main.indexOf(signature)
+    assert.ok(start > 0, '找不到 ' + signature)
+    const end = main.indexOf(TailMarker, start) + TailMarker.length
+    return main.slice(start, end)
+  }
+  const src = [
+    sliceFn('function cleanInstalledVersion(spec) {', '\n}\n'),
+    sliceFn('function pluginCardActions(opts) {', '\n}\n'),
+    sliceFn('function buildPluginCatalog(marketState, bridgeState, notes) {', '\n}\n'),
+  ].join('\n')
+  const installed = new Set(registry.map((d) => d.npm))
+  const ctx = {
+    MANAGED_NPM_PLUGINS: registry,
+    Config: { pluginMarketDeclined: false, pluginNotes: {}, remoteConnect: { enabled: true, declined: false } },
+    market: {
+      PLUGIN_NAME: 'dshmarket',
+      getState: (npm) => ({
+        installed: installed.has(npm),
+        installedPackageVersion: '1.0.0',
+        version: '^1.0.0',
+        busy: '',
+        error: '',
+        lastChange: '',
+      }),
+    },
+    pluginSwitch: { isDisabled: () => false, canToggle: () => true },
+    npmVersionCache: new Map(),
+    semver: { valid: () => true, lt: () => false },
+    pluginAutoDeclined: () => false,
+  }
+  const names = Object.keys(ctx)
+  const build = new Function(...names, src + '\nreturn buildPluginCatalog')(...names.map((k) => ctx[k]))
+  const catalog = build({ installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }, { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }, {})
+
+  assert.equal(catalog.length, registry.length + 2, '插件页应渲染「插件市场 + 手机连接 + 全部推荐插件」')
+  for (const d of registry) {
+    const card = catalog.find((c) => c.id === d.id)
+    assert.ok(card, '注册表里的 ' + d.id + ' 没有渲染成卡片')
+    assert.equal(card.name, d.name, d.id + ' 卡片标题应与注册表一致')
+    assert.ok(card.status && card.status.label, d.id + ' 卡片缺少状态文案')
+    assert.ok(card.actions.length >= 1, d.id + ' 卡片缺少操作按钮')
+    assert.ok(card.icon && card.category && card.description, d.id + ' 卡片缺少图标/分类/说明')
+  }
+  assert.deepEqual(catalog.map((c) => c.id), [
+    'dshmarket',
+    'bridge-next',
+    'better-sidebar',
+    'codex-ui',
+    'usage-billing',
+    'chat-import',
+    'skills-manager',
+    'archive-manager',
+    'sidebar-qa',
+    'rewind',
+    'mcp-lens',
+  ], '卡片顺序应与注册表 order 一致')
+
+  // 4. 真 pendingAutoInstallPlugins：默认代装集合 = 注册表里 autoInstall 的那批，且只挑缺失的
+  const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
+  assert.deepEqual(autoIds, [
+    'better-sidebar',
+    'usage-billing',
+    'skills-manager',
+    'archive-manager',
+    'sidebar-qa',
+    'rewind',
+    'mcp-lens',
+  ], '默认代装集合（含后加的 5 个）应保持稳定')
+  for (const d of registry.filter((x) => x.autoInstall)) {
+    const card = catalog.find((c) => c.id === d.id)
+    assert.equal(card.autoInstallLabel, '预装 (推荐开启)', d.id + ' 卡片应标「预装 (推荐开启)」')
+    assert.match(card.status.label, /已启用|已安装/, d.id + ' 已装时状态应为已启用/已安装')
+  }
+
+  const pendSrc = sliceFn('function pendingAutoInstallPlugins() {', '\n}\n')
+  const missing = new Set(['dsh-mcp-lens', 'dsh-rewind-plugin'])
+  const pendCtx = {
+    MANAGED_NPM_PLUGINS: registry,
+    pluginAutoDeclined: () => false,
+    market: { getState: (npm) => ({ installed: !missing.has(npm) }) },
+  }
+  const pendNames = Object.keys(pendCtx)
+  const pending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => pendCtx[k]))
+  assert.deepEqual(pending().map((d) => d.npm), ['dsh-rewind-plugin', 'dsh-mcp-lens'], '缺哪个就补哪个（含后加的 5 个），顺序按注册表 order')
+
+  const declinedCtx = { ...pendCtx, pluginAutoDeclined: (id) => id === 'rewind' }
+  const declinedPending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => declinedCtx[k]))
+  assert.deepEqual(declinedPending().map((d) => d.id), ['mcp-lens'], '手动卸载过的插件不应再自动补装')
 })
 
 test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
@@ -190,6 +310,11 @@ test('默认代装：增强侧边栏 / 用量与计费随启动器自动装，�
 
   assert.match(main, /npm: 'dsh-better-sidebar',\n    name: '增强侧边栏',\n    autoInstall: true,/, '增强侧边栏应默认代装')
   assert.match(main, /npm: '@kenz1117\/dsh-ui-usage-billing',\n    name: '用量与计费',\n    autoInstall: true,/, '用量与计费应默认代装')
+  assert.match(main, /npm: '@michengai\/dsh-skills-manager',\n    name: '技能管理',\n    autoInstall: true,/, '技能管理应默认代装')
+  assert.match(main, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',\n    autoInstall: true,/, '会话归档应默认代装')
+  assert.match(main, /npm: 'dsh-sidebar-qa',\n    name: '划线提问',\n    autoInstall: true,/, '划线提问应默认代装')
+  assert.match(main, /npm: 'dsh-rewind-plugin',\n    name: '对话回退',\n    autoInstall: true,/, '对话回退应默认代装')
+  assert.match(main, /npm: 'dsh-mcp-lens',\n    name: 'MCP Lens',\n    autoInstall: true,/, 'MCP Lens 应默认代装')
   assert.doesNotMatch(main, /npm: 'dsh-chat-import',\n    name: '会话导入',\n    autoInstall: true,/, '会话导入保持手动安装')
   assert.doesNotMatch(main, /npm: '@michengai\/dsh-codex-ui',\n    name: 'Codex 风格界面',\n    autoInstall: true,/, 'Codex 风格界面默认不安装（只进插件页）')
 
