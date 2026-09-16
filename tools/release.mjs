@@ -281,6 +281,6 @@ try {
 console.log(`发布完成（${channel} 渠道，产物 ${channel === 'latest' ? 'latest.yml' : channel + '.yml'}）：https://github.com/IMHaoyan/deepseek-harness-launcher/releases/tag/${tag}`)
 console.log(channel === 'alpha'
   ? '这是 alpha 预发布版（GitHub prerelease，不占 Latest + alpha.yml）：只有把「启动器更新渠道」选成 alpha 的机器会收到它。\n'
-    + '按约定 alpha 不发公告：更新内容只记在 docs/release-notes-alpha.md（记得提交），转正式版时自动汇总进正式版发布说明。'
+    + '按约定 alpha 不发公告：更新内容只写进本地留档 .alpha-notes/release-notes.md（本地文件，不需要提交），转正式版时自动汇总进正式版发布说明。'
   : '这是正式版（GitHub Latest + latest.yml）：所有默认（latest 渠道）的机器会自动更新，选了 alpha 的机器也会拿到它。\n'
     + '正式版才发公告：上面这份说明就是挂在正式版本号下的更新内容（若来自 alpha 留档汇总，请顺手核对分组与措辞）。')
