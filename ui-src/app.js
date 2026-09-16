@@ -249,6 +249,8 @@ function showPage(name) {
   if (name === 'logs') {
     // 进入合并页（运行日志 + 服务与诊断）先拉一次最新状态（检查点列表主进程侧有 5s 缓存）
     void cmd('getState').then((s) => { if (s) render(s); });
+    // 非「启动器」来源不走状态推送，进页面时补拉一次，免得看到上一次打开的旧内容
+    if ((window._logSource || 'launcher') !== 'launcher') void loadLogSource(window._logSource);
   }
   if (name === 'plugins') {
     // 打开插件页：先拉一次最新插件状态，避免设置/恢复页操作后卡片状态滞后
@@ -480,9 +482,10 @@ function render(state) {
     applyTheme(state.theme);
   }
 
-  // 日志：控制台里唯一的日志区（原「服务与诊断」的最近日志已合并进来）
-  for (const id of ['logFull']) {
-    const el = $(id);
+  // 日志区：只在选中「启动器」时跟随状态推送；其它来源按需拉取（见 loadLogSource）
+  renderLogCause(state);
+  if ((window._logSource || 'launcher') === 'launcher') {
+    const el = $('logFull');
     if (el && el.textContent !== state.log) el.textContent = state.log || '暂无日志';
   }
 }
@@ -497,11 +500,14 @@ const ENV_KIND_LABELS = {
   none: '未安装',
 };
 
-// 卡片：{ badge: 'ok'|'warn'|'bad', name, version, detail, item, btnLabel }
+// 卡片：{ badge: 'ok'|'warn'|'bad', name, version, detail, item, btnLabel, actHtml }
+// btnLabel → 单项安装按钮（data-env-item，走事件委托）；actHtml → 自定义动作块（需要自己的 payload 时用）
 function envCardHtml(c) {
-  const actions = c.btnLabel
-    ? `<div class="env-card-actions"><button class="btn sm" data-env-item="${c.item}">${c.btnLabel}</button></div>`
-    : '';
+  const actions = c.actHtml
+    ? `<div class="env-card-actions">${c.actHtml}</div>`
+    : c.btnLabel
+      ? `<div class="env-card-actions"><button class="btn sm" data-env-item="${c.item}">${c.btnLabel}</button></div>`
+      : '';
   return `<div class="env-card">
     <div class="env-card-head">
       <span class="env-badge env-badge-${c.badge}">${c.badge === 'ok' ? '✓' : c.badge === 'warn' ? '⚠' : '✕'}</span>
@@ -599,6 +605,23 @@ function renderEnvSummary(env) {
     const detail = p.status === 'ok' ? (p.path || '') : '不装也能正常使用，只是少了完成/提问的托盘提醒';
     cards.push({ badge, name: '桌面通知（可选）', version: '', detail, item: 'plugin', btnLabel: p.status === 'ok' ? '' : '安装桌面通知' });
   }
+  // Node 的"旧布局"：dshl 曾用官方 zip 把 Node 装到用户级目录，全局包（含 DSH）也跟着落在那里。
+  // 现在默认改用官方安装包（与 nodejs.org 的 .msi 一致），这类机器可以一次性迁移过去。
+  // 只在确实存在旧布局时出现（legacyNode 由主进程的环境探测给出），显示什么就代表能做什么。
+  if (env.legacyNode && env.legacyNode.dir) {
+    const others = Array.isArray(env.legacyNode.otherGlobals) ? env.legacyNode.otherGlobals : [];
+    const detail = `当前是 dshl 的用户级安装（${esc(env.legacyNode.dir)}），全局包跟随放在该目录内。`
+      + '迁移会安装官方 Node.js 安装包（与官网 .msi 一致，落位 Program Files 并注册进「应用和功能」），'
+      + '把 DSH 装到全局根 %APPDATA%\\npm，然后只清理旧目录里 DSH 自己那份'
+      + (others.length ? `；目录下另外 ${others.length} 个全局包不会被迁移、也不会被删除。` : '。');
+    cards.push({
+      badge: 'warn',
+      name: 'Node.js 安装方式',
+      version: env.legacyNode.version ? `v${env.legacyNode.version}` : '',
+      detail,
+      actHtml: '<button class="btn sm" data-env-act="migrate-msi">迁移到官方安装（需一次管理员授权）</button>',
+    });
+  }
   $('envCards').innerHTML = cards.map(envCardHtml).join('');
 
   const missing = missingEnvItems(env);
@@ -638,6 +661,9 @@ function renderEnvJob(job) {
   $('btnEnvRetry').style.display = (job.status === 'failed' || job.status === 'cancelled') ? '' : 'none';
   const btn = $('btnEnvInstallAll');
   btn.disabled = running;
+  // 迁移入口（卡片由 renderEnvSummary 重建，可能不存在）：安装进行中一律禁用，避免并发第二个任务
+  const migrateBtn = document.querySelector('#envCards button[data-env-act="migrate-msi"]');
+  if (migrateBtn) migrateBtn.disabled = running;
   // 提示文案只认"检测结果"（renderEnvSummary 负责），安装任务状态只显示在阶段文本里，
   // 避免"安装完成"与"检测未就绪"互相矛盾；安装进行中时给出进度提示。
   if (running) $('envInstallHint').textContent = '安装进行中…';
@@ -650,7 +676,7 @@ function renderEnvJob(job) {
 
 const WIZARD_STAGE_LABELS = {
   'node-dl': '准备基础组件（Node.js）',
-  'node-ex': '校验并解压基础组件',
+  'node-ex': '校验并安装基础组件',
   'dsh-npm': '安装 DeepSeek Harness 主程序',
   'dsh-verify': '检查安装结果',
   'plugin': '安装桌面通知（可选）',
@@ -658,7 +684,7 @@ const WIZARD_STAGE_LABELS = {
 
 const WIZARD_STAGE_ACTION = {
   'node-dl': '正在准备基础组件…',
-  'node-ex': '正在校验并解压…',
+  'node-ex': '正在校验并安装…',
   'dsh-npm': '正在安装 DeepSeek Harness 主程序…',
   'dsh-verify': '正在检查安装结果…',
   'plugin': '正在安装桌面通知组件…',
@@ -816,8 +842,8 @@ function renderWizardJob(job) {
     if (cs.id === 'node-dl') {
       const sp = job.stageProgress || 0;
       if (sp >= 1) {
-        // 内置包：免下载，直接进入解压
-        $('wizardStageHint').textContent = '已使用安装包内置组件（免下载），正在解压…';
+        // 内置包：免下载，直接进入安装（官方 MSI 是 msiexec 安装；zip 兜底是解压落位）
+        $('wizardStageHint').textContent = '已使用安装包内置组件（免下载），正在安装…';
       } else {
         // 回退在线下载：显示真实字节进度
         const mb = Math.max(0, Math.min(34, Math.round(sp * 34)));
@@ -1131,6 +1157,7 @@ function renderRecovery(state) {
 }
 $('btnRecoveryRefresh').addEventListener('click', () => {
   void cmd('getState').then((s) => { if (s) render(s) });
+  if ((window._logSource || 'launcher') !== 'launcher') void loadLogSource(window._logSource);
 });
 $('btnRecoveryStart').addEventListener('click', () => { void cmd('start') });
 $('btnRecoveryStop').addEventListener('click', () => { void cmd('stop') });
@@ -1228,6 +1255,55 @@ $('btnLogCopyAll').addEventListener('click', async () => {
   }
   setTimeout(() => { btn.textContent = '复制'; }, 2000);
 });
+
+// ---------- 日志来源切换 ----------
+// 原来只有一个日志区，读的是**启动器自己的**日志；而"服务为什么起不来"写在 DSH 子进程的
+// stderr 里（server.err.log），那条路径只在「导出诊断报告」里出现 —— 用户被通知"查看日志"
+// 却看不到原因。这里给出来源切换，服务侧失败时默认按钮直接把人送到「服务错误」。
+window._logSource = 'launcher';
+const LOG_SOURCE_HINT = {
+  launcher: '显示最近 60 行；更早的日志见「打开日志文件夹」',
+  'server-err': 'DSH 服务进程的错误输出（最近 120 行）—— 服务起不来时原因在这里',
+  'server-out': 'DSH 服务进程的正常输出（最近 120 行，含启动地址）',
+};
+
+function renderLogCause(state) {
+  const row = $('logCause');
+  if (!row) return;
+  const text = (state && state.serviceError) || '';
+  const el = $('logCauseText');
+  if (el) el.textContent = text;
+  row.classList.toggle('hidden', !text);
+}
+
+async function loadLogSource(source) {
+  const key = LOG_SOURCE_HINT[source] ? source : 'launcher';
+  window._logSource = key;
+  document.querySelectorAll('#logSources [data-log-source]').forEach((el) => {
+    el.classList.toggle('checked', el.dataset.logSource === key);
+  });
+  const hint = $('logHint');
+  if (hint) hint.textContent = LOG_SOURCE_HINT[key];
+  const el = $('logFull');
+  if (!el) return;
+  if (key === 'launcher') {
+    el.textContent = (window._lastState && window._lastState.log) || '暂无日志';
+    return;
+  }
+  const r = await cmd('logRead', { source: key });
+  if (!r || !r.ok) {
+    el.textContent = '读取失败：' + ((r && r.error) || '未知原因');
+    return;
+  }
+  el.textContent = r.text || `（${r.label}日志暂无内容 —— 服务还没启动过，或日志已轮转）`;
+}
+
+$('logSources').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-log-source]');
+  if (!btn) return;
+  void loadLogSource(btn.dataset.logSource);
+});
+$('btnLogCauseJump').addEventListener('click', () => { void loadLogSource('server-err'); });
 
 $('btnLogClear').addEventListener('click', () => {
   $('logFull').textContent = '（已清空显示，新日志会继续追加）';
@@ -1760,6 +1836,15 @@ document.querySelectorAll('#pluginFilters [data-plugin-filter]').forEach((el) =>
 });
 // 状态卡上的单项安装按钮（事件委托：卡片由 render 重建）
 $('envCards').addEventListener('click', (e) => {
+  // 迁移到官方安装：重装 Node（官方 MSI）+ DSH 落到 %APPDATA%\npm + 旧残留由后端清理。
+  // DSH 会在后端按"旧目录里有 DSH"自动补进安装项（nodeReplacePlan），这里只声明"要重装 Node"。
+  const act = e.target.closest('button[data-env-act]');
+  if (act) {
+    if (act.getAttribute('data-env-act') === 'migrate-msi') {
+      void cmd('envInstall', { items: ['node'], forceNodeInstall: true, nodeInstallMode: 'msi' });
+    }
+    return;
+  }
   const btn = e.target.closest('button[data-env-item]');
   if (!btn) return;
   const item = btn.getAttribute('data-env-item');

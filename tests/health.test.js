@@ -170,3 +170,137 @@ test('孤儿槽恢复：按 mtime 取最新（此前按随机 UUID 排序会取�
   const got = JSON.parse(fs.readFileSync(path.join(env.snapshotDir, 'slot-1', 'config.json'), 'utf8'))
   assert.equal(got.port, 2222, '应恢复 mtime 最新的孤儿（2222），而不是随机名排序后的旧槽')
 })
+
+// —— extraFiles：把 ~/.dsh 侧的声明式状态也纳入快照与回退 ——
+//
+// 背景（实测）：崩溃循环里坏掉的是 settings.yaml / cordis.patch.yml / profile package.json，
+// 而主配置 config.json 从头到尾没变过 —— 只快照主配置时 pickRestoreTarget 永远返回 null。
+
+function initHExtras(t, extras, cfg) {
+  const env = makeEnv(t)
+  fs.writeFileSync(env.configPath, JSON.stringify(cfg || { port: 3080, theme: 'light' }, null, 2))
+  health.initHealth({ configPath: env.configPath, snapshotDir: env.snapshotDir, extraFiles: extras, log: () => {} })
+  return env
+}
+
+test('extraFiles：extra 内容进快照，恢复时写回并留下 broken 备份', (t) => {
+  const settings = path.join(os.tmpdir(), `dshl-extra-${Date.now()}-${Math.random().toString(36).slice(2)}.yaml`)
+  t.after(() => { try { fs.unlinkSync(settings) } catch { /* noop */ } })
+  const env = initHExtras(t, [{ id: 'settings', path: settings }])
+  fs.writeFileSync(settings, 'theme: dark\n')
+  health.captureHealthy(meta)
+  // 坏掉：缩进写坏 / 内容被改
+  fs.writeFileSync(settings, 'theme: dark\n  bad: indent\n')
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  assert.equal(fs.readFileSync(settings, 'utf8'), 'theme: dark\n', 'extra 应被写回快照内容')
+  const one = r.extras.find((e) => e.id === 'settings')
+  assert.equal(one.status, 'restored')
+  assert.ok(one.backupPath && fs.existsSync(one.backupPath), '原内容必须留备份')
+  assert.match(fs.readFileSync(one.backupPath, 'utf8'), /bad: indent/u)
+})
+
+test('extraFiles：只有 extra 变化（主配置未变）时也必须选得出回退目标', (t) => {
+  const settings = path.join(os.tmpdir(), `dshl-extra2-${Date.now()}-${Math.random().toString(36).slice(2)}.yaml`)
+  t.after(() => { try { fs.unlinkSync(settings) } catch { /* noop */ } })
+  const env = initHExtras(t, [{ id: 'settings', path: settings }])
+  fs.writeFileSync(settings, 'a: 1\n')
+  health.captureHealthy(meta)
+  // 主配置一字未动，只把 settings 改坏 —— 这正是实测里最常见的形态
+  fs.writeFileSync(settings, 'a: 1\n  broken\n')
+  assert.equal(health.configHash(), health.listSlots().find((s) => s.valid).configSha, '前提：主配置确实没变')
+  assert.equal(health.pickRestoreTarget(health.configHash()), 'slot-1', '只看主配置会误判成 known-good，必须能选出目标')
+  assert.deepEqual(health.extraDriftOfSlot('slot-1'), ['settings'])
+})
+
+test('extraFiles：校验不通过的文件被跳过并说明原因，主配置照常恢复', (t) => {
+  const pkg = path.join(os.tmpdir(), `dshl-extra3-${Date.now()}-${Math.random().toString(36).slice(2)}.json`)
+  t.after(() => { try { fs.unlinkSync(pkg) } catch { /* noop */ } })
+  const env = initHExtras(t, [{
+    id: 'profile-package',
+    path: pkg,
+    validate: () => ({ ok: false, reason: '快照声明的插件当前未安装' }),
+  }])
+  fs.writeFileSync(pkg, '{"v":1}')
+  health.captureHealthy(meta)
+  fs.writeFileSync(pkg, '{"v":2}')
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 7777 }, null, 2))
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  const one = r.extras.find((e) => e.id === 'profile-package')
+  assert.equal(one.status, 'skipped')
+  assert.match(one.reason, /当前未安装/u)
+  assert.equal(fs.readFileSync(pkg, 'utf8'), '{"v":2}', '被跳过的文件绝不能被动过')
+  assert.equal(JSON.parse(fs.readFileSync(env.configPath, 'utf8')).port, 3080, '主配置仍然恢复')
+})
+
+test('extraFiles：校验函数抛错也按"跳过"处理（fail-closed，不炸掉整次恢复）', (t) => {
+  const f = path.join(os.tmpdir(), `dshl-extra4-${Date.now()}-${Math.random().toString(36).slice(2)}.json`)
+  t.after(() => { try { fs.unlinkSync(f) } catch { /* noop */ } })
+  const env = initHExtras(t, [{ id: 'x', path: f, validate: () => { throw new Error('boom') } }])
+  fs.writeFileSync(f, 'one')
+  health.captureHealthy(meta)
+  fs.writeFileSync(f, 'two')
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 7777 }, null, 2))
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  assert.equal(r.extras.find((e) => e.id === 'x').status, 'skipped')
+  assert.equal(fs.readFileSync(f, 'utf8'), 'two')
+})
+
+test('extraFiles：快照当时不存在的文件，恢复时不得被创建', (t) => {
+  const f = path.join(os.tmpdir(), `dshl-extra5-${Date.now()}-${Math.random().toString(36).slice(2)}.json`)
+  t.after(() => { try { fs.unlinkSync(f) } catch { /* noop */ } })
+  const env = initHExtras(t, [{ id: 'later', path: f }])
+  health.captureHealthy(meta) // 此刻文件不存在
+  fs.writeFileSync(f, 'user-created')
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 7777 }, null, 2))
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  assert.equal(fs.readFileSync(f, 'utf8'), 'user-created', '快照里没有的东西不许凭空造出来')
+  assert.equal(r.extras.some((e) => e.id === 'later'), false)
+})
+
+test('extraFiles：快照里的 extra 被篡改 → 跳过它，其余照常恢复', (t) => {
+  const a = path.join(os.tmpdir(), `dshl-extra6a-${Date.now()}-${Math.random().toString(36).slice(2)}.json`)
+  const b = path.join(os.tmpdir(), `dshl-extra6b-${Date.now()}-${Math.random().toString(36).slice(2)}.json`)
+  t.after(() => { try { fs.unlinkSync(a); fs.unlinkSync(b) } catch { /* noop */ } })
+  const env = initHExtras(t, [{ id: 'a', path: a }, { id: 'b', path: b }])
+  fs.writeFileSync(a, 'A1')
+  fs.writeFileSync(b, 'B1')
+  health.captureHealthy(meta)
+  fs.writeFileSync(path.join(env.snapshotDir, 'slot-1', 'files', 'a'), 'TAMPERED')
+  fs.writeFileSync(a, 'A2')
+  fs.writeFileSync(b, 'B2')
+  fs.writeFileSync(env.configPath, JSON.stringify({ port: 7777 }, null, 2))
+  const r = health.restore(health.pickRestoreTarget(health.configHash()))
+  assert.equal(r.status, 'restored')
+  assert.equal(r.extras.find((e) => e.id === 'a').status, 'skipped')
+  assert.match(r.extras.find((e) => e.id === 'a').reason, /损坏/u)
+  assert.equal(fs.readFileSync(a, 'utf8'), 'A2', '被篡改的那份不能拿来覆盖用户文件')
+  assert.equal(r.extras.find((e) => e.id === 'b').status, 'restored')
+  assert.equal(fs.readFileSync(b, 'utf8'), 'B1')
+})
+
+test('extraFiles：未声明任何 extra 时行为与旧版一致（不生成 files 目录、不误判漂移）', (t) => {
+  const env = initH(t)
+  health.captureHealthy(meta)
+  assert.equal(fs.existsSync(path.join(env.snapshotDir, 'slot-1', 'files')), false)
+  assert.deepEqual(health.extraDriftOfSlot('slot-1'), [])
+  const metaRaw = JSON.parse(fs.readFileSync(path.join(env.snapshotDir, 'slot-1', 'meta.json'), 'utf8'))
+  assert.deepEqual(metaRaw.extras, [], '旧槽语义：extras 为空数组')
+})
+
+test('extraFiles：形状不合法的声明被忽略（id 不能当文件名用的直接丢掉）', (t) => {
+  const env = makeEnv(t)
+  fs.writeFileSync(env.configPath, '{}')
+  health.initHealth({
+    configPath: env.configPath,
+    snapshotDir: env.snapshotDir,
+    extraFiles: [{ id: '../../evil', path: 'x' }, { id: '', path: 'y' }, { id: 'ok', path: '' }, null, 'nope'],
+    log: () => {},
+  })
+  health.captureHealthy(meta)
+  const metaRaw = JSON.parse(fs.readFileSync(path.join(env.snapshotDir, 'slot-1', 'meta.json'), 'utf8'))
+  assert.deepEqual(metaRaw.extras, [])
+})

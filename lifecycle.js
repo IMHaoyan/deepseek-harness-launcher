@@ -24,6 +24,7 @@ const EVENTS = new Set([
   'service.ready',
   'service.readyTimeout',
   'service.readyRefused',
+  'service.bootFailure',
   'service.exit',
   'service.adopt',
   'service.handover',

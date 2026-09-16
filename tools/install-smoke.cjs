@@ -16,6 +16,7 @@ const tmpHome = path.join(os.tmpdir(), `dshl-smoke-${mode}-${Date.now()}`)
 process.env.DSHL_USER_NODE_DIR = path.join(tmpHome, 'user-node')
 process.env.DSHL_NPM_GLOBAL_ROOT = path.join(tmpHome, 'npm-global')
 process.env.DSHL_SKIP_PATH = '1'
+process.env.DSHL_NODE_INSTALL = 'user' // 隔离脚本一律走用户级安装，绝不碰真实系统（更不会弹 UAC）
 process.env.COREPACK_HOME = path.join(tmpHome, 'corepack-home')
 
 const envInstall = require('../env-install')

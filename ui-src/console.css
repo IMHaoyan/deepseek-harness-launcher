@@ -300,9 +300,32 @@ body.console-surface {
 .recovery-row-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 
 /* 日志区 + 反馈区 */
-.logs-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.logs-head .recovery-title { margin: 0 auto 0 0; }
+.logs-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.logs-head .recovery-title { margin: 0; }
+.logs-head #logHint { margin-left: auto; }
 .logs-card pre { height: min(52vh, 560px); min-height: 220px; overflow: auto; }
+
+/* 服务侧失败的一句话原因：只有真的出过事时才占版面（就绪后主进程会清掉 serviceError） */
+.logs-cause {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--danger-hover);
+}
+.logs-cause-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--danger);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.logs-cause .btn { flex: none; }
 
 .feedback-links {
   display: flex;

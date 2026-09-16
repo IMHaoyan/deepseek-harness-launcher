@@ -73,7 +73,7 @@ function changedName(prev, cur) {
 }
 
 const UI_FILES = ['index.html', ...COPIED]
-const MAIN_FILES = ['main.js', 'console-surface.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'diagnostics.js', 'market.js', 'bridge.js', 'update-window.js', 'changelog.js', 'notify-policy.js', 'crash-note.js', 'start-progress.js', 'service-stop-guard.js', 'service-handover.js', 'package.json']
+const MAIN_FILES = ['main.js', 'console-surface.js', 'preload.js', 'browser-preload.js', 'updater.js', 'dsh-update.js', 'env-detect.js', 'env-install.js', 'redact.js', 'run-guard.js', 'lifecycle.js', 'health.js', 'boot-failure.js', 'diagnostics.js', 'market.js', 'bridge.js', 'update-window.js', 'changelog.js', 'notify-policy.js', 'crash-note.js', 'start-progress.js', 'service-stop-guard.js', 'service-handover.js', 'package.json']
 
 // ---------- electron 子进程管理 ----------
 const electronExe = join(root, 'node_modules', 'electron', 'dist', 'electron.exe')

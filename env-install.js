@@ -1,9 +1,12 @@
 // env-install.js — 一键安装引擎：用户级 Node.js（官方发行包下载/校验/解压 + 用户 PATH）+ DSH（全局 npm 安装）+ 通知插件拷贝
 //
 // 设计要点：
-//  - 全程零管理员权限：Node 用官方 zip（自带 npm）装到 %LOCALAPPDATA%\Programs\nodejs 并写入用户 PATH
-//    （HKCU\Environment，重开终端即可用 npm/node/dsh）；DSH 用 npm install -g 装到全局根
-//    （有系统 npm 按其 prefix，否则 %APPDATA%\npm），与用户命令行 npm 完全同源。
+//  - Node 用**官方 MSI**（内置 assets/node-dist 里的 node-v<ver>-x64.msi，静默 msiexec /qn，
+//    会弹一次管理员授权）：落位 C:\Program Files\nodejs、HKLM\SOFTWARE\Node.js、机器 PATH、
+//    「应用和功能」注册与卸载 —— 与官网下载的 .msi 完全一致（见 decideNodeInstallPlan）。
+//    装不了（策略禁止 / 用户取消授权 / 版本管理器在场）才回退用户级 zip（%LOCALAPPDATA%\Programs\nodejs，
+//    免管理员，并复刻 MSI 那份 npmrc，让全局包同样落在 %APPDATA%\npm —— 语义一致，只少机器级注册）。
+//    已装用户永远复用现有 Node：升级启动器不会被动过环境。
 //  - 失败回退：全局 npm 装不上 → 回退托管目录（~/.dsh/dshl-runtime/dsh）；旧版保留不动。
 //  - 状态机单例：阶段列表 + 权重进度 + 实时日志（环形缓冲 500 行 + install.log 落盘）+ 取消。
 //  - 下载优先 Electron net（自动走系统代理）；脱离 Electron（脚本/测试）回退 Node http/https。
@@ -22,11 +25,12 @@ const IS_WIN = process.platform === 'win32'
 const DEFAULT_PNPM_VERSION = '11.8.0'
 
 let HOME = path.join(os.homedir(), '.dsh')
-let Config = { nodeMajor: 22, dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, npmRegistry: '' }
+let Config = { nodeMajor: 22, dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, npmRegistry: '', npmGlobalRoot: '' }
 let ASSETS_DIR = ''
 let logFn = () => {}
 let onPushFn = () => {}
 let onDoneFn = () => {}
+let saveConfigFn = () => {}
 
 const INSTALL_LOG = 'dshl-logs/install.log' // 相对 HOME 的安装日志
 
@@ -37,6 +41,7 @@ function initInstaller(opts = {}) {
   if (opts.log) logFn = opts.log
   if (opts.onPush) onPushFn = opts.onPush
   if (opts.onDone) onDoneFn = opts.onDone
+  if (typeof opts.saveConfig === 'function') saveConfigFn = opts.saveConfig
 }
 
 function log(message) {
@@ -49,11 +54,13 @@ function runtimeBase() {
 
 // 仅修改 DSHL 当前进程的 PATH：让后续探测/子进程立即看到刚装好的工具，不等新终端。
 // 用户全局可见性仍由 HKCU PATH + addToUserPath 负责。
+// 只接受绝对目录：复用现有 Node 时 nodeBin 可能是 PATH 上的裸 'node'，dirname 出来是 '.'，
+// 把当前目录塞进 PATH 是典型的高危写法（DLL/可执行体劫持），这里直接挡掉。
 function prependProcessPath(dirs) {
   const key = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') || 'PATH'
   const current = process.env[key] || ''
   const normalized = current.split(path.delimiter).map((p) => p.trim().toLowerCase())
-  const additions = (dirs || []).filter((d) => d && !normalized.includes(String(d).toLowerCase()))
+  const additions = (dirs || []).filter((d) => d && path.isAbsolute(d) && !normalized.includes(String(d).toLowerCase()))
   if (!additions.length) return
   process.env[key] = additions.join(path.delimiter) + (current ? path.delimiter + current : '')
 }
@@ -67,11 +74,96 @@ function userNodeDir() {
   return path.join(local, 'Programs', 'nodejs')
 }
 
-// npm 全局根（npm i -g 落点；Windows 默认 %APPDATA%\npm，与官方安装器一致）
+// Node 是否走"用户级目录"安装（否则走 ~/.dsh/dshl-runtime/node 下的托管临时目录）。
+// 两条路径的差别决定了"换 Node 会不会整目录替换掉一个既有目录"，这里与 runJob 共用同一判据。
+function userLevelNodeInstall() {
+  return !!process.env.DSHL_USER_NODE_DIR || IS_WIN
+}
+
+// 列出某目录下 npm 安装过的全局包（含 scope 包，形如 @scope/name）。读不到就返回空。
+function nodeDirGlobalPackages(dest) {
+  const nm = path.join(String(dest || ''), 'node_modules')
+  const out = []
+  let entries = []
+  try { entries = fs.readdirSync(nm, { withFileTypes: true }) } catch { return out }
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name === '.bin') continue
+    if (!e.name.startsWith('@')) { out.push(e.name); continue }
+    try {
+      for (const s of fs.readdirSync(path.join(nm, e.name), { withFileTypes: true })) {
+        if (s.isDirectory()) out.push(e.name + '/' + s.name)
+      }
+    } catch { /* 读不到这个 scope 就跳过 */ }
+  }
+  return out
+}
+
+// Node 发行版自带的包：它们不是"用户装的全局包"，换 Node 时会被新版一并带来，
+// 列账/清理都要排除，否则日志里会出现"还有 2 个全局包会删除（npm、corepack）"这种误导。
+const DISTRIBUTION_PACKAGES = new Set(['npm', 'corepack'])
+function isDistributionPackage(name) {
+  return DISTRIBUTION_PACKAGES.has(String(name || '').toLowerCase())
+}
+
+/**
+ * 换 Node 的依赖补全（纯本地判断，不问 npm、不起进程）：
+ * 两种安装方式都会让用户级 Node 目录里那份 DSH 失效：
+ *  - 官方 MSI：新 Node 装在 C:\Program Files\nodejs（机器 PATH 优先），旧目录里那份会被新版取代；
+ *  - 用户级 zip 重装：旧目录被"改名备份 → 装新的 → 删备份"整目录替换。
+ * 所以只要本次要装 Node 且该目录里确实有全局 DSH，就自动带上 dsh 阶段（新版装好后才清旧残留，
+ * 见 cleanupLegacyDshInUserNodeDir），并把会被波及的其他全局包如实列出来。
+ *
+ * 为什么可以拿"items 含 node"当替换信号：探测侧能给出 node.status=ok 时，UI 不会把 node 列进安装项
+ * （missingEnvItems 只收 status!=='ok' 的项）；而 status!=='ok' 意味着没有任何候选 Node 满足引擎范围，
+ * 那个用户级目录里的 Node 要么不存在、要么正是要被替换的那个。
+ */
+function nodeReplacePlan(items) {
+  const list = [...(items || [])]
+  const out = { list, nodeDir: '', dshInNodeDir: false, otherGlobals: [] }
+  if (!list.includes('node') || !userLevelNodeInstall()) return out
+  const dest = userNodeDir()
+  if (!dest) return out
+  out.nodeDir = dest
+  const globals = nodeDirGlobalPackages(dest)
+  out.otherGlobals = globals.filter((g) => g !== '@deepseek-ai/dsh' && !isDistributionPackage(g))
+  out.dshInNodeDir = globals.includes('@deepseek-ai/dsh')
+  if (out.dshInNodeDir && !list.includes('dsh')) {
+    list.push('dsh') // 装 DSH 会带 pnpm（normalizeInstallItems 的规则），这里显式补齐
+    if (!list.includes('pnpm')) list.push('pnpm')
+  }
+  return out
+}
+
+// npm 全局根（npm i -g 落点）。注意这只是"没问到 npm 时的兜底默认值"（MSI/官方安装器在 Windows
+// 上就是 %APPDATA%\npm）；实际落点一律以 resolveGlobalRoot() 问到的 npm prefix 为准——
+// 官方 zip 版 Node 的 npm 没有那份 prefix 覆盖，内建前缀是 node.exe 所在目录。
 function npmGlobalRoot() {
   if (process.env.DSHL_NPM_GLOBAL_ROOT) return process.env.DSHL_NPM_GLOBAL_ROOT
   if (!IS_WIN) return '/usr/local'
   return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'npm')
+}
+
+// 记账本次实际使用的 npm 全局根：探测侧（env-detect.globalPrefixes）与更新侧都读它，
+// 保证"装到哪儿就找哪儿、更新哪儿"。不记账就只能靠 %APPDATA%\npm 猜，一旦猜错
+// 就是"安装报完成、探测报未检测到 DSH"（v1.4.4 反馈的现场）。
+function rememberGlobalRoot(root) {
+  try {
+    if (!root || typeof root !== 'string') return
+    if (Config.npmGlobalRoot === root) return
+    Config.npmGlobalRoot = root
+    log('npm 全局根已记账：' + root)
+    try { saveConfigFn() } catch { /* 落盘失败不影响安装本身（下次探测还有 Node 目录候选兜底） */ }
+  } catch { /* noop */ }
+}
+
+// 当前生效的全局 DSH 所在的 npm 前缀（由最近一次环境探测缓存反推）；非全局形态/探测不可用返回 ''
+function liveGlobalPrefix() {
+  try {
+    const envDetect = require('./env-detect')
+    const dsh = envDetect.cachedReport() && envDetect.cachedReport().dsh
+    if (!dsh || dsh.kind !== 'global' || !dsh.built || !dsh.dir) return ''
+    return envDetect.npmPrefixOf(dsh.dir)
+  } catch { return '' }
 }
 
 // ---------- 用户 PATH（HKCU\Environment；免管理员，仅 Windows） ----------
@@ -293,6 +385,125 @@ async function downloadText(url, abortRef) {
   }
 }
 
+// ---------- Node 安装方式：官方 MSI（默认，与官网 .msi 完全一致）＋ 用户级 zip（兜底） ----------
+//
+// 为什么默认走官方 MSI：只用 zip 复刻永远差一半——MSI 的一致性有相当一部分不在文件里，而在
+// Windows Installer 的产品注册里（HKLM\SOFTWARE\Node.js、机器 PATH、Program Files 落位、
+// 「应用和功能」的修复/卸载）。这些必须管理员权限，也无法用"看起来像"的注册表项伪造。
+// 因此在"确实需要装 Node"时用官方 MSI；装不了（策略禁用/无管理员权限/版本管理器在场）才回退
+// 用户级 zip，并保证回退路径的语义与 MSI 一致（补 MSI 那份 npmrc → 全局包同样落在 %APPDATA%\npm）。
+
+// 本机已装的 Node.js MSI 产品标记：官方 MSI 会写 HKLM\SOFTWARE\Node.js（InstallPath + Version）。
+// 只读，不写；读不到就当没有（读失败与"没装"在这里等价，后续决策都按"没装"走 = 不会误判成已装）。
+async function readInstalledNodeMsi() {
+  if (!IS_WIN) return null
+  try {
+    const r = await runExec('reg', ['query', 'HKLM\\SOFTWARE\\Node.js'], { timeout: 10000 })
+    const parsed = parseNodeJsRegQuery(r.stdout)
+    return parsed && parsed.version ? parsed : null
+  } catch { return null }
+}
+
+// reg query 输出解析（纯函数，便于测试）：键不存在会抛错，这里只处理"查到了"的情况
+function parseNodeJsRegQuery(stdout) {
+  const text = String(stdout || '')
+  const pick = (name) => {
+    const m = new RegExp(`${name}\\s+REG_\\w+\\s+(.*)$`, 'm').exec(text)
+    return m ? m[1].trim() : ''
+  }
+  const installPath = pick('InstallPath')
+  const version = pick('Version')
+  if (!installPath && !version) return null
+  return { installPath, version }
+}
+
+// 版本管理器在场时不要去装机器级 MSI：那会和 nvm/volta/fnm 争 PATH，把用户"切版本"的行为打乱。
+function detectVersionManager(deps = {}) {
+  const exists = deps.exists || ((p) => { try { return fs.existsSync(p) } catch { return false } })
+  const env = deps.env || process.env
+  const home = deps.home || os.homedir()
+  const candidates = [
+    ['nvm', env.NVM_HOME, path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'nvm')],
+    ['volta', env.VOLTA_HOME, path.join(home, '.volta')],
+    ['fnm', env.FNM_DIR, path.join(home, '.fnm'), path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'fnm')],
+  ]
+  for (const [name, ...dirs] of candidates) {
+    if (dirs.some((d) => d && exists(d))) return name
+  }
+  return ''
+}
+
+/**
+ * Node 安装方式决策（纯函数，便于测试；所有输入都来自探测/注册表，不在这里做 IO）。
+ * 顺序即优先级，"复用优先"是硬规则——能复用用户现有的 Node 就绝不动它：
+ *   1) 探测到可用的 Node（满足 engines）→ 复用，什么都不装
+ *   2) 本机已有 Node.js MSI 产品：版本满足 → 复用；不满足 → 拒绝（见下）
+ *   3) 版本管理器在场 → 用户级 zip（不与版本管理器争 PATH）
+ *   4) 显式配置成 user → 用户级 zip
+ *   5) 其余 → 官方 MSI
+ *
+ * 为什么"已装 MSI 但版本过旧"要拒绝而不是再装一个：Node 的 MSI 是不同版本 = 不同产品码，却
+ * 默认装到同一个 C:\Program Files\nodejs —— 两个产品共同宣称拥有同一目录，卸载其一会把文件删掉、
+ * 留下另一个残缺。也不能回退用户级：Windows 的机器 PATH 先于用户 PATH，回退装出来的 Node 会被
+ * 旧的那份遮蔽，装了等于没装。所以这里 fail-closed，把可行动作写清楚交给用户。
+ */
+function decideNodeInstallPlan(input) {
+  const o = input || {}
+  const range = o.range || envDetect.DEFAULT_ENGINE_RANGE
+  const ok = (v) => {
+    const clean = String(v || '').trim().replace(/^v/i, '')
+    if (!clean) return false
+    try { return semver.satisfies(clean, range, { includePrerelease: true }) } catch { return false }
+  }
+  if (o.nodeOk) return { action: 'reuse', reason: 'node-ok', version: String(o.nodeVersion || '') }
+  const msi = o.installedMsi
+  if (msi && msi.version) {
+    if (ok(msi.version)) return { action: 'reuse', reason: 'msi-ok', version: String(msi.version) }
+    return { action: 'refuse', reason: 'msi-too-old', version: String(msi.version), range }
+  }
+  if (o.versionManager) return { action: 'install-user', reason: 'version-manager-' + o.versionManager }
+  if (o.mode === 'user') return { action: 'install-user', reason: 'mode-user' }
+  return { action: 'install-msi', reason: 'default' }
+}
+
+// msiexec 退出码 → 结局（纯函数，便于测试）。0/3010 都算装好（3010 = 需要重启，Node 用不到）。
+const MSI_POLICY_CODES = new Set([1625, 1622]) // 被系统策略禁止 / 打开安装包失败
+function interpretMsiResult(code, cancelledByUser) {
+  if (cancelledByUser) return { ok: false, cancelled: true, policy: false, detail: '管理员授权被取消' }
+  const n = Number(code)
+  if (n === 0 || n === 3010) return { ok: true, cancelled: false, policy: false, detail: n === 3010 ? '安装完成（需重启）' : '安装完成' }
+  if (n === 1602) return { ok: false, cancelled: true, policy: false, detail: '安装程序被取消（1602）' }
+  if (n === 1618) return { ok: false, cancelled: false, policy: false, detail: '另一个安装程序正在运行（1618）' }
+  if (MSI_POLICY_CODES.has(n)) return { ok: false, cancelled: false, policy: true, detail: `安装被系统策略禁止（${n}）` }
+  return { ok: false, cancelled: false, policy: false, detail: Number.isFinite(n) ? `msiexec 退出码 ${n}` : 'msiexec 结果不可读' }
+}
+
+// 提权运行官方 MSI（与 main.js 的 Defender 排除项同一套做法）：外层普通权限 PowerShell →
+// Start-Process -Verb RunAs -Wait。用结果文件把三种结局分开记账：装好了 / 用户取消了 UAC /
+// msiexec 报错（含被策略禁止）。静默参数 /qn：除了一次 UAC，不弹任何向导——与官网 .msi 的双击安装
+// 产物一致，只是没有任何交互页面。
+async function runElevatedMsi(msiPath, logPath, opts = {}) {
+  const ps = (p) => String(p).replace(/'/g, "''")
+  const resultFile = path.join(os.tmpdir(), `dshl-msi-${process.pid}-${Date.now()}.txt`)
+  const inner = [
+    `$r = '${ps(resultFile)}'`,
+    'try {',
+    `  $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i','${ps(msiPath)}','/qn','/norestart','/l*v','${ps(logPath)}') -Verb RunAs -Wait -PassThru`,
+    `  'CODE=' + $p.ExitCode | Out-File -FilePath $r -Encoding utf8`,
+    `} catch { 'CANCELLED=' + $_.Exception.Message | Out-File -FilePath $r -Encoding utf8 }`,
+  ].join('; ')
+  const b64 = Buffer.from(inner, 'utf16le').toString('base64')
+  try {
+    await runExec('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', b64], { timeout: opts.timeoutMs || 30 * 60 * 1000 })
+  } catch { /* 超时/被杀：仍去读结果文件，读不到按"结果不可读"处理 */ }
+  let text = ''
+  try { text = fs.readFileSync(resultFile, 'utf8').trim() } catch { /* 无结果文件 */ }
+  try { fs.unlinkSync(resultFile) } catch { /* noop */ }
+  const codeMatch = /CODE=(-?\d+)/.exec(text)
+  const cancelledByUser = /CANCELLED=/.test(text)
+  return interpretMsiResult(codeMatch ? codeMatch[1] : NaN, cancelledByUser)
+}
+
 // ---------- 各阶段实现 ----------
 
 function nodeBases() {
@@ -344,14 +555,35 @@ async function extractArchive(archive, destDir) {
 
 // 内置 Node 发行包（发布构建时由 tools/fetch-node-dist.mjs 预置，首装免下载）：
 // 查找顺序：环境变量 DSHL_NODE_DIST_DIR（测试用）→ 开发模式 <项目根>/assets/node-dist → 打包后 <resources>/node-dist
-function bundledNodeDist() {
-  const major = Number(Config.nodeMajor) || 22
-  const dirs = [
+function nodeDistDirs() {
+  return [
     process.env.DSHL_NODE_DIST_DIR,
     path.join(__dirname, 'assets', 'node-dist'),
     path.join(process.resourcesPath || '', 'node-dist'),
   ].filter(Boolean)
-  for (const dir of dirs) {
+}
+
+// 内置的**官方 MSI**（默认安装路径）：与 zip 同一套"内置 + SHA256 侧车"逻辑
+function bundledNodeMsi() {
+  const major = Number(Config.nodeMajor) || 22
+  for (const dir of nodeDistDirs()) {
+    try {
+      const files = fs.readdirSync(dir).filter((f) => new RegExp(`^node-v${major}\\.\\d+\\.\\d+-x64\\.msi$`).test(f))
+      if (!files.length) continue
+      const file = files.sort().pop() // 同主版本取最高补丁版
+      const msiPath = path.join(dir, file)
+      const shaFile = msiPath + '.sha256'
+      const expected = fs.existsSync(shaFile) ? fs.readFileSync(shaFile, 'utf8').trim().split(/\s+/)[0] : ''
+      return { msiPath, ver: file.replace(/^node-v/, '').replace(/-x64\.msi$/, ''), expected }
+    } catch { /* 换下一个位置 */ }
+  }
+  return null
+}
+
+// 内置的 zip（**兜底路径**用；没有内置就联网下载）
+function bundledNodeDist() {
+  const major = Number(Config.nodeMajor) || 22
+  for (const dir of nodeDistDirs()) {
     try {
       const zips = fs.readdirSync(dir).filter((f) => new RegExp(`^node-v${major}\\.\\d+\\.\\d+-win-x64\\.zip$`).test(f))
       if (!zips.length) continue
@@ -363,6 +595,127 @@ function bundledNodeDist() {
     } catch { /* 换下一个位置 */ }
   }
   return null
+}
+
+function sha256Of(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+}
+
+// 拿到官方 MSI（内置优先，否则联网下载并校验官方 SHASUMS256.txt）；拿不到返回 null
+async function acquireNodeMsi(job) {
+  const bundled = bundledNodeMsi()
+  if (bundled) {
+    job.logLine(`使用内置官方 Node.js 安装包 v${bundled.ver}（免下载）：${bundled.msiPath}`)
+    if (bundled.expected && sha256Of(bundled.msiPath).toLowerCase() !== bundled.expected.toLowerCase()) {
+      job.logLine('内置 MSI SHA256 校验失败，改为联网下载')
+    } else {
+      return { msiPath: bundled.msiPath, ver: bundled.ver, temp: false }
+    }
+  }
+  const bases = nodeBases()
+  let ver = null
+  let lastErr = null
+  for (const base of bases) {
+    try {
+      ver = await resolveNodeVersion(job, base)
+      job.logLine(`Node.js 版本列表：${base} → v${ver}`)
+      break
+    } catch (e) { lastErr = e; job.logLine(`版本列表获取失败（${base}）：${e.message}`) }
+  }
+  if (!ver) throw new Error('无法获取 Node.js 版本列表（网络不可用？）' + (lastErr ? ` ${lastErr.message}` : ''))
+  const file = `node-v${ver}-x64.msi`
+  const tmpDir = path.join(runtimeBase(), 'tmp')
+  fs.mkdirSync(tmpDir, { recursive: true })
+  const msiPath = path.join(tmpDir, file)
+  let lastDownloadErr = null
+  for (const base of bases) {
+    if (job.aborted) throw job.cancelledError()
+    const url = `${base}/v${ver}/${file}`
+    job.logLine(`下载官方 Node.js 安装包：${url}`)
+    job.currentDownloadFile = msiPath
+    try {
+      const { bytes } = await downloadToFile(url, msiPath, (got, total) => {
+        job.stageProgress = total > 0 ? Math.min(1, got / total) : 0
+        job.pushProgress()
+      }, job.abortRef)
+      job.currentDownloadFile = null
+      job.logLine(`下载完成：${(bytes / 1024 / 1024).toFixed(1)} MB`)
+      await verifySha256(job, base, ver, file, msiPath)
+      job.logLine('SHA256 校验通过（官方 SHASUMS256.txt）')
+      return { msiPath, ver, temp: true }
+    } catch (e) {
+      job.currentDownloadFile = null
+      lastDownloadErr = e
+      job.logLine(`下载失败（${base}）：${e.message}${bases.length > 1 && base === bases[0] ? '，回退镜像源重试' : ''}`)
+    }
+  }
+  throw new Error(`Node.js 安装包下载失败：${lastDownloadErr ? lastDownloadErr.message : '未知错误'}`)
+}
+
+// 走官方 MSI 安装 Node（机器级，与官网 .msi 完全一致：Program Files 落位 + HKLM\SOFTWARE\Node.js +
+// 机器 PATH + 自己的 npmrc + 「应用和功能」注册）。返回 { ok, nodeBin, detail, cancelled, policy }。
+// 失败不抛错：调用方据此决定"回退用户级 zip"还是"明确报错"。
+async function installNodeViaMsi(job, onInstallStart) {
+  if (!IS_WIN) return { ok: false, detail: '非 Windows 平台不支持官方 MSI', cancelled: false, policy: false }
+  if (onInstallStart) onInstallStart()
+  const logDir = path.join(HOME, 'dshl-logs')
+  fs.mkdirSync(logDir, { recursive: true })
+  const msiLog = path.join(logDir, 'msi-node.log')
+  let acquired = null
+  try {
+    acquired = await acquireNodeMsi(job)
+  } catch (e) {
+    return { ok: false, detail: '官方安装包获取失败：' + (e && e.message ? e.message : String(e)), cancelled: false, policy: false }
+  }
+  job.logLine('运行官方 Node.js 安装包（msiexec /qn，会弹出一次管理员授权）…')
+  const r = await runElevatedMsi(acquired.msiPath, msiLog)
+  if (acquired.temp) { try { fs.unlinkSync(acquired.msiPath) } catch { /* noop */ } }
+  job.logLine(`官方安装包结果：${r.detail}（详细日志：${msiLog}）`)
+  if (!r.ok) return { ok: false, detail: r.detail, cancelled: r.cancelled, policy: r.policy }
+  // 落位以注册表为准（MSI 自己写的 InstallPath），回退默认目录
+  const msi = await readInstalledNodeMsi()
+  const dir = (msi && msi.installPath) || (IS_WIN ? 'C:\\Program Files\\nodejs' : '')
+  const nodeBin = path.join(dir, IS_WIN ? 'node.exe' : 'node')
+  if (!fs.existsSync(nodeBin)) {
+    return { ok: false, detail: `安装包报告成功，但未找到 ${nodeBin}`, cancelled: false, policy: false }
+  }
+  let version = ''
+  try {
+    const out = await runExec(nodeBin, ['-v'], { timeout: 15000 })
+    version = String(out.stdout || '').trim().replace(/^v/, '')
+  } catch { /* 版本探测失败不影响：文件确实在 */ }
+  job.logLine(`Node.js 安装完成（官方 MSI）：${dir}${version ? ' · v' + version : ''}`)
+  return { ok: true, nodeBin, dir, version, detail: r.detail, cancelled: false, policy: false }
+}
+
+// MSI 那份 npmrc 的等效物（**兜底路径**用）：字节级复刻官方 MSI 写入的内容
+// （实测 23 字节：prefix=${APPDATA}\npm + CRLF，ASCII、无 BOM），让 zip 版 Node 的全局包也落在
+// %APPDATA%\npm —— 这样"官方 MSI"与"用户级兜底"两种安装的语义完全一致（只有落位与注册不同）。
+const MSI_NPMRC_BYTES = Buffer.from('prefix=${APPDATA}\\npm\r\n', 'ascii')
+function writeMsiEquivalentNpmrc(job, nodeDir) {
+  try {
+    const npmDir = path.join(nodeDir, 'node_modules', 'npm')
+    if (!fs.existsSync(npmDir)) return false
+    const target = path.join(npmDir, 'npmrc')
+    if (fs.existsSync(target)) {
+      job.logLine('Node 目录已存在 npmrc（官方安装器写过或已复刻），沿用不改写')
+      return true
+    }
+    // fail-closed：只有"这个 Node 目录里还没有任何全局包"时才写。
+    // 否则翻掉前缀会让已有全局包在 npm 眼里凭空消失（它们仍能跑，但 npm 不再管理）——
+    // 那种情况必须走显式迁移，不能顺手改掉。
+    const globals = nodeDirGlobalPackages(nodeDir).filter((g) => g !== 'npm' && g !== 'corepack')
+    if (globals.length) {
+      job.logLine(`Node 目录里已有 ${globals.length} 个全局包，跳过 npmrc 复刻（避免它们被 npm 遗忘）；如需对齐请走迁移`)
+      return false
+    }
+    fs.writeFileSync(target, MSI_NPMRC_BYTES)
+    job.logLine(`已复刻官方 MSI 的 npmrc（prefix=\${APPDATA}\\npm）：${target} → 全局包将落在 ${npmGlobalRoot()}`)
+    return true
+  } catch (e) {
+    job.logLine('npmrc 复刻失败（沿用 zip 默认：全局包在 Node 目录内）：' + (e && e.message ? e.message : String(e)))
+    return false
+  }
 }
 
 // 校验并解压 Node 发行包 → 落位 nodeDest（下载路径与内置包路径共用）
@@ -563,6 +916,7 @@ async function installDshGlobal(job, nodeBin, globalRoot) {
   const installed = readInstalledVersion(pkgDir)
   if (installed && version !== 'latest' && installed === version) {
     job.logLine(`全局 npm 已安装 v${installed}（与目标版本一致），跳过安装`)
+    rememberGlobalRoot(globalRoot)
     return globalRoot
   }
   // 落点可写性预检：给用户一条可行动的报错，而不是 npm 的深层错误
@@ -596,6 +950,7 @@ async function installDshGlobal(job, nodeBin, globalRoot) {
       await runNpmInstall(job, nodeBin, npmCli, args)
       if (!fs.existsSync(binPath)) throw new Error(`安装后未找到 ${binPath}`)
       job.logLine(`全局 npm 安装完成：${pkgDir}`)
+      rememberGlobalRoot(globalRoot)
       return globalRoot
     } catch (e) {
       lastErr = e
@@ -775,9 +1130,18 @@ function readInstalledVersion(pkgDir) {
   } catch { return '' }
 }
 
-// 解析 npm 全局根：有系统 npm 时按其真实 prefix（与用户命令行 npm 完全一致）；否则默认 %APPDATA%\npm
+// 解析 npm 全局根：优先"当前生效的那一份 DSH 所在的前缀"（装到哪儿就更新哪儿，避免两份 DSH）；
+// 没有已装全局版时按其真实 prefix（与用户命令行 npm 完全一致）；问不到才用默认值兜底
 async function resolveGlobalRoot(nodeBin) {
   if (process.env.DSHL_NPM_GLOBAL_ROOT) return process.env.DSHL_NPM_GLOBAL_ROOT // 测试覆盖
+  // 已装的全局 DSH 优先：npm 的前缀与当前生效的安装可能不是同一个目录（zip 版 Node 与 MSI 混装、
+  // PATH 顺序变化、用户改过 .npmrc prefix）——那时按 npm 前缀再装一份会出现两个 DSH，
+  // "PATH 上生效的工具链唯一"就破了。形态不是 global（托管/npx/源码）时不受影响，走下面的 npm 前缀。
+  const live = liveGlobalPrefix()
+  if (live) {
+    log('npm 全局根：沿用当前生效的全局安装 ' + live)
+    return live
+  }
   const fallback = npmGlobalRoot()
   const candidates = []
   try {
@@ -822,15 +1186,79 @@ async function installDshManaged(job, nodeBin) {
   }
 }
 
-// DSH 安装主入口：优先全局 npm（统一渠道）；失败回退托管目录（旧逻辑兜底）
+/**
+ * 存量收敛（**只处理 DSH 自己那一份**）：新版在全局根装好并校验通过之后，清掉用户级 Node 目录里
+ * 那份旧 DSH（包目录 + dsh/dsh.cmd/dsh.ps1 三个 shim）。不做这一步就会出现"两份 DSH"——探测候选根
+ * 同时包含用户级 Node 目录与全局根，于是可能"启动的是旧的、更新的是新的"。
+ *
+ * 边界（按约定）：
+ *  - 只删 DSH；目录里其他全局包一律不碰、不迁移（跨 Node 大版本时原生模块 ABI 会变），只如实列账；
+ *  - 旧 Node 目录本身不删（那是能跑的 Node，也在用户 PATH 上；删它属于侵入），只报告它还在；
+ *  - 校验通过之前绝不删（否则会出现"旧的没了、新的没装好"）。
+ */
+function cleanupLegacyDshInUserNodeDir(job, newPrefix) {
+  try {
+    if (!IS_WIN && !process.env.DSHL_USER_NODE_DIR) return
+    const oldDir = userNodeDir()
+    if (!oldDir) return
+    const nm = path.join(oldDir, 'node_modules')
+    const oldPkg = path.join(nm, '@deepseek-ai', 'dsh')
+    if (!fs.existsSync(path.join(oldPkg, 'package.json'))) return
+    if (newPrefix && path.resolve(oldDir).toLowerCase() === path.resolve(newPrefix).toLowerCase()) return // 同一处，不误删
+    fs.rmSync(oldPkg, { recursive: true, force: true })
+    let shims = 0
+    for (const name of ['dsh', 'dsh.cmd', 'dsh.ps1']) {
+      try { fs.unlinkSync(path.join(oldDir, name)); shims++ } catch { /* 没有就算了 */ }
+    }
+    job.logLine(`已清理旧残留：${oldPkg}${shims ? ` + ${shims} 个 dsh shim` : ''}（新版已装在 ${newPrefix || '全局根'} 并通过校验）`)
+    const others = nodeDirGlobalPackages(oldDir).filter((g) => !isDistributionPackage(g))
+    if (others.length) {
+      job.logLine(`旧 Node 目录仍保留（${oldDir}）：里面还有 ${others.length} 个全局包，按约定不迁移、也不删除：${others.slice(0, 8).join('、')}${others.length > 8 ? ' 等' : ''}`)
+    } else {
+      job.logLine(`旧 Node 目录已无其他全局包（${oldDir}）；目录与 PATH 项保留，如需清理可在环境页处理`)
+    }
+  } catch (e) {
+    job.logLine('旧残留清理失败（不影响本次安装）：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
+// DSH 安装主入口：优先全局 npm（统一渠道）；失败回退托管目录（旧逻辑兜底）。
+// 返回 { prefix, kind }：prefix 是落位根（全局= npm 前缀，托管=托管包目录），kind 供后续步骤区分
+// （只有全局安装才有"npm 前缀目录要进用户 PATH"这一步）。
 async function installDsh(job, nodeBin, resolvedGlobalRoot) {
   try {
     const globalRoot = resolvedGlobalRoot || await resolveGlobalRoot(nodeBin)
-    return await installDshGlobal(job, nodeBin, globalRoot)
+    const prefix = await installDshGlobal(job, nodeBin, globalRoot)
+    return { prefix, kind: 'global' }
   } catch (e) {
     job.logLine(`全局 npm 安装失败（回退托管目录）：${e.message}`)
-    return await installDshManaged(job, nodeBin)
+    return { prefix: await installDshManaged(job, nodeBin), kind: 'managed' }
   }
+}
+
+/**
+ * 落点自检（v1.4.4 事故的直接教训）：原来的验收是**自证**——dsh-verify 拿安装侧自己的 prefix 复验，
+ * 必然通过，却证明不了"探测侧也找得到它"。这里改用独立于记账值的判据再确认一次：
+ *   ① 落点就是 npm 默认全局根（%APPDATA%\npm 等）→ 探测侧的默认候选；
+ *   ② 落点本身是一个 Node 安装目录（npm 内建前缀 = node.exe 所在目录）→ 探测侧的 Node 目录候选；
+ *   ③ npm 自己报的 prefix 就是它 → 探测侧尾查问的正是这个。
+ * 三条都不成立才记一行警告（宁可少报也不误报：候选根与 npm 的前缀都列出来，便于当场定位）。
+ */
+async function checkLandingFindable(job, kind, prefix, nodeBin) {
+  try {
+    if (!prefix || kind !== 'global') return
+    const envDetect = require('./env-detect')
+    const norm = (p) => { try { return path.resolve(String(p)).toLowerCase() } catch { return String(p).toLowerCase() } }
+    const target = norm(prefix)
+    if (norm(npmGlobalRoot()) === target) return
+    const nodeBins = IS_WIN ? ['node.exe'] : [path.join('bin', 'node')]
+    if (nodeBins.some((b) => fs.existsSync(path.join(prefix, b)))) return
+    // 问 npm 时按"所选 Node 自带的 npm"与"PATH 上的 npm"各问一次：安装侧 resolveGlobalRoot 是先 PATH 后
+    // nodeBin，两种答案都算命中，避免因为顺序差异误报
+    const asked = [await envDetect.readNpmPrefix(nodeBin), await envDetect.readNpmPrefix(null)]
+    if (asked.some((p) => p && norm(p) === target)) return
+    job.logLine(`警告：安装落点不在环境探测的候选根内（落点 ${prefix}；npm 报的前缀 ${asked.filter(Boolean).join(' / ') || '未知'}）——若随后报"未检测到 DeepSeek Harness"，请把这一行连同诊断报告一起反馈`)
+  } catch { /* 自检失败不影响安装本身 */ }
 }
 
 async function verifyDsh(job, nodeBin, prefix) {
@@ -906,10 +1334,10 @@ function learnNpmDuration(actualMs) {
 }
 
 // 阶段权重由 STAGE_NOMINAL_MS 自动计算（改种子/学习值无需手调）：
-// Node 阶段（内置包解压，秒级）占小块；DSH 主程序安装（npm，数分钟）是绝对大头；尾部验证/插件小块
+// Node 阶段（内置包，秒级~一分钟）占小块；DSH 主程序安装（npm，数分钟）是绝对大头；尾部验证/插件小块
 const STAGE_LABELS = {
   'node-dl': '准备 Node.js',
-  'node-ex': '校验并解压 Node.js',
+  'node-ex': '校验并安装 Node.js', // 官方 MSI 走 msiexec；zip 兜底是解压落位 —— 两种都算"安装"
   pnpm: '安装 pnpm（用户全局）',
   'dsh-npm': '安装 DeepSeek Harness 主程序',
   'dsh-verify': '验证 DeepSeek Harness',
@@ -963,6 +1391,7 @@ function publicJob(job) {
     stageNominalMs: STAGE_NOMINAL_MS,
     silent: !!(job.opts && job.opts.silent), // 静默任务（后台迁移）：完成时不自动启动服务
     migrate: !!(job.opts && job.opts.migrate), // 迁移任务：失败重试节流用
+    nodeMode: job.nodeInstallMode || '', // Node 的实际安装方式（msi / zip-user / zip-managed / reuse）
     error: job.error || null,
   }
 }
@@ -991,7 +1420,9 @@ function startInstall(items, opts = {}) {
   }
   const list = normalizeInstallItems(items)
   if (!list.length) throw new Error('没有需要安装的项目')
-  const stageDefs = buildStages(list)
+  const nodePlan = nodeReplacePlan(list)
+  const buildList = nodePlan.list
+  const stageDefs = buildStages(buildList)
   const stats = loadInstallStats()
   const estimateNpmMs = stats.dshNpmMs
   const estimateMs = stageDefs.reduce((sum, s) => sum + (s.id === 'dsh-npm' ? estimateNpmMs : (STAGE_NOMINAL_MS[s.id] || 10000)), 0)
@@ -1000,8 +1431,10 @@ function startInstall(items, opts = {}) {
     startedAt: Date.now(),
     estimateMs,
     estimateNpmMs,
-    items: list,
+    items: buildList,
     opts: opts || {},
+    nodePlan, // 换 Node 的本地事实（旧目录里有没有 DSH、还有哪些全局包）→ runJob 里据此记账与收尾
+    nodeInstallMode: '', // 实际采用的安装方式：msi | zip-user | zip-managed | reuse（事后解释"装成了什么"）
     status: 'running',
     stages: stageDefs.map((s) => ({ ...s, status: 'pending' })),
     currentStage: -1,
@@ -1072,7 +1505,7 @@ function startInstall(items, opts = {}) {
   }
   job.stopStageClock = (timer) => { if (timer) clearInterval(timer) }
   currentJob = job
-  job.logLine(`开始一键安装：${list.join(', ')}`)
+  job.logLine(`开始一键安装：${buildList.join(', ')}`)
   pushJob(job)
   void runJob(job)
   return job
@@ -1108,6 +1541,74 @@ async function probeUserNodeVersion(nodeBin, job) {
   }
 }
 
+// 版本管理器探测的安全包装（探测本身出错不该影响安装决策）
+function detectVersionManagerSafe() {
+  try { return detectVersionManager() } catch { return '' }
+}
+
+// 当前探测到的可用 Node（取最近一次探测结果；还没探过就现探一次）。复用决策以此为准，
+// 不轻信调用方传来的信息——界面上的按钮可能已经过期。
+async function readDetectedNode() {
+  try {
+    const envDetect = require('./env-detect')
+    let report = envDetect.cachedReport()
+    if (!report) report = await envDetect.detectEnv(false)
+    const node = report && report.node
+    if (!node || node.status !== 'ok' || !node.path) return null
+    return { path: node.path, version: String(node.version || '') }
+  } catch { return null }
+}
+
+// 复用现有 Node 时的可执行文件（可能是 PATH 上的裸 'node'，后续 ensureNodeBin 会解析成绝对路径）
+async function findUsableNodeBin(job) {
+  if (job.opts && job.opts.nodeBin) return job.opts.nodeBin
+  const detected = await readDetectedNode()
+  return detected ? detected.path : ''
+}
+
+// 用户级 zip 安装（兜底路径）：落位 %LOCALAPPDATA%\Programs\nodejs，并让语义与官方 MSI 对齐
+// （复刻那份 npmrc → 全局包同样落在 %APPDATA%\npm），最后写入用户 PATH。
+async function installNodeUserLevel(job, stageIdx) {
+  const dest = userNodeDir()
+  const existing = path.join(dest, IS_WIN ? 'node.exe' : 'node')
+  const hasExisting = fs.existsSync(existing)
+  const probeFn = typeof job.nodeVersionProbe === 'function' ? job.nodeVersionProbe
+    : (job.opts && typeof job.opts.nodeVersionProbe === 'function' ? job.opts.nodeVersionProbe : null)
+  const probed = hasExisting ? (probeFn ? await probeFn(existing) : await probeUserNodeVersion(existing, job)) : ''
+  const verdict = decideUserNodeReuse({ exists: hasExisting, version: probed })
+  let nodeBin = null
+  if (verdict.reuse) {
+    job.logLine(`用户级 Node.js 已存在且版本可用（${probed}）：${dest}，跳过下载/解压`)
+    nodeBin = existing
+    job.finishStage()
+    job.enterStage(stageIdx('node-ex'))
+    job.finishStage()
+  } else {
+    if (verdict.reason === 'too-old') job.logLine(`用户级 Node.js ${probed} 不满足 ${envDetect.DEFAULT_ENGINE_RANGE}：忽略旧版本并重新安装`)
+    else if (verdict.reason === 'unknown') job.logLine('用户级 Node.js 版本无法确认：不复用，重新安装')
+    let backup = ''
+    if (fs.existsSync(dest)) {
+      backup = dest + '.old-' + Date.now()
+      try { fs.renameSync(dest, backup); job.logLine('旧 Node 目录已移到备份：' + backup) }
+      catch (e) { backup = ''; job.logLine('旧 Node 目录备份失败（继续覆盖安装）：' + (e && e.message ? e.message : String(e))) }
+    }
+    try {
+      nodeBin = await installNode(job, dest, () => {
+        job.finishStage()
+        job.enterStage(stageIdx('node-ex'))
+      })
+    } catch (e) {
+      if (backup) job.logLine('安装失败：旧目录保留在 ' + backup)
+      throw e
+    }
+    if (backup) { try { fs.rmSync(backup, { recursive: true, force: true }) } catch { /* noop */ } }
+    job.finishStage()
+  }
+  writeMsiEquivalentNpmrc(job, dest)
+  await addToUserPath(job, [dest, npmGlobalRoot()], { prepend: true })
+  return nodeBin
+}
+
 async function runJob(job) {
   const stageIdx = (id) => job.stages.findIndex((s) => s.id === id)
   let nodeBin = null
@@ -1116,48 +1617,82 @@ async function runJob(job) {
   try {
     if (job.items.includes('node')) {
       job.enterStage(stageIdx('node-dl'))
-      const useUserLevel = !!process.env.DSHL_USER_NODE_DIR || IS_WIN
+      const useUserLevel = userLevelNodeInstall()
+      job.nodeInstallMode = 'zip-managed'
       if (useUserLevel) {
-        // 用户级安装：官方 Node 发行包落位到 %LOCALAPPDATA%\Programs\nodejs（免管理员），并写入用户 PATH。
-        // 已存在时直接复用（重复迁移/重试不重复下载）。
-        const dest = userNodeDir()
-        const existing = path.join(dest, IS_WIN ? 'node.exe' : 'node')
-        const hasExisting = fs.existsSync(existing)
+        // 1) 决策：复用优先 → 官方 MSI（默认）→ 用户级 zip（兜底）→ 拒绝（给出可行动作）
+        const detectedNode = await readDetectedNode()
+        const force = !!(job.opts && job.opts.forceNodeInstall)
+        // 隔离脚本/测试可以注入探针来模拟"这个目录里是旧版本"：有探针时以它为准
         const probeFn = typeof job.nodeVersionProbe === 'function' ? job.nodeVersionProbe
           : (job.opts && typeof job.opts.nodeVersionProbe === 'function' ? job.opts.nodeVersionProbe : null)
-        const probed = hasExisting ? (probeFn ? await probeFn(existing) : await probeUserNodeVersion(existing, job)) : ''
-        const verdict = decideUserNodeReuse({ exists: hasExisting, version: probed })
-        if (verdict.reuse) {
-          job.logLine(`用户级 Node.js 已存在且版本可用（${probed}）：${dest}，跳过下载/解压`)
-          nodeBin = existing
-          nodeDest = null
+        let nodeOk = !force && !!detectedNode
+        let nodeVersion = detectedNode ? detectedNode.version : ''
+        if (probeFn && detectedNode) {
+          const userBin = path.join(userNodeDir(), IS_WIN ? 'node.exe' : 'node')
+          const probed = await probeFn(userBin)
+          nodeOk = !force && decideUserNodeReuse({ exists: true, version: probed }).reuse
+          nodeVersion = String(probed || '').trim().replace(/^v/i, '')
+        }
+        const mode = (job.opts && job.opts.nodeInstallMode) || process.env.DSHL_NODE_INSTALL || Config.nodeInstallMode || 'msi'
+        const plan = decideNodeInstallPlan({
+          mode,
+          range: (job.opts && job.opts.engineRange) || envDetect.DEFAULT_ENGINE_RANGE,
+          nodeOk,
+          nodeVersion,
+          installedMsi: job.opts && job.opts.installedMsi !== undefined ? job.opts.installedMsi : await readInstalledNodeMsi(),
+          versionManager: detectVersionManagerSafe(),
+        })
+        job.logLine(`Node 安装方式决策：${plan.action}（${plan.reason}）`)
+        if (job.nodePlan && job.nodePlan.dshInNodeDir) {
+          job.logLine(`检测到全局 DSH 就在用户级 Node 目录里（${job.nodePlan.nodeDir}）：本次会自动带上 DSH，并在新版装好、校验通过后清理旧残留`)
+        }
+        if (job.nodePlan && job.nodePlan.otherGlobals.length) {
+          const list = job.nodePlan.otherGlobals
+          job.logLine(`该目录下另有 ${list.length} 个全局包（不迁移：跨 Node 大版本时原生模块 ABI 会变）：${list.slice(0, 8).join('、')}${list.length > 8 ? ' 等' : ''}`)
+        }
+        if (plan.action === 'refuse') {
+          throw new Error(`本机已通过官方 MSI 安装 Node.js v${plan.version}，不满足 DSH 要求 ${plan.range}；`
+            + '请在「应用和功能」里升级 Node.js 后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）')
+        }
+        if (plan.action === 'reuse') {
+          // 复用已有 Node：什么都不装（"不影响已装用户"的关键路径）
+          const reuseBin = await findUsableNodeBin(job)
+          if (!reuseBin) throw new Error('决定复用现有 Node，但找不到它的可执行文件')
+          nodeBin = reuseBin
+          job.nodeInstallMode = 'reuse'
+          job.logLine(`沿用现有 Node.js（${plan.reason}${plan.version ? ' v' + plan.version : ''}）：${reuseBin}`)
           job.finishStage()
           job.enterStage(stageIdx('node-ex'))
           job.finishStage()
+        } else if (plan.action === 'install-msi') {
+          const r = await installNodeViaMsi(job, () => {
+            job.finishStage()
+            job.enterStage(stageIdx('node-ex'))
+          })
+          if (r.ok) {
+            nodeBin = r.nodeBin
+            job.nodeInstallMode = 'msi'
+            job.finishStage()
+            job.logLine('官方安装包已注册到「应用和功能」（与官网 .msi 一致，可修复/卸载）')
+            // 机器 PATH 由 MSI 负责；用户 PATH 里的 %APPDATA%\npm（全局命令靠它才调得动）幂等确认一次
+            await addToUserPath(job, [npmGlobalRoot()], { prepend: true })
+          } else {
+            // 2) 兜底：官方 MSI 用不了（策略禁止 / 用户取消授权 / 报错）→ 用户级 zip。
+            //    语义保持一致（复刻 MSI 那份 npmrc → 全局包同样落在 %APPDATA%\npm），只少机器级注册。
+            job.logLine(`官方安装包不可用（${r.detail}）：回退用户级安装（官网 .zip；全局包仍落在 ${npmGlobalRoot()}，不进「应用和功能」）`)
+            nodeBin = await installNodeUserLevel(job, stageIdx)
+            job.nodeInstallMode = 'zip-user'
+          }
         } else {
-          if (verdict.reason === 'too-old') job.logLine(`用户级 Node.js ${probed} 不满足 ${envDetect.DEFAULT_ENGINE_RANGE}：忽略旧版本并重新安装`)
-          else if (verdict.reason === 'unknown') job.logLine('用户级 Node.js 版本无法确认：不复用，重新安装')
-          let backup = ''
-          if (fs.existsSync(dest)) {
-            backup = dest + '.old-' + Date.now()
-            try { fs.renameSync(dest, backup); job.logLine('旧 Node 目录已移到备份：' + backup) }
-            catch (e) { backup = ''; job.logLine('旧 Node 目录备份失败（继续覆盖安装）：' + (e && e.message ? e.message : String(e))) }
-          }
-          try {
-            nodeBin = await installNode(job, dest, () => {
-              job.finishStage()
-              job.enterStage(stageIdx('node-ex'))
-            })
-            nodeDest = null
-          } catch (e) {
-            if (backup) job.logLine('安装失败：旧目录保留在 ' + backup)
-            throw e
-          }
-          if (backup) { try { fs.rmSync(backup, { recursive: true, force: true }) } catch { /* noop */ } }
-          job.finishStage()
+          // install-user：版本管理器在场（不与它争 PATH）或显式配置成用户级
+          job.logLine(plan.reason.startsWith('version-manager-')
+            ? `检测到版本管理器 ${plan.reason.replace('version-manager-', '')}：改走用户级安装，避免与它争 PATH`
+            : '按配置走用户级安装')
+          nodeBin = await installNodeUserLevel(job, stageIdx)
+          job.nodeInstallMode = 'zip-user'
         }
-        job.logLine(`Node.js 就绪：${nodeBin}`)
-        await addToUserPath(job, [dest, npmGlobalRoot()], { prepend: true })
+        job.logLine(`Node.js 就绪：${nodeBin}（方式：${job.nodeInstallMode}）`)
       } else {
         const tmpDest = path.join(runtimeBase(), 'node', '_installing-' + Date.now())
         try {
@@ -1178,6 +1713,9 @@ async function runJob(job) {
     if (job.items.includes('pnpm')) {
       job.enterStage(stageIdx('pnpm'))
       nodeBin = await ensureNodeBin(job, nodeBin)
+      // ensureNodeBin 之后 nodeBin 一定是绝对路径（裸 'node' 会被解析成真实 exe）→ 把它的目录补进进程 PATH，
+      // 后续 npm 的原生模块生命周期脚本（cmd /c node …）才找得到 node
+      if (nodeBin) prependProcessPath([path.dirname(nodeBin), npmGlobalRoot()])
       globalRoot = await resolveGlobalRoot(nodeBin)
       const pnpmResult = await installPnpm(job, nodeBin, globalRoot)
       if (pnpmResult && pnpmResult.globalRoot) globalRoot = pnpmResult.globalRoot
@@ -1190,8 +1728,11 @@ async function runJob(job) {
       const npmT0 = Date.now()
       const clock = job.startStageClock(job.estimateNpmMs)
       let prefix
+      let dshKind = ''
       try {
-        prefix = await installDsh(job, nodeBin, globalRoot)
+        const r = await installDsh(job, nodeBin, globalRoot)
+        prefix = r.prefix
+        dshKind = r.kind
       } finally {
         job.stopStageClock(clock)
       }
@@ -1202,6 +1743,14 @@ async function runJob(job) {
       job.finishStage()
       job.enterStage(stageIdx('dsh-verify'))
       await verifyDsh(job, nodeBin, prefix)
+      // 落点自检：独立确认"装到哪儿"能被探测侧找回（见 checkLandingFindable 注释）
+      await checkLandingFindable(job, dshKind, prefix, nodeBin)
+      // PATH 上生效的工具链唯一：npm 的 binstub（dsh / dsh.cmd）就落在 --prefix 目录，
+      // 该目录必须在用户 PATH 上（否则新终端里没有 dsh 命令）。只加 npmGlobalRoot() 这个默认值
+      // 会漏掉 zip 版 Node（前缀=node 目录）与自定义 .npmrc prefix 的机器；重复添加会被去重挡掉。
+      if (dshKind === 'global') await addToUserPath(job, [prefix], { prepend: true })
+      // 存量收敛：新版已装好并校验通过 → 清掉用户级 Node 目录里那份旧 DSH（只迁 DSH，其余全局包不碰）
+      if (dshKind === 'global') cleanupLegacyDshInUserNodeDir(job, prefix)
       job.finishStage()
     }
     if (job.items.includes('plugin')) {
@@ -1281,6 +1830,19 @@ module.exports = {
   KIND_LABELS,
   userNodeDir,
   npmGlobalRoot,
+  rememberGlobalRoot,
+  liveGlobalPrefix,
+  nodeReplacePlan,
+  nodeDirGlobalPackages,
+  checkLandingFindable,
+  decideNodeInstallPlan,
+  interpretMsiResult,
+  parseNodeJsRegQuery,
+  readInstalledNodeMsi,
+  detectVersionManager,
+  cleanupLegacyDshInUserNodeDir,
+  writeMsiEquivalentNpmrc,
+  MSI_NPMRC_BYTES,
   resolveGlobalRoot,
   normalizeInstallItems,
   buildStages,

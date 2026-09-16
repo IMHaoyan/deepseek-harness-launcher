@@ -43,10 +43,25 @@ test('verifyNpmManifestShape：合法 manifest 返回精确版本', () => {
   assert.deepEqual(r, { name: NAME, version: '1.45.0' })
 })
 
+test('verifyNpmManifestShape：精确的预发布版本也接受（上游只发预览版的插件要能用）', () => {
+  const bundle = { dsh: { bundle: { patch: './cordis.patch.yml' } } }
+  // 真实案例：dsh-mcp-lens 在 npm 上只有 0.1.0-rc.9，latest 也指向它
+  assert.deepEqual(
+    market.verifyNpmManifestShape({ name: NAME, version: '0.1.0-rc.9', ...bundle }, NAME),
+    { name: NAME, version: '0.1.0-rc.9' },
+  )
+  for (const v of ['1.4.5-alpha.1', '2.0.0-beta', '1.0.0-0', '1.0.0+build.5', '1.0.0-rc.1+build.5']) {
+    assert.equal(market.verifyNpmManifestShape({ name: NAME, version: v, ...bundle }, NAME).version, v, v + ' 是精确版本，应接受')
+  }
+})
+
 test('verifyNpmManifestShape：包名不符/非精确版本/无 bundle 声明 → 拒绝', () => {
   const base = { name: NAME, version: '1.45.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }
   assert.throws(() => market.verifyNpmManifestShape({ ...base, name: 'other-pkg' }, NAME), /包身份/)
-  assert.throws(() => market.verifyNpmManifestShape({ ...base, version: '^1.45.0' }, NAME), /精确/)
+  // 范围 / dist-tag / 缺段：装的是哪一版会变得不可预测，一律拒绝
+  for (const v of ['^1.45.0', '~1.45.0', '1.45', '1', 'latest', 'next', '1.45.0 - 2.0.0', 'v1.45.0', '1.45.0-']) {
+    assert.throws(() => market.verifyNpmManifestShape({ ...base, version: v }, NAME), /精确/, '应拒绝 ' + v)
+  }
   assert.throws(() => market.verifyNpmManifestShape({ ...base, dsh: {} }, NAME), /DSH bundle/)
   assert.throws(() => market.verifyNpmManifestShape({ ...base, dsh: { bundle: { patch: '../evil.js' } } }, NAME), /DSH bundle/)
   assert.throws(() => market.verifyNpmManifestShape(null, NAME), /invalid/)

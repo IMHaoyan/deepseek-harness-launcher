@@ -3,7 +3,8 @@
 // 复现两种真实场景（全程隔离，不碰真实用户目录与 PATH）：
 //   1) 目录里是 Node 18（探针注入 v18.20.4）→ 必须忽略旧目录、备份后重装，且不残留备份；
 //   2) 目录里是达标版本（真实探测）→ 必须复用并跳过下载。
-// 用内置 Node 发行包（assets/node-dist），不联网。
+// 走用户级安装（DSHL_NODE_INSTALL=user：本脚本明确不走官方 MSI，那条路会弹 UAC 装机器级 Node）；
+// 内置包优先，没有内置则联网下载官方 zip。
 //
 // 用法：node tools/node-reuse-smoke.cjs
 'use strict'
@@ -22,6 +23,7 @@ fs.copyFileSync(process.execPath, path.join(userNodeDir, 'node.exe')) // 内容�
 process.env.DSHL_USER_NODE_DIR = userNodeDir
 process.env.DSHL_NPM_GLOBAL_ROOT = path.join(base, 'npm-global')
 process.env.DSHL_SKIP_PATH = '1'
+process.env.DSHL_NODE_INSTALL = 'user' // 隔离脚本一律走用户级安装，绝不碰真实系统（更不会弹 UAC）
 process.env.DSHL_FRESH_TEST = '1'
 
 const envInstall = require(path.join(repo, 'env-install'))

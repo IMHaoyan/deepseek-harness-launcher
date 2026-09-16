@@ -150,15 +150,26 @@ function httpJsonFetch(url, { allowedOrigin, maxBytes = 1 * 1024 * 1024, timeout
   })
 }
 
-/** npm manifest 校验：name 一致 + 精确稳定版本 + 合法 dsh.bundle.patch 形状。 */
+/**
+ * npm manifest 校验：name 一致 + **精确**版本 + 合法 dsh.bundle.patch 形状。
+ *
+ * 「精确」= 只接受 `X.Y.Z` 或带预发布/构建后缀的完整 semver，拒绝 `^1.0.0` / `~1.0.0` / `1.0`
+ * 这类范围和缺段写法，也拒绝 `latest` 这种 dist-tag 名 —— 安装时我们把版本号原样拼进 `pkg@版本`，
+ * 范围写进来会让「装的是哪一版」变得不可预测。
+ *
+ * 为什么不再要求「稳定版」：上游只发预发布版的插件（如 dsh-mcp-lens 至今只有 0.1.0-rc.9，
+ * npm 的 latest 也指向它）会因此连版本查询都失败，既装不了也判不了可更新，还每次刷新刷一条日志。
+ * 精确性才是这里要守的契约；是否适合默认代装由注册表（autoInstall）决定，不由版本号后缀决定。
+ */
 function verifyNpmManifestShape(manifest, expectedName) {
   if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) {
     throw new Error('npm manifest is invalid')
   }
   if (manifest.name !== expectedName) throw new Error('npm 包身份不一致')
   const version = manifest.version
-  if (typeof version !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(version)) {
-    throw new Error('npm 未提供精确的稳定版本号')
+  const exact = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u
+  if (typeof version !== 'string' || !exact.test(version)) {
+    throw new Error('npm 未提供精确的版本号')
   }
   const dsh = manifest.dsh && typeof manifest.dsh === 'object' ? manifest.dsh : {}
   const bundle = dsh.bundle && typeof dsh.bundle === 'object' ? dsh.bundle : {}

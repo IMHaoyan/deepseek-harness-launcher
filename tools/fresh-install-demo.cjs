@@ -18,6 +18,7 @@ const home = path.join(base, '.dsh')
 process.env.DSHL_USER_NODE_DIR = path.join(base, 'Programs', 'nodejs')
 process.env.DSHL_NPM_GLOBAL_ROOT = path.join(base, 'npm-global')
 process.env.DSHL_SKIP_PATH = '1'
+process.env.DSHL_NODE_INSTALL = 'user' // 隔离脚本一律走用户级安装，绝不碰真实系统（更不会弹 UAC）
 process.env.DSHL_FRESH_TEST = '1'
 process.env.COREPACK_HOME = path.join(base, 'corepack-home')
 

@@ -1,0 +1,23 @@
+<Configuration>
+  <!-- DSHL 的官方 MSI 安装路径验收（Windows Sandbox）。启动后自动跑 tools/vm-accept/accept-node-msi.ps1，
+       结果写回宿主机 %USERPROFILE%\Desktop\dshl-vm-accept\（映射的可写目录），完成后自动关机。 -->
+  <VGpu>Disable</VGpu>
+  <Networking>Enable</Networking>
+  <MappedFolders>
+    <!-- 仓库只读映射：脚本与内置的官方 MSI 从这里取 -->
+    <MappedFolder>
+      <HostFolder>%USERPROFILE%\Desktop\dshl</HostFolder>
+      <SandboxFolder>C:\vm\repo</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <!-- 结果目录（可写）：报告与 msiexec 日志写回宿主机 -->
+    <MappedFolder>
+      <HostFolder>%USERPROFILE%\Desktop\dshl-vm-accept</HostFolder>
+      <SandboxFolder>C:\vm\out</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\vm\repo\tools\vm-accept\accept-node-msi.ps1 -Repo C:\vm\repo -Out C:\vm\out</Command>
+  </LogonCommand>
+</Configuration>

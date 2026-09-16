@@ -126,7 +126,8 @@ test('主进程接线：状态下发、动作记账、IPC 命令齐全', () => {
   assert.match(main, /clearPluginEnvFailure\(id\)/, '动作成功应把自己从聚合里摘掉')
   assert.match(main, /notePluginEnvFailure\(target\.key, 'install'/, '一键全部安装的失败项也要记账')
   assert.match(main, /notePluginEnvFailure\(d\.id, 'install'/, '默认代装的失败项也要记账')
-  assert.match(main, /case 'pluginsRetryEnvFailed': return JSON\.stringify\(await retryPluginEnvFailures\(\)\)/, '应有重试失败项的命令')
+  // 命令必须存在；插件操作统一走 profile 写锁（withProfileOp），所以匹配的是包了一层的形态
+  assert.match(main, /case 'pluginsRetryEnvFailed': return JSON\.stringify\(await withProfileOp\([^)]*\(\) => retryPluginEnvFailures\(\)\)\)/, '应有重试失败项的命令')
   assert.match(main, /pluginDisplayName\(id\)/, '提示条里的插件名应走统一取名')
 })
 

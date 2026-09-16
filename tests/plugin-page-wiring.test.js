@@ -83,6 +83,50 @@ test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.match(app, /function renderInstallAll\(info\)/, '控制台应渲染一键安装进度')
 })
 
+test('版本查询失败：同包同原因只留一条日志，恢复后复发再记（注入桩执行真实流程）', async () => {
+  const start = main.indexOf('async function resolveNpmVersion(name) {')
+  assert.ok(start > 0, '找不到 resolveNpmVersion')
+  const end = main.indexOf('\n}\n', start) + 3
+  const fnSrc = main.slice(start, end)
+
+  const lines = []
+  let mode = 'age' // age = 报「非精确版本」；net = 报网络错；ok = 成功
+  const ctx = {
+    npmVersionCache: new Map(),
+    NPM_VERSION_TTL_MS: 10 * 60 * 1000,
+    npmVersionErrors: new Map(),
+    log: (m) => lines.push(m),
+    market: {
+      verifyNpmPackage: async (name) => {
+        if (mode === 'ok') return { name, version: '0.1.0-rc.9' }
+        if (mode === 'age') throw new Error('npm 未提供精确的版本号')
+        throw new Error('无法从 npm 官方源验证包（HTTP 429）')
+      },
+    },
+  }
+  const names = Object.keys(ctx)
+  const resolve = new Function(...names, fnSrc + '\nreturn resolveNpmVersion')(...names.map((k) => ctx[k]))
+
+  assert.equal(await resolve('dsh-mcp-lens'), '')
+  assert.equal(await resolve('dsh-mcp-lens'), '', '同样的失败：第二次不该再刷一条')
+  assert.equal(lines.length, 1, '同包同原因只留一条日志（实际 ' + lines.length + ' 条）')
+  assert.match(lines[0], /dsh-mcp-lens：npm 未提供精确的版本号/)
+
+  mode = 'net'
+  assert.equal(await resolve('dsh-mcp-lens'), '')
+  assert.equal(lines.length, 2, '原因变了要重新留证')
+
+  mode = 'ok'
+  assert.equal(await resolve('dsh-mcp-lens'), '0.1.0-rc.9', '缓存未命中时会重新查；查成功应返回版本号')
+  assert.equal(lines.length, 2, '成功不写日志')
+  assert.equal(ctx.npmVersionErrors.size, 0, '成功后清账：下次再失败要重新记一条')
+
+  mode = 'age'
+  ctx.npmVersionCache.clear()
+  assert.equal(await resolve('dsh-mcp-lens'), '')
+  assert.equal(lines.length, 3, '恢复后复发应重新留证')
+})
+
 test('按钮形态统一：未安装 1 个、已安装 2 个（走主进程同一份推导）', () => {
   // 直接执行 main.js 里的 pluginCardActions，避免"测试抄一份实现"的假护栏
   const start = main.indexOf('function pluginCardActions(')
@@ -130,6 +174,7 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
   const deferCalls = []
   const applied = []
   let stopped = 0
+  let releaseProfileOp = () => {}
   const ctx = {
     pluginInstallAllRunning: false,
     pluginInstallAllTarget: 0,
@@ -139,7 +184,10 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
     broadcastState() {},
     notify() {},
     log() {},
-    stopServiceForPluginChange: async () => { stopped++ },
+    // profile 写锁：拿到返回 release，拿不到返回 null（批量流程必须占用它，见 main.js 的说明）
+    tryBeginProfileOp: () => releaseProfileOp,
+    profileBusyError: () => ({ ok: false, error: '另一个插件操作正在进行，请等它结束后再试', busy: true }),
+    stopServiceForPluginChange: async () => { stopped++; return { ok: true } },
     MANAGED_NPM_PLUGINS: [
       { id: 'a', name: '插件A', npm: 'pkg-a' },
       { id: 'b', name: '插件B', npm: 'pkg-b' },
@@ -163,6 +211,50 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
   assert.deepEqual(applied, [], '批量流程不得调用 applyPluginChange（那是重启入口）')
   assert.equal(result.installed, 3)
   assert.equal(result.pendingRestart, true, '结果应标记「待重启生效」')
+
+  // 锁被占用：一个都不许装（并发改写同一份依赖树正是 profile 损坏的来源）
+  releaseProfileOp = null
+  deferCalls.length = 0
+  const blocked = await fn(...names.map((k) => ctx[k]))()
+  assert.equal(blocked.ok, false, '拿不到 profile 写锁时必须拒绝')
+  assert.equal(deferCalls.length, 0, '拿不到锁时不得改任何插件的 profile')
+})
+
+test('批量安装：停服务失败时中止，绝不在别人占着依赖树时改写它', async () => {
+  const start = main.indexOf('async function installAllManagedPlugins() {')
+  const end = main.indexOf('\n}', main.indexOf('return { ok: true, installed, skipped, pendingRestart', start)) + 2
+  const fnSrc = main.slice(start, end)
+
+  const deferCalls = []
+  const ctx = {
+    pluginInstallAllRunning: false,
+    pluginInstallAllTarget: 0,
+    pluginInstallAllDone: 0,
+    pluginInstallAllCurrent: '',
+    pluginInstallAllError: '',
+    broadcastState() {},
+    notify() {},
+    log() {},
+    tryBeginProfileOp: () => (() => {}),
+    profileBusyError: () => ({ ok: false, error: 'busy' }),
+    stopServiceForPluginChange: async () => ({ ok: false, error: '服务正在停止中，请稍候重试', busy: true }),
+    MANAGED_NPM_PLUGINS: [{ id: 'a', name: '插件A', npm: 'pkg-a' }],
+    market: { getState: () => ({ installed: false }) },
+    runNpmPluginAction: async () => { deferCalls.push('a'); return { ok: true } },
+    installManagedMarket: async () => { deferCalls.push('m'); return { ok: true } },
+    applyPluginChange: async () => true,
+    deferPluginChange: () => {},
+    clearPluginEnvFailure: () => {},
+    notePluginEnvFailure: () => {},
+    notePluginReleaseAgeRetry: () => {},
+  }
+  const names = Object.keys(ctx)
+  const fn = new Function(...names, fnSrc + '\nreturn installAllManagedPlugins')
+  const result = await fn(...names.map((k) => ctx[k]))()
+
+  assert.equal(result.ok, false)
+  assert.match(result.error, /正在停止/u)
+  assert.deepEqual(deferCalls, [], '停不下来就一个都别装')
 })
 
 test('推荐插件注册表：九个 npm 插件 + 通用动作/更新检查', () => {
@@ -252,19 +344,32 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     assert.ok(card.actions.length >= 1, d.id + ' 卡片缺少操作按钮')
     assert.ok(card.icon && card.category && card.description, d.id + ' 卡片缺少图标/分类/说明')
   }
+  // 排序契约：预装（插件市场 / 手机连接 / 注册表声明 autoInstall 的那批）排前面，手动安装的排后面，
+  // 各组内按注册表 order —— 用户一眼看到的就是「默认会给我装什么」。
   assert.deepEqual(catalog.map((c) => c.id), [
     'dshmarket',
     'bridge-next',
-    'better-sidebar',
-    'codex-ui',
     'usage-billing',
-    'chat-import',
     'skills-manager',
     'archive-manager',
-    'sidebar-qa',
     'rewind',
+    'better-sidebar',
+    'codex-ui',
+    'chat-import',
+    'sidebar-qa',
     'mcp-lens',
-  ], '卡片顺序应与注册表 order 一致')
+  ], '卡片顺序应为「预装在前、手动在后」，各组内按 order')
+  assert.deepEqual(catalog.filter((c) => !c.preset).map((c) => c.id), [
+    'better-sidebar', 'codex-ui', 'chat-import', 'sidebar-qa', 'mcp-lens',
+  ], 'preset=false 的应恰好是手动安装的那批')
+  assert.equal(catalog.findIndex((c) => !c.preset), catalog.filter((c) => c.preset).length,
+    '预装卡片必须全部连续排在前面（不与手动项交错）')
+  for (const d of registry) {
+    const card = catalog.find((c) => c.id === d.id)
+    assert.equal(card.preset, !!d.autoInstall, d.id + ' 的 preset 应等于注册表声明的 autoInstall（不看运行时状态）')
+  }
+  assert.equal(catalog.find((c) => c.id === 'dshmarket').preset, true, '插件市场默认开启')
+  assert.equal(catalog.find((c) => c.id === 'bridge-next').preset, true, '手机连接随启动器分发')
 
   // 4. 真 pendingAutoInstallPlugins：默认代装集合 = 注册表里 autoInstall 的那批，且只挑缺失的
   const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
@@ -362,7 +467,9 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
     envReport: { pnpm: { status: 'ok' } },
     server: { running: () => true },
     sleep: async () => {},
-    stopServiceForPluginChange: async () => { calls.stops++ },
+    stopServiceForPluginChange: async () => { calls.stops++; return { ok: true } },
+    // 后台自动流程：拿不到 profile 写锁就整次跳过、且不记账
+    tryBeginBackgroundProfileOp: () => (() => {}),
     applyPluginChange: async (verb, version, spec) => { calls.applied.push(spec && spec.name); return true },
     notify: () => { calls.notified++ },
     log: () => {},

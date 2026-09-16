@@ -33,6 +33,7 @@ const notifyPolicy = require('./notify-policy')
 const crashNote = require('./crash-note')
 const startProgress = require('./start-progress')
 const bridge = require('./bridge')
+const bootFailure = require('./boot-failure')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -95,6 +96,12 @@ const CONFIG_PATH = SELF_TEST
   ? path.join(os.tmpdir(), 'dshl-selftest-config.json')
   : path.join(HOME, 'dshl', 'config.json')
 const SELFTEST_RESULT = path.join(os.tmpdir(), 'dshl-selftest-result.txt')
+// DSH 侧的声明式状态文件：服务起不来时，坏掉的往往就是这几个，
+// 而启动器自己的 config.json 一点没变 —— 所以健康快照必须把它们一起纳入（见 health.js 顶部说明）。
+const DSH_SETTINGS_YAML = path.join(HOME, 'settings.yaml')
+const DSH_PROFILE_DIR = path.join(HOME, 'profiles', 'web')
+const DSH_PROFILE_PATCH = path.join(DSH_PROFILE_DIR, 'cordis.patch.yml')
+const DSH_PROFILE_PACKAGE = path.join(DSH_PROFILE_DIR, 'package.json')
 const ASSETS_DIR = path.join(__dirname, 'assets')
 const WWWROOT = path.join(__dirname, 'wwwroot')
 const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
@@ -102,7 +109,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
@@ -119,6 +126,7 @@ function initEnvRuntime() {
     Config,
     ASSETS_DIR,
     log,
+    saveConfig, // 安装侧记账 npm 全局根后立刻落盘（探测/更新都读它）
     onPush: pushEnv,
     onDone: () => {
       // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
@@ -169,7 +177,15 @@ async function refreshEnv(force = false) {
     if (changed) {
       const s = envDetect.envSummary(report)
       log(`ENV-DIAG ready=${s.ready} node=${s.node.status}/${s.node.version || '-'} pnpm=${s.pnpm ? s.pnpm.status + '/' + (s.pnpm.version || '-') : '?'} dsh=${s.dsh.status}/${s.dsh.kind}/${s.dsh.version || '-'} plugin=${s.plugin.status} plan=${report.plan ? 'yes' : 'no'}`)
-      if (!s.ready) log('ENV-DIAG issues: ' + (s.issues.length ? s.issues.join('；') : '(none)'))
+      if (!s.ready) {
+        log('ENV-DIAG issues: ' + (s.issues.length ? s.issues.join('；') : '(none)'))
+        // 未就绪才多记一行"找过哪些根"：安装完却报未检测到 DSH 时，这一行直接给出两边说的目录
+        log(`ENV-DIAG roots: node=${s.node.path || '-'} dshDir=${s.dsh.dir || '-'} dshRoot=${s.dsh.root || '-'} npmGlobalRoot=${Config.npmGlobalRoot || '-'} npmPrefix=${s.npmPrefix || '-'}`)
+      }
+      // 旧布局（用户级 Node 目录里还装着全局 DSH）：官方 MSI 成为默认安装方式后，这类机器可迁移；只记事实，不静默改环境
+      if (s.legacyNode) {
+        log(`ENV-DIAG legacy-node: ${s.legacyNode.dir}（v${s.legacyNode.version || '?'}${s.legacyNode.otherGlobals.length ? `，另有 ${s.legacyNode.otherGlobals.length} 个全局包` : ''}）→ 可迁移到官方 MSI（只迁移 DSH）`)
+      }
       broadcastState()
     }
     return report
@@ -343,6 +359,11 @@ function applyConfigJson(cfg) {
   if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
   if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
   if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
+  // 上次安装/更新实际使用的 npm 全局根（探测侧据此找回"装到哪儿"的 DSH）：
+  // 只认绝对路径——配置写坏了就当作没记账，绝不拿相对路径去拼扫描目录
+  if (typeof cfg.npmGlobalRoot === 'string' && path.isAbsolute(cfg.npmGlobalRoot)) Config.npmGlobalRoot = cfg.npmGlobalRoot
+  // Node 安装方式：msi（默认，官方安装包，与官网 .msi 一致，需一次管理员授权）/ user（用户级 zip 兜底）
+  if (cfg.nodeInstallMode === 'msi' || cfg.nodeInstallMode === 'user') Config.nodeInstallMode = cfg.nodeInstallMode
   // 上次真正成功的 npm 源（'default' = 不带 --registry、用 npm 自身配置）：下次优先试它
   if (typeof cfg.dshRegistryOk === 'string') Config.dshRegistryOk = cfg.dshRegistryOk
   if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
@@ -532,6 +553,8 @@ const server = {
   launchUrl: null, // 本轮服务 stdout 打印的访问地址（新 DSH 带一次性 token，形如 ?token=xxx）；null=未知/无鉴权
   phaseLine: '', // 启动期"当前环节"：服务进程最近一条插件日志（说明页在"等待端口就绪"后面显示它）
   phaseAt: 0, // 上面那行到达的时间（页面据此显示"（N 秒前）"，避免把已过去的事说成"正在"）
+  errTail: [], // 子进程 stderr 尾部若干行：**失败原因的唯一来源**（server.err.log 是同一份证据的落盘）
+  startPromise: null, // 进行中的启动：并发调用共用同一次启动，不再 spawn 第二个 dsh web 抢同一个端口
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
   claimed() { return this.claimedPid !== 0 && this.claimedAlive },
@@ -861,7 +884,7 @@ async function handlePortOccupied(source, retryDepth = 0) {
     if (verdict === 'retry-start') {
       log(`端口 ${PORT} 在占有者确认窗口内变为空闲：由启动器直接拉起服务`)
       if (retryDepth >= 1) break // 极端抖动：不再递归，按冲突处理，交给用户在控制台决定
-      return startServer(retryDepth + 1)
+      return startServerInner(retryDepth + 1) // 递归走内部实现，否则会等回自己这次的 startPromise
     }
     if (verdict === 'conflict') {
       log(`端口 ${PORT} 占有者确认失败（PID ${pid || '未知'}，sig=${matched > 0 ? 'match' : 'none'}，probe=${probe.reason || 'n/a'}）`)
@@ -907,7 +930,22 @@ async function reportBindBlocked(code) {
   lifecycle.emit('service.blocked', { port: PORT, reason: 'bind-' + String(code).toLowerCase() })
 }
 
-async function startServer(occupantRetry = 0) {
+/**
+ * 启动互斥：并发调用共用同一次启动，绝不 spawn 第二个 dsh web 去抢同一个端口。
+ * 原来唯一的守卫是 startServerInner 里的 `if (server.owned() || server.claimed()) return true` ——
+ * 两条流程在"还没有 child"时都能通过它，于是两个进程同时 bind 同一个端口（server.err.log 里的
+ * EADDRINUSE 就是这么来的）。这里把"启动中"显式化，后来者直接等前一次的结果。
+ */
+function startServer(occupantRetry = 0) {
+  if (server.startPromise) return server.startPromise
+  const p = startServerInner(occupantRetry)
+  server.startPromise = p
+  const clear = () => { if (server.startPromise === p) server.startPromise = null }
+  p.then(clear, clear)
+  return p
+}
+
+async function startServerInner(occupantRetry = 0) {
   if (server.owned() || server.claimed()) return true // 已有我们负责的服务在跑（含认领的自重启后继）
   server.blockedReason = ''
   server.suggestedPort = 0
@@ -961,6 +999,7 @@ async function startServer(occupantRetry = 0) {
   server.launchUrl = null // 新进程的 launch token 只在本轮 stdout 中出现
   server.phaseLine = '' // 新进程的"当前环节"从零开始（上一轮的最后一条日志不能说成这一轮的动静）
   server.phaseAt = 0
+  server.errTail = [] // 上一代的 stderr 不能当成本代的失败原因
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
   try {
@@ -1039,6 +1078,13 @@ async function startServer(occupantRetry = 0) {
   child.stderr.on('data', (d) => {
     writeSafe(errS, d)
     noteChildPhase(child, d) // 插件日志（[usage-billing] …）走 stderr：它就是"当前环节"的来源
+    // 留一份内存环形缓冲：失败原因（plugin tree / settings.yaml / bundle）只在这里，
+    // 落盘那份用户看不到，诊断报告又要手动导出。
+    for (const line of String(d).split(/\r?\n/)) {
+      if (!line.trim()) continue
+      server.errTail.push(line)
+    }
+    if (server.errTail.length > ERR_TAIL_LINES) server.errTail.splice(0, server.errTail.length - ERR_TAIL_LINES)
     if (bindErr) return
     const m = /listen (EACCES|EADDRINUSE)/i.exec(String(d))
     if (m) bindErr = m[1].toUpperCase()
@@ -1082,6 +1128,8 @@ async function startServer(occupantRetry = 0) {
     if (server.child !== child || child.exitCode !== null) {
       // 启动阶段就退出：若是端口无法监听，按冲突上报（控制台给一键换端口入口）
       if (bindErr) await reportBindBlocked(bindErr)
+      // 否则也要留下证据：这条路径原来既不计数也不解释，用户只看到"启动失败"四个字
+      else noteServiceFailure('startup')
       return false
     }
     // 把"当前环节"（服务进程最近一条插件日志）推给说明页：环节变化就推，否则每秒补推一次
@@ -1109,6 +1157,7 @@ async function startServer(occupantRetry = 0) {
   // 否则子进程与 __starting 都留着 → servicePhase() 永远返回 'starting'（WebUI 永久卡在
   // "正在启动服务…"）、scheduleHealthyCapture 也没安排，而控制台还显示"运行中"。
   if (bindErr) await reportBindBlocked(bindErr)
+  else noteServiceFailure('ready-timeout')
   log(`DSH did not become ready in ${READY_TIMEOUT_SEC}s, killing PID ${child.pid}`)
   lifecycle.emit('service.readyTimeout', { pid: child.pid, port: PORT, timeoutSec: READY_TIMEOUT_SEC })
   child.__starting = false
@@ -1246,6 +1295,7 @@ function markReady(child, ownerVerdict) {
   // 计数窗口不在这里清空：服务"起来就崩"的循环必须继续累计，否则回退/halt 永远到不了阈值。
   readySince = Date.now()
   autoRestartStopped = false
+  clearServiceFailureTracking() // 起来了 = 上一轮的失败证据作废，连续计数归零
   return true
 }
 
@@ -1330,6 +1380,7 @@ async function runHandover(fromPid, code, signal) {
 function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
   const verdictSource = source || 'handover'
   markHealthFault()
+  noteServiceFailure(verdictSource) // 崩因进内存证据：通知与控制台都据此写清原因
   // 就绪后很快又崩 = 崩溃循环特征：计入硬止损计数（与计数窗口独立）
   if (readySince && Date.now() - readySince < RESTART_STABLE_MS) fastCrashStreak += 1
   else fastCrashStreak = 0
@@ -1348,7 +1399,10 @@ function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
   // 已显式停止自动恢复时不再重复打扰（通知+闪烁只发一次，halt 时已交代）
   if (!autoRestartStopped) {
     startFlash()
-    notify('DeepSeek Harness', '服务意外退出', WEB_URL, 'service')
+    const why = lastBootFailureInfo && lastBootFailureInfo.reason ? lastBootFailureInfo.reason : ''
+    notify('DeepSeek Harness', why
+      ? `服务意外退出：${why}`
+      : '服务意外退出', WEB_URL, 'service')
   }
   broadcastState()
   void maybeAutoRestart()
@@ -1454,6 +1508,13 @@ let restartWindow = [] // 最近窗口内的自动重启时间戳
 let lastRestartAt = 0
 let autoRestartStopped = false
 let readySince = 0 // 本轮服务就绪时刻（0 = 未就绪）
+// 失败原因证据：子进程 stderr 的尾部若干行。落盘那份（server.err.log）用户看不到，
+// 这里留一份内存副本，用于「通知里写清原因」与「确定性失败判定」。
+const ERR_TAIL_LINES = 60
+// 同一签名的失败连续出现几次（{ signature, count }）；见 boot-failure.js
+let lastBootFailure = null
+let lastBootFailureInfo = null // 最近一次失败的分类结果（给界面/通知展示）
+let lastServiceError = '' // 一句话真因：进 state，控制台据此显示（成功就绪后清空）
 
 function restartAttemptsInWindow() {
   const cutoff = Date.now() - RESTART_WINDOW_MS
@@ -1496,13 +1557,47 @@ function clearRestartTracking() {
   cancelRestartRetry() // 计数与冷却一起复位：留着待触定时器会凭空发起一轮重启
 }
 
-function haltAutoRestart() {
+function haltAutoRestart(failure) {
   if (autoRestartStopped) return
   autoRestartStopped = true
-  log('auto-restart stopped (recovery exhausted), waiting for user')
-  lifecycle.emit('service.autoRestartHalted', { attempts: restartAttemptsInWindow(), restoredAt: lastRecoveryAt || '' })
-  notify('DeepSeek Harness', '自动恢复已停止：服务仍无法稳定运行，请打开 DSHL 控制台查看日志并手动处理', undefined, 'service')
+  const info = failure || lastBootFailureInfo
+  const why = info && info.reason ? info.reason : ''
+  log('auto-restart stopped (recovery exhausted), waiting for user' + (why ? '：' + why : ''))
+  lifecycle.emit('service.autoRestartHalted', { attempts: restartAttemptsInWindow(), restoredAt: lastRecoveryAt || '', reason: (info && info.kind) || '' })
+  // 有原因就把原因写进通知正文：用户不必先学会"打开控制台看日志"才知道出了什么事
+  notify('DeepSeek Harness', why
+    ? `自动恢复已停止：${why}。完整日志在 DSHL 控制台「日志与反馈」页（可切换查看服务日志）`
+    : '自动恢复已停止：服务仍无法稳定运行，请打开 DSHL 控制台查看日志并手动处理', undefined, 'service')
   broadcastState()
+}
+
+// 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
+// 不抛错：证据采集失败绝不能影响启动/重启流程本身。
+function noteServiceFailure(context) {
+  let info
+  try {
+    info = bootFailure.classifyBootFailure(server.errTail.join('\n'))
+  } catch {
+    info = { kind: 'unknown', target: '', signature: '', eligible: false, line: '', reason: '服务启动失败' }
+  }
+  lastBootFailureInfo = info
+  lastBootFailure = bootFailure.nextFailureStreak(lastBootFailure, info.signature)
+  if (info.line) lastServiceError = info.line
+  log(`service failure [${context}] kind=${info.kind} streak=${lastBootFailure.count}${info.target ? ' target=' + info.target : ''}${info.line ? ' :: ' + info.line : ''}`)
+  lifecycle.emit('service.bootFailure', { kind: info.kind, streak: lastBootFailure.count, target: info.target })
+  return info
+}
+
+/** 一次成功就绪 = 这份证据已经过期，清掉连续计数与界面上的原因行（日志里仍逐条留证）。 */
+function clearServiceFailureTracking() {
+  lastBootFailure = null
+  lastBootFailureInfo = null
+  lastServiceError = ''
+}
+
+function deterministicFailure() {
+  if (!bootFailure.isDeterministic(lastBootFailure)) return null
+  return Object.assign({}, lastBootFailureInfo, { count: lastBootFailure.count })
 }
 
 async function maybeAutoRestart() {
@@ -1531,6 +1626,16 @@ async function maybeAutoRestart() {
     }
     return
   }
+  // 确定性失败：同一种失败连续复现 = 根因在磁盘状态上，重试会逐字复现。
+  // 放在硬止损**之后**：那条路径还有一次"回退到上一个健康状态"的机会（现在它真的能修东西了），
+  // 比直接放弃更有价值；这里收敛的是"没到就绪阈值、光靠计数窗口一次次重试"的那一类。
+  const deterministic = deterministicFailure()
+  if (deterministic) {
+    log(`同一失败已连续 ${deterministic.count} 次（${deterministic.kind}）：判定为确定性失败，不再重试`)
+    lifecycle.emit('service.autoRestartExhausted', { attempts: restartAttemptsInWindow(), reason: 'deterministic-' + deterministic.kind })
+    haltAutoRestart(deterministic)
+    return
+  }
   const attempts = restartAttemptsInWindow()
   if (attempts >= RESTART_MAX) {
     if (recoveryDone) {
@@ -1541,6 +1646,13 @@ async function maybeAutoRestart() {
     log(`auto-restart attempts exhausted (${attempts} in 10min)`)
     lifecycle.emit('service.autoRestartExhausted', { attempts })
     await attemptConfigRecovery() // 崩溃循环：自动回退上一个健康配置（每次运行最多一次）
+    // 没有"不同的快照"可回退时 attemptConfigRecovery 会直接返回：看护会停在既不重启、
+    // 也不声明停止的僵尸态 —— 用户看到状态一直是「已停止」，既没有解释也没有下一步。
+    // 这里补上显式终态（原来实测就是这样停在 09-10 那次循环之后的）。
+    if (!autoRestartStopped && !server.running() && !recoveryDone && !restartRetryPending()) {
+      log('config recovery had no target：没有可回退的不同快照，停止自动恢复并交代原因')
+      haltAutoRestart()
+    }
     return
   }
   lastRestartAt = now
@@ -1563,8 +1675,7 @@ async function maybeAutoRestart() {
 }
 
 // ---------- 稳定性：活跃运行证据 / 健康门 / 健康快照 / 崩溃回退 / 诊断（借鉴 dsh-desktop） ----------
-let runGuardHandle = null // run-guard 会话句柄（markClean 必需，禁止跨会话缓存）
-let healthCaptured = false // 本次运行是否已捕获健康快照（single-flight）
+let runGuardHandle = null // run-guard 会话句柄（markClean 必需，禁止跨会话缓存）let healthCaptured = false // 本次运行是否已捕获健康快照（single-flight）
 let healthTimer = null
 let healthFault = false // 就绪后到捕获前出现加载失败/异常退出 → 本次不捕获
 let fastCrashStreak = 0 // 就绪后 RESTART_STABLE_MS 内再次崩溃的连续次数：不依赖计数窗口的硬止损
@@ -1655,6 +1766,59 @@ function recoveryCheckpoints() {
   return list
 }
 
+/**
+ * profile package.json 的回退前置校验：快照里声明的 bundle 必须**当前都在 node_modules 里**。
+ * 不通过就跳过这个文件 —— 回退一份"声明了但没装"的 package.json，等于亲手造出
+ * `cannot resolve profile bundle`（本次排查的根因之一），比不回退更糟。
+ * @param {{snapshotBytes: Buffer}} ctx
+ */
+function profilePackageRestorable(ctx) {
+  let pkg
+  try {
+    const bytes = ctx && ctx.snapshotBytes
+    pkg = JSON.parse(Buffer.isBuffer(bytes) ? bytes.toString('utf8') : String(bytes || ''))
+  } catch {
+    return { ok: false, reason: '快照里的 package.json 不是合法 JSON' }
+  }
+  const bundles = pkg && pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
+    ? pkg.dsh.profile.bundles
+    : []
+  const missing = []
+  for (const name of bundles) {
+    if (typeof name !== 'string' || !name) continue
+    // DSH 自带的层随安装包提供，不在 profile 的 node_modules 里，不能按"缺失"算
+    if (name.startsWith('@deepseek-ai/')) continue
+    if (!fs.existsSync(path.join(DSH_PROFILE_DIR, 'node_modules', name, 'package.json'))) missing.push(name)
+  }
+  if (missing.length) {
+    return {
+      ok: false,
+      reason: `快照声明的插件 ${missing.slice(0, 3).join('、')}${missing.length > 3 ? ' 等' : ''} 当前未安装，回退会造出「声明了但没装」的启动失败`,
+    }
+  }
+  return { ok: true }
+}
+
+/** 纳入健康快照的 DSH 侧声明式状态文件（顺序 = 展示顺序）。 */
+function healthExtraFiles() {
+  return [
+    { id: 'dsh-settings-yaml', path: DSH_SETTINGS_YAML },
+    { id: 'profile-cordis-patch', path: DSH_PROFILE_PATCH },
+    { id: 'profile-package', path: DSH_PROFILE_PACKAGE, validate: profilePackageRestorable },
+  ]
+}
+
+/** 把 health.restore() 的 extras 结果压成一句人话（用于日志与通知）。 */
+function describeRestoreExtras(extras) {
+  if (!Array.isArray(extras) || !extras.length) return ''
+  const restored = extras.filter((e) => e.status === 'restored').length
+  const skipped = extras.filter((e) => e.status !== 'restored')
+  const parts = []
+  if (restored) parts.push(`同时回退 ${restored} 个关联文件`)
+  for (const s of skipped.slice(0, 2)) parts.push(`${s.id} 已跳过（${s.reason || s.status}）`)
+  return parts.join('；')
+}
+
 // 崩溃循环（连续 5 次自动重启失败）→ 自动回退到上一个健康配置（每次运行最多一次）
 async function attemptConfigRecovery(force) {
   if (recoveryDone) return
@@ -1677,9 +1841,12 @@ async function attemptConfigRecovery(force) {
     // 配置可能已变化（nodePath/harnessRoot/port）：重新探测环境，重试基于新配置而非旧缓存
     try { await refreshEnv(true) } catch (e) { log('config recovery: env refresh failed: ' + e.message) }
     clearRestartTracking() // 回退后重新计数（只允许这一次重试）
-    log(`config recovered from slot ${r.slotId} (backup ${path.basename(r.backupPath)})`)
-    lifecycle.emit('recovery.restore', { slotId: r.slotId, backup: path.basename(r.backupPath), at: lastRecoveryAt })
-    notify('DeepSeek Harness Launcher', '服务反复启动失败，已自动回退到上一个正常配置；原配置已备份为 ' + path.basename(r.backupPath) + '（日志目录可查）', undefined, 'recovery')
+    const extraNote = describeRestoreExtras(r.extras)
+    log(`config recovered from slot ${r.slotId} (backup ${path.basename(r.backupPath)})${extraNote ? '；' + extraNote : ''}`)
+    lifecycle.emit('recovery.restore', { slotId: r.slotId, backup: path.basename(r.backupPath), at: lastRecoveryAt, extras: (r.extras || []).map((e) => e.id + ':' + e.status).join(',') })
+    notify('DeepSeek Harness Launcher', '服务反复启动失败，已自动回退到上一个正常配置'
+      + (extraNote ? '（' + extraNote + '）' : '')
+      + '；原配置已备份为 ' + path.basename(r.backupPath) + '（日志目录可查）', undefined, 'recovery')
     broadcastState()
     // 回退后仅允许这一次重试；仍失败（且不是端口被占用等已交代的场景）→ 显式停止自动恢复
     if (envReady()) {
@@ -1726,13 +1893,16 @@ async function restoreCheckpoint(slotId) {
     try { await refreshEnv(true) } catch (e) { log('manual restore: env refresh failed: ' + (e && e.message ? e.message : String(e))) }
     clearRestartTracking()
     recoveryDone = true // 本次运行已回退过：不让自动回退再叠加一次
-    log(`health: manual restore from slot ${r.slotId} (backup ${lastRestoreBackup})`)
-    lifecycle.emit('health.restore.manual', { slotId: r.slotId, backup: lastRestoreBackup, at: lastRecoveryAt })
-    notify('DeepSeek Harness Launcher', '已回退到健康检查点 ' + r.slotId + '，原配置已备份为 ' + lastRestoreBackup + '（日志目录可查）', undefined, 'recovery')
+    const extraNote = describeRestoreExtras(r.extras)
+    log(`health: manual restore from slot ${r.slotId} (backup ${lastRestoreBackup})${extraNote ? '；' + extraNote : ''}`)
+    lifecycle.emit('health.restore.manual', { slotId: r.slotId, backup: lastRestoreBackup, at: lastRecoveryAt, extras: (r.extras || []).map((e) => e.id + ':' + e.status).join(',') })
+    notify('DeepSeek Harness Launcher', '已回退到健康检查点 ' + r.slotId
+      + (extraNote ? '（' + extraNote + '）' : '')
+      + '，原配置已备份为 ' + lastRestoreBackup + '（日志目录可查）', undefined, 'recovery')
     const ok = envReady() ? await handleStart() : false
     broadcastState()
     if (!ok) {
-      return { ok: false, status: 'restored', slotId: r.slotId, backupFile: lastRestoreBackup, error: envReady() ? '已回退，但服务启动失败，请查看日志' : '已回退，但运行环境未就绪' }
+      return { ok: false, status: 'restored', slotId: r.slotId, backupFile: lastRestoreBackup, extras: r.extras || [], error: envReady() ? '已回退，但服务启动失败，请查看日志' : '已回退，但运行环境未就绪' }
     }
     if (consoleIsOpen()) hideConsole()
     return { ok: true, status: 'restored', slotId: r.slotId, backupFile: lastRestoreBackup }
@@ -1787,6 +1957,73 @@ function saveCrashDiagnostics() {
 
 // ---------- 插件市场：变更后重启服务生效 ----------
 // 与 DSH 更新同一套「停服务 → 装/卸 → 起服务 → 强制重载页面」，期间页面切"正在应用插件变更…"。
+
+// ---------- profile 写锁：同一时刻只允许一个流程改 profile ----------
+// 为什么需要：`dsh plugin add/remove` 会改两处（node_modules 与 package.json 的
+// dependencies/dsh.profile.bundles），这两处**不是原子的**。两个操作并发时，或者服务在别人改写
+// 依赖树的途中被拉起来，DSH 读到的就是"声明了 X 但 node_modules 里没有 X" → 启动硬失败
+// （实测 server.err.log: cannot resolve profile bundle "dsh-sidebar-qa"），而上游给出的修复命令
+// 本身会死循环，用户只能人工收拾。
+//
+// 原有的守卫都太窄，挡不住这件事：
+//   - market.js 的 s.busy 是**单包**的（A 包在写时 B 包照样能开始写同一棵树）；
+//   - pluginInstallAllRunning 只管 pluginsInstallAll 一个入口；
+//   - 前台只是把**被点的那一个按钮**置灰，别的卡片照样能点。
+// 所以锁加在所有会改 profile 的入口上，而不是再补一个更细的标志位。
+// 语义：**fail fast**（后来者立刻拿到一句可读的拒绝），不排队 —— 排队会让界面看起来卡住，
+// 而且把多次改动叠起来只会放大风险。前台已有 .plugin-feedback 红字通道可以显示这句话。
+const PROFILE_BUSY_ERROR = '另一个插件操作正在进行，请等它结束后再试'
+let profileOp = null // { label, at }；null = 空闲
+
+/** 尝试占用 profile 写锁。成功返回 release()，失败返回 null。 */
+function tryBeginProfileOp(label) {
+  if (profileOp !== null) return null
+  const token = { label: String(label || '插件操作'), at: Date.now() }
+  profileOp = token
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    if (profileOp === token) profileOp = null
+  }
+}
+
+function profileOpBusy() {
+  return profileOp !== null
+}
+
+function profileBusyError() {
+  return { ok: false, error: PROFILE_BUSY_ERROR, busy: true, busyWith: (profileOp && profileOp.label) || '' }
+}
+
+/**
+ * 跑一段会改 profile 的操作；锁被占用时立刻返回失败（不执行 fn）。
+ * @param {string} label 展示给用户/日志的用途名
+ * @param {() => Promise<any>} fn
+ */
+async function withProfileOp(label, fn) {
+  const release = tryBeginProfileOp(label)
+  if (!release) {
+    log(`[profile-lock] 拒绝 ${label}：${PROFILE_BUSY_ERROR}（占用者：${(profileOp && profileOp.label) || '未知'}）`)
+    return profileBusyError()
+  }
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
+/**
+ * 后台自动流程用：锁被占用时**不记账**地放弃本次尝试，留给下一次触发点。
+ * （记账会让"本版本已尝试过"成真，自动补装就再也不会发生了。）
+ * @returns {(() => void)|null} 拿到锁返回 release，否则 null
+ */
+function tryBeginBackgroundProfileOp(label) {
+  const release = tryBeginProfileOp(label)
+  if (!release) log(`[profile-lock] ${label} 跳过：${PROFILE_BUSY_ERROR}`)
+  return release
+}
 /**
  * 让插件变更真正生效：重启服务 + 强制重载页面 + 通知。
  * 注意：**安装/卸载插件本身不需要重启**（pnpm 只是改 profile 目录），重启是为了让正在跑的 DSH 进程加载新插件。
@@ -1896,6 +2133,9 @@ async function maybeAutoInstallPluginMarket() {
     return
   }
   marketAutoInstalling = true
+  // 拿不到 profile 写锁就整次跳过，且**不记账**（记账会让"本版本已尝试过"成真，自动补装再也不发生）
+  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装插件市场')
+  if (!releaseProfileOp) { marketAutoInstalling = false; return }
   try {
     Config.pluginMarketAutoTryVersion = ver
     try { saveConfig() } catch { /* noop */ }
@@ -1914,6 +2154,7 @@ async function maybeAutoInstallPluginMarket() {
     broadcastState()
   } finally {
     marketAutoInstalling = false
+    releaseProfileOp()
   }
 }
 
@@ -1930,15 +2171,26 @@ function resolveBridgePayloadRoot() {
   return fs.existsSync(path.join(dir, 'version.json')) ? dir : devDir
 }
 
-/** 插件变更前确保服务已停：pnpm 改写 profile 依赖树时不能有 dsh 进程占用。 */
+/**
+ * 插件变更前确保服务已停：pnpm 改写 profile 依赖树时不能有 dsh 进程占用。
+ * 返回 { ok } —— 调用方**必须**检查：停止没成功就往下走，等于在别人还占着依赖树时改写它。
+ * 原来的实现把 stopServer() 的返回值丢掉，而 stopServer() 在"已有停止在进行"时会立刻返回
+ * false（service-stop-guard 防重入），于是第二个流程以为已经停妥，接着改 profile 并起服务 ——
+ * 实测 13:15–13:16 那批并发操作就是这么交叉起来的。
+ */
 async function stopServiceForPluginChange() {
-  if (!server.running()) return
+  if (serviceStopping()) {
+    return { ok: false, error: '服务正在停止中，请稍候重试', busy: true }
+  }
+  if (!server.running()) return { ok: true }
   const snap = envInstall.getJob()
   if (snap && snap.job && snap.job.status === 'running') {
     try { envInstall.cancelInstall() } catch { /* noop */ }
   }
   webLoadTabs('plugin')
-  await stopServer()
+  const stopped = await stopServer()
+  if (!stopped) return { ok: false, error: '服务正在停止中，请稍候重试', busy: true }
+  return { ok: true }
 }
 
 /** 手动开启/关闭远程连接：装/卸插件并重启服务生效。 */
@@ -1948,7 +2200,8 @@ async function stopServiceForPluginChange() {
  */
 async function applyRemoteConnect(enabled, opts = {}) {
   const snap = bridge.getState()
-  await stopServiceForPluginChange()
+  const stop = await stopServiceForPluginChange()
+  if (!stop.ok) return stop
   if (enabled) {
     const r = await bridge.install({ force: !!opts.force })
     if (!r.ok) return r
@@ -1988,6 +2241,8 @@ async function maybeAutoInstallBridge() {
     return
   }
   bridgeAutoInstalling = true
+  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装远程连接插件')
+  if (!releaseProfileOp) { bridgeAutoInstalling = false; return }
   try {
     bridgeAutoTriedFor = app.getVersion()
     log('bridge: 自动安装远程连接插件 …')
@@ -2002,6 +2257,7 @@ async function maybeAutoInstallBridge() {
     }
   } finally {
     bridgeAutoInstalling = false
+    releaseProfileOp()
     broadcastState()
   }
 }
@@ -2209,6 +2465,8 @@ const MANAGED_NPM_PLUGINS = [
 
 // npm 侧最新版本缓存：只影响卡片上「可更新」提示，不阻塞渲染；进插件页/点刷新时补一次。
 const npmVersionCache = new Map() // npm 包名 -> { version, at }
+// 版本查询失败的去重账本：包名 -> 上一次记过的原因（同原因不重复刷日志；查成功即清除）
+const npmVersionErrors = new Map()
 const NPM_VERSION_TTL_MS = 10 * 60 * 1000
 
 // 「一键全部安装」进度：主进程持状态、前台只读，窗口重开也能接上进度显示。
@@ -2299,9 +2557,15 @@ async function resolveNpmVersion(name) {
   try {
     const v = await market.verifyNpmPackage(name)
     npmVersionCache.set(name, { version: v.version, at: Date.now() })
+    npmVersionErrors.delete(name) // 恢复了：下次再失败要重新留证
     return v.version
   } catch (e) {
-    log('[plugins] 版本查询失败 ' + name + '：' + ((e && e.message) || String(e)))
+    const detail = (e && e.message) || String(e)
+    // 每次进插件页都会查一遍：同包同原因只记一次（理由变了或恢复后复发再记），避免一行日志刷满整屏。
+    if (npmVersionErrors.get(name) !== detail) {
+      npmVersionErrors.set(name, detail)
+      log('[plugins] 版本查询失败 ' + name + '：' + detail)
+    }
     return ''
   }
 }
@@ -2342,6 +2606,9 @@ function setManagedPluginNote(id, text) {
  */
 async function installAllManagedPlugins() {
   if (pluginInstallAllRunning) return { ok: false, error: '一键安装正在进行中' }
+  // 同步占锁（在第一个 await 之前）：与 IPC 入口的检查之间没有可插入的窗口
+  const releaseProfileOp = tryBeginProfileOp('一键安装全部插件')
+  if (!releaseProfileOp) return profileBusyError()
   pluginInstallAllRunning = true
   pluginInstallAllTarget = 0
   pluginInstallAllDone = 0
@@ -2351,6 +2618,7 @@ async function installAllManagedPlugins() {
   const failed = []
   let installed = 0
   let skipped = 0
+  let stopFailed = null
   try {
     const targets = []
     for (const d of MANAGED_NPM_PLUGINS) {
@@ -2360,32 +2628,40 @@ async function installAllManagedPlugins() {
     pluginInstallAllTarget = targets.length
     if (targets.length) {
       // 只在最开始停一次服务；之后的安装都在服务停止状态下进行
-      await stopServiceForPluginChange()
-      for (const target of targets) {
-        pluginInstallAllCurrent = target.label
-        broadcastState()
-        let r
-        try { r = await target.run() } catch (e) { r = { ok: false, error: (e && e.message) || String(e) } }
-        if (r && r.ok) {
-          if (r.already) skipped++
-          else installed++
-          clearPluginEnvFailure(target.key)
-          notePluginReleaseAgeRetry(r.releaseAge)
-        } else {
-          failed.push(target.label + '：' + ((r && r.error) || '未知原因'))
-          notePluginEnvFailure(target.key, 'install', (r && r.env) || market.classifyEnvFailure(String((r && r.error) || '')))
-          log('[plugins] 一键安装失败 ' + target.label + '：' + ((r && r.error) || '未知原因'))
+      const stop = await stopServiceForPluginChange()
+      if (!stop.ok) {
+        // 停不下来就一个都别装：在别人还占着依赖树时改写它，正是 profile 损坏的来源
+        stopFailed = stop.error
+        log('[plugins] 一键安装中止：' + stop.error)
+      } else {
+        for (const target of targets) {
+          pluginInstallAllCurrent = target.label
+          broadcastState()
+          let r
+          try { r = await target.run() } catch (e) { r = { ok: false, error: (e && e.message) || String(e) } }
+          if (r && r.ok) {
+            if (r.already) skipped++
+            else installed++
+            clearPluginEnvFailure(target.key)
+            notePluginReleaseAgeRetry(r.releaseAge)
+          } else {
+            failed.push(target.label + '：' + ((r && r.error) || '未知原因'))
+            notePluginEnvFailure(target.key, 'install', (r && r.env) || market.classifyEnvFailure(String((r && r.error) || '')))
+            log('[plugins] 一键安装失败 ' + target.label + '：' + ((r && r.error) || '未知原因'))
+          }
+          pluginInstallAllDone++
+          broadcastState()
         }
-        pluginInstallAllDone++
-        broadcastState()
       }
     }
   } finally {
     pluginInstallAllRunning = false
     pluginInstallAllCurrent = ''
-    pluginInstallAllError = failed.length ? failed.join('；') : ''
+    pluginInstallAllError = stopFailed || (failed.length ? failed.join('；') : '')
+    releaseProfileOp()
     broadcastState()
   }
+  if (stopFailed) return { ok: false, error: stopFailed, installed, skipped }
   if (installed > 0) {
     notify('DeepSeek Harness', '已安装 ' + installed + ' 个插件，点控制台顶部的「立即重启生效」后启用', undefined, 'recovery')
   }
@@ -2455,6 +2731,8 @@ async function maybeAutoInstallRecommendedPlugins() {
     return
   }
   recommendedAutoInstalling = true
+  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装推荐插件')
+  if (!releaseProfileOp) { recommendedAutoInstalling = false; return }
   try {
     Config.pluginAutoInstallTriedVersion = ver
     try { saveConfig() } catch { /* noop */ }
@@ -2462,7 +2740,11 @@ async function maybeAutoInstallRecommendedPlugins() {
     // 安装要停服务（pnpm 改写 profile 依赖树时不能有 dsh 进程在跑）：先等服务起来再动，最多等 3 分钟
     const deadline = Date.now() + 180 * 1000
     while (Date.now() < deadline && !server.running()) await sleep(1000)
-    await stopServiceForPluginChange()
+    const stop = await stopServiceForPluginChange()
+    if (!stop.ok) {
+      log('plugins: 自动安装推荐插件中止：' + stop.error)
+      return
+    }
     const installed = []
     const failed = []
     for (const d of targets) {
@@ -2485,6 +2767,7 @@ async function maybeAutoInstallRecommendedPlugins() {
     }
   } finally {
     recommendedAutoInstalling = false
+    releaseProfileOp()
     broadcastState()
   }
 }
@@ -2559,7 +2842,8 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
   if (npmDef) {
     if (act === 'install' || act === 'uninstall' || act === 'update' || act === 'reinstall') {
       // pnpm 改写 profile 依赖树时不能有 dsh 进程占用；重启由 applyPluginChange 统一负责。
-      await stopServiceForPluginChange()
+      const stop = await stopServiceForPluginChange()
+      if (!stop.ok) return stop
       return runNpmPluginAction(npmDef, act, { defer })
     }
     if (act === 'enable' || act === 'disable') return runNpmPluginAction(npmDef, act, { defer })
@@ -2689,6 +2973,9 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       note: noteOf(d.id),
       id: d.id,
       order: d.order,
+      // 预装集合的成员（注册表声明 autoInstall）：页面上排在手插件前面。
+      // 用注册表意图而不是运行时的 autoInstall —— 用户卸载/关闭某个预装插件后，列表不该跟着重排。
+      preset: !!d.autoInstall,
       name: d.name,
       subtitle: d.subtitle,
       description: d.description,
@@ -2717,6 +3004,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
             note: noteOf('dshmarket'),
       id: 'dshmarket',
       order: 10,
+      preset: true, // 默认开启（随启动器代装）
       name: '插件市场',
       subtitle: 'dshmarket',
       description: '在 DSH 内浏览、安装和管理可视化插件，是后续插件分发的主要入口。',
@@ -2742,6 +3030,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
             note: noteOf('bridge-next'),
       id: 'bridge-next',
       order: 20,
+      preset: true, // 随启动器分发
       name: '手机连接',
       subtitle: 'DSH Bridge Next · 远程连接',
       description: '在 DSH 设置页提供「手机连接」分区，支持手机扫码、云端登录和本机会话管理。',
@@ -2764,7 +3053,9 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       actions: bridgeActions,
     },
     ...npmEntries,
-  ].sort((a, z) => a.order - z.order)
+    // 排序契约：预装集合（插件市场、手机连接 + 注册表声明 autoInstall 的那批）排前面，手动安装的排后面，
+    // 各组内按注册表的 order。这样用户一眼看到的就是「默认会给我装什么」，而不是一张混排清单。
+  ].sort((a, z) => (a.preset === z.preset ? a.order - z.order : (a.preset ? -1 : 1)))
 }
 
 // ---------- 通知 ----------
@@ -2811,7 +3102,13 @@ function notifyStartResult(ok) {
   else if (ok && server.claimed()) notify('DeepSeek Harness', `服务已自行重启并由启动器接管（PID ${server.displayPid()}），不影响正在运行的会话`, undefined, 'recovery')
   else if (ok) notify('DeepSeek Harness', `检测到已在运行的服务（PID ${server.displayPid()}），已接管`, undefined, 'recovery')
   else if (server.blockedReason) notify('DeepSeek Harness', server.blockedReason + '（DSHL 控制台已打开，可一键切换）', undefined, 'service')
-  else if (envReady()) notify('DeepSeek Harness', '服务启动失败，请打开 DSHL 控制台查看日志', undefined, 'service')
+  else if (envReady()) {
+    // 有原因就写进通知：用户不必先学会"打开控制台看日志"才知道出了什么事（那些日志还不一定有原因）
+    const why = lastBootFailureInfo && lastBootFailureInfo.reason ? lastBootFailureInfo.reason : ''
+    notify('DeepSeek Harness', why
+      ? `服务启动失败：${why}。DSHL 控制台「日志与反馈」可查看服务日志`
+      : '服务启动失败，请打开 DSHL 控制台查看日志', undefined, 'service')
+  }
   else notify('DeepSeek Harness', '运行环境未就绪，请打开 DSHL 控制台一键安装', undefined, 'service')
 }
 
@@ -2978,11 +3275,20 @@ function buildTray() {
   buildTrayMenu()
 }
 
-// ---------- 闪烁（QQ/微信式：图标 ↔ 空白交替；持续到用户点击托盘/打开窗口为止，不错过提醒） ----------
+// ---------- 闪烁（QQ/微信式：图标 ↔ 空白交替） ----------
+// 语义（两条通道刻意分开）：
+//   闪烁 = 「**未读**提醒」。用户已经在这个窗口上（有焦点）就不再闪；切过去/点托盘 → 立刻停。
+//   系统通知 = 「异常告知」。**不**看焦点：服务崩溃这类事该说就说（见 notify）。
+// 判据是**窗口焦点**，不是"窗口开没开"：窗口开着但被别的程序盖住、或最小化，用户并没有在看它，
+// 提醒仍然该起作用（Windows 默认"点击聚焦"，鼠标移到窗口上不算获得焦点）。
+// 停止路径有三条：托盘/打开动作（openWebUi 等）、窗口获得焦点、以及这里开始前的焦点判断。
 let flashTimer = null
 let flashOn = false
 
 function startFlash() {
+  // 集中在这里判断，而不是让每个调用点自己记得判断 —— 否则新增一个触发点就会漏（原来
+  // 崩溃与更新两条路径都没判断，scanNotify 判断了，同一份语义有两个实现）。
+  if (webUiFocused()) return
   if (!flashTimer) flashTimer = setInterval(onFlashTick, 600)
 }
 
@@ -3136,6 +3442,8 @@ function showUpdateWindow() {
       preloadPath: path.join(__dirname, 'preload.js'),
       icon: path.join(ASSETS_DIR, 'ds.ico'),
       onError: (err) => log('update window: ' + ((err && err.message) || String(err))),
+      // 更新窗口是独立 BrowserWindow：聚焦它同样算"用户已经看到提醒"
+      onWebContents: (_wc, win) => { win.on('focus', () => stopFlash()) },
       onClosed: () => {
         updateWindowHandle = null
         webPushState()
@@ -3782,6 +4090,10 @@ function openWebUi(opts = {}) {
   // 最小化→恢复 / 隐藏→显示 不一定触发 resize：显式重排，防止页面区残留零尺寸（整片灰）
   webWin.on('show', () => webLayout())
   webWin.on('restore', () => webLayout())
+  // 「聚焦即已读」：与 openWebUi 的 stopFlash 同一语义，但覆盖**窗口本来就开着**的情况 ——
+  // 用户 alt-tab / 点任务栏 / 直接点窗口把 DSH 切到前台时不会走 openWebUi（那是"打开"入口），
+  // 于是原来只能靠点托盘才能让图标停止闪烁。
+  webWin.on('focus', () => stopFlash())
   // 最大化状态变化 → 重排 + 壳按钮图标/提示实时切换（□ ↔ ❐）+ 持久化
   webWin.on('maximize', () => { webLayout(); webPushState(); saveWebWindowState() })
   webWin.on('unmaximize', () => { webLayout(); webPushState(); saveWebWindowState() })
@@ -3895,6 +4207,10 @@ function stateJson() {
     port: PORT,
     blocked: server.blockedReason || '',
     suggestedPort: server.suggestedPort || 0,
+    // 服务侧失败的一句话真因（来自子进程 stderr）：控制台据此在日志卡片顶部显示原因行。
+    // 只在确实有未处理的失败时非空（成功就绪会清掉），所以不会长期占版面。
+    serviceError: lastServiceError || '',
+    serviceErrorKind: (lastBootFailureInfo && lastBootFailureInfo.kind) || '',
     version: app.getVersion(),
     firstRun: firstRun,
     autostart: autostartEnabled(),
@@ -4134,6 +4450,42 @@ function tailOf(file, lines) {
   } catch { return '(无日志文件：' + path.basename(file) + ')' }
 }
 
+// ---------- 运行日志的来源切换 ----------
+// 原来控制台只有一个日志区，读的是**启动器自己的** dshl.log；而"服务为什么起不来"写在
+// 子进程的 server.err.log 里，那条路径只在「导出诊断报告」里出现。
+// 于是最典型的场景变成：通知说"请打开控制台查看日志" → 用户打开 → 只看到
+// `starting DSH web` / `DSH exited unexpectedly`，没有一行解释。
+const LOG_SOURCES = {
+  launcher: { label: '启动器', file: () => TRAY_LOG, lines: 60 },
+  'server-err': { label: '服务错误', file: () => ERR_LOG, lines: 120 },
+  'server-out': { label: '服务输出', file: () => OUT_LOG, lines: 120 },
+}
+
+/**
+ * 读一个日志来源的尾部若干行。文本统一走 redact()：server.out.log 里会有一次性 launch token。
+ * @param {string} source launcher | server-err | server-out
+ * @param {number} [lines]
+ */
+function readLogSource(source, lines) {
+  const key = String(source || 'launcher')
+  const spec = LOG_SOURCES[key]
+  if (!spec) return { ok: false, source: key, error: '未知的日志来源' }
+  const n = Math.min(Math.max(Math.floor(Number(lines)) || spec.lines, 1), 500)
+  const file = spec.file()
+  let text = ''
+  try {
+    text = fs.readFileSync(file, 'utf8').split(/\r?\n/).slice(-n).join('\n').trim()
+  } catch { text = '' }
+  return {
+    ok: true,
+    source: key,
+    label: spec.label,
+    file: path.basename(file),
+    lines: n,
+    text: text ? redact(text) : '',
+  }
+}
+
 function buildFeedbackPack(text, contact, includeLogs) {
   const version = app.getVersion()
   const subject = `[DSHL 反馈] v${version} - ${String(text).slice(0, 40).replace(/\r?\n/g, ' ')}`
@@ -4295,6 +4647,8 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'openUrlExternal': try { shell.openExternal(uiUrl()) } catch { /* noop */ } return '{}'
         case 'openNpmDsh': try { shell.openExternal('https://www.npmjs.com/package/@deepseek-ai/dsh') } catch { /* noop */ } return '{}'
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
+        // 日志与反馈页的来源切换：launcher=启动器自己的日志；server-* = DSH 子进程的 stdout/stderr
+        case 'logRead': return JSON.stringify(readLogSource(value && value.source, value && value.lines))
         case 'healthRestore': return JSON.stringify(await restoreCheckpoint(String((value && value.slotId) || '')))
         case 'openHealthSnapshot': {
           const slotId = String((value && value.slotId) || '')
@@ -4525,8 +4879,8 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         }
         // ---------- 插件市场（dshmarket 安装/卸载） ----------
         case 'marketGetState': return JSON.stringify(market.getState())
-        case 'marketInstall': return JSON.stringify(await installManagedMarket())
-        case 'marketUninstall': return JSON.stringify(await uninstallManagedMarket())
+        case 'marketInstall': return JSON.stringify(await withProfileOp('安装插件市场', () => installManagedMarket()))
+        case 'marketUninstall': return JSON.stringify(await withProfileOp('卸载插件市场', () => uninstallManagedMarket()))
         case 'marketDecline': {
           // 用户在设置里明确卸载 → 不再自动装回来（直到手动重新安装）
           Config.pluginMarketDeclined = !!value
@@ -4534,26 +4888,30 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           return JSON.stringify({ ok: true, declined: Config.pluginMarketDeclined })
         }
         // ---------- 通用插件注册表（控制台「插件」页） ----------
+        // 凡是会改 profile 的入口一律走 profile 写锁：并发改写同一份依赖树是
+        // "装完插件 DSH 就起不来" 的直接来源（详见 PROFILE_BUSY_ERROR 上方的说明）。
         case 'pluginsGetState': return JSON.stringify(buildPluginCatalog(market.getState(), bridge.getState(), Config.pluginNotes))
         case 'pluginCheckUpdates': return JSON.stringify(await checkManagedPluginUpdates())
         case 'pluginSetNote': return JSON.stringify(setManagedPluginNote(value && value.id, value && value.text))
-        case 'pluginsApplyRestart': return JSON.stringify(await applyPendingPluginChanges())
+        case 'pluginsApplyRestart': return JSON.stringify(await withProfileOp('重启生效', () => applyPendingPluginChanges()))
         case 'pluginsInstallAll': {
           if (pluginInstallAllRunning) return JSON.stringify({ ok: false, error: '一键安装正在进行中' })
-          // 后台跑：立刻回执让按钮进入进度态，安装明细随后由 state 推送刷新
+          if (profileOpBusy()) return JSON.stringify(profileBusyError())
+          // 后台跑：立刻回执让按钮进入进度态，安装明细随后由 state 推送刷新。
+          // 锁由 installAllManagedPlugins 自己在第一个 await 之前同步占用。
           void installAllManagedPlugins()
           return JSON.stringify({ ok: true, started: true })
         }
         case 'pluginAction': {
           const id = String((value && value.id) || '').slice(0, 80)
           const action = String((value && value.action) || '').slice(0, 40)
-          return JSON.stringify(await runManagedPluginAction(id, action))
+          return JSON.stringify(await withProfileOp(`插件 ${action}`, () => runManagedPluginAction(id, action)))
         }
-        case 'pluginsRetryEnvFailed': return JSON.stringify(await retryPluginEnvFailures())
+        case 'pluginsRetryEnvFailed': return JSON.stringify(await withProfileOp('重试失败的插件', () => retryPluginEnvFailures()))
         // ---------- 远程连接（DSH Bridge Next 插件安装/卸载） ----------
         case 'remoteConnectGetState': return JSON.stringify({ enabled: Config.remoteConnect.enabled, declined: Config.remoteConnect.declined, autoEnabledFor: Config.remoteConnect.autoEnabledFor, plugin: bridge.getState() })
-        case 'remoteConnectSet': return JSON.stringify(await setRemoteConnectManaged(!!(value && value.enabled)))
-        case 'remoteConnectReinstall': return JSON.stringify(await reinstallRemoteConnectManaged())
+        case 'remoteConnectSet': return JSON.stringify(await withProfileOp('手机连接开关', () => setRemoteConnectManaged(!!(value && value.enabled))))
+        case 'remoteConnectReinstall': return JSON.stringify(await withProfileOp('重装手机连接', () => reinstallRemoteConnectManaged()))
         case 'openDshDir': { // 源码形态"手动更新"：打开源码仓库目录
           const dir = envReport && envReport.dsh && envReport.dsh.dir
           if (dir) {
@@ -4721,7 +5079,7 @@ async function runSelfTest() {
     if (!consoleWc) { selftestPrint('FAILED: console view not created'); app.exit(2); return }
     const title = await consoleWc.executeJavaScript('document.title')
     const consoleOk = await consoleWc.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('consoleNav') !== null && document.getElementById('consoleContent') !== null && document.getElementById('navGeneral') !== null && document.getElementById('navPlugins') !== null && document.getElementById('pagePlugins') !== null && document.getElementById('pluginCards') !== null && document.getElementById('navLog') !== null && document.getElementById('btnEnvBack') !== null && document.getElementById('btnOpenEnv') !== null && document.getElementById('btnRecoveryStart') !== null && document.getElementById('btnRecoveryRestart') !== null && document.getElementById('btnRecoveryStop') !== null && document.getElementById('btnRecoveryDiag') !== null && document.getElementById('btnRecoveryDiagDir') !== null && document.getElementById('btnOpenLogsDir') !== null && document.getElementById('recoverySlots') !== null && document.getElementById('logFull') !== null && document.getElementById('btnGithub') !== null && document.getElementById('btnChangelog') !== null && document.getElementById('pendingRestartBar') !== null && document.getElementById('btnApplyRestart') !== null && document.getElementById('btnConsoleReturn') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.getElementById('btnReset') !== null ? 'console-ok' : 'console-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('consoleNav') !== null && document.getElementById('consoleContent') !== null && document.getElementById('navGeneral') !== null && document.getElementById('navPlugins') !== null && document.getElementById('pagePlugins') !== null && document.getElementById('pluginCards') !== null && document.getElementById('navLog') !== null && document.getElementById('btnEnvBack') !== null && document.getElementById('btnOpenEnv') !== null && document.getElementById('btnRecoveryStart') !== null && document.getElementById('btnRecoveryRestart') !== null && document.getElementById('btnRecoveryStop') !== null && document.getElementById('btnRecoveryDiag') !== null && document.getElementById('btnRecoveryDiagDir') !== null && document.getElementById('btnOpenLogsDir') !== null && document.getElementById('recoverySlots') !== null && document.getElementById('logFull') !== null && document.getElementById('logSources') !== null && document.getElementById('logCause') !== null && document.getElementById('logCauseText') !== null && document.getElementById('btnLogCauseJump') !== null && document.getElementById('btnGithub') !== null && document.getElementById('btnChangelog') !== null && document.getElementById('pendingRestartBar') !== null && document.getElementById('btnApplyRestart') !== null && document.getElementById('btnConsoleReturn') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.getElementById('btnReset') !== null ? 'console-ok' : 'console-missing'",
     )
     selftestPrint(`CONSOLE OK: ${title} | ${consoleOk}`)
     if (consoleOk !== 'console-ok') { selftestPrint('FAILED: console DOM incomplete'); app.exit(2); return }
@@ -5328,7 +5686,7 @@ function init() {
     }
   } catch (err) { log('run-guard: dev marker check failed: ' + (err && err.message ? err.message : String(err))) }
   lifecycle.initLifecycle({ dir: LOG_DIR, log })
-  health.initHealth({ configPath: CONFIG_PATH, snapshotDir: HEALTH_SNAPSHOT_DIR, log })
+  health.initHealth({ configPath: CONFIG_PATH, snapshotDir: HEALTH_SNAPSHOT_DIR, extraFiles: healthExtraFiles(), log })
   diagnostics.initDiagnostics({ dir: DIAG_DIR, log })
   registerIpc()
 
@@ -5507,13 +5865,35 @@ app.on('before-quit', () => {
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ } // 覆盖更新安装等非托盘路径的退出
   lifecycle.emit('app.exit', { reason: 'quit' })
 }) // 覆盖更新安装等非托盘路径的退出
+app.on('will-quit', () => {
+  // 兜底：任何走到 will-quit 的路径都算受控退出（幂等，重复调用无副作用）
+  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
+})
 app.on('window-all-closed', () => { /* 托盘常驻，不退出 */ })
 app.on('activate', () => openDshOrConsole()) // macOS Dock 点击
-// 开发者热重启（tools/dev.mjs 用 taskkill /F 结束进程）与其它受控终止：收到 SIGTERM 后先清理
-// active-run 标记再退出，否则每次热重启都会在下次启动被当成"上次非正常退出"，弹出崩溃提示。
+// 开发者热重启（tools/dev.mjs 写 .dev-restart.json 后强杀）：这次退出是"预期"的，
+// 不算崩溃证据，避免每次改主进程代码都弹一次崩溃提示卡 + 生成诊断报告。
+// 注意：真正的兜底是下面那个标记文件，不是下面的 SIGTERM —— Windows 上 taskkill /F 是
+// TerminateProcess，根本投递不了 SIGTERM；那句 handler 只在类 Unix 上有效。
+// Windows 关机/注销：Electron 发 session-end，**不会**走 before-quit。
+// 不处理它的话，每次重启电脑都会在下次启动被判成「上次非受控退出」——
+// 弹崩溃卡 + 发通知 + 落一份诊断报告，而且 crashStreak 一路累加（实测 59 次里有相当一部分是这么来的）。
+app.on('session-end', () => {
+  reallyExit = true
+  try { saveWebWindowState() } catch { /* noop */ }
+  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
+  try { lifecycle.emit('app.exit', { reason: 'session-end' }) } catch { /* noop */ }
+})
 process.on('SIGTERM', () => {
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
   try { lifecycle.emit('app.exit', { reason: 'sigterm' }) } catch { /* noop */ }
+  app.quit()
+})
+// 控制台 Ctrl+C / VS Code 停止按钮：Windows 上映射为 SIGINT（不是 SIGTERM）。
+// 没有这个 handler 时会直接终止进程、不走 before-quit，同样留下假的崩溃证据。
+process.on('SIGINT', () => {
+  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
+  try { lifecycle.emit('app.exit', { reason: 'sigint' }) } catch { /* noop */ }
   app.quit()
 })
 process.on('uncaughtException', (err) => {

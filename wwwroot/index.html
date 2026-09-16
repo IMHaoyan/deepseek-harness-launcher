@@ -396,7 +396,17 @@
     <section class="card logs-card">
       <div class="logs-head">
         <span class="recovery-title">运行日志</span>
+        <!-- 来源可切：服务起不来的原因在「服务错误」里，不在启动器自己的日志里 -->
+        <span class="chips" id="logSources">
+          <button class="chip checked" data-log-source="launcher" title="启动器自己的日志：服务启停、插件变更、更新与崩溃收尾">启动器</button>
+          <button class="chip" data-log-source="server-err" title="DSH 服务进程的错误输出 —— 服务启动失败时原因在这里">服务错误</button>
+          <button class="chip" data-log-source="server-out" title="DSH 服务进程的正常输出（含启动地址）">服务输出</button>
+        </span>
         <span class="recovery-hint" id="logHint">显示最近 60 行；更早的日志见「打开日志文件夹」</span>
+      </div>
+      <div class="logs-cause hidden" id="logCause">
+        <span class="logs-cause-text" id="logCauseText"></span>
+        <button class="btn sm" id="btnLogCauseJump">查看服务错误日志</button>
       </div>
       <pre id="logFull"></pre>
     </section>
