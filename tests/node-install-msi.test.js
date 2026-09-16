@@ -58,6 +58,20 @@ test('decideNodeInstallPlan：本机已有 Node.js MSI 产品时按其版本决�
   assert.equal(old.range, envDetect.DEFAULT_ENGINE_RANGE)
 })
 
+test('decideNodeInstallPlan：注册了 MSI 但可执行文件不在 → 拒绝并请用户修复（不能复用也不能并装）', () => {
+  // 这是 2026-09-16 实测到的 bug：决策层信注册表说"复用"，可执行文件却不在 → 复用兑现不了，
+  // 安装任务以一句看不懂的错误中止。现在变成明确的 refuse + 可行动作。
+  const broken = envInstall.decideNodeInstallPlan({ installedMsi: { version: '24.16.0' }, msiUsable: false })
+  assert.equal(broken.action, 'refuse')
+  assert.equal(broken.reason, 'msi-broken')
+  assert.equal(broken.version, '24.16.0')
+  // 版本过旧优先于"文件不在"（先能升级才谈得上修复）
+  assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '18.20.0' }, msiUsable: false }).reason, 'msi-too-old')
+  // 文件在 → 照常复用；未提供该信息（旧调用方）→ 保持历史行为
+  assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '24.16.0' }, msiUsable: true }).action, 'reuse')
+  assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '24.16.0' } }).action, 'reuse')
+})
+
 test('decideNodeInstallPlan：默认官方 MSI；版本管理器在场或配置成 user 才走用户级兜底', () => {
   assert.deepEqual(envInstall.decideNodeInstallPlan({}), { action: 'install-msi', reason: 'default' })
   // 存量迁移（用户级 zip 布局 → 官方安装）走的就是这条：调用方带 forceNodeInstall，于是 nodeOk=false，

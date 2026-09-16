@@ -437,7 +437,7 @@ function detectVersionManager(deps = {}) {
  * Node 安装方式决策（纯函数，便于测试；所有输入都来自探测/注册表，不在这里做 IO）。
  * 顺序即优先级，"复用优先"是硬规则——能复用用户现有的 Node 就绝不动它：
  *   1) 探测到可用的 Node（满足 engines）→ 复用，什么都不装
- *   2) 本机已有 Node.js MSI 产品：版本满足 → 复用；不满足 → 拒绝（见下）
+ *   2) 本机已有 Node.js MSI 产品：版本满足且可执行文件在 → 复用；版本过旧 / 文件不在 → 拒绝（见下）
  *   3) 版本管理器在场 → 用户级 zip（不与版本管理器争 PATH）
  *   4) 显式配置成 user → 用户级 zip
  *   5) 其余 → 官方 MSI
@@ -446,6 +446,9 @@ function detectVersionManager(deps = {}) {
  * 默认装到同一个 C:\Program Files\nodejs —— 两个产品共同宣称拥有同一目录，卸载其一会把文件删掉、
  * 留下另一个残缺。也不能回退用户级：Windows 的机器 PATH 先于用户 PATH，回退装出来的 Node 会被
  * 旧的那份遮蔽，装了等于没装。所以这里 fail-closed，把可行动作写清楚交给用户。
+ *
+ * msiUsable=false（注册表说装了、可执行文件却找不到）同样必须拒绝：既兑现不了"复用"，
+ * 也不能再装一个产品去争同一目录 —— 只能请用户先在「应用和功能」里修复或卸载它。
  */
 function decideNodeInstallPlan(input) {
   const o = input || {}
@@ -458,8 +461,9 @@ function decideNodeInstallPlan(input) {
   if (o.nodeOk) return { action: 'reuse', reason: 'node-ok', version: String(o.nodeVersion || '') }
   const msi = o.installedMsi
   if (msi && msi.version) {
-    if (ok(msi.version)) return { action: 'reuse', reason: 'msi-ok', version: String(msi.version) }
-    return { action: 'refuse', reason: 'msi-too-old', version: String(msi.version), range }
+    if (!ok(msi.version)) return { action: 'refuse', reason: 'msi-too-old', version: String(msi.version), range }
+    if (o.msiUsable === false) return { action: 'refuse', reason: 'msi-broken', version: String(msi.version), range }
+    return { action: 'reuse', reason: 'msi-ok', version: String(msi.version) }
   }
   if (o.versionManager) return { action: 'install-user', reason: 'version-manager-' + o.versionManager }
   if (o.mode === 'user') return { action: 'install-user', reason: 'mode-user' }
@@ -1559,11 +1563,20 @@ async function readDetectedNode() {
   } catch { return null }
 }
 
-// 复用现有 Node 时的可执行文件（可能是 PATH 上的裸 'node'，后续 ensureNodeBin 会解析成绝对路径）
-async function findUsableNodeBin(job) {
+// 复用现有 Node 时的可执行文件：探测结果 → 调用方给的信息 → 官方 MSI 登记的位置（PATH 失效时的兜底）
+async function findUsableNodeBin(job, installedMsi) {
   if (job.opts && job.opts.nodeBin) return job.opts.nodeBin
   const detected = await readDetectedNode()
-  return detected ? detected.path : ''
+  if (detected) return detected.path
+  const dir = installedMsi && installedMsi.installPath
+  if (dir) {
+    const bin = path.join(dir, IS_WIN ? 'node.exe' : 'node')
+    if (fs.existsSync(bin)) {
+      const v = await probeUserNodeVersion(bin, job)
+      if (decideUserNodeReuse({ exists: true, version: v }).reuse) return bin
+    }
+  }
+  return ''
 }
 
 // 用户级 zip 安装（兜底路径）：落位 %LOCALAPPDATA%\Programs\nodejs，并让语义与官方 MSI 对齐
@@ -1635,15 +1648,22 @@ async function runJob(job) {
           nodeVersion = String(probed || '').trim().replace(/^v/i, '')
         }
         const mode = (job.opts && job.opts.nodeInstallMode) || process.env.DSHL_NODE_INSTALL || Config.nodeInstallMode || 'msi'
+        const installedMsi = job.opts && job.opts.installedMsi !== undefined ? job.opts.installedMsi : await readInstalledNodeMsi()
+        // 版本合格还不够：注册表说装了、文件却不在（产品被破坏/手工删过）时，"复用"是兑现不了的。
+        // 这里先探一次它登记的那个 node.exe，把"能不能真复用"作为决策输入 —— 免得决定复用了才发现没有可执行文件。
+        const msiUsable = installedMsi && installedMsi.installPath
+          ? decideUserNodeReuse({ exists: fs.existsSync(path.join(installedMsi.installPath, IS_WIN ? 'node.exe' : 'node')), version: await probeUserNodeVersion(path.join(installedMsi.installPath, IS_WIN ? 'node.exe' : 'node'), null) }).reuse
+          : undefined
         const plan = decideNodeInstallPlan({
           mode,
           range: (job.opts && job.opts.engineRange) || envDetect.DEFAULT_ENGINE_RANGE,
           nodeOk,
           nodeVersion,
-          installedMsi: job.opts && job.opts.installedMsi !== undefined ? job.opts.installedMsi : await readInstalledNodeMsi(),
+          installedMsi,
+          msiUsable,
           versionManager: detectVersionManagerSafe(),
         })
-        job.logLine(`Node 安装方式决策：${plan.action}（${plan.reason}）`)
+        job.logLine(`Node 安装方式决策：${plan.action}（${plan.reason}${msiUsable === false ? '：注册表登记的 Node 找不到可执行文件' : ''}）`)
         if (job.nodePlan && job.nodePlan.dshInNodeDir) {
           job.logLine(`检测到全局 DSH 就在用户级 Node 目录里（${job.nodePlan.nodeDir}）：本次会自动带上 DSH，并在新版装好、校验通过后清理旧残留`)
         }
@@ -1652,13 +1672,18 @@ async function runJob(job) {
           job.logLine(`该目录下另有 ${list.length} 个全局包（不迁移：跨 Node 大版本时原生模块 ABI 会变）：${list.slice(0, 8).join('、')}${list.length > 8 ? ' 等' : ''}`)
         }
         if (plan.action === 'refuse') {
-          throw new Error(`本机已通过官方 MSI 安装 Node.js v${plan.version}，不满足 DSH 要求 ${plan.range}；`
-            + '请在「应用和功能」里升级 Node.js 后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）')
+          throw new Error(plan.reason === 'msi-broken'
+            ? `本机注册了官方 Node.js v${plan.version}，但找不到它的可执行文件（安装可能被破坏或文件被删除）；`
+              + '请在「应用和功能」里对 Node.js 执行「修复」或先卸载，然后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）'
+            : `本机已通过官方 MSI 安装 Node.js v${plan.version}，不满足 DSH 要求 ${plan.range}；`
+              + '请在「应用和功能」里升级 Node.js 后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）')
         }
         if (plan.action === 'reuse') {
           // 复用已有 Node：什么都不装（"不影响已装用户"的关键路径）
-          const reuseBin = await findUsableNodeBin(job)
-          if (!reuseBin) throw new Error('决定复用现有 Node，但找不到它的可执行文件')
+          const reuseBin = await findUsableNodeBin(job, installedMsi)
+          if (!reuseBin) {
+            throw new Error('检测到可用的 Node.js，但定位不到它的可执行文件；请在「应用和功能」里修复 Node.js 或改用用户级安装（设置 → 运行环境）后重试')
+          }
           nodeBin = reuseBin
           job.nodeInstallMode = 'reuse'
           job.logLine(`沿用现有 Node.js（${plan.reason}${plan.version ? ' v' + plan.version : ''}）：${reuseBin}`)

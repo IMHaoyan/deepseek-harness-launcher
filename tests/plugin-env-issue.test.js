@@ -92,7 +92,13 @@ test('靠一次性放行装好时：只给低噪提示（含按本地时间写�
   const releaseAge = { retried: true, entries: [{ name: 'dshmarket@1.47.0', publishedAt: '2026-09-15T04:59:30.465Z' }] }
   assert.equal(agg.notePluginReleaseAgeRetry(releaseAge), true)
   assert.match(agg.note(), /1 个不足 24h 的新版本/)
-  assert.match(agg.note(), /2026-09-16 12:59:30/, '本地时间（UTC+8）展示，不是 ISO 串')
+  // 期望值按"同一条规则"现算（发布时刻 + 24h，再按本机本地时间格式化）：硬编码成某个时区的字符串
+  // 会让这条断言只在 UTC+8 的机器上绿（换台机器/出差改时区就红），而它真正要守的是"本地时间、不是 ISO 串"。
+  const expected = new Date(Date.parse('2026-09-15T04:59:30.465Z') + 24 * 60 * 60 * 1000)
+    .toLocaleString('sv-SE', { hour12: false })
+  assert.ok(expected, '期望值应能算出来')
+  assert.match(agg.note(), new RegExp(expected.replace(/:/g, '\\:')), `按本地时间展示（期望含 ${expected}）`)
+  assert.doesNotMatch(agg.note(), /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, '不能把 ISO 串直接摊给用户')
   assert.equal(agg.issue(), null, '操作成功不该弹提示条')
   assert.equal(agg.notePluginReleaseAgeRetry(null), false)
   assert.equal(agg.notePluginReleaseAgeRetry({ retried: false, entries: [] }), false)

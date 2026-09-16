@@ -238,6 +238,46 @@ test('rememberGlobalRoot：实际用的前缀记账进 Config 并落盘；值没
   assert.equal(saves, 1)
 })
 
+// ---------- Node 探测：PATH 之外的兜底线索（官方安装记录） ----------
+
+test('探测兜底：PATH 上没有 node 时，认官方安装记录登记的位置', async (t) => {
+  // 为什么需要：安装侧会因为"注册表里已装 MSI"决定复用现有 Node；探测侧只认 PATH 的话，
+  // PATH 一被改坏两边就打架 —— 复用决定兑现不了、安装任务当场失败（2026-09-16 实测到的 bug）。
+  const sb = sandbox(t)
+  const msiDir = path.join(sb.base, 'msi-nodejs')
+  fs.mkdirSync(msiDir, { recursive: true })
+  const bin = path.join(msiDir, process.platform === 'win32' ? 'node.exe' : 'node')
+  try { fs.linkSync(process.execPath, bin) } catch { fs.copyFileSync(process.execPath, bin) }
+
+  const emptyPath = path.join(sb.base, 'empty-path')
+  fs.mkdirSync(emptyPath, { recursive: true })
+  const savedPath = process.env.PATH
+  t.after(() => {
+    if (savedPath === undefined) delete process.env.PATH
+    else process.env.PATH = savedPath
+    delete process.env.DSHL_MSI_NODE_PATH
+  })
+  process.env.PATH = emptyPath // 模拟"官方安装目录被移出 PATH"
+  process.env.DSHL_MSI_NODE_PATH = bin // 等价于注册表登记的位置
+
+  initDetect(sb.home, {})
+  const report = await envDetect.detectEnv(true)
+
+  assert.equal(report.node.status, 'ok', 'PATH 上没有 node 时也要能找到官方安装的那份')
+  assert.equal(report.node.source, 'msi', '来源要标明是官方安装记录，便于诊断')
+  assert.equal(path.resolve(report.node.path), path.resolve(bin), '用的必须是登记位置那一份')
+})
+
+test('msiNodeBin：有官方 MSI 的机器上按注册表登记位置解析（没装则为空）', async () => {
+  const bin = await envDetect.msiNodeBin()
+  if (process.platform !== 'win32') {
+    assert.equal(bin, '', '非 Windows 没有这条线索')
+    return
+  }
+  // 本机没装官方 MSI 时允许为空；装了就必须指向 <InstallPath>\node.exe 且文件确实存在
+  if (bin) assert.ok(fs.existsSync(bin) && /node\.exe$/i.test(bin), '解析结果应存在且是 node.exe：' + bin)
+})
+
 // ---------- 换 Node 会整目录替换：目录里的全局包必须记在账上 ----------
 
 test('nodeReplacePlan：Node 目录里有全局 DSH 时自动带上 dsh（换 Node 不会把它换没了）', (t) => {

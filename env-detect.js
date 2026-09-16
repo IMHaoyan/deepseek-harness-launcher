@@ -266,10 +266,31 @@ function npxCacheRoots() {
   return roots
 }
 
-function nodeCandidates() {
+// 官方 MSI 登记的 Node 安装位置（HKLM\SOFTWARE\Node.js 的 InstallPath）。
+// 为什么探测侧必须认它：安装侧会因为"注册表里已装 MSI 且版本合格"而决定**复用**现有 Node；
+// 探测侧若只认 PATH，一旦 PATH 被改坏/没加进去，两边就打架 —— 复用决定兑现不了，安装任务当场失败。
+// 顺序放在 PATH 之后：PATH 上那份才是用户命令行真正在用的，注册表只作 PATH 失效时的兜底。
+let msiNodeMemo
+async function msiNodeBin() {
+  if (!IS_WIN) return ''
+  if (process.env.DSHL_MSI_NODE_PATH) return process.env.DSHL_MSI_NODE_PATH // 测试/排障覆盖
+  if (msiNodeMemo !== undefined) return msiNodeMemo
+  msiNodeMemo = ''
+  try {
+    const out = await runText('reg', ['query', 'HKLM\\SOFTWARE\\Node.js', '/v', 'InstallPath'], 10000)
+    const m = /InstallPath\s+REG_\w+\s+(.*)$/m.exec(out)
+    const dir = m ? m[1].trim() : ''
+    const bin = dir ? path.join(dir, 'node.exe') : ''
+    if (bin && fs.existsSync(bin)) msiNodeMemo = bin
+  } catch { /* 没装官方 MSI 就跳过 */ }
+  return msiNodeMemo
+}
+
+function nodeCandidates(extra = []) {
   const list = []
   if (!FRESH_TEST && Config.nodePath) list.push({ path: Config.nodePath, source: 'config' })
   if (!FRESH_TEST) list.push({ path: 'node', source: 'system' })
+  for (const p of extra) if (p) list.push({ path: p, source: 'msi' }) // 官方 MSI 登记的位置（PATH 失效时的兜底）
   // 用户级 Node（dshl 一键安装落位；PATH 广播后系统候选也能命中，这里兜底 dshl 自身进程）
   const un = userNodeDir()
   if (un) {
@@ -306,7 +327,9 @@ function nodeCandidates() {
 // ---------- 探测：Node ----------
 
 async function detectNode(range) {
-  const candidates = nodeCandidates()
+  // 官方 MSI 登记的位置作为兜底候选（FRESH_TEST 下不看：那是机器上本来就有的东西，不算 dshl 自装物）
+  const msiBin = FRESH_TEST ? '' : await msiNodeBin()
+  const candidates = nodeCandidates([msiBin])
   let best = null // 已发现的最高版本（用于 tooOld 提示）
   let firstMissingExplicit = null
   for (const c of candidates) {
@@ -643,6 +666,7 @@ module.exports = {
   globalPrefixes,
   npmPrefixOf,
   legacyUserNodeLayout,
+  msiNodeBin,
   readNpmPrefix,
   normalizeNpmPrefix,
   runtimeBase,
