@@ -30,6 +30,9 @@ function A([string]$name, [bool]$ok, [string]$detail) {
 function Step([string]$msg) { Write-Host ''; Write-Host ("=== " + $msg + " ===") }
 
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
+# 第一件事就落一个"我跑起来了"的标记：宿主侧据此区分「沙箱没起来 / LogonCommand 没执行」与「脚本卡在某一步」
+$startedMark = Join-Path $Out 'vm-started.txt'
+try { ("started {0} host={1} user={2}" -f (Get-Date -Format s), $env:COMPUTERNAME, $env:USERNAME) | Set-Content -Path $startedMark -Encoding UTF8 } catch { }
 $log = Join-Path $Out 'vm-accept-transcript.txt'
 try { Start-Transcript -Path $log -Force | Out-Null } catch { }
 
