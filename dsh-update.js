@@ -1,6 +1,8 @@
 // dsh-update.js — DSH 更新：检测全自动、更新全手动
 // 策略（用户选定）：
-//  - 静默检查最新版（启动后 + 每 6 小时，24 小时节流）；发现新版 → 主页卡片 + 托盘气泡一次，绝不自动更新；
+//  - 静默检查最新版（节奏 = 启动后 15 秒一次 + 每 6 小时一次，由 main.js 的定时器决定）；
+//    模块内只剩一个 30 分钟"最小间隔地板"，防的是启动器被反复重启时每次启动都联网；发现新版 → 主页卡片 +
+//    托盘气泡一次，绝不自动更新；
 //  - 用户点击卡片"立即更新"后才执行更新（全局 npm：npm update -g --prefix 全局根，npmmirror 优先）；
 //  - 托管形态走统一引擎（内部优先全局 npm，失败回退托管原子安装，失败旧版不动）；
 //  - npx 形态先迁移到全局 npm 再更新（失败回退 npx 预热）；源码版仅提示；
@@ -13,7 +15,12 @@ const fs = require('fs')
 const os = require('os')
 const semver = require('semver')
 
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000 // 检查节流：24 小时
+// 检查的最小间隔地板 —— **不是**检查节奏（节奏由 main.js 的 6 小时 tick 决定）。
+// 它只防一种情况：启动器被反复重启（dev 热重启 / 崩溃后重启 / 用户来回重启托盘）时，每次启动都联网查一遍；
+// 离线时一次检查最坏要等两个源各 90 秒（见 fetchLatest 的 registry 回退），所以这道地板不能省。
+// 必须显著小于 tick：tick 从进程启动开始计时、首次检查在 +15s，地板一旦接近或等于 tick，就会把每个 tick
+// 都挡在门外，节奏会悄悄变成 12 小时一次 —— tests/dsh-update-cadence.test.js 钉住了这条不变式。
+const CHECK_MIN_GAP_MS = 30 * 60 * 1000
 const JOB_WAIT_TIMEOUT_MS = 20 * 60 * 1000 // 安装任务最长等待：20 分钟
 
 let Config = null
@@ -847,7 +854,7 @@ function waitForJob() {
 
 // ---------- 检测（静默，只提示不更新） ----------
 
-// reason: 触发原因（'startup' / 'timer' / 'manual'）；force=true 跳过 24h 节流（设置页手动"检查更新"）
+// reason: 触发原因（'startup' / 'timer' / 'manual'）；force=true 跳过最小间隔地板（设置页手动"检查更新"）
 async function checkOnce(reason, force) {
   if (checking || updating) return
   if (!Config || !envDetect || !envInstall) return
@@ -858,7 +865,12 @@ async function checkOnce(reason, force) {
     return
   }
   const now = Date.now()
-  if (!force && now - (Number(Config.dshUpdateCheckedAt) || 0) < CHECK_INTERVAL_MS) return
+  const sinceLastCheck = now - (Number(Config.dshUpdateCheckedAt) || 0)
+  if (!force && sinceLastCheck < CHECK_MIN_GAP_MS) {
+    // 被地板挡掉的那次要留痕：否则日志里"没查"和"查了说没事"长得一模一样，检查频率只能靠猜
+    log(`dsh-update: 距上次检查 ${Math.round(sinceLastCheck / 60000)} 分钟（地板 ${CHECK_MIN_GAP_MS / 60000} 分钟），本次 ${reason || 'startup'} 检查跳过`)
+    return
+  }
   checking = true
   setState({ status: 'checking' })
   try {
@@ -876,6 +888,9 @@ async function checkOnce(reason, force) {
       return
     }
     const latest = await fetchLatest(plan.nodeCmd)
+    // 记的是"上次尝试"而不是"上次成功"：写在判空之前，取版本失败也落盘。
+    // 这样离线时反复重启启动器不会每次都去等两个源各 90 秒；失败的重试机会落在地板到期后的下一次
+    // 启动检查或下一个 6 小时 tick 上（把这次写入挪到判空之后会拆掉地板的这层保护）。
     Config.dshUpdateCheckedAt = now
     try { saveConfig() } catch { /* noop */ }
     if (!latest) {

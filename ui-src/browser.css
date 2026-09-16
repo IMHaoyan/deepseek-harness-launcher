@@ -246,22 +246,33 @@ body:not(.ready) #tabbar { visibility: hidden; }
 .win-btn.console-btn:hover { color: var(--text-primary); }
 .win-btn.console-btn.active { color: var(--brand); background: var(--ghost-active); }
 .console-btn-label { line-height: 1; white-space: nowrap; }
-/* 「有更新」徽标：位于控制台按钮左边，绿色实底 + 白字（对齐 .plugin-badge-preinstall 的绿）。
-   只在 DSHL 或 DSH 有新版本时显示；无更新时由 .hidden 整颗隐藏，不占位。 */
+/* 「有更新」徽标：位于控制台按钮左边。两档语义（文案 + 底色双通道，判定在主进程 updateBadgeTier）：
+     - 有更新（默认档）= 检测到新版本，快路径还没备好 → 淡绿底 + 深绿字，只传达"有新东西"
+     - 可更新（.ready）= 就绪（启动器已下载 / DSH 已预装）→ 绿色实底白字，传达"现在点一下就好"
+   只在 DSHL 或 DSH 有新版本时显示；无更新时由 .hidden 整颗隐藏，不占位。
+   fail-closed：tier 缺失/未知时壳按默认档渲染，绝不显示实底那一档。 */
 .win-btn.update-badge {
   width: auto;
   flex: none;
   margin-right: 6px;
   padding: 0 12px;
   border-radius: 999px;
-  color: #FFFFFF;
-  background: #16A34A;
+  color: #15803D;
+  background: rgba(22, 163, 74, 0.14);
   font-size: 12.5px;
   font-weight: 600;
 }
 
-.win-btn.update-badge:hover { background: #15803D; color: #FFFFFF; }
+.win-btn.update-badge:hover { color: #14532D; background: rgba(22, 163, 74, 0.22); }
+.win-btn.update-badge.ready { color: #FFFFFF; background: #16A34A; }
+.win-btn.update-badge.ready:hover { color: #FFFFFF; background: #15803D; }
 .update-badge-label { line-height: 1; white-space: nowrap; }
+
+@media (prefers-color-scheme: dark) {
+  /* 深色下淡绿底会发闷：换成更透的绿 + 亮绿字；.ready 实底档不受影响（选择器优先级更高） */
+  .win-btn.update-badge { color: #4ADE80; background: rgba(34, 197, 94, 0.18); }
+  .win-btn.update-badge:hover { color: #86EFAC; background: rgba(34, 197, 94, 0.26); }
+}
 
 /* 窄窗口下优先保住窗口按钮组的可用宽度：标题栏空间不够时收起「控制台」二字 */
 @media (max-width: 760px) {

@@ -7,6 +7,16 @@ const send = (name, payload) => window.browserBridge.send(name, payload);
 let state = { tabs: [], activeId: null, rightId: null, splitOn: false, splitRatio: 0.5, maximized: false, tabsEnabled: false, consoleOpen: false, update: null };
 let restartErrTimer = null; // 重启失败的红字提示窗口：期间 render 不覆盖按钮文案
 
+// DSH 侧就绪说明（徽标悬停提示用）。口径与控制台「立即更新」按钮的 tooltip 完全一致，
+// 避免同一个就绪状态在两处说成两样；拿不到形态（老推送/探测失败）时不编造解释，返回空串。
+function dshReadyHint(d) {
+  if (d.ready) return '（已预装就绪，约 15 秒）';
+  if (d.kind === 'source') return '（源码安装，需手动更新）';
+  if (d.prewarmed) return '（依赖已缓存，约 1 分钟）';
+  if (d.kind === 'global' || d.kind === 'managed' || d.kind === 'npx') return '（约 1-2 分钟）';
+  return '';
+}
+
 function render() {
   // 标签/分屏恒关（设置页开关已移除）：标题栏只保留 标题 + 最小化/最大化/关闭
   const tabsEnabled = state.tabsEnabled !== false;
@@ -36,17 +46,24 @@ function render() {
   $('tabs').style.display = tabsEnabled ? '' : 'none';
   $('btnNew').style.display = tabsEnabled ? '' : 'none';
   $('btnSplit').style.display = tabsEnabled ? '' : 'none';
-  // 「有更新」徽标：DSHL 或 DSH 任一新版本可用即显示（无更新时整颗隐藏，不占位）
+  // 「有更新」徽标：DSHL 或 DSH 任一新版本可用即显示（无更新时整颗隐藏，不占位）；分两档，由主进程的 tier 决定：
+  //   有更新（pending）= 检测到新版本，快路径还没备好（下载中 / 预装中，或该形态本来就没有快路径）
+  //   可更新（ready）  = 全部可见更新都已就绪（启动器已下载 / DSH 已预装）：点一下就是最快路径
+  // 缺 tier 一律按"有更新"渲染（fail-closed：不承诺没有依据的"就绪"）。
   const upd = state.update || {};
   const updLatest = (upd.launcher && upd.launcher.latest) || (upd.dsh && upd.dsh.latest) || '';
   const btnUpdateNotice = $('btnUpdateNotice');
   if (btnUpdateNotice) {
+    const updReady = upd.tier === 'ready';
     btnUpdateNotice.classList.toggle('hidden', !updLatest);
+    btnUpdateNotice.classList.toggle('ready', !!updLatest && updReady);
     if (updLatest) {
+      const label = btnUpdateNotice.querySelector('.update-badge-label');
+      if (label) label.textContent = updReady ? '✓ 可更新' : '有更新';
       const parts = [];
-      if (upd.launcher && upd.launcher.latest) parts.push('DSHL v' + upd.launcher.latest + (upd.launcher.ready ? '（已下载，点安装）' : ''));
-      if (upd.dsh && upd.dsh.latest) parts.push('DSH v' + upd.dsh.latest);
-      const title = '有新版本：' + parts.join('，') + '。点击查看更新内容';
+      if (upd.launcher && upd.launcher.latest) parts.push('DSHL v' + upd.launcher.latest + (upd.launcher.ready ? '（已下载，点安装）' : '（下载中）'));
+      if (upd.dsh && upd.dsh.latest) parts.push('DSH v' + upd.dsh.latest + dshReadyHint(upd.dsh));
+      const title = (updReady ? '更新已就绪' : '有新版本') + '：' + parts.join('，') + '。点击查看更新内容';
       btnUpdateNotice.title = title;
       btnUpdateNotice.setAttribute('aria-label', title);
     }

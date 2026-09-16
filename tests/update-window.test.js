@@ -11,7 +11,8 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const root = path.resolve(__dirname, '..')
-const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8')
+// 统一成 LF：下面的断言里有跨行的正则（样式块、函数体切片），CRLF 检出会让它们全部失配
+const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n?/gu, '\n')
 
 const html = read('ui-src/update.html')
 const js = read('ui-src/update.js')
@@ -106,8 +107,10 @@ test('导航栏「有更新」徽标：位置、显隐与点击都在壳里', ()
   assert.match(shellJs, /btnUpdateNotice\.classList\.toggle\('hidden', !updLatest\)/, '无更新时应隐藏徽标')
   assert.match(shellJs, /send\('updateOpen'\)/, '点击应打开更新窗口')
   assert.match(mainJs, /case 'browser:updateOpen': showUpdateWindow\(\)/, '主进程应有 browser:updateOpen 分支')
+  assert.match(shellHtml, /<span class="update-badge-label">有更新<\/span>/, '初始档必须是"有更新"（首帧推送前不许宣称就绪）')
   assert.match(shellCss, /\.win-btn\.update-badge \{/, '徽标应有自己的样式')
-  assert.match(shellCss, /\.win-btn\.update-badge \{\n  width: auto;[\s\S]*?background: #16A34A;/, '徽标应为绿色实底')
+  assert.match(shellCss, /\.win-btn\.update-badge \{\n  width: auto;[\s\S]*?background: rgba\(22, 163, 74, 0\.14\);/, '默认档应为淡绿底（有更新）')
+  assert.match(shellCss, /\.win-btn\.update-badge\.ready \{ color: #FFFFFF; background: #16A34A; \}/, '就绪档应为绿色实底白字（可更新）')
 })
 
 test('导航栏徽标的数据来自主进程推送（两者任一有更新就显示）', () => {
@@ -117,6 +120,58 @@ test('导航栏徽标的数据来自主进程推送（两者任一有更新就�
   assert.match(mainJs, /u\.status === 'downloading' \|\| u\.status === 'downloaded'/, '启动器：下载中/已下载 都算有更新')
   assert.match(mainJs, /d\.status === 'available'/, 'DSH：只有 available 才算有更新')
   assert.match(shellJs, /upd\.launcher && upd\.launcher\.latest\) \|\| \(upd\.dsh && upd\.dsh\.latest\)/, '壳按两者取或判断显隐')
+})
+
+test('徽标两档：全部可见更新都就绪才是"可更新"，其余一律"有更新"（fail-closed）', () => {
+  // 判定是纯函数：直接跑真实源码片段，而不是只做正则匹配
+  const start = mainJs.indexOf('function updateBadgeTier(launcher, dsh) {')
+  const end = mainJs.indexOf('\n}\n', start) + 3
+  assert.ok(start > 0 && end > start, 'main.js 应有 updateBadgeTier 纯函数')
+  const tier = new Function(mainJs.slice(start, end) + '\nreturn updateBadgeTier')()
+  const L = (latest, ready) => ({ latest, ready })
+  // 没有更新 → pending（此时徽标本来就整颗隐藏）
+  assert.equal(tier(L('', false), { latest: '' }), 'pending', '无更新应为 pending')
+  // 检测到但没就绪 → pending
+  assert.equal(tier(L('1.4.6', false), { latest: '' }), 'pending', '启动器下载中 = 有更新')
+  assert.equal(tier(L('', false), { latest: '0.2.0', ready: false }), 'pending', 'DSH 预装中 = 有更新')
+  // 两侧都就绪 → ready
+  assert.equal(tier(L('1.4.6', true), { latest: '0.2.0', ready: true }), 'ready', '两侧都就绪 = 可更新')
+  // 只就绪一侧 → 仍是 pending（一半就绪时承诺"就绪"就是假的）
+  assert.equal(tier(L('1.4.6', true), { latest: '0.2.0', ready: false }), 'pending', '只启动器就绪：DSH 还得等')
+  assert.equal(tier(L('1.4.6', false), { latest: '0.2.0', ready: true }), 'pending', '只 DSH 就绪：启动器还在下')
+  // 就绪但这一侧没有更新（不该把它算进来）
+  assert.equal(tier(L('', false), { latest: '0.2.0', ready: true }), 'ready', '没有更新的那一侧不参与判定')
+  // 缺字段/脏值 → pending（fail-closed）
+  for (const bad of [undefined, null, {}, { latest: '1.4.6' }, { latest: '1.4.6', ready: 'true' }, { latest: '1.4.6', ready: 1 }]) {
+    assert.equal(tier(bad, null), 'pending', '缺 ready/脏值必须按未就绪：' + JSON.stringify(bad))
+  }
+})
+
+test('徽标两档的渲染契约：文案、样式与悬停解释都跟着 tier 走', () => {
+  assert.match(mainJs, /d\.staged === true && String\(d\.stageVersion \|\| ''\) === latest/, 'DSH 就绪必须认版本号对得上的暂存树')
+  assert.match(mainJs, /tier: updateBadgeTier\(lu, du\)/, '主进程算好 tier 再下发')
+  assert.match(shellJs, /const updReady = upd\.tier === 'ready';/, '壳只按 tier 渲染，不自己判断')
+  assert.match(shellJs, /btnUpdateNotice\.classList\.toggle\('ready', !!updLatest && updReady\)/, '就绪档要切到 .ready 样式')
+  assert.match(shellJs, /label\.textContent = updReady \? '✓ 可更新' : '有更新';/, '文案两档一一对应')
+  // 类名写错是静默故障：颜色会变、文案永远停在"有更新"。所以把选择器与标记对起来查。
+  const labelSel = /btnUpdateNotice\.querySelector\('\.([\w-]+)'\)/.exec(shellJs)
+  assert.ok(labelSel, '壳应有取徽标文案节点的查询')
+  assert.ok(shellHtml.includes(`class="${labelSel[1]}"`), `browser.html 里没有 .${labelSel[1]}（类名对不上 = 文案永远不更新）`)
+  assert.match(shellJs, /const title = \(updReady \? '更新已就绪' : '有新版本'\)/, '悬停提示要说明是哪一档')
+  assert.match(shellJs, /function dshReadyHint\(d\)/, 'DSH 侧就绪说明应集中在一处')
+  // 状态词与耗时口径必须与控制台按钮、更新窗口同源，否则同一个就绪状态在三处说成三样
+  const app = read('ui-src/app.js')
+  const updJs = read('ui-src/update.js')
+  for (const [state, cost] of [['已预装就绪', '约 15 秒'], ['依赖已缓存', '约 1 分钟'], ['', '约 1-2 分钟']]) {
+    for (const [file, src] of [['browser.js', shellJs], ['app.js', app], ['update.js', updJs]]) {
+      if (state) assert.ok(src.includes(state), `${file} 缺状态词「${state}」`)
+      assert.ok(src.includes(cost), `${file} 缺耗时口径「${cost}」`)
+    }
+  }
+  const builtShell = read('wwwroot/browser.js')
+  const builtCss = read('wwwroot/browser.css')
+  assert.match(builtShell, /✓ 可更新/, 'wwwroot 未同步：请执行 npm run build:assets')
+  assert.match(builtCss, /\.win-btn\.update-badge\.ready/, 'wwwroot 未同步：请执行 npm run build:assets')
 })
 
 test('更新窗口的窗口模块与打包清单', () => {

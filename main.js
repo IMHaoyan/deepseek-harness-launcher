@@ -3574,19 +3574,22 @@ function webPushState() {
     launcherVersion: app.getVersion(),
     service: servicePhase(),
     dshVersionText: dshTitleTooltipVersion(), // 标题栏悬停提示（'' = 还没探测到，壳就只显示标题）
-    // 「有更新」徽标：两者任一有更新就显示；壳只读，不在这里判断逻辑
+    // 「有更新」徽标：两者任一有更新就显示；两档语义（有更新 / 可更新）由 updateBadgeTier 说了算，
+    // 壳只按 tier 渲染文案与样式，不自己判断
     update: (() => {
       const lu = launcherUpdateInfo()
+      const du = dshUpdateInfo()
       return {
-        launcher: { latest: lu.latest, ready: lu.ready },
-        dsh: { latest: dshUpdateInfo().latest },
+        launcher: { latest: lu.latest, ready: lu.ready === true },
+        dsh: { latest: du.latest, ready: du.ready === true, kind: du.kind, prewarmed: du.prewarmed === true },
+        tier: updateBadgeTier(lu, du),
         windowOpen: updateWindowIsOpen(),
       }
     })(),
   })
 }
 
-/** 启动器更新摘要（徽标 + 更新窗口共用同一份口径）。 */
+/** 启动器更新摘要（导航栏徽标两档用；更新窗口走 updateStateSnapshot 直接读原状态）。 */
 function launcherUpdateInfo() {
   try {
     const u = JSON.parse(updater.getState() || '{}')
@@ -3595,12 +3598,32 @@ function launcherUpdateInfo() {
   } catch { return { latest: '', ready: false } }
 }
 
-/** DSH 更新摘要。 */
+/**
+ * DSH 更新摘要（导航栏徽标两档 + 悬停说明用；更新窗口走 updateStateSnapshot 直接读原状态）。
+ * ready = 后台预装好的那棵整树正好对应这个版本号 —— 只信版本号对得上的暂存树；
+ * 没就绪时点下去会退回完整安装（约 1 分钟），只是慢，不会失败。
+ */
 function dshUpdateInfo() {
   try {
     const d = dshUpdater.getState() || {}
-    return { latest: d.status === 'available' ? (d.latest || '') : '' }
-  } catch { return { latest: '' } }
+    const latest = d.status === 'available' ? (d.latest || '') : ''
+    const ready = !!latest && d.staged === true && String(d.stageVersion || '') === latest
+    return { latest, ready, kind: d.kind || '', prewarmed: d.prewarmed === true }
+  } catch { return { latest: '', ready: false, kind: '', prewarmed: false } }
+}
+
+/**
+ * 徽标两档判定（纯函数，便于测试）：
+ *   'ready'   —— 全部"看得见的更新"都已就绪：启动器已下载 / DSH 已预装。点一下就是最快路径。
+ *   'pending' —— 还有更新没就绪（下载中 / 预装中 / 该形态本来就没有快路径），或压根没有更新。
+ * 缺字段、未知值一律算未就绪（fail-closed）：宁可不承诺"点一下就好"，也不让用户按 15 秒的预期去等 1 分钟。
+ * 注意判据是"全部就绪"而不是"任一就绪"：徽标说的是整体状态，一半就绪时承诺就绪就是假的。
+ */
+function updateBadgeTier(launcher, dsh) {
+  const items = []
+  if (launcher && launcher.latest) items.push(launcher.ready === true)
+  if (dsh && dsh.latest) items.push(dsh.ready === true)
+  return items.length > 0 && items.every(Boolean) ? 'ready' : 'pending'
 }
 
 // 布局：仅把展示中的 1-2 个视图挂到 contentView 并 setBounds（原生合成器，切换零闪烁）
@@ -4770,7 +4793,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           const ch = value === 'alpha' ? 'alpha' : 'latest'
           if (Config.dshChannel !== ch) {
             Config.dshChannel = ch
-            Config.dshUpdateCheckedAt = 0 // 换渠道后立刻重新检查，不必等 24h 节流
+            Config.dshUpdateCheckedAt = 0 // 换渠道后立刻重新检查，不必等最小间隔地板
             saveConfig()
             log('dsh-update: channel switched to ' + ch)
             dshUpdater.noteChannelChange() // 作废旧渠道的版本缓存：否则「重试」会照着旧渠道的缓存装
@@ -5851,7 +5874,8 @@ function init() {
   // 启动后 10 秒静默检查启动器更新（仅打包版；轻量只读 GitHub latest.yml，10s 避开新窗口弹出瞬间即可，开发模式跳过）
   setTimeout(() => updater.autoCheck(), 10000)
   // DSH 更新检查：启动后 15 秒首次（此时环境探测/服务启动均已完成，检测越早用户越早看到新版提示），
-  // 此后每 6 小时一次（模块内 24h 节流；只检测绝不自动更新）
+  // 此后每 6 小时一次 —— **这里的定时器就是检查节奏**，模块内只剩一个 30 分钟最小间隔地板
+  // （dsh-update.js 的 CHECK_MIN_GAP_MS，只防启动器被反复重启时每次启动都联网）；只检测绝不自动更新
   // 发现新版后由 dsh-update.warmLatest 立即后台预热缓存，用户点"立即更新"时秒级完成
   setTimeout(() => { void dshUpdater.checkOnce('startup') }, 15000)
   setInterval(() => { void dshUpdater.checkOnce('timer') }, 6 * 60 * 60 * 1000)
