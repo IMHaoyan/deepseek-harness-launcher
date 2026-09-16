@@ -18,7 +18,7 @@
 //   npm run release "v1.0.7 更新内容：\n- 第一条\n- 第二条"  —— 字面 \n 表示换行（真实换行会被批处理截断）
 //   npm run release -- --notes-file <文件路径>        —— 从文件读取说明（中文/多行/特殊字符最稳，推荐）
 import { execFileSync } from 'node:child_process'
-import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -88,7 +88,7 @@ function notesFromCommits() {
   } catch { return '- 维护性更新' }
 }
 
-// 说明优先级：--notes-file 指向的文件 > 命令行字面文本 > 按提交自动生成。
+// 说明优先级：--notes-file 指向的文件 > 命令行字面文本 > **同一条 alpha 线的本地留档** > 按提交自动生成。
 // 为什么优先文件：中文与多行说明经 npm/cmd 传递会被拆散或截断，走文件最稳。
 const argv = process.argv.slice(2)
 const notesFileArg = argv.findIndex((a) => a === '--notes-file' || a.startsWith('--notes-file='))
@@ -113,9 +113,84 @@ if (notesFileArg >= 0) {
 } else {
   rawNotes = argv.filter((a) => !a.startsWith('--')).join(' ').trim().replace(/\\n/g, '\n')
 }
-const body = rawNotes || notesFromCommits()
+
+// ---------- alpha 与正式版的口径（约定见 docs/release-notes-style.md） ----------
+// alpha：内容只进**本地留档**（.alpha-notes/ 是 gitignore 的：不发公告，也不进公开仓库），
+//        GitHub Release 正文留一句占位；
+// 正式版：才把这条 alpha 线的留档汇总成公告（没给 --notes-file 时自动汇总，省得手抄）。
+const ALPHA_RECORD = join(root, '.alpha-notes', 'release-notes.md')
+const ALPHA_PLACEHOLDER = 'alpha 预发布版，仅用于内部验证；更新内容不发公告，转正式版时随正式版发布说明公布。'
+
+function recordAlphaNotes(ver, notesText) {
+  try {
+    mkdirSync(dirname(ALPHA_RECORD), { recursive: true })
+    const existing = existsSync(ALPHA_RECORD)
+      ? readFileSync(ALPHA_RECORD, 'utf8')
+      : '# alpha 预发布记录（本地存盘：不发公告、不进公开仓库）\n\n> 等这条 alpha 线转正式版时，正式版发布说明会自动汇总本文件里的条目（前提是按发布说明规范写）。\n'
+    if (existing.includes(`## v${ver} `)) {
+      console.log('本地留档已含该版本，跳过追加：' + ALPHA_RECORD)
+      return
+    }
+    writeFileSync(ALPHA_RECORD, existing.replace(/\s*$/, '\n') + '\n' + notesText.trim() + '\n', 'utf8')
+    console.log('alpha 内容已存入本地留档：' + ALPHA_RECORD + '（本地文件，不需要提交）')
+  } catch (e) {
+    console.error('本地留档写入失败（不影响本次发布）：' + (e && e.message ? e.message : String(e)))
+  }
+}
+
+// 汇总"同一条 alpha 线"（同 base 版本、按 alpha 序号升序）的条目，按固定分组顺序合并、去掉重复行
+function notesFromAlphaRecord(ver) {
+  const base = String(ver).split('-')[0]
+  let text = ''
+  try { text = readFileSync(ALPHA_RECORD, 'utf8') } catch { return '' }
+  const chunks = text.split(/^## /mu).slice(1) // 去掉文件头
+  const picked = []
+  for (const c of chunks) {
+    const head = c.split('\n', 1)[0]
+    const m = /^v(\S+)\s+—/.exec(head)
+    if (!m || !m[1].startsWith(base + '-alpha')) continue
+    const n = Number((/-alpha\.(\d+)$/.exec(m[1]) || [])[1] || 0)
+    picked.push({ n, body: c.slice(head.length).trim() })
+  }
+  if (!picked.length) return ''
+  picked.sort((a, b) => a.n - b.n)
+  const groups = new Map()
+  for (const p of picked) {
+    let cur = ''
+    for (const raw of p.body.split('\n')) {
+      const line = raw.trim()
+      const gm = /^\*\*(新增|优化|调整|修复|移除)\*\*$/.exec(line)
+      if (gm) { cur = gm[1]; if (!groups.has(cur)) groups.set(cur, []); continue }
+      if (!cur || !line.startsWith('- ')) continue
+      const arr = groups.get(cur)
+      if (!arr.includes(line)) arr.push(line)
+    }
+  }
+  const parts = []
+  for (const g of ['新增', '优化', '调整', '修复', '移除']) {
+    const items = groups.get(g)
+    if (items && items.length) parts.push(`**${g}**\n${items.join('\n')}`)
+  }
+  return parts.join('\n\n')
+}
+
+let body = rawNotes
+let notesSource = rawNotes ? '命令行/文件' : ''
+if (!body && channel === 'latest') {
+  const aggregated = notesFromAlphaRecord(version)
+  if (aggregated) { body = aggregated; notesSource = 'alpha 本地留档汇总' }
+}
+if (!body) { body = notesFromCommits(); notesSource = '提交列表兜底' }
 const notes = `${header()}\n\n${body}\n`
-console.log('--- 发布说明 ---\n' + notes + '----------------')
+console.log(`--- 发布说明（来源：${notesSource}）---\n` + notes + '----------------')
+if (channel === 'alpha') {
+  console.log('注意：alpha 版本不发公告 —— 上面的内容只会写进本地留档，Release 正文仅留一句占位说明。')
+}
+// --dry-run：只把说明算出来看一眼（正式版会汇总 alpha 留档，最值得先核对），不构建、不上传、不写留档
+if (process.argv.slice(2).includes('--dry-run')) {
+  console.log('--dry-run：仅打印渠道判定与发布说明，未构建、未上传、未写留档。')
+  process.exit(0)
+}
 
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
@@ -188,7 +263,13 @@ console.log(`产物校验通过：${exe} / ${channel === 'latest' ? 'latest.yml'
 
 // ---------- 4. 创建 Release 并上传（说明经 --notes-file 传文件，避免换行/引号被 shell 拆散） ----------
 const notesFile = join(root, 'dist', '.release-notes.md')
-writeFileSync(notesFile, notes, 'utf8')
+if (channel === 'alpha') {
+  // alpha 不发公告：内容进本地留档，Release 正文只留占位（转正式版时才把留档汇总成公告）
+  recordAlphaNotes(version, notes)
+  writeFileSync(notesFile, ALPHA_PLACEHOLDER + '\n', 'utf8')
+} else {
+  writeFileSync(notesFile, notes, 'utf8')
+}
 // alpha 必须发成 GitHub prerelease 且不占用 Latest：否则正式用户（updater.js 里 latest 渠道
 // allowPrerelease=false）会把尚未验证的版本当成正式更新拉走。
 const prereleaseArgs = channel === 'latest' ? [] : ['--prerelease', '--latest=false']
@@ -199,5 +280,7 @@ try {
 }
 console.log(`发布完成（${channel} 渠道，产物 ${channel === 'latest' ? 'latest.yml' : channel + '.yml'}）：https://github.com/IMHaoyan/deepseek-harness-launcher/releases/tag/${tag}`)
 console.log(channel === 'alpha'
-  ? '这是 alpha 预发布版（GitHub prerelease，不占 Latest + alpha.yml）：只有把「启动器更新渠道」选成 alpha 的机器会收到它，正式版用户不受影响。'
-  : '这是正式版（GitHub Latest + latest.yml）：所有默认（latest 渠道）的机器会自动更新，选了 alpha 的机器也会拿到它。')
+  ? '这是 alpha 预发布版（GitHub prerelease，不占 Latest + alpha.yml）：只有把「启动器更新渠道」选成 alpha 的机器会收到它。\n'
+    + '按约定 alpha 不发公告：更新内容只记在 docs/release-notes-alpha.md（记得提交），转正式版时自动汇总进正式版发布说明。'
+  : '这是正式版（GitHub Latest + latest.yml）：所有默认（latest 渠道）的机器会自动更新，选了 alpha 的机器也会拿到它。\n'
+    + '正式版才发公告：上面这份说明就是挂在正式版本号下的更新内容（若来自 alpha 留档汇总，请顺手核对分组与措辞）。')
