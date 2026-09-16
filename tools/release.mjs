@@ -164,12 +164,27 @@ if (process.env.DSHL_SKIP_PRECHECK === '1') {
 }
 run(process.execPath, ['tools/fetch-node-dist.mjs'])
 run(npm, ['run', 'build:assets'])
-run(npm, ['run', 'dist:win'])
+// electron-builder 的 yml 文件名取自 **publish 配置里的 channel**（默认 latest），不会自己看版本号：
+// 不显式传的话，alpha 版本也会写成 latest.yml —— 而 electron-updater 的 alpha 渠道只会去下 alpha.yml。
+// 所以这里按渠道显式传一次（`--publish never`，只是让它在本地按渠道名写出 yml，不触发上传）。
+run(npm, ['run', 'dist:win', '--', `-c.publish.channel=${channel}`])
 
 // ---------- 3. 产物校验 ----------
 for (const f of [exePath, blockmapPath, channelYml]) {
   if (!existsSync(f)) { console.error('产物缺失：' + f); process.exit(1) }
 }
+// yml 必须是这次的版本，且指向这次的安装包：文件名对得上不代表内容对得上（旧产物会留在 dist 里）
+const ymlText = readFileSync(channelYml, 'utf8')
+const ymlVersion = (/^version:\s*(\S+)/mu.exec(ymlText) || [])[1] || ''
+if (ymlVersion !== version) {
+  console.error(`产物版本不一致：${channel === 'latest' ? 'latest.yml' : channel + '.yml'} 里是 ${ymlVersion || '（读不到）'}，package.json 是 ${version}`)
+  process.exit(1)
+}
+if (!ymlText.includes(exe)) {
+  console.error(`产物不匹配：${channel === 'latest' ? 'latest.yml' : channel + '.yml'} 没有指向 ${exe}`)
+  process.exit(1)
+}
+console.log(`产物校验通过：${exe} / ${channel === 'latest' ? 'latest.yml' : channel + '.yml'}（${channel} 渠道，版本 ${ymlVersion}）`)
 
 // ---------- 4. 创建 Release 并上传（说明经 --notes-file 传文件，避免换行/引号被 shell 拆散） ----------
 const notesFile = join(root, 'dist', '.release-notes.md')
