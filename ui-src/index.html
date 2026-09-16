@@ -195,6 +195,10 @@
         <span class="label">DSH 更新渠道</span>
         <div class="chips" id="dshChannelChips"></div>
       </div>
+      <div class="row" title="latest：只收启动器正式版（默认）；alpha：跟随预发布版，能提前拿到新功能。切回 latest 不会把已装的 alpha 降级——等下一个正式版即可；切换后立即按新渠道重新检查。">
+        <span class="label">启动器更新渠道</span>
+        <div class="chips" id="launcherChannelChips"></div>
+      </div>
       <div class="row">
         <span class="label">恢复默认</span>
         <div class="chips">
@@ -315,6 +319,19 @@
       <div>
         <div class="plugin-page-heading">本页是 DSHL 精选的预装插件，不是插件管理器</div>
         <div class="plugin-page-subtitle">要浏览、安装和管理更多插件，请使用 DSH 窗口内的「插件市场」。DSHL 只负责随启动器代装和维护这几个插件。</div>
+      </div>
+    </div>
+
+    <!-- 环境级故障：一批插件同一原因失败时只解释一次（原因 + 受影响插件 + 何时自愈 + 重试失败项） -->
+    <div id="pluginEnvBar" class="plugin-env-bar hidden" role="status">
+      <span class="plugin-env-dot" aria-hidden="true"></span>
+      <div class="plugin-env-body">
+        <span class="plugin-env-title" id="pluginEnvTitle"></span>
+        <span class="plugin-env-detail" id="pluginEnvDetail"></span>
+      </div>
+      <div class="plugin-env-actions">
+        <button class="btn sm" id="btnPluginEnvRetry" title="只重试这批失败的插件；装完点顶部「立即重启生效」">重试失败的插件</button>
+        <button class="btn sm" id="btnPluginEnvDismiss" title="收起这条提示（下一次失败会再次出现）">知道了</button>
       </div>
     </div>
 

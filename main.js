@@ -102,7 +102,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
@@ -194,7 +194,7 @@ function maybeStartDeferred() {
     void handleStart()
     void maybeAutoInstallPluginMarket() // 环境/服务刚就绪：补上插件市场默认安装
     void maybeAutoInstallBridge() // 远程连接插件同样补装
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（增强侧边栏 / 用量与计费）同样补装
+    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 会话归档 / 对话回退）同样补装
   }
 }
 
@@ -338,9 +338,13 @@ function applyConfigJson(cfg) {
   if (typeof cfg.dshVersion === 'string' && cfg.dshVersion) Config.dshVersion = cfg.dshVersion
   if (typeof cfg.pnpmVersion === 'string' && cfg.pnpmVersion) Config.pnpmVersion = cfg.pnpmVersion
   if (cfg.dshChannel === 'alpha' || cfg.dshChannel === 'latest') Config.dshChannel = cfg.dshChannel
+  // 启动器自身的更新渠道：只认这两个值，写坏了就保持默认（绝不因为配置脏就去拉预发布包）
+  if (cfg.launcherChannel === 'alpha' || cfg.launcherChannel === 'latest') Config.launcherChannel = cfg.launcherChannel
   if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
   if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
   if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
+  // 上次真正成功的 npm 源（'default' = 不带 --registry、用 npm 自身配置）：下次优先试它
+  if (typeof cfg.dshRegistryOk === 'string') Config.dshRegistryOk = cfg.dshRegistryOk
   if (Number.isFinite(cfg.dshUpdateCheckedAt) && cfg.dshUpdateCheckedAt > 0) Config.dshUpdateCheckedAt = cfg.dshUpdateCheckedAt
   if (Number.isFinite(cfg.dshMigrateRetryAt) && cfg.dshMigrateRetryAt > 0) Config.dshMigrateRetryAt = cfg.dshMigrateRetryAt
   if (typeof cfg.defExcludeTryVersion === 'string') Config.defExcludeTryVersion = cfg.defExcludeTryVersion
@@ -526,6 +530,8 @@ const server = {
   blockedReason: '',
   suggestedPort: 0,
   launchUrl: null, // 本轮服务 stdout 打印的访问地址（新 DSH 带一次性 token，形如 ?token=xxx）；null=未知/无鉴权
+  phaseLine: '', // 启动期"当前环节"：服务进程最近一条插件日志（说明页在"等待端口就绪"后面显示它）
+  phaseAt: 0, // 上面那行到达的时间（页面据此显示"（N 秒前）"，避免把已过去的事说成"正在"）
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
   claimed() { return this.claimedPid !== 0 && this.claimedAlive },
@@ -569,6 +575,8 @@ let runningProgress = null // { reason, steps:[{key,label}], index, startedAt }
 function beginLoadingProgress(reason) {
   const steps = startProgress.stepsFor(reason)
   runningProgress = steps.length ? { reason, steps, index: 0, startedAt: Date.now() } : null
+  server.phaseLine = '' // 新一轮流程：上一轮的"当前环节"作废
+  server.phaseAt = 0
   pushLoadingProgress()
 }
 
@@ -591,7 +599,22 @@ function loadingProgressPayload() {
     total: runningProgress.steps.length,
     label: step ? step.label : '',
     startedAt: runningProgress.startedAt,
+    // 当前环节：服务进程最近一条插件日志（'' = 没有可展示的，页面显示 phaseFallback）
+    phase: server.phaseLine || '',
+    phaseAt: server.phaseAt || 0,
+    // 兜底文案由主进程给：文案只有一处定义（start-progress.js），页面不自己编一套
+    phaseFallback: startProgress.PHASE_FALLBACK,
   }
+}
+
+// 启动期"当前环节"采集：只认服务进程自己打印的插件日志（`[名字] …`），存最后一条供说明页展示。
+// 按行缓冲交给 start-progress.createPhaseReader（chunk 会把一行劈成两半，残行不能当环节展示）。
+function noteChildPhase(child, chunk) {
+  if (!child || !child.__starting || !child.__phase) return
+  const picked = child.__phase.push(String(chunk))
+  if (!picked) return
+  server.phaseLine = picked
+  server.phaseAt = Date.now()
 }
 
 // 只推给"正显示说明页"的标签视图；页面再按 reason 过滤（失败页 reason 不同 → 不显示步骤行）
@@ -936,6 +959,8 @@ async function startServer(occupantRetry = 0) {
   clearClaimed()
   const gen = server.gen
   server.launchUrl = null // 新进程的 launch token 只在本轮 stdout 中出现
+  server.phaseLine = '' // 新进程的"当前环节"从零开始（上一轮的最后一条日志不能说成这一轮的动静）
+  server.phaseAt = 0
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
   try {
@@ -984,8 +1009,10 @@ async function startServer(occupantRetry = 0) {
   // launch token，页面须带 token 首次访问换取浏览器 cookie（默认 30 天）。
   // 捕获后立即刷新 WebUI：首次加载可能早于本行到达而停在鉴权页/空白，由 refreshWebUiOnReady 与鉴权兜底补上。
   child.__launchBuf = ''
+  child.__phase = startProgress.createPhaseReader() // "当前环节"的行缓冲（chunk 可能把一行劈成两半）
   const onData = (d) => {
     writeSafe(outS, d)
+    noteChildPhase(child, d)
     if (server.gen !== gen) return // 过期世代的输出：不再解读
     child.__launchBuf = (child.__launchBuf + String(d)).slice(-8192)
     let nl
@@ -1011,6 +1038,7 @@ async function startServer(occupantRetry = 0) {
   let bindErr = ''
   child.stderr.on('data', (d) => {
     writeSafe(errS, d)
+    noteChildPhase(child, d) // 插件日志（[usage-billing] …）走 stderr：它就是"当前环节"的来源
     if (bindErr) return
     const m = /listen (EACCES|EADDRINUSE)/i.exec(String(d))
     if (m) bindErr = m[1].toUpperCase()
@@ -1047,12 +1075,21 @@ async function startServer(occupantRetry = 0) {
   broadcastState() // 立刻把 phase=starting 推给控制台（否则启动期间控制台一直显示上一次的"已停止"）
   markLoadingProgress('ready') // 子进程已起，进入最耗时的一步：等待端口就绪
   const deadline = Date.now() + READY_TIMEOUT_SEC * 1000
+  let pushedPhase = null // 上一次推给说明页的"当前环节"
+  let pushedAt = 0
   while (Date.now() < deadline) {
     if (server.stopping || server.startedStopping) return false // 用户主动停止：不算端口问题
     if (server.child !== child || child.exitCode !== null) {
       // 启动阶段就退出：若是端口无法监听，按冲突上报（控制台给一键换端口入口）
       if (bindErr) await reportBindBlocked(bindErr)
       return false
+    }
+    // 把"当前环节"（服务进程最近一条插件日志）推给说明页：环节变化就推，否则每秒补推一次
+    // （补推是为了晚加载/刚刷新的说明页也能立刻拿到当前环节）
+    if (server.phaseLine !== pushedPhase || Date.now() - pushedAt >= 1000) {
+      pushedPhase = server.phaseLine
+      pushedAt = Date.now()
+      pushLoadingProgress()
     }
     if (await portOpen()) {
       // 端口有人应答 ≠ 我们的服务起来了。事故里就是这一步把别人的应答当成了就绪，
@@ -2069,13 +2106,16 @@ function cleanInstalledVersion(spec) {
 // 卡片渲染 / 安装 / 卸载 / 更新检查都是通用的（统一走 market.installByName / uninstallByName）。
 // autoInstall: true 表示「默认代装」：首次运行或升级到本版本时由启动器自动补装一次
 //（见 maybeAutoInstallRecommendedPlugins）；用户手动卸载过就不再自动装回来。
+// 当前默认代装集合：用量与计费 / 技能管理 / 会话归档 / 对话回退。
+// 不代装的（卡片标「手动安装」，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、
+// MCP Lens（上游在 npm 上只有预发布版，稳定版校验会拒绝）、会话导入；改集合须同步
+// tests/plugin-page-wiring.test.js 的默认代装断言与 README「预装插件」小节。
 const MANAGED_NPM_PLUGINS = [
   {
     id: 'better-sidebar',
     order: 30,
     npm: 'dsh-better-sidebar',
     name: '增强侧边栏',
-    autoInstall: true,
     subtitle: 'dsh-better-sidebar',
     description: '把 DSH 的右侧栏变成 VSCode 式工作区：资源管理器、编辑器、终端、Git 和内置浏览器，按会话隔离。',
     icon: '🗂️',
@@ -2139,7 +2179,6 @@ const MANAGED_NPM_PLUGINS = [
     order: 65,
     npm: 'dsh-sidebar-qa',
     name: '划线提问',
-    autoInstall: true,
     subtitle: 'dsh-sidebar-qa',
     description: '在对话里划选文本 → 右侧面板内嵌问答：自动开一个同工作区的独立会话，主对话零打断。依赖「增强侧边栏」。',
     icon: '💬',
@@ -2161,7 +2200,6 @@ const MANAGED_NPM_PLUGINS = [
     order: 75,
     npm: 'dsh-mcp-lens',
     name: 'MCP Lens',
-    autoInstall: true,
     subtitle: 'dsh-mcp-lens',
     description: '把庞大的 MCP 工具库收敛成 mcp_search / mcp_call 两个入口：按需发现、按精确 schema 调用，省上下文与费用；可用的 server 需显式放行（默认全关）。',
     icon: '🔭',
@@ -2179,6 +2217,80 @@ let pluginInstallAllTarget = 0
 let pluginInstallAllDone = 0
 let pluginInstallAllCurrent = ''
 let pluginInstallAllError = ''
+
+// ---------- 插件安装的环境级故障聚合 ----------
+// 一次批量安装里 N 个插件同一原因失败时，逐张卡片各写一条「操作失败」会让人以为插件本身有问题。
+// 这里把可归类的原因（pnpm 的 24h 观察期拒绝整份 lockfile / node_modules 被占用 / npm 源限流 /
+// pnpm 未就绪）收敛成**一条**解释 + 一次「重试失败的插件」。只存内存：环境恢复后不该继续占版面。
+let pluginEnvIssue = null // { kind, title, reason, entries, recoversAt, recoverable, names, retry, at }
+let pluginEnvNote = '' // 安装靠「一次性放行」完成时的低噪提示（插件页概览行后缀）
+
+/** 插件卡片 / 提示条用的人类可读名字。 */
+function pluginDisplayName(id) {
+  if (id === 'dshmarket') return '插件市场'
+  if (id === 'bridge-next') return '手机连接'
+  const def = MANAGED_NPM_PLUGINS.find((d) => d.id === id)
+  return def ? def.name : String(id || '')
+}
+
+/** 记一次插件动作失败：能归类就并入聚合（同 kind 累加失败项，换 kind 重新开始）。 */
+function notePluginEnvFailure(id, action, info) {
+  if (!info || !info.kind) return false
+  const label = pluginDisplayName(id)
+  const same = !!pluginEnvIssue && pluginEnvIssue.kind === info.kind
+  const names = same ? pluginEnvIssue.names.slice() : []
+  const retry = same ? pluginEnvIssue.retry.slice() : []
+  if (label && !names.includes(label)) names.push(label)
+  // 不可重试的原因（如 pnpm 未就绪）不给「重试」按钮：按钮必须对应真实可用的动作。
+  if (info.recoverable !== false && id && !retry.some((x) => x.id === id)) {
+    retry.push({ id: String(id), action: String(action || ''), label })
+  }
+  pluginEnvIssue = Object.assign({}, info, { names, retry, at: Date.now() })
+  pluginEnvNote = ''
+  return true
+}
+
+/** 某个插件动作成功了：把它从聚合里摘掉；摘空了整条提示就消失。 */
+function clearPluginEnvFailure(id) {
+  if (!pluginEnvIssue) return false
+  const label = pluginDisplayName(id)
+  pluginEnvIssue.names = pluginEnvIssue.names.filter((n) => n !== label)
+  pluginEnvIssue.retry = pluginEnvIssue.retry.filter((x) => x.id !== id)
+  if (pluginEnvIssue.names.length) return false
+  pluginEnvIssue = null
+  return true
+}
+
+/**
+ * 这次安装是被 24h 观察期拒绝后靠一次性放行完成的：不占版面（操作本身是成功的），
+ * 但要让用户知道「profile 还处于别家 pnpm 操作会被拒的状态」，以及它什么时候自己好。
+ */
+function notePluginReleaseAgeRetry(releaseAge) {
+  if (!releaseAge || !releaseAge.retried) return false
+  const entries = Array.isArray(releaseAge.entries) ? releaseAge.entries : []
+  const recoverAt = market.releaseAgeRecoversAt(entries)
+  const when = Number.isFinite(Date.parse(recoverAt)) ? new Date(Date.parse(recoverAt)).toLocaleString('sv-SE', { hour12: false }) : ''
+  pluginEnvNote = entries.length
+    ? 'profile 里有 ' + entries.length + ' 个不足 24h 的新版本，本次已一次性放行装好'
+    : 'profile 里有不足 24h 的新版本，本次已一次性放行装好'
+  if (when) pluginEnvNote += '；其他 pnpm 操作要等 ' + when + ' 后才不再被拒'
+  return true
+}
+
+/** 重试聚合里的失败项（只重试这些，不动已成功的；和批量安装一样攒着等一次重启）。 */
+async function retryPluginEnvFailures() {
+  const items = (pluginEnvIssue && pluginEnvIssue.retry) || []
+  if (!items.length) return { ok: false, error: '没有可重试的失败项' }
+  const failed = []
+  for (const item of items) {
+    let r
+    try { r = await runManagedPluginAction(item.id, item.action, { defer: true }) } catch (e) { r = { ok: false, error: (e && e.message) || String(e) } }
+    if (!r || !r.ok) failed.push(item.label + '：' + ((r && r.error) || '未知原因'))
+  }
+  broadcastState()
+  if (failed.length) return { ok: false, error: failed.join('；'), failed: failed.length }
+  return { ok: true, retried: items.length }
+}
 
 /** 拉取 npm 官方源上的最新版本号；失败返回空串（卡片退化为「已安装」，不显示误导性状态）。 */
 async function resolveNpmVersion(name) {
@@ -2257,8 +2369,11 @@ async function installAllManagedPlugins() {
         if (r && r.ok) {
           if (r.already) skipped++
           else installed++
+          clearPluginEnvFailure(target.key)
+          notePluginReleaseAgeRetry(r.releaseAge)
         } else {
           failed.push(target.label + '：' + ((r && r.error) || '未知原因'))
+          notePluginEnvFailure(target.key, 'install', (r && r.env) || market.classifyEnvFailure(String((r && r.error) || '')))
           log('[plugins] 一键安装失败 ' + target.label + '：' + ((r && r.error) || '未知原因'))
         }
         pluginInstallAllDone++
@@ -2352,8 +2467,13 @@ async function maybeAutoInstallRecommendedPlugins() {
     const failed = []
     for (const d of targets) {
       const r = await market.installByName(d.npm)
-      if (r && r.ok) installed.push(d.name + (r.version ? '@' + r.version : ''))
-      else failed.push(d.name + '：' + ((r && r.error) || '未知原因'))
+      if (r && r.ok) {
+        installed.push(d.name + (r.version ? '@' + r.version : ''))
+        notePluginReleaseAgeRetry(r.releaseAge)
+      } else {
+        failed.push(d.name + '：' + ((r && r.error) || '未知原因'))
+        notePluginEnvFailure(d.id, 'install', (r && r.env) || market.classifyEnvFailure(String((r && r.error) || '')))
+      }
     }
     if (installed.length) {
       // 一次装完再重启一次（失败项留给插件页手动重试）
@@ -2393,7 +2513,7 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
     notePluginAutoDeclined(descriptor.id, false) // 手动装回来 → 以后继续自动维护
     if (opts.defer) deferPluginChange('install', descriptor.npm, descriptor.name)
     else await applyPluginChange('install', r.version || '', { name: descriptor.npm, profile: market.PROFILE_NAME, logTag: 'plugins', label: descriptor.name })
-    return { ok: true, version: r.version || '' }
+    return { ok: true, version: r.version || '', releaseAge: r.releaseAge || null }
   }
   if (action === 'uninstall') {
     const r = await market.uninstallByName(descriptor.npm)
@@ -2419,6 +2539,19 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
 }
 
 async function runManagedPluginAction(id, action, opts = {}) {
+  const r = await dispatchManagedPluginAction(id, action, opts)
+  // 环境级失败（与「装哪个插件」无关的那些）只解释一次；成功的动作把自己从聚合里摘掉。
+  if (r && r.ok) {
+    clearPluginEnvFailure(id)
+    if (r.releaseAge) notePluginReleaseAgeRetry(r.releaseAge)
+  } else if (r) {
+    notePluginEnvFailure(id, action, r.env || market.classifyEnvFailure(String(r.error || '')))
+  }
+  broadcastState() // 让提示条立刻跟上（失败时上面的分发路径不一定推过状态）
+  return r
+}
+
+async function dispatchManagedPluginAction(id, action, opts = {}) {
   const defer = !!opts.defer
   const pid = String(id || '')
   const act = String(action || '')
@@ -2983,6 +3116,9 @@ function updateStateSnapshot() {
       status: dsh.status || 'idle',
       channel: dsh.channel || '',
       error: dsh.error || '',
+      // 就绪程度决定"点击后大概多久"（更新窗口与控制台 tooltip 共用同一份口径）
+      prewarmed: !!dsh.prewarmed,
+      staged: !!dsh.staged,
     },
   }
 }
@@ -3772,6 +3908,7 @@ function stateJson() {
     theme: Config.theme,
     env: envDetect.envSummary(envReport),
     dshUpdate: dshUpdater.getState(),
+    launcherChannel: Config.launcherChannel,
     log: logTail,
     // 稳定性状态（控制台"上次未正常退出/已回退配置"提示用）
     lastExit: runGuardHandle ? (runGuardHandle.previousRun ? 'crashed' : 'clean') : 'unknown',
@@ -3809,6 +3946,20 @@ function stateJson() {
       names: (Config.pluginPendingRestart && Config.pluginPendingRestart.names) || [],
       mode: (Config.pluginPendingRestart && Config.pluginPendingRestart.mode) || 'restart',
     },
+    // 插件安装的环境级故障（与具体插件无关）：插件页据此把 N 条「操作失败」收敛成一条解释
+    pluginEnvIssue: pluginEnvIssue
+      ? {
+        kind: pluginEnvIssue.kind,
+        title: pluginEnvIssue.title,
+        reason: pluginEnvIssue.reason,
+        entries: pluginEnvIssue.entries,
+        recoversAt: pluginEnvIssue.recoversAt,
+        names: pluginEnvIssue.names,
+        retryCount: (pluginEnvIssue.retry || []).length,
+        at: pluginEnvIssue.at,
+      }
+      : null,
+    pluginEnvNote: pluginEnvNote || '',
     diagnosticsDir: DIAG_DIR,
   })
 }
@@ -4223,6 +4374,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           Config.dshVersion = 'latest' // 重置默认：安装/升级都装 latest
           Config.pnpmVersion = '11.8.0'
           Config.dshChannel = 'latest' // 更新渠道也回默认
+          Config.launcherChannel = 'latest' // 启动器更新渠道同理（默认只收正式版）
           Config.nodeMajor = 22
           Config.nodeMirror = ''
           Config.npmRegistry = ''
@@ -4269,6 +4421,17 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
             log('dsh-update: channel switched to ' + ch)
             dshUpdater.noteChannelChange() // 作废旧渠道的版本缓存：否则「重试」会照着旧渠道的缓存装
             void dshUpdater.checkOnce('manual', true)
+          }
+          broadcastState()
+          return '{}'
+        }
+        case 'setLauncherChannel': {
+          const ch = value === 'alpha' ? 'alpha' : 'latest'
+          if (Config.launcherChannel !== ch) {
+            Config.launcherChannel = ch
+            try { saveConfig() } catch { /* noop */ }
+            updater.onChannelChanged() // 落到 electron-updater，并作废已下载的旧渠道包
+            void updater.check() // 换渠道后立刻按新渠道检查一次（打包态才真正联网）
           }
           broadcastState()
           return '{}'
@@ -4386,6 +4549,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           const action = String((value && value.action) || '').slice(0, 40)
           return JSON.stringify(await runManagedPluginAction(id, action))
         }
+        case 'pluginsRetryEnvFailed': return JSON.stringify(await retryPluginEnvFailures())
         // ---------- 远程连接（DSH Bridge Next 插件安装/卸载） ----------
         case 'remoteConnectGetState': return JSON.stringify({ enabled: Config.remoteConnect.enabled, declined: Config.remoteConnect.declined, autoEnabledFor: Config.remoteConnect.autoEnabledFor, plugin: bridge.getState() })
         case 'remoteConnectSet': return JSON.stringify(await setRemoteConnectManaged(!!(value && value.enabled)))
@@ -5211,6 +5375,8 @@ function init() {
   updater.initUpdater({
     log,
     currentVersion: app.getVersion(),
+    // 渠道由配置说了算（设置页可切）：latest=只收正式版，alpha=预发布版
+    getChannel: () => Config.launcherChannel,
     // 更新通知统一 update 分类；"已下载"按版本跨重启去重（同一版本只提醒一次）
     onNotify: (title, message, meta) => {
       const version = meta && meta.version ? String(meta.version) : ''
@@ -5297,7 +5463,7 @@ function init() {
     }
     void maybeAutoInstallPluginMarket() // 插件市场默认安装（每个版本只自动尝试一次）
     void maybeAutoInstallBridge() // 远程连接插件（默认开启，见 Config.remoteConnect）
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（增强侧边栏 / 用量与计费）
+    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 会话归档 / 对话回退）
     if (args.console) {
       showConsolePage('main')
       await handleStart()

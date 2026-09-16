@@ -17,6 +17,7 @@
       .card { background: #2B2B2C !important; border-color: rgba(255, 255, 255, 0.12) !important; }
       .sub { color: #D3D5D6 !important; }
       .step { color: #B9BCBE !important; }
+      .phase { color: #9AA0A6 !important; }
       .hint { color: #B9BCBE !important; }
       .bar .fill { background: #4D8DFF !important; }
       #btnReload { background: rgba(255,255,255,0.92) !important; color: #1A1C1E !important; }
@@ -51,6 +52,9 @@
     /* 步骤行（进度条上方）：有真实步骤时才出现；进度条本身始终是循环动画 */
     .step { font-size: 12px; color: #61666B; line-height: 18px; margin: 0 0 8px; }
     .step.hidden { display: none; }
+    /* 当前环节行：紧跟在步骤行后面，内容是服务进程自己刚打印的那条日志（没有则显示兜底文案） */
+    .phase { font-size: 12px; color: #8A9098; line-height: 18px; margin: 0 0 12px; word-break: break-all; }
+    .phase.hidden { display: none; }
     .sub { font-size: 13px; color: #61666B; line-height: 20px; margin: 0 0 16px; }
     body.failed h1 { color: #B42318; }
     #btnReload {
@@ -80,6 +84,7 @@
   <div class="card">
     <h1 id="title">正在启动 DeepSeek Harness 服务…</h1>
     <p class="step hidden" id="step"></p>
+    <p class="phase hidden" id="phase"></p>
     <div class="bar"><div class="fill"></div></div>
     <p class="sub" id="sub">首次启动通常需要 3~15 秒，服务就绪后窗口会自动进入。</p>
     <p class="hint hidden" id="hint"></p>

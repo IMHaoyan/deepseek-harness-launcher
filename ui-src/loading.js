@@ -92,20 +92,38 @@ if (reason === 'blocked') {
 // 只负责"第几步/共几步 + 已等待秒数"这行文字：进度条保持循环动画（不按步数画死宽度）。
 // 没数据 / reason 不匹配（未启动、端口冲突、页面失败、凭据页）→ 不显示步骤行。
 const stepEl = document.getElementById('step')
+const phaseEl = document.getElementById('phase')
 const baseSub = t.sub
 let progressData = null
 let tickTimer = null
+
+// 当前环节行：转述服务进程自己刚打印的那条日志（主进程已清洗/脱敏，页面只做展示）。
+// 超过 3 秒没有新日志就标注"（N 秒前）"——不把已经过去的事说成"正在执行"。
+function renderPhase() {
+  if (!phaseEl) return
+  if (!progressData) { phaseEl.textContent = ''; phaseEl.classList.add('hidden'); return }
+  const line = String(progressData.phase || '')
+  if (line) {
+    const ago = progressData.phaseAt ? Math.round((Date.now() - progressData.phaseAt) / 1000) : 0
+    phaseEl.textContent = '服务进程日志：' + line + (ago >= 3 ? '（' + ago + ' 秒前）' : '')
+  } else {
+    phaseEl.textContent = progressData.phaseFallback || ''
+  }
+  phaseEl.classList.toggle('hidden', !phaseEl.textContent)
+}
 
 function tickElapsed() {
   if (!progressData || !subEl) return
   const sec = Math.max(0, Math.round((Date.now() - progressData.startedAt) / 1000))
   subEl.textContent = baseSub + '（已等待 ' + sec + ' 秒）'
+  renderPhase()
 }
 
 function renderProgress(p) {
   if (!p || p.reason !== reason || !p.total) {
     progressData = null
     if (stepEl) stepEl.classList.add('hidden')
+    if (phaseEl) { phaseEl.textContent = ''; phaseEl.classList.add('hidden') }
     if (subEl && reason !== 'blocked') subEl.textContent = baseSub
     if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
     return

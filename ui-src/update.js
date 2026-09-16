@@ -150,6 +150,15 @@ function renderDsh(state) {
       await cmd('dshUpdateNow')
     })
     box.appendChild(btn)
+    // 耗时口径按实测给，并区分"预装就绪"与"还得现装"：两者差 4 倍左右，混着说用户没法预期
+    const hint = document.createElement('span')
+    hint.className = 'upd-note'
+    hint.textContent = s.staged
+      ? '已预装就绪，约 15 秒'
+      : s.prewarmed
+        ? '依赖已缓存，约 1 分钟'
+        : '约 1-2 分钟'
+    box.appendChild(hint)
     return
   }
 

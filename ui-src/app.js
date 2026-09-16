@@ -38,6 +38,11 @@ const DSH_CHANNEL_VALUES = [
   { key: 'latest', label: 'latest' },
   { key: 'alpha', label: 'alpha' },
 ];
+// 启动器自身的更新渠道：latest = GitHub 正式版（默认）；alpha = 预发布版（GitHub prerelease）
+const LAUNCHER_CHANNEL_VALUES = [
+  { key: 'latest', label: 'latest' },
+  { key: 'alpha', label: 'alpha' },
+];
 
 // ---------- 缩放微调控件：按住左右拖动（5% 一格），双击变输入框（越界 clamp） ----------
 function makeZoomWidget(id, min, max, cmdName) {
@@ -300,6 +305,12 @@ function render(state) {
     window._lastDshChannel = dshChannel;
     buildChips('dshChannelChips', DSH_CHANNEL_VALUES, dshChannel, (c) => cmd('setDshChannel', c.key));
   }
+  // 启动器更新渠道（设置页）：latest = 只收正式版，alpha = 预发布版；同样切完立即重查
+  const launcherChannel = state.launcherChannel === 'alpha' ? 'alpha' : 'latest';
+  if (window._lastLauncherChannel !== launcherChannel) {
+    window._lastLauncherChannel = launcherChannel;
+    buildChips('launcherChannelChips', LAUNCHER_CHANNEL_VALUES, launcherChannel, (c) => cmd('setLauncherChannel', c.key));
+  }
 
   // 状态
   const running = window._running;
@@ -447,6 +458,7 @@ function render(state) {
   renderPlugins(state.plugins);
   renderInstallAll(state.pluginInstallAll);
   renderPendingRestart(state.pluginPendingRestart);
+  renderPluginEnvIssue(state.pluginEnvIssue, state.pluginEnvNote);
 
   // 通知分类开关（设置页）+ 恢复页（检查点/回退记录/服务操作）
   renderNotifyCategories(state.notifyCategories);
@@ -1336,9 +1348,13 @@ function renderDshUpdate(u) {
       } else if (status === 'available') {
         btn.disabled = false;
         btn.textContent = '立即更新';
-        btn.title = u.prewarmed
-          ? `新版本 v${latest} 可用（缓存已预热）：点击后约 10 秒完成（会重启服务，进行中的对话会中断）`
-          : `新版本 v${latest} 可用：点击后约 1-2 分钟完成（会重启服务，进行中的对话会中断）`;
+        // 耗时口径按实测给，且明确区分"预装好了"与"还得现装"：
+        // 预装就绪 = 改名切换 + 重启服务（实测约 15s）；只有缓存 = 整树解包落盘（实测约 1 分钟）
+        btn.title = u.staged
+          ? `新版本 v${latest} 可用（已预装就绪）：点击后约 15 秒完成（会重启服务，进行中的对话会中断）`
+          : u.prewarmed
+            ? `新版本 v${latest} 可用（依赖已缓存）：点击后约 1 分钟完成（会重启服务，进行中的对话会中断）`
+            : `新版本 v${latest} 可用：点击后约 1-2 分钟完成（会重启服务，进行中的对话会中断）`;
       } else if (status === 'updating') {
         btn.disabled = true;
         btn.textContent = '更新中…';
@@ -1502,7 +1518,14 @@ function renderPlugins(plugins, force) {
   const summary = $('pluginSummary');
   const installAll = window._pluginInstallAll;
   const summaryError = installAll && installAll.error ? ' · 上次一键安装有失败项' : '';
-  if (summary) summary.textContent = list.length + ' 个插件 · ' + installedCount + ' 个已安装' + summaryError;
+  // 环境提示（如「profile 里有不足 24h 的新版本，本次靠一次性放行装好」）只占概览行后缀，
+  // 全文退到 tooltip：常规信息不抢版面，但需要解释时能查。
+  const envNote = window._pluginEnvNote || '';
+  if (summary) {
+    summary.textContent = list.length + ' 个插件 · ' + installedCount + ' 个已安装' + summaryError
+      + (envNote ? ' · ' + envNote.split('；')[0] : '');
+    summary.title = envNote;
+  }
   cards.textContent = '';
   for (const p of visible) cards.appendChild(pluginCardEl(p));
   const empty = $('pluginEmpty');
@@ -1567,6 +1590,67 @@ function renderInstallAll(info) {
   btn.textContent = '一键全部安装';
   btn.disabled = false;
 }
+
+/**
+ * 环境级故障提示条：一批插件同一原因失败时，主进程只归类出一条解释（pluginEnvIssue）——
+ * 卡片上仍各自保留自己的错误原文，这里回答「为什么一起失败 / 何时自己好 / 要不要重试」。
+ * 只显示能归类的故障；「知道了」按这条故障的生成时刻记，同一批不再打扰。
+ */
+function renderPluginEnvIssue(info, note) {
+  window._pluginEnvNote = note || '';
+  window._pluginEnvIssue = info && info.kind ? info : null;
+  renderPlugins(window._plugins || [], true); // 概览行后缀跟随（低噪）
+  const bar = $('pluginEnvBar');
+  if (!bar) return;
+  const issue = window._pluginEnvIssue;
+  const dismissed = !!issue && window._pluginEnvDismissedAt === issue.at;
+  bar.classList.toggle('hidden', !issue || dismissed);
+  if (!issue || dismissed) return;
+  const title = $('pluginEnvTitle');
+  if (title) title.textContent = issue.title || '插件安装被环境拦下了';
+  const detail = $('pluginEnvDetail');
+  if (detail) {
+    const names = Array.isArray(issue.names) ? issue.names : [];
+    const parts = [issue.reason || ''];
+    if (names.length) parts.push('本次受影响：' + names.join('、') + '。');
+    if (issue.recoversAt) {
+      const when = fmtLocalTime(issue.recoversAt);
+      if (when) parts.push('预计 ' + when + ' 之后自动恢复。');
+    }
+    detail.textContent = parts.filter(Boolean).join(' ');
+    const entries = Array.isArray(issue.entries) ? issue.entries : [];
+    detail.title = entries.length
+      ? '被 pnpm 拒绝的条目：\n' + entries.map((e) => '· ' + e.name + '（' + fmtLocalTime(e.publishedAt) + ' 发布）').join('\n')
+      : '';
+  }
+  const retry = $('btnPluginEnvRetry');
+  if (retry) {
+    const n = Number(issue.retryCount) || 0;
+    retry.classList.toggle('hidden', n === 0);
+    retry.textContent = n > 1 ? '重试这 ' + n + ' 个插件' : '重试失败的插件';
+  }
+}
+
+// 重试失败项：只跑这批失败的插件，装完仍由顶部「立即重启生效」统一生效
+$('btnPluginEnvRetry').addEventListener('click', async () => {
+  const btn = $('btnPluginEnvRetry');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '重试中…';
+  const r = await cmd('pluginsRetryEnvFailed');
+  const fresh = await cmd('pluginsGetState');
+  if (fresh) renderPlugins(fresh, true);
+  btn.disabled = false;
+  btn.textContent = old;
+  showConsoleToast(r && r.ok ? '重试已完成，点顶部「立即重启生效」后启用' : ('重试仍有失败：' + ((r && r.error) || '未知原因')));
+});
+
+$('btnPluginEnvDismiss').addEventListener('click', () => {
+  const issue = window._pluginEnvIssue;
+  if (issue) window._pluginEnvDismissedAt = issue.at;
+  const bar = $('pluginEnvBar');
+  if (bar) bar.classList.add('hidden');
+});
 
 function setPluginFilter(filter) {
   window._pluginFilter = filter;

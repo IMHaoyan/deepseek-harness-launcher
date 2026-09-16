@@ -413,6 +413,38 @@ body.console-surface {
   line-height: 19px;
 }
 
+/* 环境级故障提示条：一批插件同一原因失败时，用一条解释代替 N 张卡片各写一遍「操作失败」。 */
+.plugin-env-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 11px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: rgba(239, 68, 68, 0.08);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.plugin-env-bar.hidden { display: none; }
+
+.plugin-env-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: #EF4444;
+}
+
+.plugin-env-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.plugin-env-title { font-weight: 600; }
+.plugin-env-detail { color: var(--text-secondary); }
+.plugin-env-actions { display: flex; flex: none; gap: 8px; margin-left: auto; }
+
+[data-theme="dark"] .plugin-env-bar { background: rgba(239, 68, 68, 0.14); }
+
 .plugin-page-summary {
   flex: none;
   padding: 5px 11px;

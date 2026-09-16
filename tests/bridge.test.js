@@ -91,6 +91,46 @@ test('withReleaseAgeOverride：只在 add/remove 注入一次 pnpm 观察期放�
   assert.deepEqual(bridge.withReleaseAgeOverride(null), [])
 })
 
+test('bridge：与 market 同一套「先按策略默认跑、命中判定才放行重试」契约', async () => {
+  const fs = require('node:fs')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'bridge.js'), 'utf8').replace(/\r\n?/gu, '\n')
+  assert.match(src, /async function runCliOnce\(args\)/, '必须有一个「不注入放行参数」的基础执行器')
+  assert.match(src, /if \(!releaseAgeViolation\(e && e\.output\)\) throw e/, '只有命中 24h 观察期判定才重试')
+  assert.equal(bridge.releaseAgeViolation('lockfile failed supply-chain policy check'), true)
+  assert.equal(bridge.releaseAgeViolation('ERR_PNPM_EPERM: operation not permitted'), false)
+  assert.deepEqual(
+    bridge.parseReleaseAgeEntries('  dshmarket@1.47.0 was published at 2026-09-15T04:59:30.465Z, within the minimumReleaseAge cutoff (x)'),
+    [{ name: 'dshmarket@1.47.0', publishedAt: '2026-09-15T04:59:30.465Z' }],
+  )
+
+  const start = src.indexOf('async function runCli(args) {')
+  const end = src.indexOf('\n}\n', start) + 3
+  assert.ok(start > 0 && end > start, '找不到 runCli')
+  const calls = []
+  const ctx = {
+    log: () => {},
+    withReleaseAgeOverride: bridge.withReleaseAgeOverride,
+    releaseAgeViolation: bridge.releaseAgeViolation,
+    parseReleaseAgeEntries: bridge.parseReleaseAgeEntries,
+    runCliOnce: async (args) => {
+      calls.push(args.slice())
+      if (calls.length === 1) {
+        const e = new Error('dsh plugin 退出码 1：…bypassed the policy locally')
+        e.output = 'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION: 1 lockfile entries failed verification'
+        throw e
+      }
+      return { code: 0, output: '' }
+    },
+  }
+  const names = Object.keys(ctx)
+  const run = new Function(...names, src.slice(start, end) + '\nreturn runCli')(...names.map((k) => ctx[k]))
+  await run(['add', 'link:C:/payload/bridge-next.tgz', '-w'])
+  assert.deepEqual(calls, [
+    ['add', 'link:C:/payload/bridge-next.tgz', '-w'],
+    ['add', '--config.minimumReleaseAge=0', 'link:C:/payload/bridge-next.tgz', '-w'],
+  ], '默认路径不得注入放行参数，只有被整体拒绝后才放行重试')
+})
+
 test('verifyPluginManifest：合法 manifest 返回身份', () => {
   const pkg = { name: NAME, version: '0.1.0-dev.0', dsh: { bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } } }
   assert.deepEqual(bridge.verifyPluginManifest(pkg), { name: NAME, version: '0.1.0-dev.0' })

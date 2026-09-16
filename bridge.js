@@ -29,10 +29,17 @@ const { spawn } = require('child_process')
 const PLUGIN_NAME = '@agents-anywhere/dsh-bridge-next'
 const PROFILE_NAME = 'web'
 const BUNDLE_PATCH = './cordis.patch.yml'
-// pnpm 11 起默认带 24h「新版本观察期」：lockfile 里只要有一个刚发布不久的版本，
-// 之后任何 add/remove 都会在动手前被整体拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。
-// 用户点名安装/卸载时显式关掉该策略，与 dshmarket 的 RELEASE_AGE_OVERRIDE 保持一致。
+// pnpm 11 起默认带 24h「新版本观察期」：它在每次 add/remove/install 前校验整份 lockfile，
+// lockfile 里只要有一个刚发布不久且未放行的版本，任何操作都会在动手前被整体拒绝
+// （ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。处理方式与 market.js 一致：
+//   - 默认不关策略，让 pnpm 自己把新鲜版本写进 minimumReleaseAgeExclude（lockfile 保持合规）；
+//   - 只有真的被整体拒绝时，才用一次性放行重试一次（重试不写放行记录，只能当兜底）。
 const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
+const RELEASE_AGE_MARKERS = [
+  'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
+  'failed supply-chain policy check',
+  'bypassed the policy locally',
+]
 const PROFILE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CLI_TIMEOUT_MS = 15 * 60 * 1000 // 首次安装要拉依赖树，给足时间
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024
@@ -480,13 +487,32 @@ function withToolchainPath(baseEnv, dirs) {
   return env
 }
 
-/** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。 */
+/** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。只用于命中判定后的那一次重试。 */
 function withReleaseAgeOverride(args) {
   const list = Array.isArray(args) ? args : []
   const command = list[0]
   if (command !== 'add' && command !== 'remove') return list
   if (list.includes(RELEASE_AGE_OVERRIDE)) return list
   return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
+}
+
+/** 这次失败是不是「24h 观察期拒绝整份 lockfile」（判定口径与 market.js 一致）。 */
+function releaseAgeViolation(output) {
+  const text = String(output == null ? '' : output)
+  return RELEASE_AGE_MARKERS.some((marker) => text.includes(marker))
+}
+
+/** 从 pnpm 的判定里抠出被拒条目（名字 + 发布时间），供控制台按本地时间解释「何时自动恢复」。 */
+function parseReleaseAgeEntries(output) {
+  const text = String(output == null ? '' : output)
+  const out = []
+  const re = /^\s*(\S+) was published at ([^,\s]+), within the minimumReleaseAge cutoff/gmu
+  let m = re.exec(text)
+  while (m !== null) {
+    if (!out.some((e) => e.name === m[1])) out.push({ name: m[1], publishedAt: m[2] })
+    m = re.exec(text)
+  }
+  return out
 }
 
 function captureProcess(child, label) {
@@ -509,12 +535,18 @@ function captureProcess(child, label) {
       clearTimeout(timer)
       const output = chunks.join('').trimEnd()
       if (code === 0) resolve({ code, output })
-      else reject(new Error(label + ' 退出码 ' + code + (output ? '：' + output.slice(-400) : '')))
+      else {
+        const err = new Error(label + ' 退出码 ' + code + (output ? '：' + output.slice(-400) : ''))
+        err.exitCode = code
+        err.output = output // 完整输出：分类 / 抠条目都靠它（错误文案里只留尾部 400 字）
+        reject(err)
+      }
     })
   })
 }
 
-async function runCli(args) {
+/** 跑一次 `dsh plugin`（不注入任何放行参数）。 */
+async function runCliOnce(args) {
   if (!envDetect) throw new Error('bridge: envDetect 未初始化')
   const env = await envDetect.detectEnv(false)
   if (!env || !env.plan) throw new Error('运行环境未就绪，无法安装远程连接插件')
@@ -528,7 +560,7 @@ async function runCli(args) {
   const pnpmDir = env.pnpm && env.pnpm.path ? path.dirname(env.pnpm.path) : ''
   let child
   try {
-    child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...withReleaseAgeOverride(args)], {
+    child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...args], {
       cwd: profileDir(),
       env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
       windowsHide: true,
@@ -536,6 +568,27 @@ async function runCli(args) {
     })
   } catch (e) { throw e }
   return captureProcess(child, 'dsh plugin')
+}
+
+/** add/remove 的统一入口：先按策略默认跑，被 24h 观察期整体拒绝时才一次性放行重试一次。 */
+async function runCli(args) {
+  const list = Array.isArray(args) ? args : []
+  try {
+    return await runCliOnce(list)
+  } catch (e) {
+    if (!releaseAgeViolation(e && e.output)) throw e
+    const entries = parseReleaseAgeEntries(e && e.output)
+    log('pnpm 的 24h 新版本观察期拒绝了整份 lockfile（' + entries.length + ' 个条目）：'
+      + (list[0] || '') + ' —— 一次性放行后重试')
+    try {
+      return await runCliOnce(withReleaseAgeOverride(list))
+    } catch (e2) {
+      const err = new Error(((e2 && e2.message) || String(e2)) + '（已用一次性放行重试过一次）')
+      err.exitCode = e2 && e2.exitCode
+      err.output = (e2 && e2.output) || ''
+      throw err
+    }
+  }
 }
 
 function resolvePnpmScript(pnpmCmd) {
@@ -727,6 +780,8 @@ module.exports = {
   pluginStateOf,
   needsInstall,
   withReleaseAgeOverride,
+  releaseAgeViolation,
+  parseReleaseAgeEntries,
   satisfied,
   verifyPluginManifest,
   readPackageFromTarball,

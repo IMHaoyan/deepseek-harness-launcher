@@ -188,10 +188,23 @@ async function verifyNpmPackage(name) {
   return verifyNpmManifestShape(raw, name)
 }
 
-// pnpm 11 起默认带 24h「新版本观察期」：lockfile 里只要有一个刚发布不久的版本，
-// 之后任何 add/remove 都会在动手前被整体拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。
-// 用户点名安装/卸载时显式关掉该策略，与 dshmarket 的 RELEASE_AGE_OVERRIDE 保持一致。
+// pnpm 11 起默认带 24h「新版本观察期」（minimumReleaseAge 默认 1440 分钟），而且它在每次
+// add/remove/install 前校验**整份** lockfile：只要里面有一个「发布不足 24h 且未被
+// minimumReleaseAgeExclude 放行」的条目，任何操作都会被整体拒绝
+// （ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。这条失败与「装哪个插件」无关，所以它的表现是
+// 「所有插件一起装失败」。处理方式对齐 dshmarket（它的 #39）：
+//   - 默认**不关策略**：pnpm 自己会把点名安装的新鲜版本写进 minimumReleaseAgeExclude
+//     （"Added 1 entry to minimumReleaseAgeExclude in pnpm-workspace.yaml"），lockfile 保持合规，
+//     别的工具（DSH 内置市场、终端里的 pnpm、IDE）不会被这次安装连坐；
+//   - 只有真的被整体拒绝时，才用一次性放行重试一次 —— 那次重试**不写**放行记录，所以它只能
+//     当兜底，不能当默认路径（否则 lockfile 会长期处于「绕过了策略」的状态）。
 const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
+// 判定「24h 观察期拒绝整份 lockfile」的标记：错误码可能被尾部截断，后两句是 pnpm 稳定打印的。
+const RELEASE_AGE_MARKERS = [
+  'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
+  'failed supply-chain policy check',
+  'bypassed the policy locally',
+]
 
 // ---------- 执行 dsh plugin（DSHL 保证 PATH 上的 pnpm 可用） ----------
 
@@ -207,7 +220,7 @@ function withToolchainPath(baseEnv, dirs) {
   return env
 }
 
-/** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。 */
+/** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。只用于命中判定后的那一次重试。 */
 function withReleaseAgeOverride(args) {
   const list = Array.isArray(args) ? args : []
   const command = list[0]
@@ -216,7 +229,94 @@ function withReleaseAgeOverride(args) {
   return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
 }
 
-async function runCli(args) {
+/** 这次失败是不是「24h 观察期拒绝整份 lockfile」。 */
+function releaseAgeViolation(output) {
+  const text = String(output == null ? '' : output)
+  return RELEASE_AGE_MARKERS.some((marker) => text.includes(marker))
+}
+
+/**
+ * 从 pnpm 的判定里抠出被拒条目（名字 + 发布时间）。
+ * pnpm 打印的是 `<name>@<version> was published at <ISO>, within the minimumReleaseAge cutoff (<ISO>)`；
+ * 面板据此按本地时间告诉用户「什么时候自动恢复」，而不是笼统说一句「稍后再试」。
+ */
+function parseReleaseAgeEntries(output) {
+  const text = String(output == null ? '' : output)
+  const out = []
+  const re = /^\s*(\S+) was published at ([^,\s]+), within the minimumReleaseAge cutoff/gmu
+  let m = re.exec(text)
+  while (m !== null) {
+    if (!out.some((e) => e.name === m[1])) out.push({ name: m[1], publishedAt: m[2] })
+    m = re.exec(text)
+  }
+  return out
+}
+
+/** 全部条目满 24h 后策略自动放行：取最晚的发布时间 + 24h（本地时间由界面负责展示）。 */
+function releaseAgeRecoversAt(entries) {
+  const times = (Array.isArray(entries) ? entries : [])
+    .map((e) => Date.parse(e && e.publishedAt))
+    .filter((t) => Number.isFinite(t))
+  if (!times.length) return ''
+  return new Date(Math.max(...times) + 24 * 60 * 60 * 1000).toISOString()
+}
+
+/**
+ * 环境级失败分类：这些原因与「装哪个插件」无关，同一批安装会一起中。
+ * 面板据此把 N 条一模一样的「操作失败」收敛成一条解释 —— 文案只在这里定义一处。
+ */
+function classifyEnvFailure(output) {
+  const text = String(output == null ? '' : output)
+  const empty = { kind: '', title: '', reason: '', entries: [], recoversAt: '', recoverable: false }
+  if (releaseAgeViolation(text)) {
+    const entries = parseReleaseAgeEntries(text)
+    return {
+      kind: 'release-age',
+      title: 'pnpm 的 24h「新版本观察期」拒绝了 profile 的锁文件',
+      reason: 'profile 里有 ' + (entries.length ? entries.length + ' 个' : '若干') + '依赖是发布不足 24 小时的新版本，'
+        + 'pnpm 在每次安装前都会校验整份锁文件，所以这一批插件会一起失败（与插件本身无关）。',
+      entries,
+      recoversAt: releaseAgeRecoversAt(entries),
+      recoverable: true, // 可以原样重试：条目过期后自然通过
+    }
+  }
+  if (/ERR_PNPM_EPERM|EPERM: operation not permitted|EBUSY|resource busy/iu.test(text)) {
+    return {
+      kind: 'locked',
+      title: 'profile 里的文件被别的进程占用',
+      reason: '有进程正握着 profile 的 node_modules（常见于 DSH 还没完全退出、或杀软正在扫描），pnpm 改不了依赖树。等 DSH 完全退出后重试即可。',
+      entries: [], recoversAt: '', recoverable: true,
+    }
+  }
+  if (/HTTP 429/u.test(text)) {
+    return {
+      kind: 'rate-limit',
+      title: 'npm 源限流（HTTP 429）',
+      reason: '安装前的包身份校验被 npm 官方源限流了，与插件无关；稍后重试即可。',
+      entries: [], recoversAt: '', recoverable: true,
+    }
+  }
+  if (/ERR_PNPM_NO_MATCHING_VERSION/u.test(text)) {
+    return {
+      kind: 'registry-missing',
+      title: '当前 npm 源里找不到要装的精确版本',
+      reason: 'pnpm 在配置的源上找不到该版本（镜像同步滞后时常见）。可在运行环境页换源，或稍后重试。',
+      entries: [], recoversAt: '', recoverable: true,
+    }
+  }
+  if (/pnpm 未就绪|未检测到 pnpm|运行环境未就绪/u.test(text)) {
+    return {
+      kind: 'env',
+      title: 'pnpm 运行环境未就绪',
+      reason: '启动器没检测到可用的 pnpm，插件安装无法进行；先到「运行环境」页安装/修复 pnpm。',
+      entries: [], recoversAt: '', recoverable: false,
+    }
+  }
+  return empty
+}
+
+/** 跑一次 `dsh plugin`（不注入任何放行参数），失败时把完整输出挂在 error 上供上层分类。 */
+async function runCliOnce(args) {
   if (!envDetect) throw new Error('market: envDetect 未初始化')
   const env = await envDetect.detectEnv(false)
   if (!env || !env.plan) throw new Error('运行环境未就绪，无法安装插件')
@@ -231,7 +331,7 @@ async function runCli(args) {
   return new Promise((resolve, reject) => {
     let child
     try {
-      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...withReleaseAgeOverride(args)], {
+      child = spawn(nodeCmd, [dshBin, 'plugin', '--profile', PROFILE_NAME, ...args], {
         cwd: profileDir(),
         env: withToolchainPath(Object.assign({}, process.env, { DSH_HOME: HOME }), [nodeDir, pnpmDir]),
         windowsHide: true,
@@ -256,9 +356,39 @@ async function runCli(args) {
       clearTimeout(timer)
       const output = chunks.join('').trimEnd()
       if (code === 0) resolve({ code, output })
-      else reject(new Error('dsh plugin 退出码 ' + code + (output ? '：' + output.slice(-400) : '')))
+      else {
+        const err = new Error('dsh plugin 退出码 ' + code + (output ? '：' + output.slice(-400) : ''))
+        err.exitCode = code
+        err.output = output // 完整输出：分类 / 抠条目都靠它（错误文案里只留尾部 400 字）
+        reject(err)
+      }
     })
   })
+}
+
+/**
+ * add/remove 的统一入口：**先按策略默认跑**，只有被 24h 观察期整体拒绝时才用一次性放行重试一次。
+ * 成功后回传 releaseAge（被拒条目 + 是否走了重试），界面据此解释「为什么别的工具这几天用不了」。
+ */
+async function runCli(args) {
+  const list = Array.isArray(args) ? args : []
+  try {
+    return await runCliOnce(list)
+  } catch (e) {
+    if (!releaseAgeViolation(e && e.output)) throw e
+    const entries = parseReleaseAgeEntries(e && e.output)
+    log('pnpm 的 24h 新版本观察期拒绝了整份 lockfile（' + entries.length + ' 个条目）：'
+      + (list[0] || '') + ' —— 一次性放行后重试')
+    try {
+      const r = await runCliOnce(withReleaseAgeOverride(list))
+      return Object.assign({}, r, { releaseAge: { entries, retried: true } })
+    } catch (e2) {
+      const err = new Error(((e2 && e2.message) || String(e2)) + '（已用一次性放行重试过一次）')
+      err.exitCode = e2 && e2.exitCode
+      err.output = (e2 && e2.output) || ''
+      throw err
+    }
+  }
 }
 
 // ---------- 安装 / 卸载 ----------
@@ -285,9 +415,8 @@ async function installByName(name, opts = {}) {
     log('installing ' + pkg + '@' + verified.version + '（npm 官方源校验通过）…')
     // -w：profile 目录本身是一个 pnpm workspace 根（pnpm-workspace.yaml），
     // 新版本 pnpm 拒绝在 workspace 根加依赖，除非显式 -w/--workspace-root。
-    // 放行「新版本观察期」的策略由 runCli 统一注入（见 RELEASE_AGE_OVERRIDE）：
-    // 否则 lockfile 里任何一个刚发布的版本都会让本次 add/remove 在动手前被整体拒绝。
-    await runCli(['add', pkg + '@' + verified.version, '-w'])
+    // 24h 观察期由 runCli 统一处理：先按策略默认跑，被整体拒绝时才一次性放行重试。
+    const cli = await runCli(['add', pkg + '@' + verified.version, '-w'])
     const after = pluginStateOf(readProfileManifest(), pkg)
     if (!after.installed || !after.bundle) {
       throw new Error('安装后 profile 未正确记录该插件（dependencies/bundles 缺一）')
@@ -295,12 +424,13 @@ async function installByName(name, opts = {}) {
     s.lastChange = '已安装 ' + pkg + '@' + after.version
     log('installed ' + pkg + '@' + after.version)
     s.busy = ''
-    return { ok: true, version: after.version }
+    return { ok: true, version: after.version, releaseAge: (cli && cli.releaseAge) || null }
   } catch (e) {
     s.error = (e && e.message) || String(e)
     s.busy = ''
     log('install failed: ' + pkg + '：' + s.error)
-    return { ok: false, error: s.error }
+    const env = classifyEnvFailure((e && e.output) || s.error)
+    return { ok: false, error: s.error, env: env.kind ? env : null }
   }
 }
 
@@ -331,7 +461,8 @@ async function uninstallByName(name) {
     s.error = (e && e.message) || String(e)
     s.busy = ''
     log('uninstall failed: ' + pkg + '：' + s.error)
-    return { ok: false, error: s.error }
+    const env = classifyEnvFailure((e && e.output) || s.error)
+    return { ok: false, error: s.error, env: env.kind ? env : null }
   }
 }
 
@@ -358,6 +489,11 @@ module.exports = {
   verifyNpmManifestShape,
   pnpmReady,
   withReleaseAgeOverride,
+  releaseAgeViolation,
+  parseReleaseAgeEntries,
+  releaseAgeRecoversAt,
+  classifyEnvFailure,
+  RELEASE_AGE_OVERRIDE,
   PLUGIN_NAME,
   PROFILE_NAME,
   NPM_REGISTRY_ORIGIN,

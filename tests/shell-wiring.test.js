@@ -20,6 +20,7 @@ const html = read('ui-src/browser.html')
 const css = read('ui-src/browser.css')
 const shellJs = read('ui-src/browser.js')
 const loadingJs = read('ui-src/loading.js')
+const loadingHtml = read('ui-src/loading.html')
 const viewPreloadJs = read('browser-preload.js')
 const mainJs = read('main.js')
 
@@ -71,6 +72,31 @@ test('说明页步骤：主进程推 loading:progress、preload 暴露、页面�
   assert.ok(dirHasStartProgress(), 'start-progress.js 必须存在（步骤表）')
   assert.match(viewPreloadJs, /onLoadingProgress:/, '视图 preload 要暴露订阅入口')
   assert.match(loadingJs, /onLoadingProgress\(renderProgress\)/, '说明页要订阅并按 reason 过滤')
+})
+
+// "等待端口就绪"那 10 秒里要能看出服务进程在干什么：主进程采集 → 载荷带出 → 页面展示，缺一环就是空话。
+test('说明页"当前环节"接线完整：采集 → 推送 → 展示', () => {
+  // 采集：stdout 与 stderr 都要喂给行缓冲（插件日志走 stderr，漏了就等于没采）
+  assert.match(mainJs, /function noteChildPhase\(child, chunk\)/, '要有环节采集函数')
+  assert.match(mainJs, /child\.__phase = startProgress\.createPhaseReader\(\)/, '按行缓冲要用 start-progress 的读取器')
+  const onData = mainJs.slice(mainJs.indexOf('const onData = (d) =>'), mainJs.indexOf('child.stdout.on(\'data\', onData)'))
+  assert.match(onData, /noteChildPhase\(child, d\)/, 'stdout 要喂给环节采集')
+  assert.match(mainJs, /child\.stderr\.on\('data',[\s\S]{0,400}?noteChildPhase\(child, d\)/, 'stderr 要喂给环节采集')
+  // 载荷：phase / phaseAt / 兜底文案三件套
+  assert.match(mainJs, /phase: server\.phaseLine \|\| ''/, '载荷要带 phase')
+  assert.match(mainJs, /phaseAt: server\.phaseAt \|\| 0/, '载荷要带 phaseAt（页面据此标注"N 秒前"）')
+  assert.match(mainJs, /phaseFallback: startProgress\.PHASE_FALLBACK/, '兜底文案由主进程给，页面不自己编')
+  // 等待循环里要持续推（否则晚加载/刚刷新的说明页拿不到环节）
+  const loop = mainJs.slice(mainJs.indexOf('const deadline = Date.now() + READY_TIMEOUT_SEC * 1000'))
+  assert.match(loop.slice(0, 1200), /pushLoadingProgress\(\)/, '等待就绪期间要持续推环节')
+  // 展示：页面元素存在，且 loading.js 不许引用不存在的 id
+  assert.ok(loadingHtml.includes('id="phase"'), 'loading.html 要有 phase 行')
+  assert.match(loadingJs, /getElementById\('phase'\)/, 'loading.js 要渲染 phase 行')
+  assert.match(loadingJs, /progressData\.phaseFallback/, 'loading.js 要用主进程给的兜底文案（不许自己编一套）')
+  assert.match(loadingJs, /progressData\.phase\b/, 'loading.js 要展示主进程给的环节行')
+  const ids = [...loadingJs.matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1])
+  const missing = [...new Set(ids)].filter((id) => !loadingHtml.includes('id="' + id + '"'))
+  assert.deepEqual(missing, [], 'loading.js 引用了 loading.html 里不存在的 id：' + missing.join(', '))
 })
 
 test('齿轮按钮接线完整：HTML / 壳脚本 / 主进程命令三处都有', () => {

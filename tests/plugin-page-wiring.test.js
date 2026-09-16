@@ -149,6 +149,9 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
     installManagedMarket: async (opts) => { deferCalls.push({ id: "dshmarket", action: "install", defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
     applyPluginChange: async (verb) => { applied.push(verb); return true },
     deferPluginChange: () => {},
+    clearPluginEnvFailure: () => {},
+    notePluginEnvFailure: () => {},
+    notePluginReleaseAgeRetry: () => {},
   }
   const names = Object.keys(ctx)
   const fn = new Function(...names, fnSrc + '\nreturn installAllManagedPlugins')
@@ -266,14 +269,11 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   // 4. 真 pendingAutoInstallPlugins：默认代装集合 = 注册表里 autoInstall 的那批，且只挑缺失的
   const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
   assert.deepEqual(autoIds, [
-    'better-sidebar',
     'usage-billing',
     'skills-manager',
     'archive-manager',
-    'sidebar-qa',
     'rewind',
-    'mcp-lens',
-  ], '默认代装集合（含后加的 5 个）应保持稳定')
+  ], '默认代装集合应保持稳定（增强侧边栏 / 划线提问 / MCP Lens 改为手动后只剩这 4 个）')
   for (const d of registry.filter((x) => x.autoInstall)) {
     const card = catalog.find((c) => c.id === d.id)
     assert.equal(card.autoInstallLabel, '预装 (推荐开启)', d.id + ' 卡片应标「预装 (推荐开启)」')
@@ -281,7 +281,8 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   }
 
   const pendSrc = sliceFn('function pendingAutoInstallPlugins() {', '\n}\n')
-  const missing = new Set(['dsh-mcp-lens', 'dsh-rewind-plugin'])
+  // 缺失集合里故意混入手动安装项（MCP Lens / 划线提问）：它们不得进入代装队列
+  const missing = new Set(['dsh-mcp-lens', 'dsh-sidebar-qa', '@michengai/dsh-archive-manager', 'dsh-rewind-plugin'])
   const pendCtx = {
     MANAGED_NPM_PLUGINS: registry,
     pluginAutoDeclined: () => false,
@@ -289,11 +290,11 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   }
   const pendNames = Object.keys(pendCtx)
   const pending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => pendCtx[k]))
-  assert.deepEqual(pending().map((d) => d.npm), ['dsh-rewind-plugin', 'dsh-mcp-lens'], '缺哪个就补哪个（含后加的 5 个），顺序按注册表 order')
+  assert.deepEqual(pending().map((d) => d.npm), ['@michengai/dsh-archive-manager', 'dsh-rewind-plugin'], '只补 autoInstall 里缺失的（手动项缺了也不动），顺序按注册表 order')
 
   const declinedCtx = { ...pendCtx, pluginAutoDeclined: (id) => id === 'rewind' }
   const declinedPending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => declinedCtx[k]))
-  assert.deepEqual(declinedPending().map((d) => d.id), ['mcp-lens'], '手动卸载过的插件不应再自动补装')
+  assert.deepEqual(declinedPending().map((d) => d.id), ['archive-manager'], '手动卸载过的插件不应再自动补装')
 })
 
 test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
@@ -301,20 +302,20 @@ test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
   assert.doesNotMatch(html, /id="btnRemoteConnect"/, '设置页不应再保留远程连接行')
   assert.doesNotMatch(html, /id="btnRecoveryMarket"/, '恢复页不应再保留插件修复行')
 })
-test('默认代装：增强侧边栏 / 用量与计费随启动器自动装，会话导入仍手动', () => {
+test('默认代装：用量与计费 / 技能管理 / 会话归档 / 对话回退随启动器自动装，界面类与 MCP Lens 保持手动', () => {
   assert.match(main, /pluginAutoInstallTriedVersion: '', pluginAutoDeclined: \{\}/, '配置应有自动安装记账字段')
   assert.match(main, /function pluginAutoDeclined\(id\)/, '应有「用户卸载过」记忆查询')
   assert.match(main, /function notePluginAutoDeclined\(id, declined\)/, '应有「用户卸载过」记账写入')
   assert.match(main, /async function maybeAutoInstallRecommendedPlugins\(\)/, '应有推荐插件默认代装流程')
   assert.match(main, /function pendingAutoInstallPlugins\(\)/, '应有「缺哪些就装哪些」的筛选')
 
-  assert.match(main, /npm: 'dsh-better-sidebar',\n    name: '增强侧边栏',\n    autoInstall: true,/, '增强侧边栏应默认代装')
+  assert.doesNotMatch(main, /npm: 'dsh-better-sidebar',\n    name: '增强侧边栏',\n    autoInstall: true,/, '增强侧边栏改为手动安装')
   assert.match(main, /npm: '@kenz1117\/dsh-ui-usage-billing',\n    name: '用量与计费',\n    autoInstall: true,/, '用量与计费应默认代装')
   assert.match(main, /npm: '@michengai\/dsh-skills-manager',\n    name: '技能管理',\n    autoInstall: true,/, '技能管理应默认代装')
   assert.match(main, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',\n    autoInstall: true,/, '会话归档应默认代装')
-  assert.match(main, /npm: 'dsh-sidebar-qa',\n    name: '划线提问',\n    autoInstall: true,/, '划线提问应默认代装')
+  assert.doesNotMatch(main, /npm: 'dsh-sidebar-qa',\n    name: '划线提问',\n    autoInstall: true,/, '划线提问改为手动安装（依赖增强侧边栏）')
   assert.match(main, /npm: 'dsh-rewind-plugin',\n    name: '对话回退',\n    autoInstall: true,/, '对话回退应默认代装')
-  assert.match(main, /npm: 'dsh-mcp-lens',\n    name: 'MCP Lens',\n    autoInstall: true,/, 'MCP Lens 应默认代装')
+  assert.doesNotMatch(main, /npm: 'dsh-mcp-lens',\n    name: 'MCP Lens',\n    autoInstall: true,/, 'MCP Lens 改为手动安装（上游 npm 只有预发布版，稳定版校验会拒绝）')
   assert.doesNotMatch(main, /npm: 'dsh-chat-import',\n    name: '会话导入',\n    autoInstall: true,/, '会话导入保持手动安装')
   assert.doesNotMatch(main, /npm: '@michengai\/dsh-codex-ui',\n    name: 'Codex 风格界面',\n    autoInstall: true,/, 'Codex 风格界面默认不安装（只进插件页）')
 
@@ -366,6 +367,8 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
     notify: () => { calls.notified++ },
     log: () => {},
     saveConfig: () => {},
+    notePluginEnvFailure: () => {},
+    notePluginReleaseAgeRetry: () => {},
     broadcastState: () => {},
   }
   const names = Object.keys(ctx)

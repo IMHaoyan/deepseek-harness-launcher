@@ -3,7 +3,9 @@
 //  - 静默检查最新版（启动后 + 每 6 小时，24 小时节流）；发现新版 → 主页卡片 + 托盘气泡一次，绝不自动更新；
 //  - 用户点击卡片"立即更新"后才执行更新（全局 npm：npm update -g --prefix 全局根，npmmirror 优先）；
 //  - 托管形态走统一引擎（内部优先全局 npm，失败回退托管原子安装，失败旧版不动）；
-//  - npx 形态先迁移到全局 npm 再更新（失败回退 npx 预热）；源码版仅提示。
+//  - npx 形态先迁移到全局 npm 再更新（失败回退 npx 预热）；源码版仅提示；
+//  - 全局形态发现新版即后台"预装"一整套可切换的安装树（见"预装与改名切换"节）：
+//    点击更新时只做同卷目录改名（秒级），把 40s 的解包落盘挪到用户无感的检查阶段。
 'use strict'
 const { spawn } = require('child_process')
 const path = require('path')
@@ -40,12 +42,15 @@ const state = {
   latestChannel: '', // latest 这个版本号是从哪个渠道取来的（缓存与渠道同源；换渠道必须作废）
   kind: '', // 当前安装形态（source | managed | global | npx）：source 不支持自动更新，UI 按此区分
   error: '',
-  prewarmed: false, // 新版完整依赖树是否已预热进 npm/npx 缓存（点击"立即更新"可秒级完成）
+  prewarmed: false, // 新版依赖树是否已就绪（npm/npx 缓存预热，或整树预装完成）
+  staged: false, // 是否已预装出"可整目录顶上"的安装树（true 时点击更新只剩改名 + 重启服务）
+  stageVersion: '', // 预装树对应的版本号（与 latest 不一致即视为无效）
 }
 
 let checking = false
 let updating = false
 let warming = null // 当前预热任务（防重入）
+let staging = null // 已就绪的预装树：{ version, installDir, stagePkg, stagePrefix, stageRoot, binPath }
 let lastNotifiedVersion = '' // 同一新版本只提示一次
 let rollbackUsed = false // 每次更新周期最多一次回滚
 let lastFetchError = '' // 最近一次取版本失败的原因（用于给用户可读的检查失败提示）
@@ -64,12 +69,14 @@ function emitLifecycle(event, detail) {
 }
 
 // 更新事务状态：写入/清空（best-effort，仅用于诊断与回滚依据）
+// 返回值表示"是否真的落盘"：改名切换前的那次写入必须成功，否则崩溃在两次改名之间就没有修复凭据。
 function writeUpdateState(value) {
-  if (!statePath) return
+  if (!statePath) return false
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true })
     fs.writeFileSync(statePath, JSON.stringify(Object.assign({ updatedAt: new Date().toISOString() }, value), null, 2))
-  } catch (e) { log('dsh-update: state write failed: ' + (e && e.message ? e.message : String(e))) }
+    return true
+  } catch (e) { log('dsh-update: state write failed: ' + (e && e.message ? e.message : String(e))); return false }
 }
 
 function clearUpdateState() {
@@ -85,6 +92,73 @@ function readUpdateState() {
   } catch { return null }
 }
 
+/**
+ * 改名切换事务的恢复：按文件系统事实决定收场方式（补完 / 退回 / 无需修复）。
+ * 崩在两次改名之间时安装目录会短暂不存在 —— 但旧树与预装树至少有一个还在，改名就能救回来。
+ * 返回 null 表示"改名救不了"，交给原来的重装路径。
+ */
+async function recoverSwapTransaction(st, nodeBin, ctx) {
+  const installDir = String(st.installDir || '')
+  const backupDir = String(st.backupDir || '')
+  const stagePkg = String(st.stagePkg || '')
+  const target = String(ctx.to || '')
+  if (!installDir || !backupDir) return null
+  const installed = readPkgAt(installDir)
+  const staged = stagePkg ? readPkgAt(stagePkg) : null
+  const probe = staged ? await probeDshVersion(nodeBin, path.join(stagePkg, 'lib', 'bin.js')) : ''
+  const decided = decideSwapRecovery({
+    target,
+    installVersion: installed ? installed.version : '',
+    backupExists: fs.existsSync(backupDir),
+    stagedPkgExists: !!staged,
+    stagedVersion: staged ? staged.version : '',
+    probeVersion: probe,
+  })
+  const stageRoot = stageRootOf(installDir)
+  const finish = (payload) => {
+    try { clearUpdateState() } catch { /* noop */ }
+    if (!warming) cleanupStage(stageRoot, '')
+    return payload
+  }
+  if (decided.action === 'done') {
+    log('dsh-update: 上次的改名切换其实已完成，只清理事务与暂存残留')
+    emitLifecycle('update.dsh', { step: 'interrupted-swap-done', from: ctx.from, to: target })
+    return finish({ recovered: true, to: target, mode: 'swap-done' })
+  }
+  if (decided.action === 'intact') {
+    // 切换还没开始，安装目录完好（旧版可用）：不动它，也不谎称"已修复"
+    log(`dsh-update: 上次的切换尚未开始（安装目录为 v${installed.version}），无需修复`)
+    emitLifecycle('update.dsh', { step: 'interrupted-swap-idle', from: ctx.from, to: target })
+    return finish({ recovered: false, reason: 'swap-not-started' })
+  }
+  if (decided.action === 'complete') {
+    try {
+      fs.mkdirSync(path.dirname(installDir), { recursive: true }) // 作用域目录可能已随旧树一起被移走
+      if (installed) fs.renameSync(installDir, path.join(path.dirname(backupDir), 'rejected-' + Date.now()))
+      fs.renameSync(stagePkg, installDir)
+    } catch (err) {
+      log('dsh-update: 补完切换失败，改用重装：' + ((err && err.message) || String(err)))
+      return null
+    }
+    log(`dsh-update: 上次未完成的切换已补完 → v${target}`)
+    emitLifecycle('update.dsh', { step: 'interrupted-swap-completed', from: ctx.from, to: target })
+    notify('DeepSeek Harness', `上次未完成的 DSH 更新已补完（v${target}）`)
+    return finish({ recovered: true, to: target, mode: 'swap-completed' })
+  }
+  if (decided.action === 'restore') {
+    const r = await restoreSwap({ installDir, backupDir }, nodeBin)
+    if (!r.ok) {
+      log('dsh-update: 退回旧树失败，改用重装：' + (r.error || ''))
+      return null
+    }
+    log(`dsh-update: 预装树不可用，已退回原来的 v${r.version || '?'}`)
+    emitLifecycle('update.dsh', { step: 'interrupted-swap-restored', from: ctx.from, to: target })
+    notify('DeepSeek Harness', `上次 DSH 更新未完成，已退回原来的 v${r.version || ctx.from || '旧版本'}`)
+    return finish({ recovered: false, reason: 'rolled-back', to: r.version })
+  }
+  return null // fallback：安装目录丢了又没有备份，只能重装
+}
+
 // ---------- 中断的更新自愈 ----------
 // 事务状态在更新开始时写入、成功收尾时清除。启动时若读到残留的 phase='start'，
 // 说明上次更新没走完（典型：装到一半退出启动器）——npm 全局安装会残留半套文件，
@@ -98,12 +172,18 @@ async function recoverInterruptedUpdate() {
   log(`dsh-update: 检测到未完成的更新事务（${from || '?'} → ${to || '?'}, kind=${kind}）`)
   emitLifecycle('update.dsh', { step: 'interrupted', from, to, kind })
   if (!to) { clearUpdateState(); return { recovered: false, reason: 'no-target' } }
-  notify('DeepSeek Harness', `上次 DSH 更新未完成（${from || '?'} → ${to}），正在自动修复…`)
   let nodeBin = 'node'
   try {
     const r = await envDetect.detectEnv(false)
     if (r && r.plan) nodeBin = r.plan.nodeCmd || 'node'
   } catch { /* 用默认 node */ }
+  // 改名切换事务：改名是 O(1) 的，先按文件系统事实收场，能不重装就不重装
+  if (st.swap && st.installDir) {
+    const handled = await recoverSwapTransaction(st, nodeBin, { from, to })
+    if (handled) return handled
+    log('dsh-update: 改名切换事务无法就地修复，改用重装路径')
+  }
+  notify('DeepSeek Harness', `上次 DSH 更新未完成（${from || '?'} → ${to}），正在自动修复…`)
   let ok = false
   try {
     if (kind === 'global') {
@@ -267,7 +347,8 @@ function getState() {
 // 同时记下"用户显式选过这个渠道"，供降级闸区分"意图内的下降"与"缓存过期"。
 function noteChannelChange() {
   userSwitchedChannel = channelOf()
-  setState({ status: 'idle', error: '', latest: '', latestChannel: '', prewarmed: false })
+  staging = null // 旧渠道的预装树作废（暂存目录名是版本号，下次检查会自己清场）
+  setState({ status: 'idle', error: '', latest: '', latestChannel: '', prewarmed: false, staged: false, stageVersion: '' })
 }
 
 function pushState() {
@@ -362,7 +443,22 @@ async function runNpm(args, opts = {}) {
 }
 
 function registries() {
-  return Config.npmRegistry ? [Config.npmRegistry] : ['https://registry.npmmirror.com', null]
+  if (Config.npmRegistry) return [Config.npmRegistry] // 用户显式指定：只认它（保持原行为）
+  const order = ['https://registry.npmmirror.com', null]
+  const ok = String(Config.dshRegistryOk || '')
+  // 'default' 是"不带 --registry、用 npm 自身配置的源"的记号（null 与 '' 在数组里不好比较）
+  const preferred = ok === 'default' ? null : ok
+  if (preferred === '' || !order.some((r) => r === preferred)) return order
+  return [preferred, ...order.filter((r) => r !== preferred)]
+}
+
+// 记住"上次真正成功的源"，下次把它提到最前：省掉每次先试一个不通用源的固定损耗。
+// 只在成功时写（失败不写）——绝不把坏源记成首选。
+function noteRegistryOk(registry) {
+  const val = registry || 'default'
+  if (!Config || Config.dshRegistryOk === val) return
+  Config.dshRegistryOk = val
+  try { saveConfig() } catch { /* 记不上不影响本次安装 */ }
 }
 
 async function fetchLatest(nodeBin) {
@@ -374,7 +470,7 @@ async function fetchLatest(nodeBin) {
     const r = await runNpm(args, { nodeBin })
     if (r.ok) {
       const line = String(r.stdout).trim().split(/\r?\n/)[0].trim()
-      if (semver.valid(line)) return { version: line, registry, channel }
+      if (semver.valid(line)) { noteRegistryOk(registry); return { version: line, registry, channel } }
       log(`dsh-update: npm view 输出异常：${line || '(空)'}`)
       return null
     }
@@ -387,13 +483,15 @@ async function fetchLatest(nodeBin) {
 // 全局 npm 更新：npm i -g --prefix <全局根> @deepseek-ai/dsh@<版本>（npmmirror 优先、官方回退）
 // 用 install + 显式版本（而非 npm update）：幂等且指定精确目标版本，失败重试不会留下"半套"文件；
 // 超时给足 25 分钟（慢速网络全量依赖树约 13 分钟，90s 默认超时会永远杀不掉大下载）。
+// --prefer-offline：目标版本是显式钉死的，缓存命中时省掉元数据往返；注意**不能**加给 `npm view`
+// （那会把"最新版"读成缓存里的旧值，检测直接失效）。
 async function runGlobalUpdate(nodeBin, globalRoot, version) {
   for (const registry of registries()) {
-    const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund']
+    const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund', '--prefer-offline']
     if (registry) args.push('--registry', registry)
     // 用当前环境 npm（用户级/系统均可）并显式指定全局根，确保落在与 npm i -g 相同的目录
     const r = await runNpm(args, { nodeBin, timeoutMs: 25 * 60 * 1000 })
-    if (r.ok) return r
+    if (r.ok) { noteRegistryOk(registry); return r }
     log(`dsh-update: npm install -g 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
   }
   return { ok: false, error: '全局更新失败' }
@@ -404,17 +502,313 @@ async function runNpxWarm(latest, nodeBin) {
   return runNpm(['exec', '--yes', '--package', `@deepseek-ai/dsh@${latest}`, '--', 'dsh', '--version'], { nodeBin })
 }
 
-// ---------- 预热缓存（发现新版本后后台执行，纯尽力而为） ----------
-// 把新版"完整依赖树"下载进 npm/npx 缓存：用户点"立即更新"时几乎不再走网络，秒级完成。
-// 失败静默（只记日志）：不影响检测/更新主流程，下次检查发现新版时会重试。
-async function warmLatest(latest, nodeBin, kind) {
+// ---------- 预装（staging）与改名切换 ----------
+// 为什么需要：只把 tarball 灌进 npm 缓存（旧的 warmLatest）省掉的是"下载"，省不掉"解包落盘"——
+// npm install -g 每次都要把整棵树重新写一遍（实测 213MB / 2.5 万个文件 ≈ 40s），这才是更新慢的主因
+// （对照：缓存已热时重铺仍是 40s；同 prefix 重装同版本 1.5s）。
+// 做法：发现新版本时用**与线上完全相同的命令**（npm install -g --prefix <暂存 prefix>）在后台装好一整套
+// 包目录，点击更新时只做同卷目录改名（实测 0.04s），把那 40s 挪到用户无感的检查阶段。
+// 三条硬约束（任一条错了都会"切完起不来"）：
+//   1) 暂存 prefix 必须与全局根同卷（由 installDir 反推），跨卷改名会退化成整树拷贝；
+//   2) 暂存的包目录布局必须与线上同构 —— 所以用同一条 -g 命令，而不是 --install-strategy=nested
+//      （后者不做去重，实测树会从 213MB 膨胀到 592MB，等于给用户永久加 2.8 倍磁盘占用）；
+//   3) 顶上之前必须探测（--version）确认新树真能跑；bin 入口布局变了就不切，退回完整安装。
+const STAGE_DIR_NAME = '.dshl-stage'
+const STAGE_TIMEOUT_MS = 25 * 60 * 1000
+
+/** 从已安装包目录反推 npm 前缀：<prefix>/node_modules/@deepseek-ai/dsh → <prefix>；形态不符返回 ''。 */
+function npmPrefixOf(installDir) {
+  const dir = String(installDir || '')
+  if (!dir) return ''
+  const scopeDir = path.dirname(dir) // <prefix>/node_modules/@deepseek-ai（注意作用域目录还要再上一层）
+  const nmDir = path.dirname(scopeDir) // <prefix>/node_modules
+  return path.basename(nmDir) === 'node_modules' ? path.dirname(nmDir) : ''
+}
+
+/** 暂存根目录：与安装目录同卷（都由 installDir 反推）。 */
+function stageRootOf(installDir) {
+  const prefix = npmPrefixOf(installDir)
+  return prefix ? path.join(prefix, STAGE_DIR_NAME) : ''
+}
+
+/**
+ * 暂存/切换路径规划（纯函数）。备份目录按版本号确定性命名 —— 同一版本在任何一次调用里都必须算出
+ * 同一条路径，否则"事务里记的备份路径"和"实际改名的路径"会对不上，崩溃恢复就找不到旧树了。
+ * （同名的旧备份在切换前会被删掉，不会互相顶替。）
+ */
+function planSwapPaths(input) {
+  const src = input || {}
+  const installDir = String(src.installDir || '')
+  const version = String(src.version || '')
+  const stageRoot = stageRootOf(installDir)
+  if (!stageRoot || !semver.valid(version)) return null
+  const stagePrefix = path.join(stageRoot, version)
+  return {
+    prefix: npmPrefixOf(installDir),
+    stageRoot,
+    stagePrefix,
+    stagePkg: path.join(stagePrefix, 'node_modules', '@deepseek-ai', 'dsh'),
+    backupDir: path.join(stageRoot, 'old-' + version),
+  }
+}
+
+/**
+ * 预装树可用性判定（纯函数）：只有"版本对得上 + 探测跑得起来 + bin 布局没变"才允许顶上。
+ * @returns {{action:'use'} | {action:'discard', reason:string}}
+ */
+function decideStagedInstall(input) {
+  const src = input || {}
+  const target = String(src.targetVersion || '')
+  if (!target) return { action: 'discard', reason: 'no-target' }
+  if (src.installDirExists !== true) return { action: 'discard', reason: 'no-install-dir' }
+  if (src.stagedPkgExists !== true) return { action: 'discard', reason: 'staging-incomplete' }
+  if (String(src.stagedVersion || '') !== target) return { action: 'discard', reason: 'staged-version-mismatch' }
+  if (String(src.probeVersion || '') !== target) return { action: 'discard', reason: 'probe-failed' }
+  // 线上 .bin 的 shim 指向包内相对路径；bin 入口布局变了，换目录就会让 shim 失效
+  if (src.installedBinLayout && String(src.stagedBinLayout || '') !== String(src.installedBinLayout)) {
+    return { action: 'discard', reason: 'bin-layout-changed' }
+  }
+  return { action: 'use', reason: '' }
+}
+
+/**
+ * 中断事务的切换恢复判定（纯函数）：按文件系统事实决定怎么收场，不猜。
+ * @returns {{action:'done'|'complete'|'restore'|'intact'|'fallback', reason:string}}
+ */
+function decideSwapRecovery(input) {
+  const src = input || {}
+  const target = String(src.target || '')
+  const installed = String(src.installVersion || '')
+  if (target && installed === target) return { action: 'done', reason: 'swap-completed' }
+  if (src.backupExists === true) {
+    const usable = src.stagedPkgExists === true
+      && String(src.stagedVersion || '') === target
+      && String(src.probeVersion || '') === target
+    return usable ? { action: 'complete', reason: 'staged-usable' } : { action: 'restore', reason: 'staged-unusable' }
+  }
+  // 安装目录还在（只是还没换到目标版本）→ 切换根本没开始，旧版完好，什么都别动
+  if (installed) return { action: 'intact', reason: 'swap-not-started' }
+  return { action: 'fallback', reason: 'install-missing' }
+}
+
+/** 过期暂存目录选择（纯函数）：只认版本号目录与 old-/rejected- 备份，其余名字一律不碰（不误删）。 */
+function staleStageEntries(names, keep) {
+  const k = String(keep || '')
+  return (names || []).filter((n) => typeof n === 'string' && n && n !== k
+    && (!!semver.valid(n) || /^(old|rejected)-/.test(n)))
+}
+
+/** 读取某个目录下的 @deepseek-ai/dsh 包信息；非本包/不可读返回 null。 */
+function readPkgAt(dir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+    if (!pkg || pkg.name !== '@deepseek-ai/dsh') return null
+    const bin = pkg.bin
+    const binLayout = typeof bin === 'string'
+      ? 'string:' + bin
+      : (bin && typeof bin === 'object' ? Object.keys(bin).sort().map((k) => k + '=' + String(bin[k])).join(',') : '')
+    return { version: String(pkg.version || ''), binLayout }
+  } catch { return null }
+}
+
+/** 探测：用指定 node 跑一次 dsh --version（实测 0.14s，足够做"新树能不能跑"的门禁）。 */
+function probeDshVersion(nodeBin, binPath) {
+  return new Promise((resolve) => {
+    if (!binPath || !fs.existsSync(binPath)) return resolve('')
+    let child = null
+    try {
+      child = spawn(nodeBin || 'node', [binPath, '--version'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch { return resolve('') }
+    let out = ''
+    const t = setTimeout(() => { try { child.kill() } catch { /* noop */ } }, 30000)
+    child.stdout.on('data', (d) => { out += String(d) })
+    child.on('error', () => { clearTimeout(t); resolve('') })
+    child.on('exit', () => { clearTimeout(t); resolve(String(out).trim().split(/\r?\n/)[0].trim()) })
+  })
+}
+
+/** 清理暂存目录：删掉 keep 之外的版本目录与 old-/rejected- 备份，返回删掉的名字。 */
+function cleanupStage(stageRoot, keep) {
+  if (!stageRoot) return []
+  let names = []
+  try { names = fs.readdirSync(stageRoot) } catch { return [] }
+  const removed = []
+  for (const name of staleStageEntries(names, keep)) {
+    try { fs.rmSync(path.join(stageRoot, name), { recursive: true, force: true }); removed.push(name) } catch { /* 删不掉下次再删 */ }
+  }
+  return removed
+}
+
+/** 后台预装：把目标版本完整装进暂存 prefix 并探测确认可用。只为全局形态服务。 */
+async function stageLatest(version, nodeBin, kind, installDir) {
+  // 托管形态有 env-install 自己的原子安装，npx 形态没有可切换的目录：都不走这里
+  if (kind !== 'global') return { ok: false, reason: 'kind-' + (kind || 'unknown') }
+  const paths = planSwapPaths({ installDir, version })
+  if (!paths) return { ok: false, reason: 'no-install-dir' }
+  const installed = readPkgAt(installDir)
+  if (!installed) return { ok: false, reason: 'installed-pkg-unreadable' }
+  try {
+    fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) // 清掉上次的半成品
+    fs.mkdirSync(paths.stagePrefix, { recursive: true })
+  } catch (err) {
+    return { ok: false, reason: 'stage-not-writable: ' + ((err && err.message) || String(err)) }
+  }
+  cleanupStage(paths.stageRoot, version) // 其他版本的暂存已过期
+  let last = { ok: false, error: '未执行' }
+  for (const registry of registries()) {
+    const args = ['install', '-g', '--prefix', paths.stagePrefix, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund', '--prefer-offline']
+    if (registry) args.push('--registry', registry)
+    last = await runNpm(args, { nodeBin, timeoutMs: STAGE_TIMEOUT_MS })
+    if (last.ok) { noteRegistryOk(registry); break }
+    log(`dsh-update: stage install failed (registry=${registry || '默认'}): ${last.error}`)
+  }
+  if (!last.ok) {
+    try { fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) } catch { /* noop */ }
+    return { ok: false, reason: last.error || 'npm 预装失败' }
+  }
+  const staged = readPkgAt(paths.stagePkg)
+  const probe = staged ? await probeDshVersion(nodeBin, path.join(paths.stagePkg, 'lib', 'bin.js')) : ''
+  const decided = decideStagedInstall({
+    targetVersion: version,
+    installDirExists: fs.existsSync(installDir),
+    stagedPkgExists: !!staged,
+    stagedVersion: staged ? staged.version : '',
+    probeVersion: probe,
+    stagedBinLayout: staged ? staged.binLayout : '',
+    installedBinLayout: installed.binLayout,
+  })
+  if (decided.action !== 'use') {
+    log(`dsh-update: staged tree rejected (${decided.reason})：退回完整安装路径`)
+    try { fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) } catch { /* noop */ }
+    return { ok: false, reason: decided.reason }
+  }
+  staging = {
+    version,
+    installDir,
+    stagePkg: paths.stagePkg,
+    stagePrefix: paths.stagePrefix,
+    stageRoot: paths.stageRoot,
+    binPath: path.join(paths.stagePkg, 'lib', 'bin.js'),
+  }
+  log(`dsh-update: staged v${version} ready（点击更新只需改名切换）：${paths.stagePkg}`)
+  setState({ prewarmed: true, staged: true, stageVersion: version })
+  return { ok: true, version }
+}
+
+/**
+ * 改名切换：旧树让位 → 预装树顶上 → 探测。任一步失败都把旧树改回来（旧版完好是最低要求）。
+ * 调用方必须已经停掉服务：Windows 上跑着的进程会锁住文件，改名会失败。
+ */
+async function swapStagedInto(input) {
+  const src = input || {}
+  const installDir = String(src.installDir || '')
+  const version = String(src.version || '')
+  const nodeBin = src.nodeBin || 'node'
+  const info = src.info || staging // info 可注入：测试用真实目录演练切换，不依赖后台预装
+  if (!info || !version || info.version !== version || info.installDir !== installDir) return { ok: false, reason: 'no-staged-tree' }
+  const paths = planSwapPaths({ installDir, version })
+  if (!paths) return { ok: false, reason: 'no-install-dir' }
+  // 顶上之前再判一次（预装到现在之间磁盘上可能被别的东西改过）
+  const installed = readPkgAt(installDir)
+  const staged = readPkgAt(paths.stagePkg)
+  const probe = staged ? await probeDshVersion(nodeBin, path.join(paths.stagePkg, 'lib', 'bin.js')) : ''
+  const decided = decideStagedInstall({
+    targetVersion: version,
+    installDirExists: fs.existsSync(installDir),
+    stagedPkgExists: !!staged,
+    stagedVersion: staged ? staged.version : '',
+    probeVersion: probe,
+    stagedBinLayout: staged ? staged.binLayout : '',
+    installedBinLayout: installed ? installed.binLayout : '',
+  })
+  if (decided.action !== 'use') {
+    staging = null
+    setState({ staged: false, stageVersion: '' })
+    return { ok: false, reason: decided.reason }
+  }
+  // 记事务（含切换路径）必须在第一次改名之前落盘：崩在两次改名之间时安装目录会短暂不存在，
+  // recoverInterruptedUpdate 全靠这份凭据把旧树改名回来。
+  const txOk = writeUpdateState({
+    kind: 'global',
+    from: String(src.from || ''),
+    to: version,
+    phase: 'start',
+    swap: true,
+    installDir,
+    stagePkg: paths.stagePkg,
+    stagePrefix: paths.stagePrefix,
+    backupDir: paths.backupDir,
+  })
+  if (!txOk) return { ok: false, reason: 'tx-state-unwritable' }
+  const t0 = Date.now()
+  try {
+    fs.rmSync(paths.backupDir, { recursive: true, force: true })
+    fs.renameSync(installDir, paths.backupDir) // 旧树让位（同卷改名，O(1)）
+  } catch (err) {
+    return { ok: false, reason: 'rename-out-failed: ' + ((err && err.message) || String(err)) }
+  }
+  try {
+    fs.renameSync(paths.stagePkg, installDir) // 预装树顶上（同卷改名，O(1)）
+  } catch (err) {
+    try { fs.renameSync(paths.backupDir, installDir) } catch { /* 连回退改名也失败：留给 recoverInterruptedUpdate 按事务状态修 */ }
+    return { ok: false, reason: 'rename-in-failed: ' + ((err && err.message) || String(err)) }
+  }
+  // 改名成功 ≠ 新树能跑：立刻探测，不过就把旧树改回来
+  const after = await probeDshVersion(nodeBin, path.join(installDir, 'lib', 'bin.js'))
+  if (after !== version) {
+    const back = await restoreSwap({ installDir, backupDir: paths.backupDir }, nodeBin)
+    log(`dsh-update: post-swap probe failed (${after || '空'})，改名回退 ${back.ok ? 'ok' : 'failed'}`)
+    return { ok: false, reason: 'post-swap-probe-failed' }
+  }
+  staging = null
+  setState({ staged: false, stageVersion: '' })
+  return { ok: true, ms: Date.now() - t0, installDir, backupDir: paths.backupDir, stageRoot: paths.stageRoot, installVersion: version }
+}
+
+/** 切换回退：新树退回暂存目录（保留现场供诊断），旧树改名回原位。 */
+async function restoreSwap(state, nodeBin) {
+  const installDir = state && state.installDir
+  const backupDir = state && state.backupDir
+  if (!installDir || !backupDir) return { ok: false, error: '缺少切换路径' }
+  const rejected = path.join(path.dirname(backupDir), 'rejected-' + Date.now())
+  try {
+    // 恢复路径要自己保证落点存在：崩在两次改名之间时，作用域目录也可能一起没了
+    fs.mkdirSync(path.dirname(installDir), { recursive: true })
+    if (fs.existsSync(installDir)) fs.renameSync(installDir, rejected)
+  } catch (err) { return { ok: false, error: (err && err.message) || String(err) } }
+  try {
+    fs.renameSync(backupDir, installDir)
+  } catch (err) { return { ok: false, error: (err && err.message) || String(err) } }
+  const probed = await probeDshVersion(nodeBin || 'node', path.join(installDir, 'lib', 'bin.js'))
+  return { ok: true, version: probed, rejected }
+}
+
+/** 切换成功后的收尾：删掉旧树备份与暂存残留（正在预装的那份不能碰）。 */
+function finalizeSwap(state) {
+  if (!state || !state.installDir) return
+  try { fs.rmSync(state.backupDir, { recursive: true, force: true }) } catch { /* 删不掉不影响 */ }
+  if (!warming) cleanupStage(state.stageRoot, '')
+}
+
+// ---------- 后台就绪（发现新版本后执行，纯尽力而为，失败静默） ----------
+// 全局形态：预装一整套可切换的安装树（见上节）——点击更新只剩改名 + 重启服务；
+// 预装失败退回旧的"灌 npm 缓存"路径，行为与从前一致。
+// 托管/npx 形态：仍只预热缓存（托管有 env-install 自己的原子安装，npx 没有可切换的目录）。
+async function warmLatest(latest, nodeBin, kind, installDir) {
   if (warming) return warming
   warming = (async () => {
     try {
+      if (kind === 'global' && installDir) {
+        const r = await stageLatest(latest, nodeBin, kind, installDir)
+        if (r.ok) return
+        // 缓存已经热过就别重复灌一遍（每次检查都会重试预装，失败原因通常不在缓存上）
+        if (state.prewarmed) return
+        log('dsh-update: staging unavailable (' + r.reason + ')，退回缓存预热')
+      }
       if (kind === 'npx') {
         await runNpxWarm(latest, nodeBin)
       } else {
-        // managed / global：临时目录完整安装（--ignore-scripts 只拉包不跑构建），npm 共享缓存被灌满全依赖树
+        // managed / global 兜底：临时目录完整安装（--ignore-scripts 只拉包不跑构建），npm 共享缓存被灌满全依赖树
         const tmp = path.join(os.tmpdir(), 'dshl-dsh-warm')
         fs.mkdirSync(tmp, { recursive: true })
         let ok = false
@@ -493,25 +887,35 @@ async function checkOnce(reason, force) {
     // 再比就成了死比较（恒为 false），prewarmed 永远停在 true，新版本再也不会被预热。
     const prevLatest = state.latest
     setState({ current, latest: latest.version, kind: plan.kind, latestChannel: latest.channel || channelOf() })
+    const installDir = (report.dsh && report.dsh.dir) || ''
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
       log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, reason=${reason || 'timer'})`)
       const newVersionSeen = prevLatest !== latest.version
-      setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false } : {}))
-      // 后台预热缓存（不阻塞检测）：点"立即更新"时依赖树已在 npm/npx 缓存里，秒级完成
-      if (!state.prewarmed) void warmLatest(latest.version, plan.nodeCmd, plan.kind)
-      // 手动检查不弹通知（控制台行内已有提示）；自动检查按版本跨重启去重：同一版本只提醒一次
+      // 换了目标版本：上一版的预装树作废（暂存目录名就是版本号，stageLatest 会自己清场）
+      if (newVersionSeen) staging = null
+      setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false, staged: false, stageVersion: '' } : {}))
+      // 后台就绪（不阻塞检测）：全局形态预装一整套可切换的安装树，点击"立即更新"时只剩改名 + 重启服务。
+      // 仅缓存预热过（prewarmed 但没 staged）时也再试一次预装——预装失败过不该永久放弃。
+      if (!state.prewarmed || (plan.kind === 'global' && installDir && !state.staged)) {
+        void warmLatest(latest.version, plan.nodeCmd, plan.kind, installDir)
+      }
+      // 手动检查不弹通知（控制台行内已有提示）；自动检查按版本跨重启去重：同一版本只提醒一次。
+      // 通知里不给耗时承诺：点击那一刻的耗时取决于预装是否已完成，具体秒数在按钮 tooltip 上按状态给。
       if (reason !== 'manual') {
         const claimed = claimAvailableNotice ? claimAvailableNotice(latest.version) : lastNotifiedVersion !== latest.version
         if (claimed) {
           lastNotifiedVersion = latest.version
           notify('DeepSeek Harness', plan.kind === 'source'
             ? `新版本 v${latest.version} 可用：当前为源码安装，请打开DSHL 控制台点"手动更新"（git pull && pnpm run build）`
-            : `新版本 v${latest.version} 可用：打开DSHL 控制台点"立即更新"即可升级（npm 安装约 2-5 分钟）`)
+            : `新版本 v${latest.version} 可用：点右上角「有更新」或控制台「立即更新」即可升级（会重启服务，进行中的对话会中断）`)
         }
       }
     } else {
       log(`dsh-update: v${current} 已是最新（latest v${latest.version}）`)
       setState({ status: 'up-to-date' })
+      // 已是最新：暂存目录里剩下的都是过期物（含切换失败留下的 rejected-*），顺手清掉。
+      // 正在预装时不动（那份还在写盘，删了只会让本次预装白跑）。
+      if (!warming) cleanupStage(stageRootOf(installDir), '')
     }
   } catch (err) {
     log('dsh-update: check failed: ' + (err && err.message ? err.message : String(err)))
@@ -562,6 +966,7 @@ async function updateNow() {
     txInfo = { kind: plan.kind, from: fromVersion, to: latest }
     emitLifecycle('update.dsh', { step: 'start', from: fromVersion, to: latest, kind: plan.kind })
     let globalRootForRollback = ''
+    let swapState = null // 改成名切换成功后留下的切换现场（回滚/收尾都按它走）
 
     const svc = getServerState ? getServerState() : { running: false }
     const wasRunning = svc.running
@@ -604,13 +1009,23 @@ async function updateNow() {
       const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
       globalRootForRollback = globalRoot
       if (markProgress) markProgress('install')
-      const r = await runGlobalUpdate(plan.nodeCmd, globalRoot, latest)
-      if (!r.ok) {
-        if (wasRunning) {
-          try { await startService() } catch { /* noop */ } // 旧版完好，直接拉回
-          if (reloadWebTabs) reloadWebTabs()
+      // 首选：把后台预装好的整棵树改名顶上（实测 0.04s，替掉 40s 的解包落盘）
+      const installDir = (report.dsh && report.dsh.dir) || ''
+      const sw = await swapStagedInto({ nodeBin: plan.nodeCmd, installDir, version: latest, from: fromVersion })
+      if (sw.ok) {
+        swapState = sw
+        log(`dsh-update: staged swap ok in ${sw.ms}ms（备份保留至校验/回滚结束）：${sw.backupDir}`)
+      } else {
+        // 没有预装树（用户点得太快 / 预装失败 / 被渠道切换作废）→ 退回完整安装，行为与从前一致
+        if (sw.reason !== 'no-staged-tree') log('dsh-update: staged swap unavailable (' + sw.reason + ')，改用 npm install -g')
+        const r = await runGlobalUpdate(plan.nodeCmd, globalRoot, latest)
+        if (!r.ok) {
+          if (wasRunning) {
+            try { await startService() } catch { /* noop */ } // 旧版完好，直接拉回
+            if (reloadWebTabs) reloadWebTabs()
+          }
+          throw new Error(r.error)
         }
-        throw new Error(r.error)
       }
     } else if (plan.kind === 'npx') {
       // npx 缓存：先迁移到全局 npm（统一渠道），失败回退 npx 预热
@@ -677,7 +1092,10 @@ async function updateNow() {
         const why = decision.reason
         log(`dsh-update: v${latest} 启动失败/版本不符，回滚到 v${fromVersion} …（${why}）`)
         emitLifecycle('update.dsh', { step: 'rollback-start', from: fromVersion, to: latest, reason: why })
-        const rb = await runGlobalUpdate(plan.nodeCmd, globalRootForRollback, fromVersion)
+        // 改名切换过的：旧树还在暂存目录里，改名回来就是回滚（省掉一次重装旧版的 40s）
+        const rb = swapState
+          ? await restoreSwap(swapState, plan.nodeCmd)
+          : await runGlobalUpdate(plan.nodeCmd, globalRootForRollback, fromVersion)
         if (rb.ok) {
           try { await refreshEnv(true) } catch { /* noop */ }
           if (wasRunning) {
@@ -699,7 +1117,8 @@ async function updateNow() {
         emitLifecycle('update.dsh', { step: 'rollback-failed', from: fromVersion, to: latest })
         notify('DeepSeek Harness', `DSH v${latest} 启动失败，回滚到 v${fromVersion} 也未成功；请手动执行：npm i -g --prefix "${globalRootForRollback}" @deepseek-ai/dsh@${fromVersion}，然后重新启动服务`)
         setState({ status: 'error', error: `v${latest} 启动失败，回滚也未成功（请查看控制台日志）` })
-        try { clearUpdateState() } catch { /* noop */ }
+        // 改名回退也可能只做了一半：此时安装目录可能不存在，事务状态就是唯一的修复凭据，不能清
+        if (!swapState) { try { clearUpdateState() } catch { /* noop */ } }
         return
       }
       log(`dsh-update: post-update verification failed (start=${startOk}, runningVersion=${runningVersion || '?'})`)
@@ -717,27 +1136,79 @@ async function updateNow() {
       hasToken: readPageCredential().hasToken,
     })
     if (!outcome.ok) {
+      // 还没回滚过、且手上就有旧树（改名切换留下的备份）→ 直接恢复：
+      // 让用户面对一个"起不来的新版"没有意义。decideRollback 只在"知道旧版本号"时才给回滚动作，
+      // 拿不到旧版本号（fromVersion 为空）的场景在这里补上。
+      if (swapState && !rollbackUsed) {
+        rollbackUsed = true
+        log(`dsh-update: ${outcome.reason}，用改名把旧树恢复回来 …`)
+        emitLifecycle('update.dsh', { step: 'rollback-start', from: fromVersion, to: latest, reason: outcome.reason })
+        const rb = await restoreSwap(swapState, plan.nodeCmd)
+        if (rb.ok) {
+          try { await refreshEnv(true) } catch { /* noop */ }
+          if (wasRunning) {
+            try { await startService() } catch { /* noop */ }
+            if (reloadWebTabs) reloadWebTabs()
+          }
+          const backVersion = rb.version || fromVersion || '旧版本'
+          log(`dsh-update: restored previous tree (v${backVersion})`)
+          emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest, mode: 'swap' })
+          notify('DeepSeek Harness', `DSH v${latest} 未能确认更新成功（${outcome.reason}），已恢复原来的 v${backVersion}`)
+          setState({ status: 'error', error: `v${latest} 未生效，已恢复 v${backVersion}` })
+          try { clearUpdateState() } catch { /* noop */ }
+          return
+        }
+        // 恢复本身也可能只做了一半：把事务留在盘上，交给下次启动的 recoverInterruptedUpdate
+        log('dsh-update: restore by rename failed（保留更新事务，交给下次启动修复）: ' + (rb.error || ''))
+        notify('DeepSeek Harness', outcome.message + '；已保留更新事务，重启启动器会自动修复')
+        setState({ status: 'error', error: outcome.message })
+        return
+      }
       notify('DeepSeek Harness', outcome.message)
       log(`dsh-update: reported failure after install (${outcome.reason}, startOk=${startOk}, runningVersion=${runningVersion || '?'}, latest=${latest})`)
       emitLifecycle('update.dsh', { step: 'updated-start-failed', from: fromVersion, to: latest, kind: plan.kind, startOk, runningVersion })
-      try { clearUpdateState() } catch { /* noop */ }
+      // 新版已经顶上但没确认成功：备份留着（路径已记日志），不在这里删，给人工退路
+      if (!swapState) { try { clearUpdateState() } catch { /* noop */ } }
       setState({ status: 'error', error: outcome.message })
       return
     }
     notify('DeepSeek Harness', outcome.message)
     log(`dsh-update: updated to v${latest}${/凭据已变化/.test(outcome.message) ? ' (page credential changed)' : ''}`)
     emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
+    finalizeSwap(swapState) // 更新确认成功：删掉旧树备份与暂存残留
     try { clearUpdateState() } catch { /* noop */ }
     setState({ status: 'updated', current: latest })
   } catch (err) {
     log('dsh-update: update failed: ' + (err && err.message ? err.message : String(err)))
     emitLifecycle('update.dsh', { step: 'failed', error: ((err && err.message) || String(err)).slice(0, 128) })
     setState({ status: 'error', error: err && err.message ? err.message : String(err) })
-    // 已明确失败（非被中断）：写终态，避免下次启动被自愈逻辑当成"未完成的更新"重装一遍
-    if (txInfo) { try { writeUpdateState(Object.assign({}, txInfo, { phase: 'failed' })) } catch { /* noop */ } }
+    // 已明确失败（非被中断）：写终态，避免下次启动被自愈逻辑当成"未完成的更新"重装一遍。
+    // 但改名切换事务不能标 failed —— 下次启动要靠它判断"补完 / 退回"。
+    if (txInfo && !swapState) { try { writeUpdateState(Object.assign({}, txInfo, { phase: 'failed' })) } catch { /* noop */ } }
   } finally {
     updating = false
   }
 }
 
-module.exports = { initDshUpdater, checkOnce, updateNow, getState, warmLatest, decideRollback, decideUpdateTarget, decideUpdateOutcome, noteChannelChange, recoverInterruptedUpdate }
+module.exports = {
+  initDshUpdater,
+  checkOnce,
+  updateNow,
+  getState,
+  warmLatest,
+  decideRollback,
+  decideUpdateTarget,
+  decideUpdateOutcome,
+  // 预装/改名切换（纯函数，供测试直接验证判定逻辑）
+  npmPrefixOf,
+  stageRootOf,
+  planSwapPaths,
+  decideStagedInstall,
+  decideSwapRecovery,
+  staleStageEntries,
+  // 切换动作本身也导出：测试用真实目录演练"顶上 / 退回"，而不是只测判定
+  swapStagedInto,
+  restoreSwap,
+  noteChannelChange,
+  recoverInterruptedUpdate,
+}
