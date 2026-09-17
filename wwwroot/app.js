@@ -1554,7 +1554,11 @@ function pluginCardEl(p) {
   }
   const list = Array.isArray(p.actions) ? p.actions : [];
   if (!list.length && p.busy) {
-    const wait = document.createElement('span'); wait.className = 'plugin-action-hint'; wait.textContent = '正在处理…'; actions.appendChild(wait);
+    // 忙态文案由主进程给（安装中…/卸载中…/重新安装中…/更新中…）：带开关的卡片没有状态胶囊，
+    // 这行就是"正在做什么"的唯一落点，泛泛的"正在处理…"说不清在做什么。
+    const wait = document.createElement('span'); wait.className = 'plugin-action-hint';
+    wait.textContent = (p.status && p.status.label) || '正在处理…';
+    actions.appendChild(wait);
   }
   for (const act of list) {
     const btn = document.createElement('button');
@@ -1737,6 +1741,25 @@ function setPluginFilter(filter) {
 }
 
 // 卡片内所有交互走这里：操作按钮 + 开关式插件的启停
+// 动作 → 结果措辞（按钮文案的动词化）。按钮走的是"停服务 → 改 profile → 重启服务"整段，
+// 耗时与说明页同口径（loading.js 的 plugin 档：约 10~60 秒），所以进度与结果都必须显式说出来。
+const PLUGIN_ACTION_VERB = {
+  install: '安装', uninstall: '卸载', reinstall: '重新安装', update: '更新',
+  enable: '启用', disable: '关闭',
+};
+function pluginDisplayName(id) {
+  const p = (window._plugins || []).find((x) => x.id === id);
+  return (p && (p.name || p.id)) || id;
+}
+/** 卡片级进度/结果文案：按钮自己的"处理中…"只在那一个节点上，重渲染就没了，这里落在卡片上。 */
+function setPluginCardFeedback(btn, text) {
+  const card = btn && btn.closest('.plugin-card');
+  const feedback = card && card.querySelector('.plugin-feedback');
+  if (!feedback) return;
+  feedback.textContent = text;
+  feedback.classList.remove('hidden');
+}
+
 $('pluginCards').addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-plugin-action]');
   if (!btn) return;
@@ -1752,21 +1775,27 @@ $('pluginCards').addEventListener('click', async (e) => {
     if (!ok) return;
   }
   const old = btn.textContent;
+  const name = pluginDisplayName(id);
+  const verb = PLUGIN_ACTION_VERB[action] || '处理';
   btn.disabled = true;
   btn.textContent = '处理中…';
+  setPluginCardFeedback(btn, `正在${verb}「${name}」…（会重启 DSH 服务，约 10~60 秒）`);
   const r = await cmd('pluginAction', { id, action });
-  const fresh = await cmd('pluginsGetState');
-  if (fresh) renderPlugins(fresh, true);
   if (!r || !r.ok) {
-    const card = btn.closest('.plugin-card');
-    const feedback = card && card.querySelector('.plugin-feedback');
-    if (feedback) {
-      feedback.textContent = '✕ ' + ((r && r.error) || '操作失败，请查看日志');
-      feedback.classList.remove('hidden');
-    }
+    const msg = (r && r.error) || '操作失败，请查看日志';
+    setPluginCardFeedback(btn, '✕ ' + msg);
+    showConsoleToast(`✕ ${verb}「${name}」失败：${msg}`);
     btn.disabled = false;
     btn.textContent = old;
+  } else {
+    // 成功必须自己说一声：卡片重渲染只是"状态变了"，不解释"刚刚发生了什么"
+    showConsoleToast(r.restartPending
+      ? `已${verb}「${name}」；点顶部「立即重启生效」后生效`
+      : `已${verb}「${name}」，服务已重启生效`);
   }
+  // 刷新放最后：重渲染会把上面写过的卡片节点换掉，失败提示靠 toast + 主进程下发的 error 落地
+  const fresh = await cmd('pluginsGetState');
+  if (fresh) renderPlugins(fresh, true);
 });
 
 // 开关式插件（如手机连接）：勾选即开启、取消即关闭并卸载

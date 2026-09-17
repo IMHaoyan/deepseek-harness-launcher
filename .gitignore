@@ -22,6 +22,7 @@ assets/node-dist/
 .codex/
 .codex-remote-attachments/
 .playwright-cli/
+.playwright-mcp/
 
 # alpha 预发布记录：只做本地存盘（不发公告、也不进公开仓库），转正式版时才把内容汇总成正式版公告
 .alpha-notes/

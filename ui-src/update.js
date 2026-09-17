@@ -17,7 +17,7 @@ const MAX_VERSIONS = 30
 
 // 动作进行中时抑制状态回跳（下载进度推送会让状态在 downloading 间抖动）
 const busy = { launcher: false, dsh: false }
-const released = { launcher: false, dsh: false }
+const released = { launcher: false }
 
 /** 更新窗口的所有命令都走独立通道 update:cmd；主进程只放行该窗口需要的一组动作。 */
 async function cmd(name, value) {
@@ -55,9 +55,27 @@ const DSH_STATUS = {
   checking: '检查中…',
   available: '有新版本',
   updating: '更新中…',
+  updated: '已更新',
   'up-to-date': '已是最新',
-  error: '检查失败',
+  error: '检查/更新失败',
   idle: '未检查',
+}
+
+/**
+ * 点击闩锁是否该释放（纯函数，便于测试钉住「主进程报出终态就必须释放」这条不变式）。
+ *
+ * busy.dsh 是渲染进程本地的「我刚在这里点了更新」标记，只负责盖住「点击 → 主进程把状态置为
+ * updating」之间那一小段空档。它必须由主进程报出的状态收尾：成功是 updated、失败是 error，
+ * 而旧写法只在「available 且带错误」时释放 —— 成功与失败两种收场都会永远停在「更新中…」，
+ * 一直到窗口重开为止（2026-09-17 实测：更新已完成、服务已重启，行内仍显示更新中）。
+ * 只有 updating（确实在进行中）与 available（点击后可能先到的一条旧状态）不释放。
+ */
+function dshBusyRelease(input) {
+  const src = input || {}
+  if (src.busy !== true) return false
+  if (src.status === 'updating') return false
+  if (src.status === 'available') return !!src.error
+  return true
 }
 
 function renderVersion(el, current, latest, pending) {
@@ -123,7 +141,7 @@ function renderLauncher(state) {
 function renderDsh(state) {
   const s = state || {}
   const status = s.status || 'idle'
-  if (busy.dsh && status === 'available' && s.error) busy.dsh = false
+  if (dshBusyRelease({ busy: busy.dsh, status, error: s.error })) busy.dsh = false
 
   renderVersion($('updDshVersion'), s.current, status === 'available' ? s.latest : '', status === 'updating')
 
@@ -144,7 +162,6 @@ function renderDsh(state) {
     btn.textContent = `更新到 v${s.latest}`
     btn.addEventListener('click', async () => {
       busy.dsh = true
-      released.dsh = true
       btn.disabled = true
       btn.textContent = '正在更新…'
       await cmd('dshUpdateNow')
@@ -163,8 +180,10 @@ function renderDsh(state) {
   }
 
   const note = document.createElement('span')
-  note.className = 'upd-note' + ((status === 'up-to-date') ? ' ok' : '')
+  note.className = 'upd-note' + ((status === 'up-to-date' || status === 'updated') ? ' ok' : '')
   note.textContent = DSH_STATUS[status] || DSH_STATUS.idle
+  // 失败原因按需降级到 tooltip：行内只放状态词，原因一长就会撑破这一行
+  if (s.error) note.title = s.error
   box.appendChild(note)
 }
 
@@ -339,6 +358,7 @@ async function loadChangelog(force) {
   if (changelogLoaded && !force) return
   const status = $('updChangelogStatus')
   status.textContent = '加载中…'
+  status.title = '' // 上一次的失败理由不能留在 tooltip 上冒充这一次的
   try {
     const r = await cmdUpd('changelogGet', { force: !!force })
     if (!r || !r.ok) throw new Error((r && r.error) || '主进程未返回更新内容')
@@ -346,9 +366,11 @@ async function loadChangelog(force) {
     changelogLoaded = true
     renderReleases(releases)
     const more = releases.length === MAX_VERSIONS ? `（只看最近 ${MAX_VERSIONS} 个版本）` : ''
-    // 主进程用旧缓存兜底时如实说明，别让用户以为这就是最新列表
+    // 主进程用旧缓存兜底时如实说明，别让用户以为这就是最新列表。
+    // 失败原因不占版面（行内只够放"刷新失败"），具体理由挂 tooltip —— 而"离线"是猜的，不能用它当理由。
+    status.title = r.error || ''
     status.textContent = r.error
-      ? `共 ${releases.length} 个版本（离线，显示上次缓存）`
+      ? `共 ${releases.length} 个版本（刷新失败，显示上次缓存）`
       : `共 ${releases.length} 个版本${more}`
   } catch (err) {
     const box = $('updChangelog')

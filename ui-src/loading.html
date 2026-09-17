@@ -22,7 +22,6 @@
       .bar .fill { background: #4D8DFF !important; }
       #btnReload { background: rgba(255,255,255,0.92) !important; color: #1A1C1E !important; }
       #btnSecondary { border-color: rgba(255, 255, 255, 0.3); }
-      #btnConsole { border-color: rgba(255, 255, 255, 0.3); }
     }
     .card {
       background: #FFFFFF;
@@ -56,6 +55,9 @@
     .phase { font-size: 12px; color: #8A9098; line-height: 18px; margin: 0 0 12px; word-break: break-all; }
     .phase.hidden { display: none; }
     .sub { font-size: 13px; color: #61666B; line-height: 20px; margin: 0 0 16px; }
+    /* 第二行（重启页把句子断在句号后，避免“进入。”被拆到两行）：与上一行连成一段，不额外撑高卡片 */
+    #sub2 { margin: -16px 0 16px; }
+    #sub2.hidden { display: none; }
     body.failed h1 { color: #B42318; }
     #btnReload {
       border: none; border-radius: 8px; padding: 9px 22px;
@@ -69,11 +71,6 @@
     }
     #btnSecondary:hover { background: rgba(0, 0, 0, 0.05); }
     #btnSecondary.hidden { display: none; }
-    #btnConsole {
-      border: 1px solid rgba(0, 0, 0, 0.18); border-radius: 8px; padding: 8px 18px;
-      background: transparent; color: inherit; font-size: 13px; cursor: pointer; margin-left: 10px;
-    }
-    #btnConsole:hover { background: rgba(0, 0, 0, 0.05); }
     #btnReload.hidden { display: none; }
     .hint { font-size: 12px; color: #61666B; line-height: 18px; margin: 0 0 12px; }
     .hint.hidden { display: none; }
@@ -86,11 +83,11 @@
     <p class="step hidden" id="step"></p>
     <p class="phase hidden" id="phase"></p>
     <div class="bar"><div class="fill"></div></div>
-    <p class="sub" id="sub">首次启动通常需要 3~15 秒，服务就绪后窗口会自动进入。</p>
+    <p class="sub" id="sub">首次启动通常需要 8~15 秒，服务就绪后窗口会自动进入。</p>
+    <p class="sub hidden" id="sub2"></p>
     <p class="hint hidden" id="hint"></p>
     <button id="btnReload">重新加载</button>
     <button id="btnSecondary" class="hidden">再刷新一次</button>
-    <button id="btnConsole">打开 DSHL 控制台</button>
   </div>
   <script src="loading.js"></script>
 </body>

@@ -22,7 +22,7 @@ test('自己人页面（控制台/窗口壳）任何命令都放行', () => {
 })
 
 test('说明页的白名单命令放行（含带 query 的真实地址）', () => {
-  for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart', 'browser:consoleToggle']) {
+  for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart']) {
     assert.equal(trust.decideCommand(tab(AUTH_PAGE), LOADING_URL, name), 'allow', `说明页应放行 ${name}`)
   }
   // loadingUrl() 生成的一律是 `…loading.html?reason=…`；裸地址与 hash 也算说明页
@@ -63,8 +63,9 @@ test('非我们视图的发送方（含取不到发送方）一律拒绝', () =>
   }
 })
 
-test('判定表本身：说明页白名单恰好四条，不多不少', () => {
-  assert.deepEqual([...trust.LOADING_PAGE_COMMANDS].sort(), ['browser:authRestart', 'browser:blockSwitch', 'browser:consoleToggle', 'browser:fixPane'])
+// 说明页上没有“打开控制台”按钮了（用户要求删掉）→ 白名单也不该再留这条：界面不动用的权限就不该给
+test('判定表本身：说明页白名单恰好三条，不多不少', () => {
+  assert.deepEqual([...trust.LOADING_PAGE_COMMANDS].sort(), ['browser:authRestart', 'browser:blockSwitch', 'browser:fixPane'])
 })
 
 test('isLoadingPageUrl：参数非法/空值不抛错且判否', () => {

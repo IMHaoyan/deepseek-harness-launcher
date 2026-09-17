@@ -13,7 +13,7 @@
 
 // 说明页自己会用的命令（ui-src/loading.js）：重载此页 / 换端口并启动 / 重启服务以恢复访问。
 // 信任边界必须收在这三条上——DSH 页面（或用户在其中跳转到的站点）拿不到这份信任。
-const LOADING_PAGE_COMMANDS = new Set(['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart', 'browser:consoleToggle'])
+const LOADING_PAGE_COMMANDS = new Set(['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart'])
 
 /**
  * URL 是否就是说明页本身。允许带 query/hash（loadingUrl() 生成的就是 `…loading.html?reason=…`），

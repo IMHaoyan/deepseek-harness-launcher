@@ -77,7 +77,8 @@
 - **一键全部安装**：依次补齐所有尚未安装的插件；已安装的不动，不做静默升级。
 - **不靠关闭策略换成功率**：装 / 卸默认按 pnpm 自己的策略跑 —— 这样 pnpm 会把点名安装的新鲜版本写进 profile 的 `minimumReleaseAgeExclude`，锁文件保持合规，DSH 内置市场、终端里的 pnpm、IDE 都不会被这次安装连坐；只有真的被「24h 新版本观察期」整体拒绝时，才用 `--config.minimumReleaseAge=0` 一次性放行重试一次（这次重试不写放行记录，所以只能当兜底）。
 - **失败按原因归类**：一批插件同一原因失败时（观察期拒绝整份锁文件、`node_modules` 被别的进程占用、npm 源限流 429、pnpm 未就绪），插件页只给**一条**解释 + 一次「重试失败的插件」，卡片上仍保留各自的错误原文；能算出自愈时刻的按本地时间写出来（观察期 = 最晚的发布时间 + 24h），不写「稍后再试」这类没法验证的话。靠在观察期上一次性放行装好时只留一句概览行后缀（全文在 tooltip），不占版面。
-- **默认代装**：插件市场（`dshmarket`）、手机连接（DSH Bridge Next，随安装包分发，入口在 DSH 设置页「手机连接」分区）默认开启；用量与计费（`@kenz1117/dsh-ui-usage-billing`）、技能管理（`@michengai/dsh-skills-manager`）、会话归档（`@michengai/dsh-archive-manager`）、对话回退（`dsh-rewind-plugin`）在首次运行或升级后自动补装一次 —— 用户手动卸载过就不再装回，手动装回后恢复自动维护。**以下保持手动安装**（卡片标「手动安装」，仍可一键装）：增强侧边栏（`dsh-better-sidebar`）、划线提问（`dsh-sidebar-qa`）、MCP Lens（`dsh-mcp-lens`）、Codex 风格界面（`@michengai/dsh-codex-ui`）、会话导入（`dsh-chat-import`）。其中 MCP Lens 上游在 npm 上只发布过预发布版（`0.1.0-rc.9`，npm 的 `latest` 也指向它），因此不进默认代装集合；启动器接受**精确的**预发布版本，所以它的卡片能正常安装 / 重新安装、也能正确判定可更新（拒绝的始终是 `^1.0.0`、`latest` 这类不确定的写法，不是预发布后缀本身）。划线提问依赖增强侧边栏（前者未装时它只是不显示入口，不会报错）。
+- **默认代装**：插件市场（`dshmarket`）、手机连接（DSH Bridge Next，随安装包分发，入口在 DSH 设置页「手机连接」分区）默认开启；用量与计费（`@kenz1117/dsh-ui-usage-billing`）、技能管理（`@michengai/dsh-skills-manager`）、对话回退（`dsh-rewind-plugin`）在首次运行或升级后自动补装一次 —— 用户手动卸载过就不再装回，手动装回后恢复自动维护。**以下保持手动安装**（卡片标「手动安装」，仍可一键装）：增强侧边栏（`dsh-better-sidebar`）、划线提问（`dsh-sidebar-qa`）、Codex 风格界面（`@michengai/dsh-codex-ui`）、会话导入（`dsh-chat-import`）。划线提问依赖增强侧边栏（前者未装时它只是不显示入口，不会报错）。
+- **已停用并自动卸载**：会话归档（`@michengai/dsh-archive-manager`）与 MCP Lens（`dsh-mcp-lens`）已从预装集合移除，插件页不再有这两张卡片。老用户升级到本版本后，启动器会在服务就绪时把它们从 profile 里真正卸载（`RETIRED_NPM_PLUGINS` + `maybeRemoveRetiredPlugins`）：每个启动器版本最多清理一次，卸完重启一次服务生效，失败只记日志、下次启动再补；没有残留的机器只记一次账、不打扰。清理成功时顺带删掉这两个 id 在 DSHL 配置里的「不再自动安装」与卡片备注死键，其它插件不受影响。
 - **与 DSH 插件市场同源**：在 DSH 内置市场里的启停会同步到同一份 patch 层；carrier 插件（如 Codex 风格界面）被关闭时会一并恢复它对外层侧栏 / 设置行的覆盖，不会留下「侧栏消失」的状态。
 
 ### 更新

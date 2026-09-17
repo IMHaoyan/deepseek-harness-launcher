@@ -109,8 +109,14 @@ test('导航栏「有更新」徽标：位置、显隐与点击都在壳里', ()
   assert.match(mainJs, /case 'browser:updateOpen': showUpdateWindow\(\)/, '主进程应有 browser:updateOpen 分支')
   assert.match(shellHtml, /<span class="update-badge-label">有更新<\/span>/, '初始档必须是"有更新"（首帧推送前不许宣称就绪）')
   assert.match(shellCss, /\.win-btn\.update-badge \{/, '徽标应有自己的样式')
-  assert.match(shellCss, /\.win-btn\.update-badge \{\n  width: auto;[\s\S]*?background: rgba\(22, 163, 74, 0\.14\);/, '默认档应为淡绿底（有更新）')
+  // 默认档（有更新）：灰底白字 —— 只传达"有新东西"，不承诺耗时
+  assert.match(shellCss, /\.win-btn\.update-badge \{\n  width: auto;[\s\S]*?color: #FFFFFF;\n  background: #61666B;/, '默认档应为灰底白字（有更新）')
+  assert.match(shellCss, /\.win-btn\.update-badge:hover \{ color: #FFFFFF; background: #4B5057; \}/, '默认档悬停应为更深的灰 + 白字')
+  // 就绪档只能是绿色实底白字（唯一一档实底强调色）
   assert.match(shellCss, /\.win-btn\.update-badge\.ready \{ color: #FFFFFF; background: #16A34A; \}/, '就绪档应为绿色实底白字（可更新）')
+  // 旧的淡绿底/深绿字口径必须彻底退场：两处颜色一旦并存，同一档在不同主题下会变成两种样子
+  assert.ok(!/rgba\(22, 163, 74, 0\.14\)/.test(shellCss), '默认档不该再是淡绿底')
+  assert.ok(!/rgba\(34, 197, 94, 0\.18\)/.test(shellCss), '深色主题不该再单独改默认档底色')
 })
 
 test('导航栏徽标的数据来自主进程推送（两者任一有更新就显示）', () => {
@@ -172,6 +178,66 @@ test('徽标两档的渲染契约：文案、样式与悬停解释都跟着 tier
   const builtCss = read('wwwroot/browser.css')
   assert.match(builtShell, /✓ 可更新/, 'wwwroot 未同步：请执行 npm run build:assets')
   assert.match(builtCss, /\.win-btn\.update-badge\.ready/, 'wwwroot 未同步：请执行 npm run build:assets')
+})
+
+test('更新窗口：DSH 行的点击闩锁必须由主进程终态释放（不许永远停在「更新中…」）', () => {
+  // 判定是纯函数：直接跑真实源码片段，而不是只做正则匹配
+  const start = js.indexOf('function dshBusyRelease(input) {')
+  const end = js.indexOf('\n}\n', start) + 3
+  assert.ok(start > 0 && end > start, 'update.js 应有 dshBusyRelease 纯函数')
+  const release = new Function(js.slice(start, end) + '\nreturn dshBusyRelease')()
+  const at = (status, error) => release({ busy: true, status, error })
+  // 进行中：不许释放（否则按钮闪回，用户以为要再点一次）
+  assert.equal(at('updating', ''), false, 'updating 必须保持闩锁')
+  assert.equal(at('available', ''), false, 'available（点击后可能先到的旧状态）保持闩锁')
+  // 主进程报出的终态：必须释放 —— 这四种里少一种就是"永远卡在更新中"（实测踩过 updated）
+  assert.equal(at('updated', ''), true, '更新成功（updated）必须释放闩锁')
+  assert.equal(at('up-to-date', ''), true, '已是最新必须释放')
+  assert.equal(at('error', 'v0.1.6 启动失败'), true, '更新失败（error）必须释放，否则失败也显示"更新中"')
+  assert.equal(at('idle', ''), true, '回到 idle 必须释放')
+  assert.equal(at('available', '缓存已作废'), true, '带错误的 available 必须释放')
+  // 没点过就不该有闩锁
+  assert.equal(release({ busy: false, status: 'updating' }), false, '未点击时无需释放')
+  for (const bad of [undefined, null, {}, { busy: true }, { busy: 'true', status: 'updated' }]) {
+    assert.equal(typeof release(bad), 'boolean', '脏输入不得抛错：' + JSON.stringify(bad))
+  }
+  // 接线：renderDsh 必须用它，且成功态有对应文案（否则释放后落到"未检查"，也是一种说谎）
+  assert.match(js, /if \(dshBusyRelease\(\{ busy: busy\.dsh, status, error: s\.error \}\)\) busy\.dsh = false/, 'renderDsh 必须用 dshBusyRelease 释放闩锁')
+  assert.match(js, /updated: '已更新'/, 'DSH_STATUS 必须有 updated 文案')
+  assert.match(js, /const busy = \{ launcher: false, dsh: false \}/, 'busy.dsh 仍应是唯一的点击闩锁')
+  assert.match(js, /status === 'up-to-date' \|\| status === 'updated'/, '成功态应与其他"成功"同样用 ok 颜色')
+})
+
+test('更新窗口：终态文案覆盖主进程实际会给出的每个状态', () => {
+  const start = js.indexOf('const DSH_STATUS = {')
+  const end = js.indexOf('\n}\n', start) + 3
+  const table = new Function(js.slice(start, end) + '\nreturn DSH_STATUS')()
+  // dsh-update.js 的状态机：idle | checking | available | updating | updated | error | up-to-date
+  for (const status of ['checking', 'available', 'updating', 'updated', 'up-to-date', 'error', 'idle']) {
+    assert.ok(table[status], `DSH_STATUS 缺 ${status} 文案（会回落到"未检查"，与真实状态不符）`)
+  }
+  assert.equal(table.error, '检查/更新失败', 'error 要同时覆盖"检查失败"与"更新失败"两种情况')
+})
+
+test('更新内容：GitHub 限流（403）要给出可读原因，不能只报状态码', () => {
+  const changelogMod = require('../changelog')
+  const limited = { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1789614184' }
+  const text = changelogMod.httpErrorText(403, limited)
+  assert.match(text, /限流/, '403 + 配额用尽必须说"限流"')
+  assert.match(text, /60 次\/IP/, '要说清配额口径')
+  assert.match(text, /恢复/, '要给出预计恢复时间')
+  // 恢复时间按本地时间展示（与启动器其余时间口径一致）：用同一算法算出期望值，避免测试绑死时区
+  const local = new Date(1789614184 * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  assert.ok(text.includes(local), `恢复时间应为本地时间 ${local}：` + text)
+  // 不带限流头（或不是配额问题）时不许编造原因
+  assert.equal(changelogMod.httpErrorText(403, {}), 'HTTP 403')
+  assert.equal(changelogMod.httpErrorText(404, limited), 'HTTP 404')
+  assert.equal(changelogMod.httpErrorText(500, { 'x-ratelimit-remaining': '59' }), 'HTTP 500')
+  const text429 = changelogMod.httpErrorText(429, { 'x-ratelimit-remaining': '59' })
+  assert.match(text429, /限流/, '429 本身就是限流')
+  assert.ok(!/恢复/.test(text429), '没有 reset 头就不许编恢复时间')
+  const changelogJs = read('changelog.js')
+  assert.match(changelogJs, /done\(new Error\(httpErrorText\(response\.statusCode, response\.headers\)\)\)/, '取数失败必须走 httpErrorText')
 })
 
 test('更新窗口的窗口模块与打包清单', () => {

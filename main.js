@@ -109,7 +109,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
@@ -138,7 +138,7 @@ function initEnvRuntime() {
         await refreshEnv(true)
         if (silent) {
           log('silent install done, detection switched (service left as-is)')
-          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallPluginMarket(); void maybeAutoInstallBridge(); void maybeAutoInstallRecommendedPlugins() }
+          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallPluginMarket(); void maybeAutoInstallBridge(); void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
           return
         }
         if (envReady()) {
@@ -147,6 +147,7 @@ function initEnvRuntime() {
           void maybeAutoInstallPluginMarket() // 首次安装环境完成后：默认装上插件市场
           void maybeAutoInstallBridge() // 以及远程连接插件
           void maybeAutoInstallRecommendedPlugins() // 以及默认代装的推荐插件
+          void maybeRemoveRetiredPlugins() // 以及自动卸掉已从注册表摘除的退役插件（老用户升级后生效）
           if (server.running()) {
             await sleep(400)
             openWebUi({ hideConsole: true }) // 新手完成感：服务就绪后自动回到 DeepSeek Harness
@@ -210,7 +211,8 @@ function maybeStartDeferred() {
     void handleStart()
     void maybeAutoInstallPluginMarket() // 环境/服务刚就绪：补上插件市场默认安装
     void maybeAutoInstallBridge() // 远程连接插件同样补装
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 会话归档 / 对话回退）同样补装
+    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 对话回退）同样补装
+    void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）同样补卸
   }
 }
 
@@ -385,6 +387,8 @@ function applyConfigJson(cfg) {
   // 推荐插件（npm 分发）默认自动安装记账：每个启动器版本只自动尝试一次；
   // pluginAutoDeclined 记「用户手动卸载过」的插件 id，卸载过的以后不再自动装回来（手动装回来会清除）。
   if (typeof cfg.pluginAutoInstallTriedVersion === 'string') Config.pluginAutoInstallTriedVersion = cfg.pluginAutoInstallTriedVersion
+  // 退役插件（已从注册表摘掉的会话归档 / MCP Lens）自动卸载记账：清理成功才写，失败下次启动再补
+  if (typeof cfg.pluginRetiredCleanupVersion === 'string') Config.pluginRetiredCleanupVersion = cfg.pluginRetiredCleanupVersion
   if (cfg.pluginAutoDeclined && typeof cfg.pluginAutoDeclined === 'object' && !Array.isArray(cfg.pluginAutoDeclined)) {
     for (const [id, val] of Object.entries(cfg.pluginAutoDeclined)) {
       if (typeof id === 'string' && id && val === true) Config.pluginAutoDeclined[id] = true
@@ -1675,7 +1679,8 @@ async function maybeAutoRestart() {
 }
 
 // ---------- 稳定性：活跃运行证据 / 健康门 / 健康快照 / 崩溃回退 / 诊断（借鉴 dsh-desktop） ----------
-let runGuardHandle = null // run-guard 会话句柄（markClean 必需，禁止跨会话缓存）let healthCaptured = false // 本次运行是否已捕获健康快照（single-flight）
+let runGuardHandle = null // run-guard 会话句柄（markClean 必需，禁止跨会话缓存）
+let healthCaptured = false // 本次运行是否已捕获健康快照（single-flight）
 let healthTimer = null
 let healthFault = false // 就绪后到捕获前出现加载失败/异常退出 → 本次不捕获
 let fastCrashStreak = 0 // 就绪后 RESTART_STABLE_MS 内再次崩溃的连续次数：不依赖计数窗口的硬止损
@@ -2362,9 +2367,10 @@ function cleanInstalledVersion(spec) {
 // 卡片渲染 / 安装 / 卸载 / 更新检查都是通用的（统一走 market.installByName / uninstallByName）。
 // autoInstall: true 表示「默认代装」：首次运行或升级到本版本时由启动器自动补装一次
 //（见 maybeAutoInstallRecommendedPlugins）；用户手动卸载过就不再自动装回来。
-// 当前默认代装集合：用量与计费 / 技能管理 / 会话归档 / 对话回退。
-// 不代装的（卡片标「手动安装」，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、
-// MCP Lens（上游在 npm 上只有预发布版，稳定版校验会拒绝）、会话导入；改集合须同步
+// 当前默认代装集合：用量与计费 / 技能管理 / 对话回退。
+// 不代装的（卡片标「手动安装」，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、会话导入。
+// 从本版本起摘出注册表的两个（会话归档 / MCP Lens）只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
+// 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
 // tests/plugin-page-wiring.test.js 的默认代装断言与 README「预装插件」小节。
 const MANAGED_NPM_PLUGINS = [
   {
@@ -2420,17 +2426,6 @@ const MANAGED_NPM_PLUGINS = [
     category: '技能管理',
   },
   {
-    id: 'archive-manager',
-    order: 60,
-    npm: '@michengai/dsh-archive-manager',
-    name: '会话归档',
-    autoInstall: true,
-    subtitle: '@michengai/dsh-archive-manager',
-    description: '把暂时不用的会话收起来：单条或整个工作区归档，按标题 / 项目搜索找回，可恢复或永久清理。',
-    icon: '🗄️',
-    category: '会话管理',
-  },
-  {
     id: 'sidebar-qa',
     order: 65,
     npm: 'dsh-sidebar-qa',
@@ -2450,16 +2445,6 @@ const MANAGED_NPM_PLUGINS = [
     description: '一键就地回退到任意更早的用户消息：同窗口完成、不新建分支，可连同工作区文件一起还原（完整 Claude Code /rewind 语义）。',
     icon: '⏪',
     category: '会话管理',
-  },
-  {
-    id: 'mcp-lens',
-    order: 75,
-    npm: 'dsh-mcp-lens',
-    name: 'MCP Lens',
-    subtitle: 'dsh-mcp-lens',
-    description: '把庞大的 MCP 工具库收敛成 mcp_search / mcp_call 两个入口：按需发现、按精确 schema 调用，省上下文与费用；可用的 server 需显式放行（默认全关）。',
-    icon: '🔭',
-    category: '开发工具',
   },
 ]
 
@@ -2772,6 +2757,113 @@ async function maybeAutoInstallRecommendedPlugins() {
   }
 }
 
+// ---------- 退役插件：从注册表摘掉后，老用户机器上还要真正卸掉 ----------
+// 为什么不能只删注册表条目：注册表只决定「页面上有没有这张卡片」，老用户的 profile 里已经装过它们，
+// 不卸载就会继续被 DSH 加载（白占工具位与上下文）。触发点与默认代装完全一致；
+// 失败不记账、下次启动再补；停不下服务时整次跳过且不记账（否则"本版本已试过"会让老插件永远卸不掉）。
+const RETIRED_NPM_PLUGINS = [
+  { id: 'archive-manager', npm: '@michengai/dsh-archive-manager', name: '会话归档' },
+  { id: 'mcp-lens', npm: 'dsh-mcp-lens', name: 'MCP Lens' },
+]
+let retiredPluginCleanupRunning = false
+let retiredPluginCleanupTried = false // 本次运行是否已经真尝试过（失败后不再每个 tick 重试）
+
+/** 还没卸干净的退役插件（纯判断，无副作用）。 */
+function pendingRetiredPlugins() {
+  return RETIRED_NPM_PLUGINS.filter((d) => market.getState(d.npm).installed)
+}
+
+/** 退役插件的两张记账（不再自动安装 / 卡片备注）留着没意义：清理成功时一并删掉，别让 config 里积死键。 */
+function pruneRetiredPluginConfig() {
+  let changed = false
+  for (const d of RETIRED_NPM_PLUGINS) {
+    for (const store of [Config.pluginAutoDeclined, Config.pluginNotes]) {
+      if (store && typeof store === 'object' && Object.prototype.hasOwnProperty.call(store, d.id)) {
+        delete store[d.id]
+        changed = true
+      }
+    }
+  }
+  return changed
+}
+
+/**
+ * 自动卸载退役插件（幂等，可多处调用；触发点与 maybeAutoInstallRecommendedPlugins 相同）。
+ *   - 没有残留（新用户或已卸干净）也记账：省掉之后每次 tick 去读 profile；
+ *   - 真尝试过才置「本次运行已尝试」标记：失败留给下次启动，不会每 2s 停一次服务；
+ *   - 卸载走公共 market.uninstallByName，成功后必须重启服务才真正不再加载（applyPluginChange 负责）。
+ */
+async function maybeRemoveRetiredPlugins() {
+  if (SELF_TEST) return
+  if (retiredPluginCleanupRunning) return
+  const ver = app.getVersion()
+  if (Config.pluginRetiredCleanupVersion === ver) return
+  if (marketAutoInstalling || bridgeAutoInstalling || recommendedAutoInstalling || pluginInstallAllRunning) return
+  const targets = pendingRetiredPlugins()
+  if (!targets.length) {
+    Config.pluginRetiredCleanupVersion = ver
+    if (pruneRetiredPluginConfig()) { try { saveConfig() } catch { /* noop */ } }
+    return
+  }
+  if (retiredPluginCleanupTried) return
+  if (!envReady()) return
+  if (!envReport || !envReport.pnpm || envReport.pnpm.status !== 'ok') {
+    const detail = envReport && envReport.pnpm ? (envReport.pnpm.detail || '未就绪') : '未检测到 pnpm'
+    log('plugins: pnpm 未就绪，暂不移除退役插件（' + detail + '）')
+    return
+  }
+  retiredPluginCleanupRunning = true
+  // 拿不到 profile 写锁就整次跳过，且不记账（记账会让"本版本已尝试过"成真，老插件就永远卸不掉）
+  const releaseProfileOp = tryBeginBackgroundProfileOp('移除退役插件')
+  if (!releaseProfileOp) { retiredPluginCleanupRunning = false; return }
+  try {
+    retiredPluginCleanupTried = true
+    log('plugins: 移除退役插件（' + targets.map((d) => d.name).join('、') + '）…')
+    // 与默认代装同一时序：等服务起来再动（改 profile 时不能有 dsh 进程在跑），最多等 3 分钟
+    const deadline = Date.now() + 180 * 1000
+    while (Date.now() < deadline && !server.running()) await sleep(1000)
+    const stop = await stopServiceForPluginChange()
+    if (!stop.ok) {
+      log('plugins: 移除退役插件中止：' + stop.error)
+      return
+    }
+    const removed = []
+    const failed = []
+    for (const d of targets) {
+      const beforeRows = pluginSwitch.rowIdsForPackage(d.npm)
+      const beforeCarriers = pluginSwitch.carrierDisableIds(d.npm)
+      const r = await market.uninstallByName(d.npm)
+      if (r && r.ok) {
+        // 行/载体强制项跟着一起清：否则残留在 patch 层，以后重装同包会被这些死行影响
+        pluginSwitch.removeRows(d.npm, beforeRows, beforeCarriers)
+        removed.push(d.name)
+      } else {
+        failed.push(d.name + '：' + ((r && r.error) || '未知原因'))
+      }
+    }
+    if (failed.length) {
+      log('plugins: 移除退役插件失败 ' + failed.join('；'))
+      return
+    }
+    if (removed.length) {
+      await applyPluginChange('uninstall', '', {
+        name: removed.join('、'),
+        profile: market.PROFILE_NAME,
+        logTag: 'plugins',
+        label: '已停用的插件（' + removed.join('、') + '）',
+      })
+    }
+    Config.pluginRetiredCleanupVersion = ver
+    pruneRetiredPluginConfig()
+    try { saveConfig() } catch { /* noop */ }
+    log('plugins: 退役插件已清理（' + (removed.length ? removed.join('、') : '无残留') + '）')
+  } finally {
+    retiredPluginCleanupRunning = false
+    releaseProfileOp()
+    broadcastState()
+  }
+}
+
 /**
  * 安装/卸载/更新推荐插件（调用方负责先停服务）。
  * opts.defer=true 时只改 profile、不重启，交给批量流程攒着等用户点「立即重启生效」。
@@ -2873,6 +2965,25 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
 }
 
 /**
+ * 动作进行中的插件（id → action）。为什么需要独立记账：
+ * 一次「卸载/安装」是「停服务 → pnpm 改 profile → 重启服务」三段，market 的 busy 只覆盖中间那段 ——
+ * pnpm 一结束它就清空、磁盘上也已经生效，但服务还要 ~10 秒才回来。这 10 秒里卡片会渲染成
+ * "未安装 + 可点安装"，看着像什么都没发生（用户反馈"点了卸载没有任何反馈"就是这么来的），
+ * 而且此刻再点安装会撞上 profile 锁。这里按插件记账，直到动作（含重启）真正结束才释放。
+ */
+const pluginActionBusy = new Map()
+
+/** 动作 → 状态胶囊文案（与 market/bridge 的 installing/uninstalling 口径保持一致）。 */
+function pluginBusyLabel(action) {
+  const a = String(action || '')
+  if (a === 'install') return '安装中…'
+  if (a === 'uninstall') return '卸载中…'
+  if (a === 'reinstall') return '重新安装中…'
+  if (a === 'update') return '更新中…'
+  return '处理中…'
+}
+
+/**
  * 插件卡片的按钮形态（唯一来源，三类插件共用）：
  *   未安装 → 1 个按钮：安装
  *   已安装 → 2 个按钮：重新安装（有新版则「更新到 vX」）+ 卸载
@@ -2893,8 +3004,11 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
   const noteOf = (id) => String((notes && notes[id]) || '')
   const m = marketState || {}
   const b = bridgeState || {}
-  const marketBusy = m.busy === 'installing' || m.busy === 'uninstalling'
-  const bridgeBusy = b.busy === 'installing' || b.busy === 'uninstalling'
+  // 动作忙态优先：它覆盖「停服务 → 改 profile → 重启服务」整段（market/bridge 自己的 busy 只到 pnpm 结束）
+  const marketAct = String(pluginActionBusy.get('dshmarket') || '')
+  const bridgeAct = String(pluginActionBusy.get('bridge-next') || '')
+  const marketBusy = !!marketAct || m.busy === 'installing' || m.busy === 'uninstalling'
+  const bridgeBusy = !!bridgeAct || b.busy === 'installing' || b.busy === 'uninstalling'
   const bridgeEnabled = !!Config.remoteConnect.enabled
   const bridgeInstalled = !!b.installed
   const bridgeOutdated = !!b.outdated
@@ -2903,14 +3017,14 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
   const marketDisabled = !!m.installed && pluginSwitch.isDisabled(market.PLUGIN_NAME)
   const marketToggle = !!m.installed && pluginSwitch.canToggle(market.PLUGIN_NAME)
   const marketStatus = marketBusy
-    ? { label: m.busy === 'installing' ? '安装中…' : '卸载中…', tone: 'busy' }
+    ? { label: marketAct ? pluginBusyLabel(marketAct) : (m.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
     : (m.error
       ? { label: '操作失败', tone: 'error' }
       : (m.installed
         ? (marketDisabled ? { label: '已关闭', tone: 'muted' } : { label: marketToggle ? '已启用' : '已安装', tone: 'ok' })
         : { label: '未安装', tone: 'muted' }))
   const bridgeStatus = bridgeBusy
-    ? { label: b.busy === 'installing' ? '安装中…' : '卸载中…', tone: 'busy' }
+    ? { label: bridgeAct ? pluginBusyLabel(bridgeAct) : (b.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
     : (b.error
       ? { label: '操作失败', tone: 'error' }
       : (bridgeEnabled && !bridgePayloadReady
@@ -2954,7 +3068,10 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
     // 实际装的版本优先（node_modules）；读不到再退回把依赖范围里的版本号抠出来
     const installedVersion = raw.installedPackageVersion || cleanInstalledVersion(raw.version)
     const latest = (npmVersionCache.get(d.npm) || {}).version || ''
-    const busy = !!raw.busy
+    // 动作忙态（覆盖到服务重启结束）优先于 market 自己的 busy（只覆盖 pnpm 那段）
+    const act = String(pluginActionBusy.get(d.id) || '')
+    const busy = act || raw.busy || ''
+    const busyText = act ? pluginBusyLabel(act) : (raw.busy === 'installing' ? '安装中…' : '卸载中…')
     const outdated = !!(raw.installed && installedVersion && latest)
       && (semver.valid(installedVersion) && semver.valid(latest)
         ? semver.lt(installedVersion, latest)
@@ -2962,7 +3079,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
     const disabled = !!raw.installed && pluginSwitch.isDisabled(d.npm)
     const toggle = !!raw.installed && pluginSwitch.canToggle(d.npm)
     const status = busy
-      ? { label: raw.busy === 'installing' ? '安装中…' : '卸载中…', tone: 'busy' }
+      ? { label: busyText, tone: 'busy' }
       : (raw.error
         ? { label: '操作失败', tone: 'error' }
         : (raw.installed
@@ -2988,7 +3105,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       latestVersion: latest,
       outdated,
       payloadReady: true,
-      busy: raw.busy || '',
+      busy: busy || '',
       error: raw.error || '',
       lastChange: raw.lastChange || '',
       autoInstall: !!(d.autoInstall && !pluginAutoDeclined(d.id)),
@@ -4410,6 +4527,7 @@ function onTick() {
   if (envReady()) void maybeRepairPnpm() // pnpm 缺失/版本不匹配时后台对齐一次
   if (envReady() && server.running()) void maybeAutoInstallBridge() // 服务就绪且开关开启时补装远程连接插件
   if (envReady() && server.running()) void maybeAutoInstallRecommendedPlugins() // 服务就绪时补装默认代装插件（含服务刚起来那次）
+  if (envReady() && server.running()) void maybeRemoveRetiredPlugins() // 服务就绪时清理退役插件（成功即记账，之后不再读 profile）
   // 交接裁决自己驱动状态，不叠第二份探测
   if (!server.settling && (server.claimed() || server.adoptedPid)) void watchTrackedService()
   scanNotify()
@@ -4928,7 +5046,16 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'pluginAction': {
           const id = String((value && value.id) || '').slice(0, 80)
           const action = String((value && value.action) || '').slice(0, 40)
-          return JSON.stringify(await withProfileOp(`插件 ${action}`, () => runManagedPluginAction(id, action)))
+          // 先让卡片进入忙态并立刻推给控制台：这段动作末尾还要重启服务（实测约 10 秒），
+          // 只在 pnpm 期间显示忙态会留出一段"看着已经结束"的空档，用户会以为点了没反应。
+          pluginActionBusy.set(id, action)
+          broadcastState()
+          try {
+            return JSON.stringify(await withProfileOp(`插件 ${action}`, () => runManagedPluginAction(id, action)))
+          } finally {
+            pluginActionBusy.delete(id)
+            broadcastState() // 忙态解除 + 结果（lastChange/error）一起推给控制台
+          }
         }
         case 'pluginsRetryEnvFailed': return JSON.stringify(await withProfileOp('重试失败的插件', () => retryPluginEnvFailures()))
         // ---------- 远程连接（DSH Bridge Next 插件安装/卸载） ----------
@@ -5844,7 +5971,8 @@ function init() {
     }
     void maybeAutoInstallPluginMarket() // 插件市场默认安装（每个版本只自动尝试一次）
     void maybeAutoInstallBridge() // 远程连接插件（默认开启，见 Config.remoteConnect）
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 会话归档 / 对话回退）
+    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 对话回退）
+    void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）老用户升级后自动卸载
     if (args.console) {
       showConsolePage('main')
       await handleStart()

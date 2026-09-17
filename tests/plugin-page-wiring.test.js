@@ -57,6 +57,8 @@ test('插件卡片由 state.plugins 数据驱动', () => {
   assert.match(main, /case 'pluginAction'/, '应有通用插件动作命令')
   assert.match(app, /function renderPlugins\(plugins, force\)/, '控制台应有通用插件渲染器')
   assert.match(app, /cmd\('pluginAction', \{ id, action \}\)/, '卡片动作应走通用 pluginAction')
+  // 带开关的卡片没有状态胶囊，忙态文案只能落在进度行上：泛泛的"正在处理…"说不清在做什么
+  assert.match(app, /wait\.textContent = \(p\.status && p\.status\.label\) \|\| '正在处理…'/, '忙态进度行应显示具体动作文案')
 })
 
 test('插件卡片：状态/开关 + 一键安装契约', () => {
@@ -81,6 +83,32 @@ test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.match(app, /'立即重启生效'/, '按钮文案统一为立即重启生效')
   assert.match(main, /toggleAction: toggle \? 'toggle' : ''/, '可识别的 npm 插件安装后应显示真实开关')
   assert.match(app, /function renderInstallAll\(info\)/, '控制台应渲染一键安装进度')
+})
+
+test('插件动作全程有反馈：点击即说明在做什么，结束必须给结果（成功/失败都要说）', () => {
+  // 失败重渲染顺序：老代码先 renderPlugins 再往旧卡片写 ✕ —— 写进的是游离节点，用户什么也看不到
+  const clickStart = app.indexOf("$('pluginCards').addEventListener('click'")
+  const clickEnd = app.indexOf("$('pluginCards').addEventListener('change'", clickStart)
+  assert.ok(clickStart > 0 && clickEnd > clickStart, '找不到插件动作点击处理器')
+  const handler = app.slice(clickStart, clickEnd)
+  assert.match(handler, /setPluginCardFeedback\(btn, `正在\$\{verb\}「\$\{name\}」…/, '点击后卡片要写明正在做什么')
+  assert.match(handler, /约 10~60 秒/, '耗时要与说明页 plugin 档同口径（10~60 秒）')
+  assert.match(handler, /showConsoleToast\(r\.restartPending/, '成功必须给 toast（重启挂起时说清怎么生效）')
+  assert.match(handler, /showConsoleToast\(`✕ \$\{verb\}「\$\{name\}」失败/, '失败也要有 toast（卡片可能已被重渲染换掉）')
+  assert.match(handler, /r\.restartPending\s*\n?\s*\? `已\$\{verb\}「\$\{name\}」；点顶部「立即重启生效」后生效`/, '挂起生效的措辞要指路')
+  assert.match(handler, /服务已重启生效`\)/, '已生效的措辞要说明服务已重启')
+  const iRefresh = handler.indexOf("cmd('pluginsGetState')")
+  const iToast = handler.indexOf('showConsoleToast')
+  assert.ok(iToast > 0 && iRefresh > iToast, '状态刷新必须放在 toast 之后：先让用户看到结果，再重渲染卡片')
+  // 主进程侧：忙态从动作开始记到 finally（含重启），并推给控制台
+  assert.match(main, /const pluginActionBusy = new Map\(\)/, '主进程应按插件记账动作忙态')
+  assert.match(main, /pluginActionBusy\.set\(id, action\)\n\s+broadcastState\(\)/, '动作开始就要标记忙态并推送')
+  assert.match(main, /finally \{\n\s+pluginActionBusy\.delete\(id\)/, '动作结束（含服务重启）必须释放忙态')
+  assert.match(main, /pluginActionBusy\.get\(d\.id\)/, 'npm 插件卡片要合并动作忙态')
+  // 忙态文案与 market/bridge 的旧口径同一套词
+  for (const label of ['安装中…', '卸载中…', '重新安装中…', '更新中…']) {
+    assert.ok(main.includes(`'${label}'`), '忙态文案缺 ' + label)
+  }
 })
 
 test('版本查询失败：同包同原因只留一条日志，恢复后复发再记（注入桩执行真实流程）', async () => {
@@ -257,7 +285,7 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
   assert.deepEqual(deferCalls, [], '停不下来就一个都别装')
 })
 
-test('推荐插件注册表：九个 npm 插件 + 通用动作/更新检查', () => {
+test('推荐插件注册表：七个 npm 插件 + 通用动作/更新检查', () => {
   assert.match(main, /const MANAGED_NPM_PLUGINS = \[/, '主进程应有推荐插件注册表')
   for (const npm of [
     'dsh-better-sidebar',
@@ -265,10 +293,8 @@ test('推荐插件注册表：九个 npm 插件 + 通用动作/更新检查', ()
     '@kenz1117/dsh-ui-usage-billing',
     'dsh-chat-import',
     '@michengai/dsh-skills-manager',
-    '@michengai/dsh-archive-manager',
     'dsh-sidebar-qa',
     'dsh-rewind-plugin',
-    'dsh-mcp-lens',
   ]) {
     assert.ok(main.includes("'" + npm + "'"), '注册表缺少 ' + npm)
   }
@@ -289,7 +315,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const registry = new Function(main.slice(regStart, regEnd) + '; return MANAGED_NPM_PLUGINS')()
 
   // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
-  assert.equal(registry.length, 9, '推荐插件（npm 分发）应为 9 个')
+  assert.equal(registry.length, 7, '推荐插件（npm 分发）应为 7 个（会话归档 / MCP Lens 已摘出）')
   assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
   assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
   for (const d of registry) {
@@ -308,6 +334,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   }
   const src = [
     sliceFn('function cleanInstalledVersion(spec) {', '\n}\n'),
+    sliceFn('function pluginBusyLabel(action) {', '\n}\n'),
     sliceFn('function pluginCardActions(opts) {', '\n}\n'),
     sliceFn('function buildPluginCatalog(marketState, bridgeState, notes) {', '\n}\n'),
   ].join('\n')
@@ -315,6 +342,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const ctx = {
     MANAGED_NPM_PLUGINS: registry,
     Config: { pluginMarketDeclined: false, pluginNotes: {}, remoteConnect: { enabled: true, declined: false } },
+    pluginActionBusy: new Map(),
     market: {
       PLUGIN_NAME: 'dshmarket',
       getState: (npm) => ({
@@ -351,16 +379,14 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'bridge-next',
     'usage-billing',
     'skills-manager',
-    'archive-manager',
     'rewind',
     'better-sidebar',
     'codex-ui',
     'chat-import',
     'sidebar-qa',
-    'mcp-lens',
   ], '卡片顺序应为「预装在前、手动在后」，各组内按 order')
   assert.deepEqual(catalog.filter((c) => !c.preset).map((c) => c.id), [
-    'better-sidebar', 'codex-ui', 'chat-import', 'sidebar-qa', 'mcp-lens',
+    'better-sidebar', 'codex-ui', 'chat-import', 'sidebar-qa',
   ], 'preset=false 的应恰好是手动安装的那批')
   assert.equal(catalog.findIndex((c) => !c.preset), catalog.filter((c) => c.preset).length,
     '预装卡片必须全部连续排在前面（不与手动项交错）')
@@ -371,14 +397,34 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.equal(catalog.find((c) => c.id === 'dshmarket').preset, true, '插件市场默认开启')
   assert.equal(catalog.find((c) => c.id === 'bridge-next').preset, true, '手机连接随启动器分发')
 
+  // 3b. 动作忙态：必须让卡片显示"处理中"并收回按钮 —— 这段忙态要一直盖到服务重启结束，
+  //     否则卸载/安装的最后 ~10 秒（pnpm 已结束、服务还没回来）卡片看着像什么都没发生。
+  ctx.pluginActionBusy.set('better-sidebar', 'uninstall')
+  const busyCatalog = build(
+    { installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' },
+    { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' },
+    {},
+  )
+  const busyCard = busyCatalog.find((c) => c.id === 'better-sidebar')
+  assert.equal(busyCard.busy, 'uninstall', '忙态应写进卡片状态（渲染层据此禁用）')
+  assert.equal(busyCard.status.label, '卸载中…', '忙态文案应说清在做哪个动作')
+  assert.equal(busyCard.status.tone, 'busy', '忙态胶囊应是 busy 色调')
+  assert.deepEqual(busyCard.actions, [], '忙态下不许再给按钮（此刻再点会撞 profile 锁）')
+  ctx.pluginActionBusy.delete('better-sidebar')
+  assert.deepEqual(
+    build({ installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }, { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }, {})
+      .find((c) => c.id === 'better-sidebar').actions.map((a) => a.action),
+    ['reinstall', 'uninstall'],
+    '忙态释放后按钮要回来',
+  )
+
   // 4. 真 pendingAutoInstallPlugins：默认代装集合 = 注册表里 autoInstall 的那批，且只挑缺失的
   const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
   assert.deepEqual(autoIds, [
     'usage-billing',
     'skills-manager',
-    'archive-manager',
     'rewind',
-  ], '默认代装集合应保持稳定（增强侧边栏 / 划线提问 / MCP Lens 改为手动后只剩这 4 个）')
+  ], '默认代装集合应保持稳定（会话归档 / MCP Lens 摘出注册表后只剩这 3 个）')
   for (const d of registry.filter((x) => x.autoInstall)) {
     const card = catalog.find((c) => c.id === d.id)
     assert.equal(card.autoInstallLabel, '预装 (推荐开启)', d.id + ' 卡片应标「预装 (推荐开启)」')
@@ -386,8 +432,8 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   }
 
   const pendSrc = sliceFn('function pendingAutoInstallPlugins() {', '\n}\n')
-  // 缺失集合里故意混入手动安装项（MCP Lens / 划线提问）：它们不得进入代装队列
-  const missing = new Set(['dsh-mcp-lens', 'dsh-sidebar-qa', '@michengai/dsh-archive-manager', 'dsh-rewind-plugin'])
+  // 缺失集合里故意混入手动安装项（划线提问 / Codex 风格界面）：它们不得进入代装队列
+  const missing = new Set(['dsh-sidebar-qa', '@michengai/dsh-codex-ui', 'dsh-rewind-plugin'])
   const pendCtx = {
     MANAGED_NPM_PLUGINS: registry,
     pluginAutoDeclined: () => false,
@@ -395,11 +441,11 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   }
   const pendNames = Object.keys(pendCtx)
   const pending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => pendCtx[k]))
-  assert.deepEqual(pending().map((d) => d.npm), ['@michengai/dsh-archive-manager', 'dsh-rewind-plugin'], '只补 autoInstall 里缺失的（手动项缺了也不动），顺序按注册表 order')
+  assert.deepEqual(pending().map((d) => d.npm), ['dsh-rewind-plugin'], '只补 autoInstall 里缺失的（手动项缺了也不动），顺序按注册表 order')
 
   const declinedCtx = { ...pendCtx, pluginAutoDeclined: (id) => id === 'rewind' }
   const declinedPending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => declinedCtx[k]))
-  assert.deepEqual(declinedPending().map((d) => d.id), ['archive-manager'], '手动卸载过的插件不应再自动补装')
+  assert.deepEqual(declinedPending().map((d) => d.id), [], '手动卸载过的插件不应再自动补装')
 })
 
 test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
@@ -407,8 +453,8 @@ test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
   assert.doesNotMatch(html, /id="btnRemoteConnect"/, '设置页不应再保留远程连接行')
   assert.doesNotMatch(html, /id="btnRecoveryMarket"/, '恢复页不应再保留插件修复行')
 })
-test('默认代装：用量与计费 / 技能管理 / 会话归档 / 对话回退随启动器自动装，界面类与 MCP Lens 保持手动', () => {
-  assert.match(main, /pluginAutoInstallTriedVersion: '', pluginAutoDeclined: \{\}/, '配置应有自动安装记账字段')
+test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装，界面类保持手动；会话归档与 MCP Lens 已摘出注册表', () => {
+  assert.match(main, /pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: \{\}/, '配置应有自动安装与退役清理记账字段')
   assert.match(main, /function pluginAutoDeclined\(id\)/, '应有「用户卸载过」记忆查询')
   assert.match(main, /function notePluginAutoDeclined\(id, declined\)/, '应有「用户卸载过」记账写入')
   assert.match(main, /async function maybeAutoInstallRecommendedPlugins\(\)/, '应有推荐插件默认代装流程')
@@ -417,7 +463,10 @@ test('默认代装：用量与计费 / 技能管理 / 会话归档 / 对话回�
   assert.doesNotMatch(main, /npm: 'dsh-better-sidebar',\n    name: '增强侧边栏',\n    autoInstall: true,/, '增强侧边栏改为手动安装')
   assert.match(main, /npm: '@kenz1117\/dsh-ui-usage-billing',\n    name: '用量与计费',\n    autoInstall: true,/, '用量与计费应默认代装')
   assert.match(main, /npm: '@michengai\/dsh-skills-manager',\n    name: '技能管理',\n    autoInstall: true,/, '技能管理应默认代装')
-  assert.match(main, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',\n    autoInstall: true,/, '会话归档应默认代装')
+  // 会话归档 / MCP Lens：从注册表摘掉（页面不再有卡片），残留实例交给 RETIRED_NPM_PLUGINS 自动卸载
+  const regOnly = main.slice(main.indexOf('const MANAGED_NPM_PLUGINS = ['), main.indexOf('\n]\n', main.indexOf('const MANAGED_NPM_PLUGINS = [')) + 3)
+  assert.doesNotMatch(regOnly, /dsh-archive-manager/, '会话归档不应再留在推荐插件注册表里')
+  assert.doesNotMatch(regOnly, /dsh-mcp-lens/, 'MCP Lens 不应再留在推荐插件注册表里')
   assert.doesNotMatch(main, /npm: 'dsh-sidebar-qa',\n    name: '划线提问',\n    autoInstall: true,/, '划线提问改为手动安装（依赖增强侧边栏）')
   assert.match(main, /npm: 'dsh-rewind-plugin',\n    name: '对话回退',\n    autoInstall: true,/, '对话回退应默认代装')
   assert.doesNotMatch(main, /npm: 'dsh-mcp-lens',\n    name: 'MCP Lens',\n    autoInstall: true,/, 'MCP Lens 改为手动安装（上游 npm 只有预发布版，稳定版校验会拒绝）')
@@ -537,4 +586,83 @@ test('挂起变更统一走重启：任何插件变更都只提供「立即重�
   result = await api.applyPendingPluginChanges()
   assert.equal(result.ok, true)
   assert.equal(calls.restart, 2, '批量变更一次重启统一生效')
+})
+test('退役插件：注册表摘掉的同时，老用户机器上残留的实例会被自动卸载（注入桩执行真实流程）', async () => {
+  // 1) 注册表里不许再有这两个包（页面上的卡片来自注册表，摘掉即不再展示、不再代装）
+  const regStart = main.indexOf('const MANAGED_NPM_PLUGINS = [')
+  const regText = main.slice(regStart, main.indexOf('\n]\n', regStart) + 3)
+  assert.doesNotMatch(regText, /dsh-archive-manager|dsh-mcp-lens/, '两个退役包都不应再出现在预装插件注册表里')
+
+  // 2) 退役清单必须点名这两个包（老用户的 profile 里已经装过它们，摘卡片不等于卸载）
+  const start = main.indexOf('// ---------- 退役插件：')
+  assert.ok(start > 0, '找不到退役插件清理块')
+  const retiredStart = main.indexOf('const RETIRED_NPM_PLUGINS = [', start)
+  const retiredEnd = main.indexOf('\n]\n', retiredStart) + 3
+  assert.ok(retiredStart > start && retiredEnd > retiredStart, '找不到 RETIRED_NPM_PLUGINS 字面量')
+  const retired = new Function(main.slice(retiredStart, retiredEnd) + '; return RETIRED_NPM_PLUGINS')()
+  assert.deepEqual(retired.map((d) => d.npm), ['@michengai/dsh-archive-manager', 'dsh-mcp-lens'], '退役清单应包含会话归档与 MCP Lens')
+  for (const d of retired) assert.ok(d.id && d.name, '退役项要带 id/name（日志与提示要说人话）')
+
+  // 3) 触发点与默认代装同一批：启动 / 环境装好 / 服务就绪（onTick）
+  const triggers = main.match(/void maybeRemoveRetiredPlugins\(\)/g) || []
+  assert.ok(triggers.length >= 4, '应在启动 / 环境装好 / 服务就绪等触发点补卸（实际 ' + triggers.length + ' 处）')
+  assert.match(main, /if \(envReady\(\) && server\.running\(\)\) void maybeRemoveRetiredPlugins\(\)/, 'onTick 服务就绪时应补卸退役插件')
+
+  // 4) 跑真流程：只卸残留的、卸完只重启一次、成功记账并清掉死键
+  const end = main.indexOf('\n}\n', main.indexOf('async function maybeRemoveRetiredPlugins()', start)) + 2
+  assert.ok(end > start, '找不到 maybeRemoveRetiredPlugins 结尾')
+  const fnSrc = main.slice(start, end)
+  const calls = { uninstalls: [], applied: [] }
+  const installed = new Set(['@michengai/dsh-archive-manager', 'dsh-mcp-lens', 'dsh-chat-import'])
+  const Config = { pluginRetiredCleanupVersion: '', pluginAutoDeclined: { 'mcp-lens': true }, pluginNotes: { 'mcp-lens': '旧备注' } }
+  const ctx = {
+    SELF_TEST: false,
+    Config,
+    app: { getVersion: () => '1.4.6' },
+    marketAutoInstalling: false,
+    bridgeAutoInstalling: false,
+    recommendedAutoInstalling: false,
+    pluginInstallAllRunning: false,
+    market: {
+      PROFILE_NAME: 'web',
+      getState: (npm) => ({ installed: installed.has(npm) }),
+      uninstallByName: async (npm) => { calls.uninstalls.push(npm); installed.delete(npm); return { ok: true } },
+    },
+    pluginSwitch: { rowIdsForPackage: () => [], carrierDisableIds: () => [], removeRows: () => ({ ok: true }) },
+    envReady: () => true,
+    envReport: { pnpm: { status: 'ok' } },
+    server: { running: () => true },
+    sleep: async () => {},
+    stopServiceForPluginChange: async () => ({ ok: true }),
+    tryBeginBackgroundProfileOp: () => (() => {}),
+    applyPluginChange: async (verb, version, spec) => { calls.applied.push(spec && spec.name); return true },
+    log: () => {},
+    saveConfig: () => {},
+    broadcastState: () => {},
+  }
+  const names = Object.keys(ctx)
+  const api = new Function(...names, fnSrc + '\nreturn { maybeRemoveRetiredPlugins, pendingRetiredPlugins }')(...names.map((k) => ctx[k]))
+
+  assert.deepEqual(api.pendingRetiredPlugins().map((d) => d.npm), ['@michengai/dsh-archive-manager', 'dsh-mcp-lens'], '两个包都在时应都进清理队列')
+  await api.maybeRemoveRetiredPlugins()
+  assert.deepEqual(calls.uninstalls, ['@michengai/dsh-archive-manager', 'dsh-mcp-lens'], '应把残留的两个都卸掉（无关插件不碰）')
+  assert.equal(calls.applied.length, 1, '卸完只重启一次服务')
+  assert.equal(Config.pluginRetiredCleanupVersion, '1.4.6', '清理成功应记账')
+  assert.equal('mcp-lens' in Config.pluginAutoDeclined, false, '退役插件的「不再自动安装」死键应清掉')
+  assert.equal('mcp-lens' in Config.pluginNotes, false, '退役插件的卡片备注死键应清掉')
+
+  await api.maybeRemoveRetiredPlugins()
+  assert.equal(calls.applied.length, 1, '同一版本内不应重复清理')
+
+  // 5) 干净机器（没有残留）：只记账，不停服务、不重启
+  const cleanConfig = { pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {} }
+  const cleanCtx = Object.assign({}, ctx, {
+    Config: cleanConfig,
+    market: { PROFILE_NAME: 'web', getState: () => ({ installed: false }), uninstallByName: async () => { throw new Error('干净机器不该卸载') } },
+    stopServiceForPluginChange: async () => { throw new Error('干净机器不该停服务') },
+    applyPluginChange: async () => { throw new Error('干净机器不该重启服务') },
+  })
+  const cleanApi = new Function(...names, fnSrc + '\nreturn { maybeRemoveRetiredPlugins }')(...names.map((k) => cleanCtx[k]))
+  await cleanApi.maybeRemoveRetiredPlugins()
+  assert.equal(cleanConfig.pluginRetiredCleanupVersion, '1.4.6', '没有残留也应记账（省掉之后每 tick 读 profile）')
 })

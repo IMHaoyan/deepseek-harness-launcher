@@ -19,6 +19,34 @@ const MAX_VERSIONS = 30
 let cache = { at: 0, releases: [] }
 let inflight = null
 
+/**
+ * HTTP 失败文案（纯函数，便于测试）。
+ *
+ * GitHub 公开 API 是未认证配额：每小时 60 次/IP，用光了就是 403（响应头 x-ratelimit-remaining=0）。
+ * 只说「HTTP 403」会让用户以为仓库没了或网络坏了 —— 这里把"限流"和"预计恢复时间（按本地时间）"
+ * 说清楚：页面会把这行原文显示给用户。其余状态码保持原样，不编造原因。
+ */
+function httpErrorText(statusCode, headers) {
+  const code = Number(statusCode) || 0
+  const get = (name) => {
+    const h = headers || {}
+    const v = h[name] !== undefined ? h[name] : h[String(name).toLowerCase()]
+    if (Array.isArray(v)) return String(v[0] === undefined ? '' : v[0])
+    return v === undefined || v === null ? '' : String(v)
+  }
+  const remaining = get('x-ratelimit-remaining')
+  if ((code === 403 || code === 429) && (code === 429 || remaining === '0')) {
+    const reset = Number(get('x-ratelimit-reset')) || 0
+    const at = reset > 0 ? new Date(reset * 1000) : null
+    // 无该头或时钟异常时只说限流，不编恢复时间
+    const when = at && !Number.isNaN(at.getTime())
+      ? at.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+      : ''
+    return `HTTP ${code}（GitHub API 限流：未认证每小时 60 次/IP${when ? `，约 ${when} 后恢复` : ''}）`
+  }
+  return 'HTTP ' + code
+}
+
 /** 主进程里取 JSON（net 模块自动带 Electron 的会话与代理配置）。 */
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
@@ -46,7 +74,7 @@ function fetchJson(url) {
         response.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8')
           if (response.statusCode < 200 || response.statusCode >= 300) {
-            done(new Error('HTTP ' + response.statusCode))
+            done(new Error(httpErrorText(response.statusCode, response.headers)))
             return
           }
           try {
@@ -118,4 +146,4 @@ async function getReleases(force = false) {
   return inflight
 }
 
-module.exports = { getReleases, RELEASES_API, MAX_VERSIONS }
+module.exports = { getReleases, httpErrorText, RELEASES_API, MAX_VERSIONS }

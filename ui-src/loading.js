@@ -7,7 +7,7 @@ const pane = q.get('pane') || ''
 const TEXTS = {
   start: {
     title: '正在启动 DeepSeek Harness 服务…',
-    sub: '首次启动通常需要 3~15 秒，服务就绪后窗口会自动进入。',
+    sub: '首次启动通常需要 8~15 秒，服务就绪后窗口会自动进入。',
     btn: '重新加载',
   },
   restart: {
@@ -17,7 +17,9 @@ const TEXTS = {
   },
   restartManual: {
     title: '正在重启 DeepSeek Harness…',
-    sub: '已停止旧服务，正在拉起新进程（通常 3~15 秒）。就绪后窗口会自动刷新进入。',
+    sub: '已停止旧服务，正在拉起新进程（通常 4~8 秒）。',
+    // 第二行单独成段：句号后断行，避免在“进入。”中间被自动折行（实测近期 12 次重启 3.1~3.7s 到端口就绪）
+    sub2: '就绪后窗口会自动刷新进入。',
     btn: '重新加载',
   },
   plugin: {
@@ -67,6 +69,7 @@ const TEXTS = {
 const triedAuth = reason === 'auth' && q.get('tried') === '1'
 const t = (triedAuth ? TEXTS.authRestart : TEXTS[reason]) || TEXTS.start
 const subEl = document.getElementById('sub')
+const sub2El = document.getElementById('sub2')
 const btnEl = document.getElementById('btnReload')
 document.getElementById('title').textContent = t.title
 subEl.textContent = t.sub
@@ -79,12 +82,14 @@ if (triedAuth && t.alt) {
 }
 if (reason === 'failed' || reason === 'offline' || reason === 'auth') document.body.classList.add('failed')
 
-// 端口冲突页：detail 展示冲突原因；suggest 有值 → 一键换端口启动；无值 → 引导打开 DSHL 控制台
+// 端口冲突页：detail 展示冲突原因；suggest 有值 → 一键换端口启动；
+// 无值（附近端口全被占）→ 就地重新探测端口并重试启动。
+// 按钮文案必须等于真实动作：这里以前写「打开 DSHL 控制台（更换端口）」，点下去发的却是 fixPane（重载本页），说的和做的不是一回事。
 const detail = (q.get('detail') || '').slice(0, 500)
 const suggest = q.get('suggest') || ''
 if (reason === 'blocked') {
   subEl.textContent = detail || t.sub
-  btnEl.textContent = suggest ? `换到端口 ${suggest} 并启动` : '打开 DSHL 控制台（更换端口）'
+  btnEl.textContent = suggest ? `换到端口 ${suggest} 并启动` : '重新检测端口并重试'
   document.body.classList.add('failed')
 }
 
@@ -94,8 +99,20 @@ if (reason === 'blocked') {
 const stepEl = document.getElementById('step')
 const phaseEl = document.getElementById('phase')
 const baseSub = t.sub
+const baseSub2 = t.sub2 || '' // 可选的第二行（见 TEXTS.restartManual）
 let progressData = null
 let tickTimer = null
+
+// 文案渲染：单行状态照旧写进 #sub；有第二行的状态把它挂在 #sub2。
+// 「（已等待 N 秒）」永远跟在最后一行后面 —— 不给两行各挂一个，也不让它跑回第一行。
+function renderSub(suffix) {
+  const tail = suffix || ''
+  subEl.textContent = baseSub + (baseSub2 ? '' : tail)
+  if (!sub2El) return
+  sub2El.textContent = baseSub2 ? baseSub2 + tail : ''
+  sub2El.classList.toggle('hidden', !baseSub2)
+}
+if (reason !== 'blocked') renderSub('')
 
 // 当前环节行：转述服务进程自己刚打印的那条日志（主进程已清洗/脱敏，页面只做展示）。
 // 超过 3 秒没有新日志就标注"（N 秒前）"——不把已经过去的事说成"正在执行"。
@@ -115,7 +132,7 @@ function renderPhase() {
 function tickElapsed() {
   if (!progressData || !subEl) return
   const sec = Math.max(0, Math.round((Date.now() - progressData.startedAt) / 1000))
-  subEl.textContent = baseSub + '（已等待 ' + sec + ' 秒）'
+  renderSub('（已等待 ' + sec + ' 秒）')
   renderPhase()
 }
 
@@ -124,7 +141,7 @@ function renderProgress(p) {
     progressData = null
     if (stepEl) stepEl.classList.add('hidden')
     if (phaseEl) { phaseEl.textContent = ''; phaseEl.classList.add('hidden') }
-    if (subEl && reason !== 'blocked') subEl.textContent = baseSub
+    if (subEl && reason !== 'blocked') renderSub('')
     if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
     return
   }
@@ -155,6 +172,7 @@ if (revealMs > 0) {
 }
 document.getElementById('btnReload').addEventListener('click', () => {
   try {
+    // blocked 且没有建议端口时走 fixPane：主进程会重新探测端口 → 重试启动 → 按最新状态刷新本页
     if (reason === 'blocked' && suggest) window.browserBridge.send('blockSwitch', { port: Number(suggest) })
     else if (triedAuth) window.browserBridge.send('authRestart', { id: pane })
     else window.browserBridge.send('fixPane', { id: pane })
@@ -162,9 +180,6 @@ document.getElementById('btnReload').addEventListener('click', () => {
 })
 btnAlt.addEventListener('click', () => {
   try { window.browserBridge.send('fixPane', { id: pane }) } catch (e) { /* 桥未就绪忽略 */ }
-})
-document.getElementById('btnConsole').addEventListener('click', () => {
-  try { window.browserBridge.send('consoleToggle') } catch (e) { /* 桥未就绪忽略 */ }
 })
 
 // 步骤进度订阅：主进程推、本页按自己的 reason 过滤（桥不支持时静默）
