@@ -103,10 +103,6 @@
       "repo": "deepseek-harness-launcher"
     }
   },
-  "directories": {
-    "doc": "docs",
-    "test": "tests"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/IMHaoyan/deepseek-harness-launcher.git"
