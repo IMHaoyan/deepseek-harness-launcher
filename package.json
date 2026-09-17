@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-launcher",
   "productName": "DeepSeek Harness Launcher",
-  "version": "1.4.5",
+  "version": "1.4.6-alpha.1",
   "description": "DeepSeek Harness Launcher（DSHL）—— Windows 托盘启动器/看护工具",
   "main": "main.js",
   "private": true,
@@ -102,5 +102,20 @@
       "owner": "IMHaoyan",
       "repo": "deepseek-harness-launcher"
     }
-  }
+  },
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IMHaoyan/deepseek-harness-launcher.git"
+  },
+  "keywords": [],
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/IMHaoyan/deepseek-harness-launcher/issues"
+  },
+  "homepage": "https://github.com/IMHaoyan/deepseek-harness-launcher#readme"
 }
