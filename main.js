@@ -4786,7 +4786,15 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'openWeb': openDshOrConsole(); return '{}' // 环境未就绪/端口被占用时自动打开控制台
         case 'consoleClose': hideConsole(); return '{}'
         case 'openUrlExternal': try { shell.openExternal(uiUrl()) } catch { /* noop */ } return '{}'
-        case 'openNpmDsh': try { shell.openExternal('https://www.npmjs.com/package/@deepseek-ai/dsh') } catch { /* noop */ } return '{}'
+        case 'openLauncherRelease': {
+          try { shell.openExternal(changelog.launcherReleaseUrl(app.getVersion())) } catch { /* noop */ }
+          return '{}'
+        }
+        case 'openDshRelease': {
+          const version = (envReport && envReport.dsh && envReport.dsh.version) || dshUpdater.getState().current || ''
+          try { shell.openExternal(changelog.dshReleaseUrl(version)) } catch { /* noop */ }
+          return '{}'
+        }
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
         // 日志与反馈页的来源切换：launcher=启动器自己的日志；server-* = DSH 子进程的 stdout/stderr
         case 'logRead': return JSON.stringify(readLogSource(value && value.source, value && value.lines))
@@ -4915,6 +4923,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
             saveConfig()
             log('dsh-update: channel switched to ' + ch)
             dshUpdater.noteChannelChange() // 作废旧渠道的版本缓存：否则「重试」会照着旧渠道的缓存装
+            armDshCheckTimer() // 节奏随渠道变（alpha 1 小时 / latest 6 小时）：立刻按新渠道重新武装
             void dshUpdater.checkOnce('manual', true)
           }
           broadcastState()
@@ -5793,6 +5802,14 @@ function watchManagedPluginState() {
   add(market, (name) => name === 'state.json')
 }
 
+// DSH 更新检查的节奏定时器：周期由 dsh-update.checkTickMs() 按当前渠道给出（alpha 1 小时 / latest 6 小时）。
+// 单独抽成函数是因为换渠道必须重新武装 —— 否则切到 alpha 后要等下次启动才享受到 1 小时节奏。
+let dshCheckTimer = null
+function armDshCheckTimer() {
+  if (dshCheckTimer) { clearInterval(dshCheckTimer); dshCheckTimer = null }
+  dshCheckTimer = setInterval(() => { void dshUpdater.checkOnce('timer') }, dshUpdater.checkTickMs())
+}
+
 // ---------- 初始化 ----------
 function init() {
   loadConfig()
@@ -6002,11 +6019,13 @@ function init() {
   // 启动后 10 秒静默检查启动器更新（仅打包版；轻量只读 GitHub latest.yml，10s 避开新窗口弹出瞬间即可，开发模式跳过）
   setTimeout(() => updater.autoCheck(), 10000)
   // DSH 更新检查：启动后 15 秒首次（此时环境探测/服务启动均已完成，检测越早用户越早看到新版提示），
-  // 此后每 6 小时一次 —— **这里的定时器就是检查节奏**，模块内只剩一个 30 分钟最小间隔地板
+  // 此后按渠道周期检查 —— **armDshCheckTimer 里的定时器就是检查节奏的载体**，
+  // 周期数字的唯一来源是 dsh-update.js 的 checkTickMs（alpha 1 小时 / latest 6 小时），
+  // 模块内只剩一个 30 分钟最小间隔地板
   // （dsh-update.js 的 CHECK_MIN_GAP_MS，只防启动器被反复重启时每次启动都联网）；只检测绝不自动更新
   // 发现新版后由 dsh-update.warmLatest 立即后台预热缓存，用户点"立即更新"时秒级完成
   setTimeout(() => { void dshUpdater.checkOnce('startup') }, 15000)
-  setInterval(() => { void dshUpdater.checkOnce('timer') }, 6 * 60 * 60 * 1000)
+  armDshCheckTimer()
 }
 
 // ---------- 应用生命周期 ----------

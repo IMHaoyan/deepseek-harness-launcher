@@ -1,6 +1,7 @@
 // dsh-update.js — DSH 更新：检测全自动、更新全手动
 // 策略（用户选定）：
-//  - 静默检查最新版（节奏 = 启动后 15 秒一次 + 每 6 小时一次，由 main.js 的定时器决定）；
+//  - 静默检查最新版（节奏 = 启动后 15 秒一次 + 按渠道周期，由 main.js 按 checkTickMs() 武装的定时器执行：
+//    alpha 1 小时 / latest 6 小时）；
 //    模块内只剩一个 30 分钟"最小间隔地板"，防的是启动器被反复重启时每次启动都联网；发现新版 → 主页卡片 +
 //    托盘气泡一次，绝不自动更新；
 //  - 用户点击卡片"立即更新"后才执行更新（全局 npm：npm update -g --prefix 全局根，npmmirror 优先）；
@@ -15,12 +16,18 @@ const fs = require('fs')
 const os = require('os')
 const semver = require('semver')
 
-// 检查的最小间隔地板 —— **不是**检查节奏（节奏由 main.js 的 6 小时 tick 决定）。
+// 检查的最小间隔地板 —— **不是**检查节奏（节奏是 main.js 按 checkTickMs() 武装的周期定时器）。
 // 它只防一种情况：启动器被反复重启（dev 热重启 / 崩溃后重启 / 用户来回重启托盘）时，每次启动都联网查一遍；
 // 离线时一次检查最坏要等两个源各 90 秒（见 fetchLatest 的 registry 回退），所以这道地板不能省。
-// 必须显著小于 tick：tick 从进程启动开始计时、首次检查在 +15s，地板一旦接近或等于 tick，就会把每个 tick
-// 都挡在门外，节奏会悄悄变成 12 小时一次 —— tests/dsh-update-cadence.test.js 钉住了这条不变式。
+// 必须显著小于**最短的那个** tick（alpha 的 1 小时）：tick 从进程启动开始计时、首次检查在 +15s，
+// 地板一旦接近或等于 tick，就会把每个 tick 都挡在门外，节奏会悄悄翻倍
+// —— tests/dsh-update-cadence.test.js 钉住了这条不变式。
 const CHECK_MIN_GAP_MS = 30 * 60 * 1000
+
+// 检查节奏：每个渠道一个 tick。alpha 发版快，1 小时；latest 维持 6 小时。
+// 数字放在本模块而不是 main.js：节奏随渠道走，而渠道语义由本模块拥有（channelOf）——
+// 两处各写一份「alpha 是几小时」迟早会分叉。main.js 只按本函数武装/重新武装定时器（含用户切渠道时）。
+const CHECK_TICK_MS = { latest: 6 * 60 * 60 * 1000, alpha: 60 * 60 * 1000 }
 const JOB_WAIT_TIMEOUT_MS = 20 * 60 * 1000 // 安装任务最长等待：20 分钟
 
 let Config = null
@@ -69,6 +76,12 @@ let userSwitchedChannel = ''
 // 更新渠道：latest（默认，跟随 npm latest）/ alpha（跟随 npm alpha，提前拿预览版）
 function channelOf() {
   return Config && Config.dshChannel === 'alpha' ? 'alpha' : 'latest'
+}
+
+// 当前渠道的检查周期。查不到就回落到 latest：宁可少查，也不能让脏配置把周期变成 undefined
+// （setInterval(fn, undefined) 等价于 0 延迟，会把检查变成疯转）。
+function checkTickMs() {
+  return CHECK_TICK_MS[channelOf()] || CHECK_TICK_MS.latest
 }
 
 function emitLifecycle(event, detail) {
@@ -890,7 +903,7 @@ async function checkOnce(reason, force) {
     const latest = await fetchLatest(plan.nodeCmd)
     // 记的是"上次尝试"而不是"上次成功"：写在判空之前，取版本失败也落盘。
     // 这样离线时反复重启启动器不会每次都去等两个源各 90 秒；失败的重试机会落在地板到期后的下一次
-    // 启动检查或下一个 6 小时 tick 上（把这次写入挪到判空之后会拆掉地板的这层保护）。
+    // 启动检查或下一个周期 tick 上（alpha 1 小时 / latest 6 小时；把这次写入挪到判空之后会拆掉地板的这层保护）。
     Config.dshUpdateCheckedAt = now
     try { saveConfig() } catch { /* noop */ }
     if (!latest) {
@@ -1208,6 +1221,7 @@ async function updateNow() {
 module.exports = {
   initDshUpdater,
   checkOnce,
+  checkTickMs,
   updateNow,
   getState,
   warmLatest,

@@ -288,9 +288,15 @@ function render(state) {
   window._running = !!state.running;
   window._firstRun = !!state.firstRun;
 
-  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录；点击打开 npm 官方页）
+  // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录；点击打开对应的 GitHub Release）
   const lvEl = $('launcherVersion');
-  if (lvEl) lvEl.textContent = state.version ? `v${state.version}` : '-';
+  if (lvEl) {
+    const launcherVer = state.version ? `v${state.version}` : '';
+    lvEl.textContent = launcherVer || '-';
+    lvEl.title = launcherVer
+      ? `${launcherVer} · 在 GitHub 打开此版本的 Release`
+      : '在浏览器打开 GitHub Releases 页面';
+  }
   const dshV = (state.env && state.env.dsh && state.env.dsh.version) || (state.dshUpdate && state.dshUpdate.current) || '';
   const dshKind = state.env && state.env.dsh ? state.env.dsh.kind : '';
   const dshKindLabel = ENV_KIND_LABELS[dshKind];
@@ -299,7 +305,8 @@ function render(state) {
   if (dshVerEl) {
     dshVerEl.textContent = dshVerText;
     dshVerEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
-      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir}` : '在浏览器打开 npm 官方页';
+      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir} · 在 GitHub 打开此版本的 Release`
+      : '在浏览器打开 GitHub Releases 页面';
   }
   // DSH 更新渠道（设置页）：latest / alpha，切换后主进程立即按新渠道重新检查
   const dshChannel = (state.dshUpdate && state.dshUpdate.channel) || 'latest';
@@ -1182,8 +1189,9 @@ $('btnOpen').addEventListener('click', () => {
 $('urlText').addEventListener('click', () => {
   if (window._currentUrl) cmd('openUrlExternal');
 });
-// DSH 版本行：点击打开 npm 官方页面
-$('dshVersion').addEventListener('click', () => cmd('openNpmDsh'));
+// 两个具体版本号：分别打开 DSHL / DSH 仓库中对应版本的 GitHub Release
+$('launcherVersion').addEventListener('click', () => cmd('openLauncherRelease'));
+$('dshVersion').addEventListener('click', () => cmd('openDshRelease'));
 // 启动/停止：启动失败不再静默 —— 按主进程回传的原因跳页或就地提示 8 秒
 let toggleHintTimer = null;
 function showToggleHint(text, kind) {

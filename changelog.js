@@ -15,6 +15,8 @@ const RELEASES_API = 'https://api.github.com/repos/IMHaoyan/deepseek-harness-lau
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000 // 12 小时
 const REQUEST_TIMEOUT_MS = 15 * 1000
 const MAX_VERSIONS = 30
+const LAUNCHER_REPO = 'IMHaoyan/deepseek-harness-launcher'
+const DSH_REPO = 'deepseek-ai/deepseek-harness'
 
 let cache = { at: 0, releases: [] }
 let inflight = null
@@ -146,4 +148,23 @@ async function getReleases(force = false) {
   return inflight
 }
 
-module.exports = { getReleases, httpErrorText, RELEASES_API, MAX_VERSIONS }
+/**
+ * 构造 GitHub 某个具体版本的 Release 页面地址。
+ * DSH 仓库的 tag 带 `dsh-` 前缀（例如 dsh-v0.1.6-alpha.2），DSHL 使用普通 `v` 前缀。
+ * 没有版本号时回落到该仓库的 Releases 列表，不拼一个必然 404 的空 tag。
+ */
+function releasePageUrl(repo, version, tagPrefix = 'v') {
+  const normalized = String(version || '').trim().replace(/^v/i, '')
+  const base = `https://github.com/${repo}/releases`
+  return normalized ? `${base}/tag/${tagPrefix}${encodeURIComponent(normalized)}` : base
+}
+
+function launcherReleaseUrl(version) {
+  return releasePageUrl(LAUNCHER_REPO, version, 'v')
+}
+
+function dshReleaseUrl(version) {
+  return releasePageUrl(DSH_REPO, version, 'dsh-v')
+}
+
+module.exports = { getReleases, httpErrorText, RELEASES_API, MAX_VERSIONS, LAUNCHER_REPO, DSH_REPO, releasePageUrl, launcherReleaseUrl, dshReleaseUrl }

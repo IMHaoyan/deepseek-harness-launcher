@@ -317,7 +317,7 @@ body {
 .value.link { cursor: pointer; }
 .value.link:hover { color: var(--brand); text-decoration: underline; }
 
-/* DSH 版本行：可点击，打开 npm 官方页（class 为 version-value，需单独命中） */
+/* 版本行：可点击，打开对应的 GitHub Release（class 为 version-value，需单独命中） */
 .version-value.link { cursor: pointer; }
 .version-value.link:hover { color: var(--brand); text-decoration: underline; }
 

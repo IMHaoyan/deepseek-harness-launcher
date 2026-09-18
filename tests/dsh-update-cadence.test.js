@@ -1,13 +1,15 @@
-// tests/dsh-update-cadence.test.js — DSH 更新检查的节奏（启动后一次 + 每 6 小时 tick）。
+// tests/dsh-update-cadence.test.js — DSH 更新检查的节奏（启动后一次 + 按渠道周期的 tick）。
 //
 // 契约（为什么要有这一层测试）：
-//   1) 节奏的唯一定义处是 main.js 的定时器；dsh-update.js 里那个常量只是"最小间隔地板"，
-//      防的是启动器被反复重启（dev 热重启 / 崩溃后重启 / 用户来回重启托盘）时每次启动都联网。
-//   2) 地板必须**显著小于** tick：tick 从进程启动开始计时、首次检查在 +15s，
-//      地板一旦接近或等于 tick，就会把每个 tick 都挡在门外 —— 检查频率会悄悄退化成 12 小时一次，
+//   1) 周期数字只有一个来源：dsh-update.js 的 checkTickMs()（alpha 1 小时 / latest 6 小时）。
+//      main.js 的 armDshCheckTimer 只负责按它武装/重新武装定时器，自己不再写死小时数。
+//   2) dsh-update.js 里的 CHECK_MIN_GAP_MS 只是"最小间隔地板"，防的是启动器被反复重启
+//      （dev 热重启 / 崩溃后重启 / 用户来回重启托盘）时每次启动都联网。
+//   3) 地板必须**显著小于最短的那个 tick**（alpha 的 1 小时）：tick 从进程启动开始计时、首次检查在 +15s，
+//      地板一旦接近或等于 tick，就会把每个 tick 都挡在门外 —— 检查频率会悄悄减半，
 //      而且因为被挡掉的那次原本不写日志，这种退化在日志里完全看不出来。
-//   3) 地板只该是"防抖"量级：如果它又被调回十几小时，等于把 6 小时的节奏名存实亡。
-//   4) 时间戳记的是"上次尝试"（写在 fetchLatest 判空之前），这样离线时反复重启启动器
+//   4) 换渠道必须重新武装定时器：否则切到 alpha 后要等下次启动才享受到 1 小时节奏。
+//   5) 时间戳记的是"上次尝试"（写在 fetchLatest 判空之前），这样离线时反复重启启动器
 //      不会每次都去等两个源各 90 秒；有人把这次写入挪到判空之后就会拆掉这层保护。
 'use strict'
 const test = require('node:test')
@@ -32,30 +34,48 @@ function minGapMs() {
   return ms
 }
 
-function tickMs() {
-  const m = /void dshUpdater\.checkOnce\('timer'\) \}, ([0-9\s*]+)\)/u.exec(main)
-  assert.ok(m, 'main.js 应有一个周期性的 dshUpdater.checkOnce(\'timer\') 定时器（检查节奏的源头）')
-  const ms = new Function('return ' + m[1])()
-  assert.equal(typeof ms, 'number')
-  return ms
+// 周期数字是纯函数，直接跑行为，不再从 main.js 里抠正则
+function tickMsFor(channel) {
+  dshUpdater.initDshUpdater({ Config: { dshChannel: channel } })
+  return dshUpdater.checkTickMs()
 }
 
-test('节奏由 main.js 定义：启动后 15 秒一次 + 每 6 小时一次', () => {
-  assert.match(main, /setTimeout\(\(\) => \{ void dshUpdater\.checkOnce\('startup'\) \}, 15000\)/, '启动后要自动检查一次')
-  assert.equal(tickMs(), 6 * HOUR, '周期检查应为 6 小时（改这里必须同步 README 的更新说明）')
+test('节奏数字的唯一来源是 checkTickMs：alpha 每小时、latest 每 6 小时', () => {
+  assert.equal(tickMsFor('alpha'), HOUR, 'alpha 渠道应每小时检查一次')
+  assert.equal(tickMsFor('latest'), 6 * HOUR, 'latest 渠道维持 6 小时')
+  assert.equal(tickMsFor(''), 6 * HOUR, '渠道为脏值时应回落到 latest，不能是 undefined（setInterval 会疯转）')
 })
 
-test('地板必须显著小于 tick：否则每个 tick 都会被自己的地板吃掉（退化成 12 小时一次）', () => {
+test('main.js 只按 checkTickMs 武装定时器，不再写死小时数', () => {
+  assert.match(main, /setTimeout\(\(\) => \{ void dshUpdater\.checkOnce\('startup'\) \}, 15000\)/, '启动后要自动检查一次')
+  assert.match(
+    main,
+    /setInterval\(\(\) => \{ void dshUpdater\.checkOnce\('timer'\) \}, dshUpdater\.checkTickMs\(\)\)/,
+    '定时器周期必须取自 dshUpdater.checkTickMs()',
+  )
+  assert.doesNotMatch(main, /checkOnce\('timer'\) \}, [0-9]/, 'main.js 里不应再有写死的 tick 毫秒数')
+})
+
+test('换渠道要重新武装定时器', () => {
+  const setter = main.indexOf("case 'setDshChannel'")
+  assert.ok(setter > 0, '找不到 setDshChannel 分支')
+  const nextCase = main.indexOf("case 'setLauncherChannel'", setter)
+  assert.ok(nextCase > setter, '找不到 setDshChannel 之后的兄弟分支')
+  const arm = main.indexOf('armDshCheckTimer()', setter)
+  assert.ok(arm > setter && arm < nextCase, 'setDshChannel 分支里必须重新武装定时器：否则切到 alpha 要等下次启动')
+})
+
+test('地板必须显著小于最短 tick，否则 tick 会被自己的地板吃掉', () => {
   const gap = minGapMs()
-  const tick = tickMs()
+  const tick = Math.min(tickMsFor('alpha'), tickMsFor('latest'))
   assert.ok(gap > 0, '地板应为正数')
   // tick 从进程启动计时、首查在 +15s，所以 tick 那次的间隔是 tick-15s；给 1 分钟余量兜住计时抖动
-  assert.ok(gap + 60 * 1000 <= tick, `地板 ${gap / 60000} 分钟相对 ${tick / HOUR} 小时 tick 太大，会把 tick 挡掉`)
+  assert.ok(gap + 60 * 1000 <= tick, `地板 ${gap / 60000} 分钟相对最短 tick ${tick / HOUR} 小时太大，会把 tick 挡掉`)
 })
 
 test('地板只是防抖：不能再变回粗节流，老的 24h 常量不得残留', () => {
   const gap = minGapMs()
-  assert.ok(gap <= HOUR, `地板 ${gap / 60000} 分钟过大：它只该防"启动器反复重启"，节奏交给 6 小时 tick`)
+  assert.ok(gap <= HOUR, `地板 ${gap / 60000} 分钟过大：它只该防"启动器反复重启"，节奏交给按渠道的 tick`)
   assert.doesNotMatch(dshUpdate, /CHECK_INTERVAL_MS/, '旧的 24h 节流常量应已移除（语义已改成最小间隔地板）')
 })
 
