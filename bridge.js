@@ -204,6 +204,28 @@ function ensurePayloadRuntimeDeps(target) {
   }
 }
 
+/**
+ * Windows 上杀毒/索引器短暂持有目录句柄时，rename 会偶发 EPERM/EACCES/EBUSY。
+ * 这是瞬时锁，不是目标状态；有限重试后仍失败才向上抛，避免把偶发锁变成发布阻塞。
+ */
+function renameWithRetrySync(from, to) {
+  const retryable = new Set(['EPERM', 'EACCES', 'EBUSY'])
+  let last
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      fs.renameSync(from, to)
+      return
+    } catch (err) {
+      last = err
+      if (!retryable.has(err && err.code)) throw err
+      const waitMs = 25 * (attempt + 1)
+      const sab = new SharedArrayBuffer(4)
+      Atomics.wait(new Int32Array(sab), 0, 0, waitMs)
+    }
+  }
+  throw last
+}
+
 /** 把已验证的 tgz 解到内容寻址缓存目录；link: 让 pnpm 永不原地重写该目录。 */
 function materializePayload() {
   if (!payload) throw new Error('远程连接插件 payload 不可用：' + (payloadError || '未知原因'))
@@ -222,7 +244,7 @@ function materializePayload() {
       if (isMaterializedPayloadValid(target)) return target
       fs.rmSync(target, { recursive: true, force: true })
     }
-    fs.renameSync(tmp, target)
+    renameWithRetrySync(tmp, target)
     ensurePayloadRuntimeDeps(target)
     return target
   } finally {
