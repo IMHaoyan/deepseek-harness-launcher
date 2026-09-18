@@ -109,9 +109,10 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { zoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
+let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
 
 // ---------- 环境探测/安装（env-detect.js / env-install.js） ----------
@@ -343,6 +344,12 @@ function applyConfigJson(cfg) {
   if (cfg.theme === 'light' || cfg.theme === 'dark' || cfg.theme === 'system') Config.theme = cfg.theme
   if (typeof cfg.notify === 'boolean') Config.notify = cfg.notify
   if (typeof cfg.autoRestart === 'boolean') Config.autoRestart = cfg.autoRestart
+  // 控制台 CSS 缩放：用户显式设置才覆盖；未设置时与对话界面共用系统推导默认值。
+  // 不再叠加系统 DPI（Chromium 已处理一次）。
+  if (Number.isInteger(cfg.consoleZoom) && cfg.consoleZoom >= 50 && cfg.consoleZoom <= 200) {
+    Config.consoleZoom = cfg.consoleZoom
+    consoleZoomLoaded = true
+  }
   // tabsEnabled：设置页开关已移除，恒为关闭（精简标题栏）；历史配置里的值不再生效
   if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
   if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
@@ -4358,8 +4365,8 @@ function stateJson() {
     autoRestart: Config.autoRestart,
     tabsEnabled: Config.tabsEnabled,
     consoleOpen: consoleIsOpen(),
-    zoom: Config.zoom,
-    cssZoom: cssZoomPct(),
+    zoom: Config.consoleZoom,
+    cssZoom: Config.consoleZoom,
     webZoom: Config.webZoom,
     theme: Config.theme,
     env: envDetect.envSummary(envReport),
@@ -4823,8 +4830,17 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'testNotify': notify('DeepSeek Harness', '测试通知：链路正常，点击本通知打开 DeepSeek Harness', WEB_URL); return '{}'
         case 'setZoom': {
           const z = Number(value)
-          // 启动器缩放：50-200，会话内生效，不持久化（每次启动默认跟随系统缩放）
-          if (Number.isInteger(z) && z >= 50 && z <= 200) Config.zoom = z
+          // 控制台缩放：50-200，用户设置持久化；显示值与实际 CSS zoom 一一对应
+          if (Number.isInteger(z) && z >= 50 && z <= 200) {
+            Config.consoleZoom = z
+            saveConfig()
+          }
+          broadcastState()
+          return '{}'
+        }
+        case 'resetZoom': {
+          Config.consoleZoom = defaultWebZoomPct()
+          saveConfig()
           broadcastState()
           return '{}'
         }
@@ -4846,6 +4862,21 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           broadcastState()
           return '{}'
         }
+        case 'resetWebZoom': {
+          const z = defaultWebZoomPct()
+          Config.webZoom = z
+          let first = null
+          for (const t of webTabs) {
+            const wc = t.view.webContents
+            if (wc.isDestroyed()) continue
+            try { wc.setZoomFactor(z / 100) } catch { /* noop */ }
+            if (!first) first = wc
+          }
+          if (first) showWebZoomOverlay(first)
+          saveConfig()
+          broadcastState()
+          return '{}'
+        }
         case 'setTheme': {
           if (value === 'light' || value === 'dark' || value === 'system') {
             Config.theme = value
@@ -4859,8 +4890,9 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'setNotify': Config.notify = !!value; saveConfig(); broadcastState(); return '{}'
         case 'resetDefaults': {
           // 恢复默认设置：所有选项回到默认值，窗口恢复默认尺寸与位置
-          Config.zoom = systemZoom()
-          Config.webZoom = defaultWebZoomPct()
+          const zoomDefault = defaultWebZoomPct()
+          Config.consoleZoom = zoomDefault
+          Config.webZoom = zoomDefault
           Config.theme = 'light'
           Config.notify = true
           Config.autoRestart = true
@@ -5188,14 +5220,14 @@ async function runSelfTest() {
       return
     }
     selftestPrint('READY ' + WEB_URL)
-    selftestPrint('SYSTEM ZOOM ' + Config.zoom + ' (detected from OS)')
+    selftestPrint('SYSTEM SCALE ' + systemZoom() + '% / CONSOLE ZOOM ' + Config.consoleZoom + '%')
     selftestPrint(`ICONS OK: colored=${!IconNormal.isEmpty()} blank=${!IconBlank.isEmpty()}`)
     const [ww2, wh2] = defaultWebSize()
     const prim = screen.getPrimaryDisplay()
     const primScale = prim.scaleFactor || 1
     selftestPrint(`WEB DEFAULT SIZE ${ww2}x${wh2} logical = ${ww2 * primScale}x${wh2 * primScale} physical (0.8 of ${Math.round(prim.size.height * primScale)} physical height, 3:2)`)
     await sleep(2000)
-    // 独立窗口：原生视图（WebContentsView）挂载，初始缩放应等于控制台校正值（隐藏创建，避免闪现）
+    // 独立窗口：原生视图（WebContentsView）挂载，初始缩放应等于配置的对话界面缩放
     openWebUi({ hidden: true })
     const wc = await new Promise((resolve) => {
       const t0 = Date.now()
@@ -5207,8 +5239,8 @@ async function runSelfTest() {
     })
     if (!wc) { selftestPrint('FAILED: tab view not created'); app.exit(2); return }
     const wfPct = Math.round(wc.getZoomFactor() * 100)
-    if (wfPct !== cssZoomPct()) { selftestPrint(`FAILED: webui zoom ${wfPct}% != expected ${cssZoomPct()}%`); app.exit(2); return }
-    selftestPrint(`WEBUI OK: initial zoom ${wfPct}% (matches panel ${cssZoomPct()}%)`)
+    if (wfPct !== Config.webZoom) { selftestPrint(`FAILED: webui zoom ${wfPct}% != expected ${Config.webZoom}%`); app.exit(2); return }
+    selftestPrint(`WEBUI OK: initial zoom ${wfPct}% (matches configured ${Config.webZoom}%)`)
     // 缩放提示浮层：注入到 webview 后应显示当前百分比
     showWebZoomOverlay(wc)
     await sleep(400)
@@ -5238,7 +5270,7 @@ async function runSelfTest() {
     if (!consoleWc) { selftestPrint('FAILED: console view not created'); app.exit(2); return }
     const title = await consoleWc.executeJavaScript('document.title')
     const consoleOk = await consoleWc.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('consoleNav') !== null && document.getElementById('consoleContent') !== null && document.getElementById('navGeneral') !== null && document.getElementById('navPlugins') !== null && document.getElementById('pagePlugins') !== null && document.getElementById('pluginCards') !== null && document.getElementById('navLog') !== null && document.getElementById('btnEnvBack') !== null && document.getElementById('btnOpenEnv') !== null && document.getElementById('btnRecoveryStart') !== null && document.getElementById('btnRecoveryRestart') !== null && document.getElementById('btnRecoveryStop') !== null && document.getElementById('btnRecoveryDiag') !== null && document.getElementById('btnRecoveryDiagDir') !== null && document.getElementById('btnOpenLogsDir') !== null && document.getElementById('recoverySlots') !== null && document.getElementById('logFull') !== null && document.getElementById('logSources') !== null && document.getElementById('logCause') !== null && document.getElementById('logCauseText') !== null && document.getElementById('btnLogCauseJump') !== null && document.getElementById('btnGithub') !== null && document.getElementById('btnChangelog') !== null && document.getElementById('pendingRestartBar') !== null && document.getElementById('btnApplyRestart') !== null && document.getElementById('btnConsoleReturn') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.getElementById('btnReset') !== null ? 'console-ok' : 'console-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('consoleNav') !== null && document.getElementById('consoleContent') !== null && document.getElementById('navGeneral') !== null && document.getElementById('navPlugins') !== null && document.getElementById('pagePlugins') !== null && document.getElementById('pluginCards') !== null && document.getElementById('navLog') !== null && document.getElementById('btnEnvBack') !== null && document.getElementById('btnOpenEnv') !== null && document.getElementById('btnRecoveryStart') !== null && document.getElementById('btnRecoveryRestart') !== null && document.getElementById('btnRecoveryStop') !== null && document.getElementById('btnRecoveryDiag') !== null && document.getElementById('btnRecoveryDiagDir') !== null && document.getElementById('btnOpenLogsDir') !== null && document.getElementById('recoverySlots') !== null && document.getElementById('logFull') !== null && document.getElementById('logSources') !== null && document.getElementById('logCause') !== null && document.getElementById('logCauseText') !== null && document.getElementById('btnLogCauseJump') !== null && document.getElementById('btnGithub') !== null && document.getElementById('btnChangelog') !== null && document.getElementById('pendingRestartBar') !== null && document.getElementById('btnApplyRestart') !== null && document.getElementById('btnConsoleReturn') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.querySelector('#btnZoom .zoom-slider') !== null && document.querySelector('#btnZoom .zoom-value') !== null && document.querySelector('#btnZoom .zoom-reset') !== null && document.querySelector('#btnWebZoom .zoom-slider') !== null && document.querySelector('#btnWebZoom .zoom-value') !== null && document.querySelector('#btnWebZoom .zoom-reset') !== null && document.getElementById('btnReset') !== null ? 'console-ok' : 'console-missing'",
     )
     selftestPrint(`CONSOLE OK: ${title} | ${consoleOk}`)
     if (consoleOk !== 'console-ok') { selftestPrint('FAILED: console DOM incomplete'); app.exit(2); return }
@@ -5754,16 +5786,11 @@ function systemZoom() {
   return 100
 }
 
-// 控制台与独立 WebUI 窗口共用的缩放校正值（Windows ÷1.2；其他平台原样）
-function cssZoomPct() {
-  return Math.round(Config.zoom * (IS_WIN ? 100 / 120 : 1))
-}
-
-// 对话界面默认缩放：在 cssZoomPct 基础上收敛到 100–125%
-// 锚点：系统 150% → 125%（比"通用正常物理大小"大 25%，用户品味基准，与 150% 档实测一致）；
-// 修掉旧公式两端问题：100% 系统不再 83%（缩水）、200% 系统不再 167%（物理 3.3×）。
+// 对话界面默认缩放：仍按系统 DPI 收敛到 100–125%；控制台缩放不参与这个推导。
+// 锚点：系统 150% → 125%，避免 100% 系统缩到 83%、200% 系统放到 167%。
 function defaultWebZoomPct() {
-  return Math.min(Math.max(cssZoomPct(), 100), 125)
+  const corrected = Math.round(systemZoom() * (IS_WIN ? 100 / 120 : 1))
+  return Math.min(Math.max(corrected, 100), 125)
 }
 
 // ---------- DSH market 插件状态同步 ----------
@@ -5817,8 +5844,10 @@ function init() {
   Config.autoRestart = true
   applyRuntimePort(true) // 端口配置生效（启动时 CLI --port 作种子；运行时切换以 Config.port 为准）
   initEnvRuntime()
-  Config.zoom = systemZoom() // 启动器缩放默认跟随系统（不持久化，每次启动重读）
-  if (!webZoomLoaded) Config.webZoom = defaultWebZoomPct() // 对话界面缩放默认：用户未设置过时用收敛默认；改过则用持久化值
+  // 两个缩放的默认值同源；用户改过则分别从持久化配置恢复。
+  const zoomDefault = defaultWebZoomPct()
+  if (!consoleZoomLoaded) Config.consoleZoom = zoomDefault
+  if (!webZoomLoaded) Config.webZoom = zoomDefault
   // 主题设置驱动原生标题栏与所有渲染进程的 prefers-color-scheme（tab 栏壳深色变量随之生效）
   try { nativeTheme.themeSource = Config.theme } catch { /* noop */ }
   // 移除默认应用菜单：其 Ctrl+R 加速键会重载"壳窗口"而非对话页面（视图在主进程持有，壳重载≠页面刷新）。

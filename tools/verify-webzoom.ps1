@@ -83,7 +83,7 @@ foreach ($t in $list) { if ($t.url -match 'index\.html') { $consoleView = $t; br
 if ($consoleView) {
   $txt = ''
   for ($i = 0; $i -lt 20; $i++) {
-    $txt = Cdp-Eval $consoleView.webSocketDebuggerUrl "document.getElementById('btnWebZoom')?document.getElementById('btnWebZoom').textContent:'missing'"
+    $txt = Cdp-Eval $consoleView.webSocketDebuggerUrl "document.getElementById('btnWebZoom')?.querySelector('.zoom-value')?.value||'missing'"
     if ($txt -match '\d+%') { break }
     Start-Sleep -Milliseconds 500
   }

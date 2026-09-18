@@ -44,86 +44,71 @@ const LAUNCHER_CHANNEL_VALUES = [
   { key: 'alpha', label: 'alpha' },
 ];
 
-// ---------- 缩放微调控件：按住左右拖动（5% 一格），双击变输入框（越界 clamp） ----------
-function makeZoomWidget(id, min, max, cmdName) {
-  const el = $(id);
-  const ui = { dragging: false, editing: false, value: 100, startX: 0, startVal: 0, moved: false };
+// ---------- 缩放滑块：5% 一档；右侧文本框实时显示，点击即可输入 ----------
+function makeZoomWidget(id, min, max, cmdName, resetCmdName) {
+  const root = $(id);
+  const slider = root.querySelector('.zoom-slider');
+  const valueEl = root.querySelector('.zoom-value');
+  const resetEl = root.querySelector('.zoom-reset');
+  if (!slider || !valueEl) return { setFromState() {} };
+
+  let value = 100;
+  let editing = false;
   const clamp5 = (v) => Math.min(max, Math.max(min, Math.round(v / 5) * 5));
-  const setText = (v) => { el.textContent = v + '%'; };
+  const render = () => {
+    slider.value = String(value);
+    if (!editing) valueEl.value = value + '%';
+  };
+  const apply = (v, force) => {
+    const next = clamp5(Number(v));
+    const changed = next !== value;
+    value = next;
+    render();
+    if (changed || force) cmd(cmdName, value);
+  };
 
-  el.addEventListener('mousedown', (e) => {
-    if (e.button !== 0 || ui.editing) return;
-    ui.dragging = true;
-    ui.moved = false;
-    ui.startX = e.clientX;
-    ui.startVal = ui.value;
-    el.classList.add('dragging');
-    e.preventDefault();
-  });
-  window.addEventListener('mousemove', (e) => {
-    if (!ui.dragging) return;
-    const delta = e.clientX - ui.startX;
-    if (Math.abs(delta) < 3) return;
-    ui.moved = true;
-    ui.value = clamp5(ui.startVal + Math.round(delta / 10) * 5); // 右滑加、左滑减，10px = 5%
-    setText(ui.value);
-  });
-  window.addEventListener('mouseup', () => {
-    if (!ui.dragging) return;
-    ui.dragging = false;
-    el.classList.remove('dragging');
-    if (ui.moved) cmd(cmdName, ui.value);
+  // 滑块拖动/键盘操作时实时更新显示与实际缩放。
+  slider.addEventListener('input', () => {
+    editing = false;
+    apply(slider.value);
   });
 
-  el.addEventListener('dblclick', () => {
-    if (ui.editing) return;
-    ui.editing = true;
-    const input = document.createElement('input');
-    input.type = 'number';
-    input.min = min;
-    input.max = max;
-    input.step = 5;
-    input.value = ui.value;
-    input.className = 'zoom-input';
-    el.textContent = '';
-    el.appendChild(input);
-    input.focus();
-    input.select();
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      ui.editing = false;
-      input.remove();
-      setText(ui.value);
-    };
-    const commit = () => {
-      const v = parseInt(input.value, 10);
-      if (Number.isInteger(v)) {
-        ui.value = Math.min(max, Math.max(min, v)); // 越界 clamp（输入值不吸附步进）
-        cmd(cmdName, ui.value);
-      }
-      finish();
-    };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      else if (e.key === 'Escape') finish();
-    });
-    input.addEventListener('blur', commit);
+  // 点击文本框进入编辑：去掉百分号并全选，方便直接输入数字。
+  valueEl.addEventListener('focus', () => {
+    editing = true;
+    valueEl.value = String(value);
+    requestAnimationFrame(() => valueEl.select());
   });
+  valueEl.addEventListener('click', () => {
+    if (editing) valueEl.select();
+  });
+  const finishEdit = () => {
+    const raw = parseInt(String(valueEl.value).replace('%', ''), 10);
+    editing = false;
+    if (Number.isInteger(raw)) apply(raw, true);
+    else render();
+  };
+  valueEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); valueEl.blur(); }
+    else if (e.key === 'Escape') { e.preventDefault(); editing = false; render(); valueEl.blur(); }
+  });
+  valueEl.addEventListener('blur', () => {
+    if (editing) finishEdit();
+    else render();
+  });
+  if (resetEl) resetEl.addEventListener('click', () => { editing = false; cmd(resetCmdName); });
 
   return {
     setFromState(v) {
-      if (ui.dragging || ui.editing) return;
-      ui.value = v;
-      setText(v);
+      if (editing) return;
+      value = clamp5(Number(v));
+      render();
     },
   };
 }
-
 const zoomWidgets = {
-  launcher: makeZoomWidget('btnZoom', 50, 200, 'setZoom'),
-  web: makeZoomWidget('btnWebZoom', 50, 300, 'setWebZoom'),
+  launcher: makeZoomWidget('btnZoom', 50, 200, 'setZoom', 'resetZoom'),
+  web: makeZoomWidget('btnWebZoom', 50, 300, 'setWebZoom', 'resetWebZoom'),
 };
 
 // ---------- 服务端口控件：双击变输入框（1024–65535），保存后服务自动切换端口 ----------
@@ -192,7 +177,7 @@ function renderToggleChip(id, enabled, labelOn, labelOff) {
   chip.classList.toggle('checked', enabled);
 }
 
-// cssZoom：主进程已按平台校正过的实际 CSS 缩放值
+// cssZoom：控制台实际使用的 CSS 缩放值；与界面显示值一一对应
 function applyZoom(cssZoom) {
   document.documentElement.style.zoom = (cssZoom / 100).toString();
 }

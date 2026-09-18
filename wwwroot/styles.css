@@ -481,19 +481,94 @@ body {
 }
 .chip.checked:hover { background: var(--primary-hover); }
 
-/* ---------- 缩放微调按钮（拖动 + 双击输入） ---------- */
+/* ---------- 缩放滑块（5% 一档 + 可编辑百分比框） ---------- */
 
-.zoom-widget {
-  min-width: 72px;
-  cursor: ew-resize;
-  user-select: none;
-  -webkit-user-select: none;
-  transition: background-color 100ms ease;
+.zoom-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-left: 16px;
 }
 
-.zoom-widget.dragging {
-  background: var(--primary-active);
-  color: var(--primary-fore);
+.zoom-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 240px;
+  min-width: 160px;
+  max-width: 300px;
+  height: 20px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.zoom-slider:focus { outline: none; }
+
+.zoom-slider::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+
+.zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border: 2px solid var(--card);
+  border-radius: 50%;
+  background: var(--brand);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .22);
+}
+
+.zoom-slider:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .18), 0 1px 4px rgba(0, 0, 0, .22);
+}
+
+.zoom-value {
+  width: 60px;
+  height: 28px;
+  flex: 0 0 60px;
+  box-sizing: border-box;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 26px;
+  text-align: center;
+  outline: none;
+}
+
+.zoom-value:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, .12);
+}
+
+.zoom-reset {
+  height: 26px;
+  flex: none;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font);
+  font-size: 11px;
+  line-height: 24px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.zoom-reset:hover {
+  background: var(--ghost-hover);
+  color: var(--text-primary);
 }
 
 .zoom-input {

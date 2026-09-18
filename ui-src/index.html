@@ -142,17 +142,21 @@
     <div class="settings-groups">
     <section class="card settings-group">
       <div class="group-title">界面与使用</div>
-      <!-- 启动器缩放已隐藏（控制台固定跟随系统缩放）；元素保留以免自检断言失效 -->
-      <div class="row hidden">
-        <span class="label">启动器缩放</span>
-        <div class="chips">
-          <button class="chip checked zoom-widget" id="btnZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
+      <!-- 控制台缩放：Chromium 已负责系统 DPI，这里只保存用户自己的缩放偏好 -->
+      <div class="row">
+        <span class="label">控制台缩放</span>
+        <div class="zoom-control" id="btnZoom">
+          <input class="zoom-slider" type="range" min="50" max="200" step="5" value="100" aria-label="控制台缩放">
+          <input class="zoom-value" type="text" inputmode="numeric" value="100%" aria-label="控制台缩放比例">
+          <button class="zoom-reset" id="btnZoomReset" type="button" title="恢复系统默认缩放">恢复默认</button>
         </div>
       </div>
       <div class="row">
         <span class="label">对话界面缩放</span>
-        <div class="chips">
-          <button class="chip checked zoom-widget" id="btnWebZoom" title="按住左右拖动微调（5% 一格），双击输入数值">100%</button>
+        <div class="zoom-control" id="btnWebZoom">
+          <input class="zoom-slider" type="range" min="50" max="300" step="5" value="100" aria-label="对话界面缩放">
+          <input class="zoom-value" type="text" inputmode="numeric" value="100%" aria-label="对话界面缩放比例">
+          <button class="zoom-reset" id="btnWebZoomReset" type="button" title="恢复系统默认缩放">恢复默认</button>
         </div>
       </div>
       <div class="row">
