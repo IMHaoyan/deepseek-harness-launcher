@@ -1,11 +1,11 @@
 {
-  "version": "0.1.0-dev.1",
-  "sha256": "1c1cfa4a59e519176d25dbe9ac3c1e80c703b627d4bc09dd910eb8ca719d2906",
+  "version": "0.1.0-dev.2",
+  "sha256": "ea36f38e95e35025c179f080211131b891eb826e9f1f5c9ce1af412c4c1c1494",
   "tarball": "bridge-next.tgz",
   "package": {
     "name": "@agents-anywhere/dsh-bridge-next",
-    "version": "0.1.0-dev.1"
+    "version": "0.1.0-dev.2"
   },
   "upstreamCommit": "b413330914fbe2870390866c8cc1a9a2f7697f29",
-  "builtAt": "2026-09-12T18:09:55.328Z"
+  "builtAt": "2026-09-19T13:55:37.142Z"
 }

@@ -158,13 +158,15 @@ test('readMaterializedPackageState：bundle patch 缺失不算可用，补回后
   fs.mkdirSync(packageDir, { recursive: true })
   bridge.initBridge({ home, payloadRoot: PAYLOAD_DIR, log: () => {} })
   fs.writeFileSync(path.join(profile, 'package.json'), JSON.stringify(manifestWith({ [NAME]: bridge.expectedSpec() }, [NAME])))
+  // payload 升版时本夹具必须跟着走：satisfied() 用物化版本区分「老构建 / 新 payload」，
+  // 硬编码版本号会在每次升版时把 specMatchesPayload 误判成 false。
   fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
     name: NAME,
-    version: '0.1.0-dev.1',
+    version: bridge.payloadVersion(),
     dsh: { bundle: { patch: './cordis.patch.yml' } },
   }))
   try {
-    assert.deepEqual(bridge.readMaterializedPackageState(), { version: '0.1.0-dev.1', patchReady: false })
+    assert.deepEqual(bridge.readMaterializedPackageState(), { version: bridge.payloadVersion(), patchReady: false })
     const before = bridge.getState()
     assert.equal(before.installed, true)
     assert.equal(before.materializedPatchReady, false)
