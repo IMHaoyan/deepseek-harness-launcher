@@ -97,6 +97,7 @@ test('bridge：与 market 同一套「先按策略默认跑、命中判定才放
   assert.match(src, /async function runCliOnce\(args\)/, '必须有一个「不注入放行参数」的基础执行器')
   assert.match(src, /if \(!releaseAgeViolation\(e && e\.output\)\) throw e/, '只有命中 24h 观察期判定才重试')
   assert.equal(bridge.releaseAgeViolation('lockfile failed supply-chain policy check'), true)
+  assert.equal(bridge.releaseAgeViolation('ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED: 1 resolution-policy violation was produced'), true, 'pnpm 11.8 的 remove 硬失败也必须命中重试')
   assert.equal(bridge.releaseAgeViolation('ERR_PNPM_EPERM: operation not permitted'), false)
   assert.deepEqual(
     bridge.parseReleaseAgeEntries('  dshmarket@1.47.0 was published at 2026-09-15T04:59:30.465Z, within the minimumReleaseAge cutoff (x)'),

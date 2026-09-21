@@ -215,6 +215,11 @@ const RELEASE_AGE_MARKERS = [
   'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
   'failed supply-chain policy check',
   'bypassed the policy locally',
+  // pnpm 11.8 的 remove 路径没有 wire 观察期处理器：只要树里存在任何新鲜条目就直接硬失败，
+  // 连"违规的是谁"都不打印（2026-09-20 实测：同一棵树 add 会自愈写 minimumReleaseAgeExclude、
+  // remove 报这个码）。它同样属于「被 24h 观察期拒绝」，放行一次即可通过；
+  // 不认这个码的话，卸载路径的兜底重试永远不会触发，用户只会看到一句 pnpm 内部错误。
+  'ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED',
 ]
 
 // ---------- 执行 dsh plugin（DSHL 保证 PATH 上的 pnpm 可用） ----------

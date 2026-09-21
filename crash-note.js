@@ -52,4 +52,37 @@ function shouldNotify(severity) {
   return severity === 'notice' || severity === 'alert'
 }
 
-module.exports = { STREAK_WINDOW_MS, ALERT_STREAK, MAX_STREAK, nextStreak, severityFor, shouldNotify }
+/**
+ * 机器在上次运行开始之后才启动 → 那次运行是随「系统关机 / 重启 / 断电」结束的，不是应用崩溃。
+ *
+ * 为什么需要这一条：Windows 只在**窗口**上派发 session-end（App 没有这个事件），所以任何漏事件的
+ * 路径——强行断电、系统在 Electron 处理前把进程收走、快速启动——都会留下 marker，
+ * 下次启动就误报一次崩溃。这里用「本次开机时刻晚于上次运行开始时刻」这条硬证据把它挡掉。
+ *
+ * 方向永远是**少报**：开机时刻算得偏早时（Windows 快速启动让 uptime 偏长）本函数判否，
+ * 维持原有的崩溃判定——宁可多报一次，也不会把真崩溃说成正常退出。
+ *
+ * @param {{startedAt?: string, now?: number, uptimeSeconds?: number}} input
+ *        uptimeSeconds 取 os.uptime()（自本次系统启动以来的秒数）
+ * @returns {boolean} true = 判为随系统结束，不应记为崩溃
+ */
+function endedBySystemRestart(input) {
+  const o = input || {}
+  const started = Date.parse(String(o.startedAt || ''))
+  if (!Number.isFinite(started)) return false
+  const uptime = Number(o.uptimeSeconds)
+  if (!Number.isFinite(uptime) || uptime < 0) return false
+  const now = Number.isFinite(Number(o.now)) ? Number(o.now) : Date.now()
+  const bootAt = now - uptime * 1000
+  return bootAt > started
+}
+
+module.exports = {
+  STREAK_WINDOW_MS,
+  ALERT_STREAK,
+  MAX_STREAK,
+  nextStreak,
+  severityFor,
+  shouldNotify,
+  endedBySystemRestart,
+}

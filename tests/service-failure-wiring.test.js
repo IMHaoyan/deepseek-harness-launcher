@@ -19,15 +19,36 @@ const app = read('ui-src/app.js')
 
 // ---------- 退出证据：受控退出必须 markClean ----------
 
-test('关机/注销/中断都算受控退出：session-end / SIGINT / will-quit 都要清理 active-run 标记', () => {
-  // Windows 关机与注销走 session-end，**不经过** before-quit；缺了它每次重启电脑都会被判成崩溃
-  assert.match(main, /app\.on\('session-end',[\s\S]{0,400}?markClean\(\)/, 'session-end 必须清理标记')
-  // 控制台 Ctrl+C / VS Code 停止按钮在 Windows 上是 SIGINT（不是 SIGTERM）
+test('关机/注销/中断都算受控退出：session-end 必须挂在窗口上，其余挂 app/process', () => {
+  // 权威是 Electron 的类型定义：session-end 只在 BaseWindow / BrowserWindow 上声明，App 上没有。
+  // 2026-09-20 实测的 bug 正是把它挂到了 app.on(...) 上 —— handler 永不触发，
+  // 于是每次关机都在下次启动被判成「上次非受控退出」。这里连类型定义一起断言，防止再挂错对象。
+  const dts = read('node_modules/electron/electron.d.ts')
+  const section = (header) => {
+    const at = dts.indexOf(header)
+    assert.ok(at >= 0, `electron.d.ts 里找不到「${header}」`)
+    const rest = dts.slice(at + header.length)
+    const end = rest.search(/^  (?:class|interface) /mu)
+    return end >= 0 ? rest.slice(0, end) : rest
+  }
+  assert.match(section('class BaseWindow extends NodeEventEmitter {'), /'session-end'/, 'session-end 是窗口事件（类型定义为准）')
+  assert.doesNotMatch(section('interface App extends NodeJS.EventEmitter {'), /'session-end'/, 'App 上没有 session-end —— 挂上去等于没挂')
+
+  // 因此接线必须落在窗口实例上，且处理体要真的清标记
+  assert.match(main, /webWin\.on\('session-end',\s*onSessionEnd\)/, 'session-end 必须挂在主窗口上')
+  assert.doesNotMatch(main, /app\.on\('session-end'/, '不能再把 session-end 挂到 app 上')
+  assert.match(main, /function onSessionEnd\(\)[\s\S]{0,600}?markClean\(\)/, 'session-end 处理体必须清标记')
+
+  // 其余受控退出路径：控制台 Ctrl+C / VS Code 停止按钮在 Windows 上是 SIGINT（不是 SIGTERM）
   assert.match(main, /process\.on\('SIGINT',[\s\S]{0,400}?markClean\(\)/, 'SIGINT 必须清理标记')
   assert.match(main, /app\.on\('will-quit',[\s\S]{0,300}?markClean\(\)/, 'will-quit 作为兜底')
-  // 原有的两条不能丢
   assert.match(main, /app\.on\('before-quit',[\s\S]{0,400}?markClean\(\)/, 'before-quit 仍要清理')
   assert.match(main, /process\.on\('SIGTERM',[\s\S]{0,400}?markClean\(\)/, 'SIGTERM 仍要清理')
+})
+
+test('漏掉 session-end 的关机也判得出来：随系统结束的运行不记崩溃', () => {
+  assert.match(main, /crashNote\.endedBySystemRestart\(\{[\s\S]{0,200}?os\.uptime\(\)/, '启动时必须用开机时刻交叉验证')
+  assert.match(main, /app\.exit\.systemEnded/, '判成随系统结束必须留下生命周期证据')
 })
 
 test('开发者热重启的标记文件路径保持有效（别被"重构"掉）', () => {
@@ -36,6 +57,20 @@ test('开发者热重启的标记文件路径保持有效（别被"重构"掉）
 })
 
 // ---------- 失败原因：进内存证据、进通知、进状态 ----------
+
+test('子进程日志落盘带时间戳：错误必须能定位到时刻（内存证据不受影响）', () => {
+  // 2026-09-20 排查设备掉线时，server.err/out.log 没有时间戳，错误无法定时。
+  // 打戳只走落盘路径：内存 errTail 与"当前环节"解析必须仍是原始行，否则行解析器全部失灵。
+  assert.match(main, /createStampWriter/, '落盘必须经过 log-stamp 的打戳写入器')
+  assert.match(main, /stampers\.out\.write\(d\)/, 'stdout 落盘要走打戳写入器')
+  assert.match(main, /stampers\.err\.write\(d\)/, 'stderr 落盘要走打戳写入器')
+  assert.match(main, /stampers\.(out|err)\.flush\(\)/, '退出前要把半行也落盘')
+  assert.match(main, /server\.errTail\.push\(line\)/, 'errTail 仍推原始行（不能带时间戳前缀）')
+  assert.match(main, /noteChildPhase\(child, d\)/, '"当前环节"仍从原始块解析')
+  // 打包清单：漏了它，打包后的应用会在 require('./log-stamp') 处直接起不来（verify 也会拦）
+  const pkgJson = JSON.parse(read('package.json'))
+  assert.ok(pkgJson.build.files.includes('log-stamp.js'), 'log-stamp.js 必须在 build.files 里')
+})
 
 test('子进程 stderr 进环形缓冲（原因的唯一来源），新一代启动时清空', () => {
   assert.match(main, /server\.errTail\.push\(line\)/, 'stderr 必须留证')

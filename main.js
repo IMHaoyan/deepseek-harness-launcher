@@ -17,6 +17,7 @@ const envInstall = require('./env-install')
 const updater = require('./updater')
 const dshUpdater = require('./dsh-update')
 const { redact } = require('./redact')
+const { createStampWriter } = require('./log-stamp')
 const runGuard = require('./run-guard')
 const lifecycle = require('./lifecycle')
 const health = require('./health')
@@ -1038,6 +1039,9 @@ async function startServerInner(occupantRetry = 0) {
     if (tail.closed) return
     tail.closed = true
     if (tail.timer) { clearTimeout(tail.timer); tail.timer = null }
+    // 半行也要落盘（子进程可能没打最后一个换行就退了）
+    try { stampers.out.flush() } catch { /* noop */ }
+    try { stampers.err.flush() } catch { /* noop */ }
     try { outS.end() } catch { /* noop */ }
     try { errS.end() } catch { /* noop */ }
     try { child.stdout.destroy() } catch { /* noop */ }
@@ -1055,13 +1059,20 @@ async function startServerInner(occupantRetry = 0) {
     tail.timer = setTimeout(closeTail, TOKEN_GRACE_MS)
   })
   const writeSafe = (s, d) => { if (!tail.closed) { try { s.write(d) } catch { /* 已 end 的写入异常不该变成 uncaught 噪声 */ } } }
+  // 落盘逐行打时间戳：2026-09-20 排查"设备昨晚几点掉线"时，这两份日志没有时间戳，
+  // 错误无法定位到时刻（只能靠推断）。只影响**文件**：内存 errTail 与"当前环节"解析仍用原始行，
+  // 所以 boot-failure 的规则匹配、start-progress 的 [name] 前缀都不受影响（见 log-stamp.js）。
+  const stampers = {
+    out: createStampWriter((text) => writeSafe(outS, text)),
+    err: createStampWriter((text) => writeSafe(errS, text)),
+  }
   // 解析 dsh web 启动时打印的访问地址：新 DSH（v0.1.2-rc.1 起）每次启动生成一次性
   // launch token，页面须带 token 首次访问换取浏览器 cookie（默认 30 天）。
   // 捕获后立即刷新 WebUI：首次加载可能早于本行到达而停在鉴权页/空白，由 refreshWebUiOnReady 与鉴权兜底补上。
   child.__launchBuf = ''
   child.__phase = startProgress.createPhaseReader() // "当前环节"的行缓冲（chunk 可能把一行劈成两半）
   const onData = (d) => {
-    writeSafe(outS, d)
+    stampers.out.write(d)
     noteChildPhase(child, d)
     if (server.gen !== gen) return // 过期世代的输出：不再解读
     child.__launchBuf = (child.__launchBuf + String(d)).slice(-8192)
@@ -1087,7 +1098,7 @@ async function startServerInner(occupantRetry = 0) {
   // 启动阶段记录「端口无法监听」：子进程退出后据此给出换端口建议（见 reportBindBlocked）
   let bindErr = ''
   child.stderr.on('data', (d) => {
-    writeSafe(errS, d)
+    stampers.err.write(d)
     noteChildPhase(child, d) // 插件日志（[usage-billing] …）走 stderr：它就是"当前环节"的来源
     // 留一份内存环形缓冲：失败原因（plugin tree / settings.yaml / bundle）只在这里，
     // 落盘那份用户看不到，诊断报告又要手动导出。
@@ -4175,6 +4186,9 @@ function openWebUi(opts = {}) {
       backgroundThrottling: false,
     },
   })
+  // session-end 只派发到窗口上（App 没有这个事件）：关机/注销时靠它清掉 active-run 标记。
+  // 主窗口常驻，所以这一个挂点覆盖了"关掉窗口只剩托盘"的情形；处理体见文件末尾的 onSessionEnd。
+  webWin.on('session-end', onSessionEnd)
   // 控制台视图与窗口同生命周期：窗口创建后即可懒加载 index.html，但只有 showConsole 时才挂到标题栏下方。
   consoleSurfaceHandle = createConsoleSurface({
     ownerWindow: webWin,
@@ -5576,6 +5590,17 @@ async function runSelfTest() {
       const crashDetect = !!(g4.previousRun && g4.previousRun.pid === process.pid)
       g4.markClean()
       selftestPrint(`RUN-GUARD CRASH-DETECT ${crashDetect ? 'OK' : 'FAILED'}`)
+      // session-end 的接线必须落在**窗口对象**上（Electron 只在窗口上派发它，App 没有这个事件）。
+      // 2026-09-20 的线上 bug 就是挂在 app 上：handler 永不触发，每次关机都被下次启动判成崩溃。
+      // 这里在运行期直接查监听器数量 —— 源码文本对不上对象，只有这条能证明真的接上了。
+      const winWired = !!webWin && !webWin.isDestroyed() && webWin.listenerCount('session-end') >= 1
+      const appClean = app.listenerCount('session-end') === 0
+      if (!winWired || !appClean) {
+        selftestPrint(`SESSION-END WIRING FAILED (window=${winWired ? webWin.listenerCount('session-end') : 'none'} app=${app.listenerCount('session-end')})`)
+        app.exit(2)
+        return
+      }
+      selftestPrint('SESSION-END WIRING OK')
     } catch (err) { selftestPrint('RUN-GUARD FAILED: ' + err.message) }
     {
       const ok = redact('sk-abcdefghijklmnopqrstuvwxyz123456') === 'sk-***' && redact('plain text 123') === 'plain text 123'
@@ -5896,6 +5921,18 @@ function init() {
   log('tray started')
   lifecycle.emit('app.started', { version: app.getVersion(), platform: process.platform })
   // 上次非受控退出证据：通知 + 自动收集诊断报告（脱敏，保留 3 份）
+  // 先过一道"随系统结束"的判定：本次开机发生在那次运行开始之后 → 是关机/重启带走的，不是崩溃。
+  // 这一层只用于**少报**（漏掉 session-end 的路径也不再误报），绝不会把真崩溃说成正常退出。
+  if (runGuardHandle && runGuardHandle.previousRun) {
+    const prevRun = runGuardHandle.previousRun
+    if (crashNote.endedBySystemRestart({ startedAt: prevRun.startedAt, uptimeSeconds: os.uptime() })) {
+      lifecycle.emit('app.exit.systemEnded', Object.assign({}, 'unreadable' in prevRun
+        ? { unreadable: true }
+        : { pid: prevRun.pid, startedAt: prevRun.startedAt }))
+      log('run-guard: previous run ended with the OS session (boot after run start)，不记崩溃')
+      runGuardHandle.previousRun = undefined
+    }
+  }
   if (runGuardHandle && runGuardHandle.previousRun) {
     const prev = runGuardHandle.previousRun
     lifecycle.emit('crash.previousRun', Object.assign({}, 'unreadable' in prev
@@ -6075,15 +6112,18 @@ app.on('activate', () => openDshOrConsole()) // macOS Dock 点击
 // 不算崩溃证据，避免每次改主进程代码都弹一次崩溃提示卡 + 生成诊断报告。
 // 注意：真正的兜底是下面那个标记文件，不是下面的 SIGTERM —— Windows 上 taskkill /F 是
 // TerminateProcess，根本投递不了 SIGTERM；那句 handler 只在类 Unix 上有效。
-// Windows 关机/注销：Electron 发 session-end，**不会**走 before-quit。
-// 不处理它的话，每次重启电脑都会在下次启动被判成「上次非受控退出」——
-// 弹崩溃卡 + 发通知 + 落一份诊断报告，而且 crashStreak 一路累加（实测 59 次里有相当一部分是这么来的）。
-app.on('session-end', () => {
+// Windows 关机/注销：Electron 只在 **窗口**（BaseWindow / BrowserWindow）上派发 session-end，
+// App 上根本没有这个事件（以 electron.d.ts 的 interface App 为准）；这条路径也**不经过**
+// before-quit / will-quit。挂错对象 = handler 永不触发 = 每次关机都被下次启动判成
+// 「上次非受控退出」：弹崩溃卡 + 发通知 + 落一份诊断报告，而且 crashStreak 一路累加。
+// 主窗口常驻（close 只 hide，真退出才 destroy），所以挂在它上面即覆盖"关掉窗口只剩托盘"的情形；
+// 接线点在 openWebUi 创建窗口之后：webWin.on('session-end', onSessionEnd)。
+function onSessionEnd() {
   reallyExit = true
   try { saveWebWindowState() } catch { /* noop */ }
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
   try { lifecycle.emit('app.exit', { reason: 'session-end' }) } catch { /* noop */ }
-})
+}
 process.on('SIGTERM', () => {
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
   try { lifecycle.emit('app.exit', { reason: 'sigterm' }) } catch { /* noop */ }

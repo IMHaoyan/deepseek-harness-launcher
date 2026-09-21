@@ -206,6 +206,18 @@ function tryOut(cmd, args) {
   try { return execFileSync(cmd, args, { cwd: root, encoding: 'utf8' }) } catch { return null }
 }
 
+// 捕获 stdout 且**需要区分成败**的命令（自检门禁用）。Windows 上 npm 是 .cmd，
+// 不经 shell 无法 spawn，所以沿用 run() 的同一条判断；失败时照样把已产出的 stdout 带回来。
+function capture(cmd, args) {
+  const opts = { cwd: root, encoding: 'utf8', shell: process.platform === 'win32' && /\.cmd$/i.test(cmd) }
+  try {
+    return { ok: true, out: execFileSync(cmd, args, opts) }
+  } catch (error) {
+    const out = error && typeof error.stdout === 'string' ? error.stdout : ''
+    return { ok: false, out }
+  }
+}
+
 // ---------- 1. 前置检查 ----------
 if (tryOut('gh', ['--version']) === null) {
   console.error('未找到 GitHub CLI。请先执行：winget install GitHub.cli 然后 gh auth login')
@@ -236,6 +248,21 @@ if (process.env.DSHL_SKIP_PRECHECK === '1') {
 } else {
   run(npm, ['test'])
   run(npm, ['run', 'verify'])
+  // 运行期自检：npm test 只能断言源码**文本**（挂错 emitter 也照样绿），
+  // 断言不了"运行时接线"。2026-09-20 的两个回归（session-end 挂到 app 上、
+  // 观察期识别器少一个 marker）都是这一层先抓到的。selftest 自带隔离 HOME + 随机端口，
+  // 不碰用户配置；无 GUI 环境可用 DSHL_SKIP_SELFTEST=1 跳过（会留一条显式警告）。
+  if (process.env.DSHL_SKIP_SELFTEST === '1') {
+    console.log('警告：跳过运行期自检（DSHL_SKIP_SELFTEST=1）—— 本次发布的运行时接线未经机器验证')
+  } else {
+    const check = capture(npm, ['run', 'selftest'])
+    const failed = check.out.split('\n').filter((line) => line.includes('FAILED'))
+    if (!check.ok || failed.length > 0) {
+      console.error('运行期自检未通过（npm run selftest）' + (failed.length ? '：\n' + failed.join('\n') : ''))
+      process.exit(1)
+    }
+    console.log('运行期自检通过')
+  }
 }
 run(process.execPath, ['tools/fetch-node-dist.mjs'])
 run(npm, ['run', 'build:assets'])

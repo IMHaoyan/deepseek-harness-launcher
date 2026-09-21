@@ -117,10 +117,13 @@ test('pnpm 视图：默认不关策略，只有被 24h 观察期整体拒绝时�
   assert.deepEqual(market.withReleaseAgeOverride(['list']), ['list'])
 })
 
-test('releaseAgeViolation：认得 pnpm 的三种稳定标记（含错误码被尾部截断的情形）', () => {
+test('releaseAgeViolation：认得 pnpm 的四种稳定标记（含错误码被尾部截断的情形）', () => {
   assert.equal(market.releaseAgeViolation('[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 1 lockfile entries failed verification:'), true)
   assert.equal(market.releaseAgeViolation('✗ Lockfile failed supply-chain policy check (275 entries in 3.4s)'), true)
   assert.equal(market.releaseAgeViolation('the lockfile is stale, or that someone committed a lockfile that bypassed the policy locally'), true)
+  // pnpm 11.8 的 remove 路径缺观察期处理器时的硬失败（同一棵树 add 会自愈、remove 报这个码）：
+  // 它同样属于「被 24h 观察期拒绝」，必须命中重试，否则卸载路径永远拿不到那一次放行
+  assert.equal(market.releaseAgeViolation('[ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED] 1 resolution-policy violation was produced but no handleResolutionPolicyViolations callback was wired to react to them.'), true)
   assert.equal(market.releaseAgeViolation('ERR_PNPM_EPERM: operation not permitted'), false)
   assert.equal(market.releaseAgeViolation(''), false)
   assert.equal(market.releaseAgeViolation(undefined), false)

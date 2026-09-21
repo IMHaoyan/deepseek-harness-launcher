@@ -64,6 +64,12 @@ let upstream = ''
 try {
   upstream = execFileSync('git', ['-C', src, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
 } catch { /* 非 git 目录：留空 */ }
+// 工作区有未提交改动时，产物内容 ≠ upstreamCommit 指向的那棵树（上游 checkout 常带着在改的 WIP）。
+// 不记这一位的话，"用这个 commit 能复现出这份 payload"就是错的 —— 排查时会被误导。
+let upstreamDirty = false
+try {
+  upstreamDirty = execFileSync('git', ['-C', src, 'status', '--porcelain'], { encoding: 'utf8' }).trim() !== ''
+} catch { /* 非 git 目录：留空 */ }
 
 const meta = {
   version: pkg.version,
@@ -71,6 +77,7 @@ const meta = {
   tarball: tgzName,
   package: { name: pkg.name, version: pkg.version },
   upstreamCommit: upstream,
+  upstreamDirty,
   builtAt: new Date().toISOString(),
 }
 writeFileSync(join(assetsDir, 'version.json'), JSON.stringify(meta, null, 2) + '\n')
@@ -78,7 +85,7 @@ writeFileSync(join(assetsDir, 'version.json'), JSON.stringify(meta, null, 2) + '
 console.log('payload 已更新：')
 console.log('  版本   ' + meta.version)
 console.log('  SHA256 ' + meta.sha256)
-console.log('  提交   ' + (upstream || '(未知)'))
+console.log('  提交   ' + (upstream || '(未知)') + (upstreamDirty ? '（工作区有未提交改动，产物内容不等于该提交）' : ''))
 console.log('  产物   ' + tgzPath)
 
 

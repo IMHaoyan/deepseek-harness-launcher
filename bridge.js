@@ -39,6 +39,8 @@ const RELEASE_AGE_MARKERS = [
   'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
   'failed supply-chain policy check',
   'bypassed the policy locally',
+  // 见 market.js 同名常量：pnpm 11.8 的 remove 路径缺观察期处理器，硬失败时打的就是这个码
+  'ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED',
 ]
 const PROFILE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CLI_TIMEOUT_MS = 15 * 60 * 1000 // 首次安装要拉依赖树，给足时间
