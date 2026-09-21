@@ -41,6 +41,16 @@ test('缩放行与 chips 行同一个行间距（不再额外留白、也不推�
   assert.doesNotMatch(zoom[1], /justify-content:\s*flex-end/, '不得再把控件推到右端')
 })
 
+test('上下两行共用同一个两栏定义（卡片竖缝不能错开）', () => {
+  const consoleCss = read('ui-src/console.css')
+  const builtConsole = read('wwwroot/console.css')
+  assert.match(css, /--general-cols:\s*repeat\(2, minmax\(0, 1fr\)\);/, '两栏分割必须是单一常量')
+  assert.match(consoleCss, /#pageGeneral \{[\s\S]{0,220}?grid-template-columns: var\(--general-cols\);/, '顶部两栏必须用 --general-cols')
+  assert.match(consoleCss, /#consoleContent \.settings-groups \{ display: grid; grid-template-columns: var\(--general-cols\);/, '下半两栏必须同源')
+  assert.doesNotMatch(consoleCss, /1\.35fr/, '旧的 1.35fr/0.85fr 不对称分割已废弃（它让上半两行竖缝差出 ~150px）')
+  assert.match(builtConsole, /var\(--general-cols\)/, 'wwwroot 未同步：请执行 npm run build:assets')
+})
+
 test('wwwroot 与源码同步（改了 ui-src 必须重新构建）', () => {
   assert.match(builtCss, /--label-col:\s*\d+px;/, 'wwwroot 未同步：请执行 npm run build:assets')
   assert.match(builtCss, /\.label \{[\s\S]{0,120}?width: var\(--label-col\);/, 'wwwroot 里仍是旧规则')

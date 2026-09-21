@@ -26,6 +26,9 @@
      列宽固定 → 每行「标签 → 控件」的距离一致，控件左缘也落在同一条竖线上；
      状态卡共用同一列，所以页面上下两块卡片的文字起始竖线也对齐。 */
   --label-col: 104px;
+  /* 通用页的两栏分割：上半（状态 / 主操作）与下半（界面与使用 / 服务与更新）必须同源。
+     此前上半是 1.35fr/0.85fr、下半是 1fr/1fr，两块卡片的右缘差出约 150px（截图反馈"没对齐"）。 */
+  --general-cols: repeat(2, minmax(0, 1fr));
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }

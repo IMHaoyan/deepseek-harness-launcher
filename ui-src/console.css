@@ -185,10 +185,11 @@ body.console-surface {
   line-height: 18px;
 }
 
-/* 通用页：上半状态 / 主操作两栏，下半偏好设置分组通栏 */
+/* 通用页：上半状态 / 主操作两栏，下半偏好设置分组通栏 —— 两行共用 --general-cols，
+   所以四个卡片落在同一条竖缝上（此前两行各自的列宽不同，右缘对不齐）。 */
 #pageGeneral {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(320px, .85fr);
+  grid-template-columns: var(--general-cols);
   grid-template-areas:
     "head head"
     "status actions"
@@ -209,7 +210,8 @@ body.console-surface {
 #pageGeneral .settings-groups { grid-area: groups; }
 
 #consoleContent .card { margin-bottom: 0; }
-#consoleContent .settings-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+/* 与上半两栏同源（--general-cols）：这样"界面与使用"的左右缘与上方状态卡严格对齐 */
+#consoleContent .settings-groups { display: grid; grid-template-columns: var(--general-cols); gap: 16px; align-items: start; }
 
 .settings-group { padding-top: 16px; }
 .group-title {
