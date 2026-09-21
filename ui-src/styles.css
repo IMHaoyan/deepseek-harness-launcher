@@ -22,6 +22,10 @@
   --success: #22C55E;
   --error: #EC1313;
   --log-bg: #F9FAFB;
+  /* 设置行标签列宽：容纳最长标签「启动器更新渠道」（7 字 × 14px ≈ 98px）不折行。
+     列宽固定 → 每行「标签 → 控件」的距离一致，控件左缘也落在同一条竖线上；
+     状态卡共用同一列，所以页面上下两块卡片的文字起始竖线也对齐。 */
+  --label-col: 104px;
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
@@ -172,22 +176,22 @@ body {
 
 .row + .row { margin-top: 2px; }
 
-/* 设置行标题：14px/22 主色（对齐 AppearanceRow 规格） */
+/* 设置行标题：14px/22 主色（对齐 AppearanceRow 规格）；宽度走 --label-col，全页一条竖线 */
 .label {
   flex: none;
-  width: 88px;
+  width: var(--label-col);
   color: var(--text-primary);
   font-size: 14px;
   line-height: 22px;
 }
 
-/* 状态卡统一标签列：76px 左对齐——所有行的数值从同一竖线开始 */
+/* 状态卡复用同一标签列：数值与下方设置行的控件从同一条竖线开始（不再用 76px 自成一套） */
 #statusCard .label {
-  width: 76px;
+  width: var(--label-col);
 }
 
 
-/* 长标题行：标题在上、控件在下，控件左缘与其他行严格对齐（88px 标签列 + 12px 间距） */
+/* 长标题行：标题在上、控件在下，控件左缘与其他行严格对齐（--label-col 标签列 + 12px 间距） */
 .row.stack {
   flex-direction: column;
   align-items: flex-start;
@@ -200,7 +204,7 @@ body {
 }
 
 .row.stack .chips {
-  margin-left: 100px;
+  margin-left: calc(var(--label-col) + 12px);
 }
 
 /* 文本输入框（余额查询接口设置等） */
@@ -281,20 +285,22 @@ body {
   -webkit-user-select: text;
 }
 
-/* 设置页：选项控件靠右对齐（label 靠左，chips/按钮贴右缘；主页状态行不受影响） */
+/* 设置页：控件紧跟标签列（左缘统一），不再贴右缘。
+   "控件贴右缘"在卡片较窄或控制台 120% 缩放下会把标题与开关之间的中缝拉得很大，
+   长标签行还把 label 撑满、控件更靠右。固定 --label-col + 12px 行间距 = 每行距离一致，
+   需要贴右的元素（版本行的按钮等）各自用 margin-left: auto，不受这里影响。 */
 .settings-groups .row {
-  justify-content: space-between;
+  justify-content: flex-start;
 }
 
 .settings-groups .row.stack .chips {
-  margin-left: auto;
+  margin-left: calc(var(--label-col) + 12px);
 }
 
-/* 长标题行：标题与按钮同在一行，label 占自适应宽度（按钮已靠右对齐） */
+/* 长标签行与普通行同列（此前 label 用 flex:1 撑满 → 控件被推到右缘）；真的超长才省略号 */
 .settings-groups .row.long-label .label {
-  width: auto;
-  flex: 1;
-  min-width: 0;
+  width: var(--label-col);
+  flex: none;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -483,14 +489,13 @@ body {
 
 /* ---------- 缩放滑块（5% 一档 + 可编辑百分比框） ---------- */
 
+/* 缩放行：与 chips 行用同一个行间距（不再额外 +16px，也不再把控件推到右端） */
 .zoom-control {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: 10px;
   flex: 1 1 auto;
   min-width: 0;
-  margin-left: 16px;
 }
 
 .zoom-slider {
