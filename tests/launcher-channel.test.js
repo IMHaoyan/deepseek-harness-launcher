@@ -41,12 +41,46 @@ test('updater：channel 与 allowPrerelease 成对设置，且默认仍是正式
   assert.doesNotMatch(updaterSrc, /allowPrerelease = false\n/, '不应残留写死的 allowPrerelease=false')
   assert.match(updaterSrc, /readChannel = typeof opts\.getChannel === 'function' \? opts\.getChannel : readChannel/, '渠道来源由主进程注入')
   assert.match(main, /getChannel: \(\) => Config\.launcherChannel/, '主进程应按配置提供渠道')
-  assert.match(updaterSrc, /onChannelChanged, normalizeChannel, CHANNELS/, '渠道相关入口要导出（测试与主进程都用）')
+  assert.match(updaterSrc, /onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS/, '渠道相关入口要导出（测试与主进程都用）')
 })
 
-test('updater：换渠道作废已下载的旧渠道包，并立刻按新渠道检查', () => {
+test('updater：显式关掉 electron-updater 的 allowDowngrade 副作用（降级闸）', () => {
+  // electron-updater 的 channel setter 会把 allowDowngrade 置 true（AppUpdater.js:44 + 其文档注释），
+  // 于是"装了 alpha 的机器切回 latest"会把更旧的正式版当成更新：2026-09-21 实测
+  // v1.4.8-alpha.4 被提示「可更新到 v1.4.7」并自动下载（退出时会自动安装 = 静默降级）。
+  const setChannelAt = updaterSrc.indexOf('autoUpdater.channel = channel')
+  const allowPrereleaseAt = updaterSrc.indexOf("autoUpdater.allowPrerelease = channel === 'alpha'")
+  const disableAt = updaterSrc.indexOf('autoUpdater.allowDowngrade = false')
+  assert.ok(disableAt > 0, 'applyChannel 必须显式关掉 allowDowngrade（不能依赖 electron-updater 的默认值）')
+  assert.ok(disableAt > setChannelAt && disableAt > allowPrereleaseAt, '必须在设置 channel 之后关（setter 每次都把它打开）')
+  assert.match(updaterSrc, /allowDowngrade/, '要有注释说明这个副作用，避免以后被"清理"掉')
+})
+
+test('updater：更新源给了更旧/同版也不当更新（界面文案与真实动作一致）', () => {
+  assert.match(updaterSrc, /if \(!isNewerVersion\(info\.version, state\.current\)\) \{/, 'update-available 必须过一遍版本大小闸')
+  assert.match(updaterSrc, /updater: 忽略不比当前新的版本/, '拦下时要留日志（可解释）')
+  assert.match(updaterSrc, /setStatus\('up-to-date', \{ latest: '', error: '' \}\)/, '拦下后按"已是最新"呈现，且不带 latest')
+  assert.match(updaterSrc, /autoUpdater\.on\('update-not-available', \(\) => \{[\s\S]{0,220}?setStatus\('up-to-date', \{ latest: '', error: '' \}\)/, '检不到更新时必须清掉残留的 latest')
+})
+
+test('isNewerVersion：跑真实源码片段 —— 降级与同版都不算更新', () => {
+  const start = updaterSrc.indexOf('function isNewerVersion(')
+  assert.ok(start > 0, '找不到 isNewerVersion')
+  const end = updaterSrc.indexOf('\n}\n', start) + 3
+  const isNewer = new Function('semver', updaterSrc.slice(start, end) + '\nreturn isNewerVersion')(require('semver'))
+  // 2026-09-21 事件原样：渠道 latest、已装 v1.4.8-alpha.4、latest.yml 给 v1.4.7
+  assert.equal(isNewer('1.4.7', '1.4.8-alpha.4'), false, '更旧的正式版绝不能算更新')
+  assert.equal(isNewer('1.4.8-alpha.4', '1.4.8-alpha.4'), false, '同版不算更新')
+  assert.equal(isNewer('1.4.8-alpha.5', '1.4.8-alpha.4'), true, 'alpha 之间的正常升级要放行')
+  assert.equal(isNewer('1.4.8', '1.4.8-alpha.4'), true, 'alpha 转正式版要放行（这是预期路径）')
+  assert.equal(isNewer('1.5.0', '1.4.8-alpha.4'), true)
+  assert.equal(isNewer('', '1.4.8-alpha.4'), true, '版本号取不到时 fail-open（宁可多给一次更新）')
+  assert.equal(isNewer('not-semver', '1.4.8-alpha.4'), true)
+})
+
+test('updater：换渠道无条件作废旧渠道的 latest（不留脏值）', () => {
   assert.match(updaterSrc, /function onChannelChanged\(\) \{/, '应有渠道变更入口')
-  assert.match(updaterSrc, /if \(state\.status === 'downloading' \|\| state\.status === 'downloaded'\) \{/, '下载中/已下载都要作废')
+  assert.doesNotMatch(updaterSrc, /if \(state\.status === 'downloading' \|\| state\.status === 'downloaded'\) \{/, '不再按状态判断：任何残留都必须清掉')
   assert.match(updaterSrc, /state\.latest = ''\n\s+state\.percent = 0\n\s+state\.status = 'idle'/, '作废要清到 idle 状态')
   assert.match(main, /case 'setLauncherChannel': \{/, '应有切换命令')
   assert.match(main, /updater\.onChannelChanged\(\)/, '切换后要落到 electron-updater')
