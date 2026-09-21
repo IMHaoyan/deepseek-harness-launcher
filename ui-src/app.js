@@ -1909,7 +1909,8 @@ $('btnFeedbackSend').addEventListener('click', async () => {
   const r = await cmd('feedbackSend', { text, contact: $('feedbackContact').value, includeLogs: $('feedbackLogs').checked });
   if (!r) { showFeedbackStatus('提交失败：无响应', 'error'); return; }
   if (r.ok) {
-    showFeedbackStatus('已发送到飞书反馈群（作者会即时收到），感谢反馈！', 'ok');
+    const extra = r.chunks > 1 ? `（日志较长，已分 ${r.chunks} 条发送）` : '';
+    showFeedbackStatus(`已发送到飞书反馈群${extra}，作者会即时收到，感谢反馈！`, 'ok');
     return;
   }
   if (r.needWebhook) {

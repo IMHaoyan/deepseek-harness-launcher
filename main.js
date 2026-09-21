@@ -18,6 +18,7 @@ const updater = require('./updater')
 const dshUpdater = require('./dsh-update')
 const { redact } = require('./redact')
 const { createStampWriter } = require('./log-stamp')
+const { compactLog, sendChunked, clampChunkChars } = require('./feedback-pack')
 const runGuard = require('./run-guard')
 const lifecycle = require('./lifecycle')
 const health = require('./health')
@@ -110,7 +111,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -354,6 +355,8 @@ function applyConfigJson(cfg) {
   // tabsEnabled：设置页开关已移除，恒为关闭（精简标题栏）；历史配置里的值不再生效
   if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
   if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
+  // 反馈分片上限（字符）：界面无入口，作者按飞书实测截断点调；0/缺失 = 用默认值
+  if (Number.isFinite(cfg.feedbackChunkChars) && cfg.feedbackChunkChars > 0) Config.feedbackChunkChars = Math.floor(cfg.feedbackChunkChars)
   // 独立窗口几何：尺寸（≥640×480）+ 最大化 + 位置（多显示器变更时打开侧校验回退居中）
   if (Number.isInteger(cfg.webWindowWidth) && cfg.webWindowWidth >= 640) Config.webWindowWidth = cfg.webWindowWidth
   if (Number.isInteger(cfg.webWindowHeight) && cfg.webWindowHeight >= 480) Config.webWindowHeight = cfg.webWindowHeight
@@ -4555,9 +4558,8 @@ function onTick() {
 }
 
 // ---------- 问题反馈（飞书群机器人 webhook：POST 到固定地址，作者群内即时收到） ----------
-const FEEDBACK_BODY_MAX = 60000 // 反馈内容上限（本地落盘同样截断，避免异常超大文件）
+const FEEDBACK_BODY_MAX = 60000 // 反馈正文上限（本地落盘同样截断，避免异常超大文件；发送侧另有分片兜底）
 const FEISHU_WEBHOOK_RE = /^https:\/\/open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[0-9a-fA-F-]+$/
-const FEISHU_TEXT_MAX_BYTES = 120000 // 飞书文本消息请求体上限 150KB（官方文档），留余量防 JSON 转义膨胀
 
 // 内置反馈通道：assets/feishu-webhook.txt（.gitignore 排除，不进仓库；打包时随安装包分发）
 // 群机器人 webhook 仅能向指定群发文本消息，泄露可随时在群设置里重置，风险面小
@@ -4574,22 +4576,12 @@ function effectiveFeishuWebhook() {
   return FEISHU_WEBHOOK_RE.test(custom) ? custom : embeddedFeishuWebhook()
 }
 
-// 按 UTF-8 字节数截断（飞书上限按请求体字节计）：从尾部截，保住标题/描述/环境/日志头部
-function trimUtf8(text, maxBytes) {
-  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
-  const suffix = '\n\n…（内容超出飞书消息长度上限，已截断；完整版已保存在本地日志目录 feedback/ 下）'
-  const suffixBytes = Buffer.byteLength(suffix, 'utf8')
-  let lo = 0
-  let hi = text.length
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2)
-    if (Buffer.byteLength(text.slice(0, mid), 'utf8') + suffixBytes <= maxBytes) lo = mid
-    else hi = mid - 1
-  }
-  return text.slice(0, lo) + suffix
-}
+// 长度问题改由 feedback-pack.js 处理：先把重复行折叠，再按**字符**（飞书口径）分片发送。
+// 旧实现是按 UTF-8 字节截断单条消息 —— 中文场景下会"看着没超却仍被飞书截断"，且超限即丢尾部。
 
-// 发送文本消息到飞书群机器人：成功返回 true，失败抛出可读错误（含飞书错误码）
+// 发送文本消息到飞书群机器人：成功返回 true，失败抛出可读错误（含飞书错误码）。
+// `retryable` 标记限流/服务端抖动这类"重试有意义"的失败，交给 sendChunked 退避重试；
+// webhook 失效、参数错误等重试也没用，直接失败（避免把同一份日志反复灌进群里）。
 async function sendToFeishu(text, hook) {
   const url = hook || effectiveFeishuWebhook()
   const res = await fetch(url, {
@@ -4598,9 +4590,15 @@ async function sendToFeishu(text, hook) {
     body: JSON.stringify({ msg_type: 'text', content: { text } }),
   })
   const data = await res.json().catch(() => ({}))
-  if (!res.ok && data.code === undefined) throw new Error('HTTP ' + res.status)
+  const msg = String(data.msg || data.StatusMessage || '')
+  const throttle = /too many|rate|frequen|限流|频繁/i.test(msg)
+  if (!res.ok && data.code === undefined) {
+    throw Object.assign(new Error('HTTP ' + res.status), { retryable: res.status === 429 || res.status >= 500 })
+  }
   if (data.code !== 0 && data.StatusCode !== 0) {
-    throw new Error(data.msg || data.StatusMessage || ('飞书错误码 ' + data.code))
+    throw Object.assign(new Error(msg || ('飞书错误码 ' + data.code)), {
+      retryable: res.status === 429 || res.status >= 500 || throttle,
+    })
   }
   return true
 }
@@ -4668,11 +4666,13 @@ function buildFeedbackPack(text, contact, includeLogs) {
     `- 环境报告：${JSON.stringify(env)}`,
   )
   if (includeLogs) {
-    parts.push('', '## 日志 dshl.log（末尾 200 行）', '```', tailOf(TRAY_LOG, 200), '```')
-    parts.push('', '## 日志 server.out.log（末尾 100 行）', '```', tailOf(OUT_LOG, 100), '```')
-    parts.push('', '## 日志 server.err.log（末尾 100 行）', '```', tailOf(ERR_LOG, 100), '```')
+    // 折叠重复行再入正文：反馈日志的长度主因是同一种错误重复几十上百次（见 feedback-pack.js）
+    parts.push('', '## 日志 dshl.log（末尾 200 行）', '```', compactLog(tailOf(TRAY_LOG, 200)), '```')
+    parts.push('', '## 日志 server.out.log（末尾 100 行）', '```', compactLog(tailOf(OUT_LOG, 100)), '```')
+    parts.push('', '## 日志 server.err.log（末尾 100 行）', '```', compactLog(tailOf(ERR_LOG, 100)), '```')
   }
-  let body = parts.join('\n')
+  const raw = parts.join('\n')
+  let body = raw
   if (body.length > FEEDBACK_BODY_MAX) body = body.slice(0, FEEDBACK_BODY_MAX) + '\n\n…（超出长度限制，已截断）'
   // 统一脱敏：server.out/err 是 DSH 子进程 stdout/stderr 原样落盘（含 "?token=<一次性启动令牌>"），
   // 反馈正文会 POST 到外部 webhook，因此落盘与发送前都必须过 redact（dshl.log 在写入时已脱敏）。
@@ -4682,7 +4682,10 @@ function buildFeedbackPack(text, contact, includeLogs) {
   try { fs.mkdirSync(dir, { recursive: true }) } catch { /* noop */ }
   const filePath = path.join(dir, `feedback-${ts}.md`)
   try { fs.writeFileSync(filePath, body, 'utf8') } catch { /* noop */ }
-  return { subject, body, filePath }
+  // 另存一份**未折叠**原文：折叠只丢"完全重复的行"，但排查时想看完整时间线还有这一份
+  const fullPath = path.join(dir, `feedback-${ts}.full.md`)
+  try { fs.writeFileSync(fullPath, redact(raw).slice(0, FEEDBACK_BODY_MAX * 4), 'utf8') } catch { /* noop */ }
+  return { subject, body, filePath, fullPath }
 }
 
 // ---------- IPC 命令桥（Bridge.cs 移植） ----------
@@ -5000,13 +5003,23 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           if (!effectiveFeishuWebhook()) {
             return JSON.stringify({ ok: false, needWebhook: true, filePath: pack.filePath })
           }
+          // 长度：先折叠重复行（buildFeedbackPack 内），仍超就分片发多条（每条带 [i/N]）。
+          // 单条上限可用 config.json 的 feedbackChunkChars 调（界面无入口，作者按飞书实测上限调）。
+          const maxChars = clampChunkChars(Config.feedbackChunkChars)
           try {
-            await sendToFeishu(trimUtf8(pack.body, FEISHU_TEXT_MAX_BYTES))
-            log('feedback sent to feishu bot')
-            return JSON.stringify({ ok: true, filePath: pack.filePath })
+            const result = await sendChunked({ text: pack.body, maxChars, sendOne: (chunk) => sendToFeishu(chunk) })
+            log(`feedback sent to feishu bot（${result.chunks} 条）`)
+            return JSON.stringify({ ok: true, filePath: pack.filePath, fullPath: pack.fullPath, chunks: result.chunks })
           } catch (err) {
             log('feedback send failed: ' + err.message)
-            return JSON.stringify({ ok: false, error: '发送失败：' + err.message + '（可改用"复制全部"手动提交）', filePath: pack.filePath })
+            return JSON.stringify({
+              ok: false,
+              error: '发送失败：' + err.message + '（可改用"复制全部"手动提交）',
+              filePath: pack.filePath,
+              fullPath: pack.fullPath,
+              chunks: err && err.total ? err.total : 0,
+              sent: err && err.sent ? err.sent : 0,
+            })
           }
         }
         case 'clipboardWrite': try { clipboard.writeText(String(value)) } catch { /* noop */ } return '{}'
