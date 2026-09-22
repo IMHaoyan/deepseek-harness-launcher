@@ -1660,7 +1660,7 @@ function renderInstallAll(info) {
     btn.disabled = true;
     return;
   }
-  btn.textContent = '一键全部安装';
+  btn.textContent = '一键安装所有预装插件';
   btn.disabled = false;
 }
 
@@ -1832,12 +1832,12 @@ $('btnPluginsRefresh').addEventListener('click', async () => {
   }
 });
 
-// 一键全部安装：只装未安装的插件，进度由主进程 state 推送驱动
+// 一键安装所有预装插件：只装未安装的，进度由主进程 state 推送驱动
 $('btnPluginsInstallAll').addEventListener('click', async () => {
   const btn = $('btnPluginsInstallAll');
   const ok = await confirmDialog({
-    title: '一键安装全部插件？',
-    body: '会依次装好所有尚未安装的插件；中途不重启，装完后点顶部「立即重启生效」一次性生效。',
+    title: '一键安装所有预装插件？',
+    body: '会依次装好本页所有尚未安装的预装插件（插件市场、手机连接与各推荐插件）；中途不重启，装完后点顶部「立即重启生效」一次性生效。',
     confirmText: '开始安装',
   });
   if (!ok) return;
@@ -1847,7 +1847,7 @@ $('btnPluginsInstallAll').addEventListener('click', async () => {
   if (!r || !r.ok) {
     btn.textContent = (r && r.error) || '启动失败';
     btn.disabled = false;
-    setTimeout(() => { btn.textContent = '一键全部安装'; }, 2500);
+    setTimeout(() => { btn.textContent = '一键安装所有预装插件'; }, 2500);
   }
 });
 

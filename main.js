@@ -2475,7 +2475,7 @@ const npmVersionCache = new Map() // npm 包名 -> { version, at }
 const npmVersionErrors = new Map()
 const NPM_VERSION_TTL_MS = 10 * 60 * 1000
 
-// 「一键全部安装」进度：主进程持状态、前台只读，窗口重开也能接上进度显示。
+// 「一键安装所有预装插件」进度：主进程持状态、前台只读，窗口重开也能接上进度显示。
 let pluginInstallAllRunning = false
 let pluginInstallAllTarget = 0
 let pluginInstallAllDone = 0
@@ -2598,22 +2598,17 @@ function setManagedPluginNote(id, text) {
 }
 
 /**
- * 一键安装所有尚未安装的插件（「插件」页顶部按钮）。
- *   - 顺序执行，避免并发改同一份 profile 依赖树；
- *   - 只装未安装的，已装的不动（不做静默升级——更新仍由卡片上的按钮显式触发）；
- *   - 每个插件装完都会重启服务让变更生效，最终返回成败明细。
- */
-/**
- * 一键安装所有尚未安装的插件（「插件」页顶部按钮）。
+ * 一键安装本页所有尚未安装的预装插件（「预装插件」页顶部按钮）。
+ *   - 覆盖页面上的全部预装项：插件市场、手机连接 + 注册表里的 npm 推荐插件；
  *   - 开始时停一次服务，之后连续安装（pnpm 改写 profile 不需要服务在跑）；
- *   - 只装未安装的，已装的不动（不做静默升级）；
+ *   - 只装未安装的，已装的不动（不做静默升级——更新仍由卡片上的按钮显式触发）；
  *   - **中途不重启**：变更攒成「待重启生效」，由用户点顶部提醒条的「立即重启」一次性生效，
  *     避免装一个插件就打断一次会话。
  */
 async function installAllManagedPlugins() {
   if (pluginInstallAllRunning) return { ok: false, error: '一键安装正在进行中' }
   // 同步占锁（在第一个 await 之前）：与 IPC 入口的检查之间没有可插入的窗口
-  const releaseProfileOp = tryBeginProfileOp('一键安装全部插件')
+  const releaseProfileOp = tryBeginProfileOp('一键安装所有预装插件')
   if (!releaseProfileOp) return profileBusyError()
   pluginInstallAllRunning = true
   pluginInstallAllTarget = 0
@@ -2631,6 +2626,7 @@ async function installAllManagedPlugins() {
       if (!market.getState(d.npm).installed) targets.push({ key: d.id, label: d.name, run: () => runNpmPluginAction(d, 'install', { defer: true }) })
     }
     if (!market.getState().installed) targets.push({ key: 'dshmarket', label: '插件市场', run: () => installManagedMarket({ defer: true }) })
+    if (!bridge.getState().installed) targets.push({ key: 'bridge-next', label: '手机连接', run: () => setRemoteConnectManaged(true, { defer: true }) })
     pluginInstallAllTarget = targets.length
     if (targets.length) {
       // 只在最开始停一次服务；之后的安装都在服务停止状态下进行
@@ -2715,7 +2711,7 @@ function pendingAutoInstallPlugins() {
  * 推荐插件默认自动安装（幂等，可多处调用）：
  *   - 首次运行 / 升级到本版本后，把 autoInstall 的插件里「缺的」补齐；
  *   - 环境或 pnpm 未就绪时不记账，等下一次触发点再来；
- *   - 其它安装流程（插件市场/远程连接自动安装、一键全部安装）在跑时不插队。
+ *   - 其它安装流程（插件市场/远程连接自动安装、一键安装所有预装插件）在跑时不插队。
  */
 async function maybeAutoInstallRecommendedPlugins() {
   if (SELF_TEST) return

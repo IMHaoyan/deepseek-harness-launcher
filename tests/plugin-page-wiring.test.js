@@ -18,7 +18,8 @@ test('左侧新增插件导航，插件页容器与搜索/筛选入口齐全', (
   assert.match(html, /id="pluginCards"/, '应有插件卡片容器')
   assert.match(html, /id="pluginSearch"/, '应支持搜索')
   assert.match(html, /data-plugin-filter="all"/, '应支持按安装状态筛选')
-  assert.match(html, /id="btnPluginsInstallAll"/, '顶部应有一键全部安装按钮')
+  assert.match(html, /id="btnPluginsInstallAll"/, '顶部应有一键安装按钮')
+  assert.match(html, /一键安装所有预装插件/, '顶部按钮应写明「一键安装所有预装插件」')
   assert.match(html, /id="btnPluginsRefresh"/, '工具栏应有刷新按钮')
   assert.match(html, /class="plugin-toolbar-actions"/, '操作按钮应与搜索/筛选同排')
   assert.match(html, /id="navPlugins"[^>]*title="预装插件"/, '导航应叫「预装插件」')
@@ -65,6 +66,7 @@ test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.match(main, /async function installAllManagedPlugins\(\)/, '主进程应有一键安装逻辑')
   assert.match(main, /case 'pluginsInstallAll'/, '应有一键安装命令')
   assert.match(main, /pluginInstallAll: \{/, 'state 应下发一键安装进度')
+  assert.match(main, /key: 'bridge-next', label: '手机连接'/, '一键安装应覆盖手机连接')
   assert.match(main, /toggleAction: 'toggle'/, '手机连接开关应有真实启停语义')
   assert.match(main, /require\('\.\/plugin-switch'\)/, '主进程应加载 user patch layer 启停模块')
   assert.match(main, /pluginSwitch\.setEnabled\(d\.npm, action === 'enable'\)|pluginSwitch\.setEnabled\(descriptor\.npm, action === 'enable'\)/, 'npm 插件开关应走 user patch layer')
@@ -221,8 +223,10 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
       { id: 'b', name: '插件B', npm: 'pkg-b' },
     ],
     market: { getState: () => ({ installed: false }) },
+    bridge: { getState: () => ({ installed: false }) },
     runNpmPluginAction: async (d, action, opts) => { deferCalls.push({ id: d.id, action, defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
     installManagedMarket: async (opts) => { deferCalls.push({ id: "dshmarket", action: "install", defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
+    setRemoteConnectManaged: async (enabled, opts) => { deferCalls.push({ id: "bridge-next", action: "install", defer: !!(opts && opts.defer) }); return { ok: true } },
     applyPluginChange: async (verb) => { applied.push(verb); return true },
     deferPluginChange: () => {},
     clearPluginEnvFailure: () => {},
@@ -234,10 +238,11 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
   const result = await fn(...names.map((k) => ctx[k]))()
 
   assert.equal(stopped, 1, '整个批量流程只应停一次服务')
-  assert.equal(deferCalls.length, 3, '两个推荐插件 + 插件市场都应参与')
+  assert.equal(deferCalls.length, 4, '两个推荐插件 + 插件市场 + 手机连接都应参与')
+  assert.ok(deferCalls.some((c) => c.id === 'bridge-next' && c.defer), '手机连接也要带 defer 一起装')
   assert.ok(deferCalls.every((c) => c.defer), '每个插件都必须带 defer（否则会装一个重启一次）')
   assert.deepEqual(applied, [], '批量流程不得调用 applyPluginChange（那是重启入口）')
-  assert.equal(result.installed, 3)
+  assert.equal(result.installed, 4)
   assert.equal(result.pendingRestart, true, '结果应标记「待重启生效」')
 
   // 锁被占用：一个都不许装（并发改写同一份依赖树正是 profile 损坏的来源）
@@ -268,8 +273,10 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
     stopServiceForPluginChange: async () => ({ ok: false, error: '服务正在停止中，请稍候重试', busy: true }),
     MANAGED_NPM_PLUGINS: [{ id: 'a', name: '插件A', npm: 'pkg-a' }],
     market: { getState: () => ({ installed: false }) },
+    bridge: { getState: () => ({ installed: false }) },
     runNpmPluginAction: async () => { deferCalls.push('a'); return { ok: true } },
     installManagedMarket: async () => { deferCalls.push('m'); return { ok: true } },
+    setRemoteConnectManaged: async () => { deferCalls.push('b'); return { ok: true } },
     applyPluginChange: async () => true,
     deferPluginChange: () => {},
     clearPluginEnvFailure: () => {},
