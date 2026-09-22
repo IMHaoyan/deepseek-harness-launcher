@@ -1,6 +1,6 @@
 {
   "version": "0.1.0-dev.2",
-  "sha256": "ea36f38e95e35025c179f080211131b891eb826e9f1f5c9ce1af412c4c1c1494",
+  "sha256": "f65e8e93ea3952ef188e1aed04cf44a25c6bd3727dcbfecea8ae334cc5717f17",
   "tarball": "bridge-next.tgz",
   "package": {
     "name": "@agents-anywhere/dsh-bridge-next",
@@ -8,5 +8,11 @@
   },
   "upstreamCommit": "b413330914fbe2870390866c8cc1a9a2f7697f29",
   "upstreamDirty": true,
-  "builtAt": "2026-09-21T03:28:45.386Z"
+  "builtAt": "2026-09-21T03:28:45.386Z",
+  "patched": {
+    "by": "dshl tools/patch-bridge-icon-compat.mjs",
+    "why": "dsh 0.1.7 图标导出改名（Icon*14/16 -> *Regular/Medium）；产物内注入「新名 || 旧名」fallback，兼容 0.1.6 与 0.1.7+",
+    "appliedAt": "2026-09-22T07:53:50.579Z",
+    "upstreamSha256": "ea36f38e95e35025c179f080211131b891eb826e9f1f5c9ce1af412c4c1c1494"
+  }
 }
