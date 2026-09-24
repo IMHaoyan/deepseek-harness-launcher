@@ -445,6 +445,19 @@ body {
   color: var(--text-secondary, #61666B);
 }
 
+/* 检查更新后的"目标版本"（→ vX (next)）：常驻到本次检查结果改变为止；与 .version-hint 同字号/同色，
+   长版本号单行省略，避免撑破版本行的单行布局 */
+.version-target {
+  flex: none;
+  max-width: 168px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--text-secondary, #61666B);
+}
+
 .version-value {
   flex: 1;
   min-width: 0;

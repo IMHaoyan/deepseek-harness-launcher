@@ -1,25 +1,43 @@
 {
-  "version": "0.1.0-dev.2",
-  "sha256": "199616b4dbecf537baf3b246eb3df3b45e7c5222ea25e5badc92a89c5c08b1c4",
+  "version": "2.0.0+dshl.ui1",
+  "sha256": "b156aeb62dc3c6e6d3ec9cf20de1c88c7b86bcae45c44041780a59e533e6c0f0",
   "tarball": "bridge-next.tgz",
   "package": {
     "name": "@agents-anywhere/dsh-bridge-next",
-    "version": "0.1.0-dev.2"
+    "version": "2.0.0+dshl.ui1"
   },
-  "upstreamCommit": "b413330914fbe2870390866c8cc1a9a2f7697f29",
-  "upstreamDirty": true,
-  "builtAt": "2026-09-21T03:28:45.386Z",
+  "source": "npm @agents-anywhere/dsh-bridge-next@2.0.0",
+  "experiment": {
+    "why": "对照实验：网页端收不到回复，验证是否出在 dshl 的 5 处行为补丁上",
+    "kept": [
+      "peer @deepseek-ai/dsh-typert-protocol → >=0.1.5-rc.1 <0.2.0（绕开 dsh 兼容闸）",
+      "callid 取值改 message-first",
+      "icon IconUserOutline16 → IconUserOutlineRegular（1 处）",
+      "icon IconGlobeOutline14 → IconGlobeOutlineRegular（1 处）"
+    ],
+    "omitted": [
+      "ack 宽容（失效流幂等成功 / Feed.ack 越界忽略）",
+      "首个 ack 后上报 running",
+      "未知通知与未知操作 kind 容错",
+      "背压溢出改为丢弃而非作废整条流 + 上限抬高",
+      "同步中断日志改为 error 落盘"
+    ],
+    "rollback": "node tools/switch-bridge-payload-upstream.mjs --rollback"
+  },
   "patched": {
-    "by": "dshl tools/patch-bridge-callid-compat.mjs",
-    "why": "dsh 0.1.7 tool/result 事件把 toolCallId/content/isError 放在 data.message 上；产物内改为「message.* 优先、content[0].* 兜底」，兼容新旧两种形态",
-    "appliedAt": "2026-09-22T12:58:13.247Z",
-    "upstreamSha256": "ea36f38e95e35025c179f080211131b891eb826e9f1f5c9ce1af412c4c1c1494",
+    "by": "dshl tools/patch-bridge-settings-entry.mjs",
+    "why": "将手机连接从 sidebar.footer.action 迁至 settings.section；仅对本栏目呈现手机图标",
+    "appliedAt": "2026-09-24T07:55:55.569Z",
+    "inputSha256": "b234d834af44d5f37410d238588c6525a4a506d1349955d30b776290f46f209b",
     "history": [
       {
-        "by": "dshl tools/patch-bridge-callid-compat.mjs",
-        "why": "tool/result 取值改为 message-first（修 undefined callId 导致的 contentHash 不一致与工具结果塌缩）",
-        "appliedAt": "2026-09-22T12:58:13.247Z",
-        "inputSha256": "f65e8e93ea3952ef188e1aed04cf44a25c6bd3727dcbfecea8ae334cc5717f17"
+        "by": "dshl tools/patch-bridge-settings-entry.mjs",
+        "inputSha256": "b234d834af44d5f37410d238588c6525a4a506d1349955d30b776290f46f209b",
+        "version": "2.0.0+dshl.ui1",
+        "sites": [
+          "client.js settings.section",
+          "client.js settings.action phone icon"
+        ]
       }
     ]
   }

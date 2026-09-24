@@ -269,7 +269,9 @@ run(npm, ['run', 'build:assets'])
 // electron-builder 的 yml 文件名取自 **publish 配置里的 channel**（默认 latest），不会自己看版本号：
 // 不显式传的话，alpha 版本也会写成 latest.yml —— 而 electron-updater 的 alpha 渠道只会去下 alpha.yml。
 // 所以这里按渠道显式传一次（`--publish never`，只是让它在本地按渠道名写出 yml，不触发上传）。
-run(npm, ['run', 'dist:win', '--', `-c.publish.channel=${channel}`])
+// ⚠️ 必须用长形式 `--config.<路径>=<值>`：yargs 会把短形式 `-c.publish.channel=x` 解析成
+// 「`-c` 的值 = `.publish.channel=x`」，随后把该值当成配置文件路径去读 → ENOENT（实测 electron-builder 25）。
+run(npm, ['run', 'dist:win', '--', `--config.publish.channel=${channel}`])
 
 // ---------- 3. 产物校验 ----------
 for (const f of [exePath, blockmapPath, channelYml]) {
@@ -287,6 +289,10 @@ if (!ymlText.includes(exe)) {
   process.exit(1)
 }
 console.log(`产物校验通过：${exe} / ${channel === 'latest' ? 'latest.yml' : channel + '.yml'}（${channel} 渠道，版本 ${ymlVersion}）`)
+
+// 逐项断言打包产物（exe 元数据 / yml 与真实文件对齐 / app.asar 内文件与界面锚点）。
+// 上面那几条只看 yml 与外层文件名，这里才真正比对安装包内容与包内文件。
+run(process.execPath, ['tools/assert-package.cjs'])
 
 // ---------- 4. 创建 Release 并上传（说明经 --notes-file 传文件，避免换行/引号被 shell 拆散） ----------
 const notesFile = join(root, 'dist', '.release-notes.md')

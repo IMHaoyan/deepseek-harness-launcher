@@ -285,12 +285,17 @@ function render(state) {
   const dshV = (state.env && state.env.dsh && state.env.dsh.version) || (state.dshUpdate && state.dshUpdate.current) || '';
   const dshKind = state.env && state.env.dsh ? state.env.dsh.kind : '';
   const dshKindLabel = ENV_KIND_LABELS[dshKind];
-  const dshVerText = dshV ? `v${dshV}` : (state.env ? '未安装' : '检测中…');
+  // 已安装的这一版**就是**渠道最新版、且只挂在 next 上时，同样标注 (next)：升级完成后标记不会消失，
+  // 直到上游把它推到 alpha/latest —— 判定仍来自每次检查的 latestTag，所以下次检查一变标记就没了。
+  const dshUpd = state.dshUpdate || null;
+  const installedFromNext = !!(dshUpd && dshUpd.latestTag === 'next' && dshV && dshUpd.latest === dshV);
+  const dshNextMark = installedFromNext ? ' (next)' : '';
+  const dshVerText = dshV ? `v${dshV}${dshNextMark}` : (state.env ? '未安装' : '检测中…');
   const dshVerEl = $('dshVersion');
   if (dshVerEl) {
     dshVerEl.textContent = dshVerText;
     dshVerEl.title = dshV && state.env && state.env.dsh && state.env.dsh.dir
-      ? `v${dshV} · ${dshKindLabel || ''} · ${state.env.dsh.dir} · 在 GitHub 打开此版本的 Release`
+      ? `v${dshV}${installedFromNext ? ' · 目前只发布在 npm next（候选发布），上游推到 alpha/latest 后此标记会自动消失' : ''} · ${dshKindLabel || ''} · ${state.env.dsh.dir} · 在 GitHub 打开此版本的 Release`
       : '在浏览器打开 GitHub Releases 页面';
   }
   // DSH 更新渠道（设置页）：latest / alpha，切换后主进程立即按新渠道重新检查
@@ -1403,6 +1408,17 @@ function renderDshUpdate(u) {
   const latest = u ? u.latest : '';
   const kind = u ? u.kind : '';
   const isSource = kind === 'source';
+  // 版本来源标记：只在"该版本本次检查仍只挂在 next 上"时显示。它来自本次检查的结果（u.latestTag），
+  // 每次检查重算 —— 上游把它推到 alpha/latest 之后，下一次检查这一行就不再带标记（不粘历史、不落盘）。
+  const nextMark = u && u.latestTag === 'next' ? ' (next)' : '';
+
+  // 常驻"目标版本"：有可用更新/更新中时显示 → vX (next)，随每次检查结果刷新
+  const targetEl = $('dshUpdTarget');
+  if (targetEl) {
+    const showTarget = (status === 'available' || status === 'updating') && !!latest;
+    targetEl.textContent = showTarget ? `→ v${latest}${nextMark}` : '';
+    targetEl.classList.toggle('hidden', !showTarget);
+  }
 
   // 主页面按钮
   const btn = $('btnDshUpdateNow');
@@ -1413,17 +1429,17 @@ function renderDshUpdate(u) {
       if (status === 'available' && isSource) {
         btn.disabled = false;
         btn.textContent = '手动更新';
-        btn.title = `新版本 v${latest} 可用：当前为源码安装，点此打开源码目录（git pull && pnpm run build 后重启服务）`;
+        btn.title = `新版本 v${latest}${nextMark} 可用：当前为源码安装，点此打开源码目录（git pull && pnpm run build 后重启服务）`;
       } else if (status === 'available') {
         btn.disabled = false;
         btn.textContent = '立即更新';
         // 耗时口径按实测给，且明确区分"预装好了"与"还得现装"：
         // 预装就绪 = 改名切换 + 重启服务（实测约 15s）；只有缓存 = 整树解包落盘（实测约 1 分钟）
         btn.title = u.staged
-          ? `新版本 v${latest} 可用（已预装就绪）：点击后约 15 秒完成（会重启服务，进行中的对话会中断）`
+          ? `新版本 v${latest}${nextMark} 可用（已预装就绪）：点击后约 15 秒完成（会重启服务，进行中的对话会中断）`
           : u.prewarmed
-            ? `新版本 v${latest} 可用（依赖已缓存）：点击后约 1 分钟完成（会重启服务，进行中的对话会中断）`
-            : `新版本 v${latest} 可用：点击后约 1-2 分钟完成（会重启服务，进行中的对话会中断）`;
+            ? `新版本 v${latest}${nextMark} 可用（依赖已缓存）：点击后约 1 分钟完成（会重启服务，进行中的对话会中断）`
+            : `新版本 v${latest}${nextMark} 可用：点击后约 1-2 分钟完成（会重启服务，进行中的对话会中断）`;
       } else if (status === 'updating') {
         btn.disabled = true;
         btn.textContent = '更新中…';
@@ -1450,8 +1466,9 @@ function renderDshUpdate(u) {
   if (rowHint) {
     let text = '';
     if (status === 'checking') text = '正在检查更新…';
-    else if (status === 'available') text = `发现新版本 v${latest}`;
-    else if (status === 'updating') text = `更新中 v${latest}…`;
+    // 版本号（含 (next) 标记）由上面的常驻"目标版本"显示，这里不再重复一遍
+    else if (status === 'available') text = '发现新版本';
+    else if (status === 'updating') text = '更新中…';
     else if (status === 'updated') text = `已更新到 v${u.current}`;
     else if (status === 'up-to-date') text = '已是最新版本';
     else if (status === 'error') text = '检查/更新失败';

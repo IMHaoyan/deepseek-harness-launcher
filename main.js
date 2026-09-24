@@ -289,6 +289,10 @@ async function maybeApplyDefenderExclusion() {
     path.dirname(app.getPath('exe')), // dshl 安装目录
     path.join(process.env.APPDATA || '', 'npm'), // npm 全局目录（DSH 包）
     path.join(os.homedir(), '.dsh'), // DSH 配置 / profile / 会话
+    // npm 共享缓存：安装时所有 tarball 都解在这里，实时扫描会造成 EBUSY/EPERM 类"即刻失败"，
+    // 表现就是"更新要重试几次才成功"。LOCALAPPDATA 缺失时不要 join（会得到相对路径 'npm-cache'）。
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'npm-cache') : '',
+    path.join(os.homedir(), '.npm'), // npm 在 HOME 下的另一种默认缓存位置
   ].filter(Boolean)
   log('defender: 检查排除项（' + paths.join('；') + '）…')
   try {
@@ -3647,12 +3651,24 @@ function showWebZoomOverlay(wc) {
   wc.executeJavaScript(js).catch(() => { /* 页面未就绪时静默 */ })
 }
 
-// ---------- 右键编辑菜单（Electron 无默认右键菜单：为控制台与 WebUI 窗口补齐 剪切/复制/粘贴/全选） ----------
+// ---------- 右键编辑菜单（Electron 无默认右键菜单：为控制台、窗口壳与 WebUI 页面补齐 剪切/复制/粘贴/全选） ----------
 // withDev=true（DSHL 控制台）：额外提供"打开开发者工具"与"刷新"，用于 UI 可视化调试
 function attachContextMenu(wc, withDev) {
   wc.on('context-menu', (_event, params) => {
     const items = []
+    const selectedText = params.selectionText && params.selectionText.trim() ? params.selectionText.trim() : ''
+    if (selectedText) {
+      items.push({
+        label: '搜索',
+        click: () => {
+          const query = selectedText.slice(0, 500)
+          const url = 'https://www.google.com/search?q=' + encodeURIComponent(query)
+          try { void shell.openExternal(url).catch(() => { /* noop */ }) } catch { /* noop */ }
+        },
+      })
+    }
     if (params.isEditable) {
+      if (items.length) items.push({ type: 'separator' })
       items.push(
         { role: 'cut', label: '剪切' },
         { role: 'copy', label: '复制' },
@@ -3660,7 +3676,8 @@ function attachContextMenu(wc, withDev) {
         { type: 'separator' },
         { role: 'selectAll', label: '全选' },
       )
-    } else if (params.selectionText && params.selectionText.trim()) {
+    } else if (selectedText) {
+      if (items.length) items.push({ type: 'separator' })
       items.push(
         { role: 'copy', label: '复制' },
         { type: 'separator' },
@@ -3684,6 +3701,313 @@ function attachContextMenu(wc, withDev) {
     if (!items.length) return
     Menu.buildFromTemplate(items).popup({ window: BrowserWindow.fromWebContents(wc) })
   })
+}
+
+// ---------- 页面内查找（Ctrl+F） ----------
+// 查找条注入当前页面，文本索引也在页面内分块建立；F3/F4 只查索引字符串，不再反复做全页 findInPage。
+// 页面里的动作只走独立的 dsh:find 通道，不复用 browser:* 控制域（DSH 页面仍拿不到改端口/重启/关窗权限）。
+
+function webFindTabByContents(wc) {
+  return webTabs.find((t) => t.view && t.view.webContents === wc) || null
+}
+
+function webFindFocusedTab() {
+  const id = webFocusedId || webActiveId
+  return webTabs.find((t) => t.id === id) || null
+}
+
+function injectFindBar(tab, initialQuery) {
+  const wc = tab && tab.view && tab.view.webContents
+  if (!wc || wc.isDestroyed()) return Promise.resolve(false)
+  const seedQuery = typeof initialQuery === 'string' ? JSON.stringify(initialQuery) : 'null'
+  const js = `(function(){
+    var ROOT_ID = '__dshFindBar';
+    var existing = document.getElementById(ROOT_ID);
+    if (!window.__dshFindOpen || !existing) {
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+      var oldStyle = document.getElementById('__dshFindStyle');
+      if (oldStyle && oldStyle.parentNode) oldStyle.parentNode.removeChild(oldStyle);
+      var css = [
+        '#__dshFindBar{--dshl-find-bg:rgba(255,255,255,.98);--dshl-find-text:#202124;--dshl-find-border:rgba(0,0,0,.14);--dshl-find-shadow:0 8px 24px rgba(0,0,0,.18);--dshl-find-input-bg:#F1F3F4;--dshl-find-input-text:#202124;--dshl-find-input-border:rgba(0,0,0,.16);--dshl-find-focus:#1A73E8;--dshl-find-focus-ring:rgba(26,115,232,.24);--dshl-find-count:#5F6368;--dshl-find-hover:rgba(0,0,0,.07);--dshl-find-active:rgba(0,0,0,.12);position:fixed;top:46px;right:10px;z-index:2147483647;box-sizing:border-box;width:min(420px,calc(100vw - 20px));display:none;align-items:center;gap:6px;padding:6px;background:var(--dshl-find-bg);color:var(--dshl-find-text);border:1px solid var(--dshl-find-border);border-radius:10px;box-shadow:var(--dshl-find-shadow);font:13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}',
+        '@media (prefers-color-scheme: dark){#__dshFindBar{--dshl-find-bg:rgba(32,33,36,.98);--dshl-find-text:#E8EAED;--dshl-find-border:rgba(255,255,255,.15);--dshl-find-shadow:0 8px 24px rgba(0,0,0,.32);--dshl-find-input-bg:#303134;--dshl-find-input-text:#F1F3F4;--dshl-find-input-border:rgba(255,255,255,.16);--dshl-find-focus:#8AB4F8;--dshl-find-focus-ring:rgba(138,180,248,.28);--dshl-find-count:#BDC1C6;--dshl-find-hover:rgba(255,255,255,.1);--dshl-find-active:rgba(255,255,255,.16);}}',
+        '#__dshFindBar.show{display:flex;}',
+        '#__dshFindInput{flex:1;min-width:70px;height:28px;box-sizing:border-box;padding:0 9px;border:1px solid var(--dshl-find-input-border);border-radius:7px;outline:none;background:var(--dshl-find-input-bg);color:var(--dshl-find-input-text);font:13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}',
+        '#__dshFindInput:focus{border-color:var(--dshl-find-focus);box-shadow:0 0 0 1px var(--dshl-find-focus-ring);}',
+        '#__dshFindInput::-webkit-search-cancel-button{-webkit-appearance:none;}',
+        '#__dshFindCount{min-width:42px;color:var(--dshl-find-count);font-size:12px;text-align:center;white-space:nowrap;}',
+        '#__dshFindBar button{width:26px;height:26px;flex:none;padding:0;border:none;border-radius:7px;background:transparent;color:var(--dshl-find-text);font:18px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;cursor:pointer;}',
+        '#__dshFindBar button:hover{background:var(--dshl-find-hover);}',
+        '#__dshFindBar button:active{background:var(--dshl-find-active);}',
+        '::highlight(dshl-find-all){background:#FFE082;color:inherit;}',
+        '::highlight(dshl-find-current){background:#FF9800;color:#111;}'
+      ].join('');
+      var style = document.createElement('style'); style.id = '__dshFindStyle'; style.textContent = css;
+      var root = document.createElement('div'); root.id = ROOT_ID; root.setAttribute('role', 'search');
+      var input = document.createElement('input'); input.id = '__dshFindInput'; input.type = 'search';
+      input.placeholder = '输入后按 F4 查找'; input.autocomplete = 'off'; input.spellcheck = false;
+      input.setAttribute('aria-label', '在页面中查找');
+      var count = document.createElement('span'); count.id = '__dshFindCount'; count.textContent = '';
+      var prev = document.createElement('button'); prev.type = 'button'; prev.id = '__dshFindPrev';
+      prev.title = '上一个 (F3)'; prev.textContent = '\\u2039';
+      var next = document.createElement('button'); next.type = 'button'; next.id = '__dshFindNext';
+      next.title = '下一个 (F4)'; next.textContent = '\\u203A';
+      var close = document.createElement('button'); close.type = 'button'; close.id = '__dshFindClose';
+      close.title = '关闭 (Esc)'; close.textContent = '\\u00D7';
+      root.appendChild(input); root.appendChild(count); root.appendChild(prev); root.appendChild(next); root.appendChild(close);
+      var host = document.documentElement || document.body;
+      host.appendChild(style); host.appendChild(root);
+      var state = { index: null, indexDirty: true, dirtySeq: 0, building: false, waiters: [], query: '', matches: [], active: -1, observer: null };
+      var inputTimer = 0;
+      var emit = function(action, payload) { try { window.browserBridge.findCommand(action, payload || {}); } catch (e) {} };
+      var setResult = function(active, matches) {
+        var a = Number(active) || 0, m = Number(matches) || 0;
+        count.textContent = m > 0 ? (a + '/' + m) : (input.value ? '0/0' : '');
+      };
+      var clearHighlights = function() {
+        try {
+          if (window.CSS && CSS.highlights) {
+            CSS.highlights.delete('dshl-find-all');
+            CSS.highlights.delete('dshl-find-current');
+          }
+        } catch (e) {}
+      };
+      var toRange = function(match) {
+        var entries = state.index && state.index.entries;
+        if (!entries || !entries.length) return null;
+        var findEntry = function(offset) {
+          var lo = 0, hi = entries.length - 1;
+          while (lo <= hi) {
+            var mid = (lo + hi) >> 1, it = entries[mid];
+            if (offset < it.start) hi = mid - 1;
+            else if (offset >= it.end) lo = mid + 1;
+            else return it;
+          }
+          return null;
+        };
+        var startEntry = findEntry(match.start);
+        var endEntry = findEntry(Math.max(match.start, match.end - 1));
+        if (!startEntry || !endEntry) return null;
+        var range = document.createRange();
+        range.setStart(startEntry.node, match.start - startEntry.start);
+        range.setEnd(endEntry.node, match.end - endEntry.start);
+        return range;
+      };
+      var applyHighlights = function() {
+        if (!window.Highlight || !window.CSS || !CSS.highlights || !state.index || !state.matches.length) return;
+        try {
+          var limit = Math.min(state.matches.length, 800), ranges = [];
+          for (var i = 0; i < limit; i++) {
+            var r = toRange(state.matches[i]);
+            if (r) ranges.push(r);
+          }
+          if (ranges.length) CSS.highlights.set('dshl-find-all', new Highlight(...ranges));
+          var activeRange = toRange(state.matches[state.active]);
+          if (activeRange) CSS.highlights.set('dshl-find-current', new Highlight(activeRange));
+        } catch (e) {}
+      };
+      var scrollToMatch = function(match) {
+        var range = toRange(match);
+        if (!range || !range.startContainer || !range.startContainer.parentElement) return;
+        try { range.startContainer.parentElement.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' }); } catch (e) {}
+      };
+      var ensureIndex = function(done) {
+        if (state.index && !state.indexDirty) { done(); return; }
+        if (state.building) { state.waiters = [done]; return; }
+        state.building = true;
+        state.waiters = [done];
+        var buildSeq = state.dirtySeq;
+        var walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
+          acceptNode: function(node) {
+            var text = node.nodeValue || '';
+            if (!text || !text.trim()) return NodeFilter.FILTER_REJECT;
+            var parent = node.parentElement;
+            if (!parent) return NodeFilter.FILTER_REJECT;
+            var tag = parent.tagName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEXTAREA') return NodeFilter.FILTER_REJECT;
+            if (typeof parent.closest === 'function' && parent.closest('#__dshFindBar,#__dshPaneRoot,#__dshZoomOverlay')) return NodeFilter.FILTER_REJECT;
+            if (parent.hidden || parent.getAttribute('aria-hidden') === 'true') return NodeFilter.FILTER_REJECT;
+            if (typeof parent.checkVisibility === 'function' && !parent.checkVisibility()) return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        });
+        var parts = [], entries = [], pos = 0;
+        var finish = function() {
+          var raw = parts.join('');
+          state.index = { text: raw.toLowerCase(), entries: entries };
+          state.indexDirty = state.dirtySeq !== buildSeq;
+          state.building = false;
+          var waiters = state.waiters;
+          state.waiters = [];
+          for (var i = 0; i < waiters.length; i++) { try { waiters[i](); } catch (e) {} }
+        };
+        var step = function() {
+          var deadline = performance.now() + 8;
+          var node;
+          while ((node = walker.nextNode())) {
+            var text = node.nodeValue || '';
+            var start = pos;
+            parts.push(text);
+            entries.push({ node: node, start: start, end: start + text.length });
+            pos += text.length;
+            parts.push(' ');
+            pos += 1;
+            if (performance.now() >= deadline) { setTimeout(step, 0); return; }
+          }
+          finish();
+        };
+        step();
+      };
+      var search = function(forward) {
+        var query = input.value || '';
+        if (!query) { state.matches = []; state.active = -1; clearHighlights(); setResult(0, 0); return; }
+        count.textContent = (!state.index || state.indexDirty) ? '建索引…' : '搜索中…';
+        ensureIndex(function() {
+          var needle = query.replace(/\\s+/g, ' ').trim().toLowerCase();
+          if (!needle) { state.matches = []; state.active = -1; clearHighlights(); setResult(0, 0); return; }
+          if (state.query !== needle || state.indexDirty) {
+            state.query = needle;
+            state.indexDirty = false;
+            state.matches = [];
+            var from = 0;
+            while (state.matches.length < 20000) {
+              var at = state.index.text.indexOf(needle, from);
+              if (at < 0) break;
+              state.matches.push({ start: at, end: at + needle.length });
+              from = at + Math.max(1, needle.length);
+            }
+            state.active = -1;
+          }
+          if (!state.matches.length) { clearHighlights(); setResult(0, 0); return; }
+          if (state.active < 0) state.active = state.matches.length - 1;
+          else state.active = (state.active + (forward ? 1 : state.matches.length - 1)) % state.matches.length;
+          applyHighlights();
+          setResult(state.active + 1, state.matches.length);
+          scrollToMatch(state.matches[state.active]);
+        });
+      };
+      var runSearch = function(forward) {
+        clearTimeout(inputTimer);
+        inputTimer = 0;
+        search(forward);
+      };
+      var startObserver = function() {
+        if (state.observer || typeof MutationObserver === 'undefined') return;
+        try {
+          state.observer = new MutationObserver(function() { state.indexDirty = true; state.dirtySeq++; });
+          state.observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true });
+        } catch (e) { state.observer = null; }
+      };
+      input.addEventListener('input', function() {
+        state.matches = []; state.active = -1; state.query = ''; clearHighlights(); count.textContent = '';
+        clearTimeout(inputTimer);
+        inputTimer = 0;
+        var value = input.value;
+        if (!value) return;
+        inputTimer = setTimeout(function() {
+          inputTimer = 0;
+          if (input.value === value) search(true);
+        }, 120);
+      });
+      input.addEventListener('focus', function() { emit('focus', { focused: true }); });
+      input.addEventListener('blur', function() { emit('focus', { focused: false }); });
+      input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+          e.preventDefault(); e.stopPropagation(); runSearch(!e.shiftKey);
+        } else if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation(); emit('close', {});
+        } else if (e.key === 'F3') {
+          e.preventDefault(); e.stopPropagation(); runSearch(false);
+        } else if (e.key === 'F4') {
+          e.preventDefault(); e.stopPropagation(); runSearch(true);
+        }
+      }, true);
+      var keepFocus = function(e) { e.preventDefault(); };
+      prev.addEventListener('mousedown', keepFocus);
+      next.addEventListener('mousedown', keepFocus);
+      close.addEventListener('mousedown', keepFocus);
+      prev.addEventListener('click', function() { runSearch(false); });
+      next.addEventListener('click', function() { runSearch(true); });
+      close.addEventListener('click', function() { emit('close', {}); });
+      window.__dshFindNavigate = function(forward) { runSearch(!!forward); };
+      window.__dshFindOpen = function(query) {
+        if (typeof query === 'string') input.value = query;
+        count.textContent = '';
+        root.classList.add('show');
+        startObserver();
+        input.focus(); input.select();
+        if (input.value) setTimeout(function() { runSearch(true); }, 0);
+      };
+      window.__dshFindClose = function() {
+        clearTimeout(inputTimer); inputTimer = 0;
+        root.classList.remove('show'); clearHighlights();
+        state.matches = []; state.active = -1; count.textContent = '';
+        if (state.observer) { state.observer.disconnect(); state.observer = null; }
+        try { input.blur(); } catch (e) {}
+      };
+      window.__dshFindSetResult = setResult;
+    }
+    if (window.__dshFindOpen) window.__dshFindOpen(${seedQuery});
+  })()`
+  return wc.executeJavaScript(js).then(() => true).catch(() => false)
+}
+
+async function webFindFromInput(tab, forward) {
+  const wc = tab && tab.view && tab.view.webContents
+  if (!wc || wc.isDestroyed() || !tab.findOpen) return
+  await wc.executeJavaScript(`window.__dshFindNavigate&&window.__dshFindNavigate(${forward ? 'true' : 'false'})`).catch(() => { /* noop */ })
+}
+
+function webFindClose(tab) {
+  const wc = tab && tab.view && tab.view.webContents
+  if (!wc || wc.isDestroyed()) return
+  tab.findOpen = false
+  tab.findInputFocused = false
+  wc.executeJavaScript('window.__dshFindClose&&window.__dshFindClose()').catch(() => { /* noop */ })
+}
+
+async function webOpenFind(targetTab, initialQuery) {
+  if (consoleIsOpen()) return
+  const tab = targetTab || webFindFocusedTab()
+  if (!tab) return
+  tab.findOpen = true
+  const ok = await injectFindBar(tab, initialQuery)
+  if (!ok || !tab.findOpen) {
+    tab.findOpen = false
+    return
+  }
+}
+
+async function webOpenFindFromPage(tab) {
+  const wc = tab && tab.view && tab.view.webContents
+  if (!wc || wc.isDestroyed()) return
+  let selected = ''
+  try {
+    selected = await wc.executeJavaScript(`(function(){
+      var ae = document.activeElement, text = '';
+      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA') && typeof ae.selectionStart === 'number' && ae.selectionEnd > ae.selectionStart) {
+        text = ae.value.slice(ae.selectionStart, ae.selectionEnd);
+      } else if (window.getSelection) {
+        text = window.getSelection().toString();
+      }
+      return text;
+    })()`)
+  } catch { /* 选区读取失败则按普通 Ctrl+F 处理 */ }
+  const query = String(selected || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+  await webOpenFind(tab, query || null)
+}
+
+function webHandleFindCommand(tab, action, payload) {
+  if (!tab || !tab.findOpen) return
+  const value = payload && typeof payload === 'object' ? payload : {}
+  if (action === 'focus') {
+    tab.findInputFocused = !!value.focused
+  } else if (action === 'next') {
+    void webFindFromInput(tab, true)
+  } else if (action === 'prev') {
+    void webFindFromInput(tab, false)
+  } else if (action === 'close') {
+    webFindClose(tab)
+  }
 }
 
 // ---------- 分屏状态与布局 ----------
@@ -3843,10 +4167,18 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       preload: path.join(__dirname, 'browser-preload.js'),
     },
   })
-  const tab = { id, view, title: targetTitle || 'DeepSeek Harness', blank: false }
+  const tab = {
+    id,
+    view,
+    title: targetTitle || 'DeepSeek Harness',
+    blank: false,
+    findOpen: false,
+    findInputFocused: false,
+  }
   webTabs.push(tab)
   const wc = view.webContents
   const markBlank = (b) => { tab.blank = b; webPushState() }
+  attachContextMenu(wc) // 页面正文同样需要剪切/复制/粘贴/全选；Electron 没有默认菜单
   // 外部链接（target=_blank / window.open）→ 统一交给系统默认浏览器打开，避免被 Electron 吞掉
   wc.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) { try { shell.openExternal(url) } catch { /* noop */ } }
@@ -3855,6 +4187,11 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
   try { view.setBackgroundColor('#F9FAFB') } catch { /* 旧版无此 API，忽略 */ }
   wc.on('page-title-updated', (_e, t) => { tab.title = t || 'DeepSeek Harness'; webPushState() })
   wc.on('focus', () => { webFocusedId = id; refreshPaneOverlays() })
+  // 页面开始导航后 DOM 与旧搜索请求都会失效；让下一次 Ctrl+F 在新文档重新注入查找条。
+  wc.on('did-start-loading', () => {
+    tab.findOpen = false
+    tab.findInputFocused = false
+  })
   // 加载失败（服务未起/端口不通）→ 标记白屏，并立即换成"服务状态说明页"（文字说明 + 当前页刷新按钮），
   // 服务就绪后 refreshWebUiOnReady 会自动切回真实页面；自检模式保持原逻辑（检查空白页）
   wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
@@ -3930,10 +4267,19 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       }
     }
   })
-  // 快捷键（焦点在页面内也生效）：Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页
+  // 快捷键（焦点在页面内也生效）：Ctrl+F 页面查找、Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、
+  // Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页
   wc.on('before-input-event', (_event, input) => {
     if (input.type !== 'keyDown') return
     const key = (input.key || '').toLowerCase()
+    const mod = input.control || input.meta
+    if (mod && key === 'f') { _event.preventDefault(); void webOpenFindFromPage(tab); return }
+    if (tab.findOpen) {
+      if (input.key === 'Escape') { _event.preventDefault(); webFindClose(tab); return }
+      if (input.key === 'F3') { _event.preventDefault(); void webFindFromInput(tab, false); return }
+      if (input.key === 'F4') { _event.preventDefault(); void webFindFromInput(tab, true); return }
+      if (tab.findInputFocused && input.key === 'Enter') { _event.preventDefault(); void webFindFromInput(tab, !input.shift); return }
+    }
     if (input.control && key === '\\') { _event.preventDefault(); webToggleSplit() }
     else if (input.control && input.key === 'Delete') { _event.preventDefault(); webCloseFocused() }
     else if (input.shift && input.alt && key === 's') { _event.preventDefault(); webSwap() }
@@ -4236,10 +4582,24 @@ function openWebUi(opts = {}) {
   webWin.webContents.on('zoom-changed', () => {
     try { webWin.webContents.setZoomLevel(0) } catch { /* noop */ }
   })
-  // 焦点在壳（标签栏）时 F5 / Ctrl+R 同样刷新当前聚焦页面（默认菜单已移除，不会误触发壳重载）
+  // 焦点在壳（标签栏）时 Ctrl+F 仍查找当前聚焦页面，F5 / Ctrl+R 仍刷新（默认菜单已移除，不会误触发壳重载）
   webWin.webContents.on('before-input-event', (_event, input) => {
     if (consoleIsOpen()) return // 控制台打开时不要刷新背后的 DSH 页面
-    if (input.type === 'keyDown' && (input.key === 'F5' || (input.control && (input.key || '').toLowerCase() === 'r'))) {
+    const key = (input.key || '').toLowerCase()
+    if (input.type === 'keyDown' && (input.control || input.meta) && key === 'f') {
+      _event.preventDefault()
+      void webOpenFind()
+      return
+    }
+    if (input.type === 'keyDown') {
+      const tab = webFindFocusedTab()
+      if (tab && tab.findOpen) {
+        if (input.key === 'Escape') { _event.preventDefault(); webFindClose(tab); return }
+        if (input.key === 'F3') { _event.preventDefault(); void webFindFromInput(tab, false); return }
+        if (input.key === 'F4') { _event.preventDefault(); void webFindFromInput(tab, true); return }
+      }
+    }
+    if (input.type === 'keyDown' && (input.key === 'F5' || (input.control && key === 'r'))) {
       _event.preventDefault()
       webReloadFocusedPane()
     }
@@ -4743,6 +5103,17 @@ function registerIpc() {
       return JSON.stringify({ ok: false, error: (err && err.message) || String(err) })
     }
   })
+  // 页面内查找专用通道：只接受 DSHL 自己创建的 tab 视图，并且只操作发送方自己的 webContents。
+  // 即使 DSH 页面主动调用 bridge，也只能搜索它自己，拿不到 browser:* 的控制权限。
+  ipcMain.handle('dsh:find', async (event, message) => {
+    try {
+      const tab = webFindTabByContents(event.sender)
+      if (!tab || !event.sender || event.sender.isDestroyed()) return '{}'
+      webHandleFindCommand(tab, message && message.action, message && message.payload)
+    } catch { /* 查找失败不能影响页面主流程 */ }
+    return '{}'
+  })
+
 ipcMain.handle('dsh:cmd', async (event, name, value) => {
     try {
       const verdict = trust.decideCommand(senderOf(event), LOADING_PAGE_URL, name)

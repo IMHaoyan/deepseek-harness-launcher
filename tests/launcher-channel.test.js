@@ -113,7 +113,11 @@ test('发布脚本：渠道由版本号决定，产物 yml 与 GitHub prerelease
   assert.match(release, /if \(prereleaseTag && prereleaseTag !== 'alpha'\) \{/, '非 alpha 的预发布段直接拒绝（rc 等自定义渠道会被 updater 忽略）')
   assert.match(release, /const prereleaseArgs = channel === 'latest' \? \[\] : \['--prerelease', '--latest=false'\]/, 'alpha 必须发成不占 Latest 的 prerelease')
   assert.match(release, /for \(const f of \[exePath, blockmapPath, channelYml\]\)/, '产物断言要校验渠道 yml')
-  assert.match(release, /run\(npm, \['run', 'dist:win', '--', `-c\.publish\.channel=\$\{channel\}`\]\)/, '构建时要按渠道显式传给 electron-builder（它默认只写 latest.yml）')
+  // electron-builder 的 yargs 会把短形式 `-c.publish.channel=x` 解析成「-c 的值 = .publish.channel=x」，
+  // 再拿它当配置文件路径 → ENOENT。这里同时钉住「必须用长形式」和「不许回退到短形式」。
+  assert.match(release, /run\(npm, \['run', 'dist:win', '--', `--config\.publish\.channel=\$\{channel\}`\]\)/, '构建时要按渠道显式传给 electron-builder（它默认只写 latest.yml），且必须用 --config.<路径>=<值> 长形式')
+  assert.doesNotMatch(release, /'-c\.publish\.channel=/, '短形式 -c.publish.channel= 会被 yargs 当成 -c 的值，实测 ENOENT')
+  assert.match(release, /run\(process\.execPath, \['tools\/assert-package\.cjs'\]\)/, '构建后要跑产物断言（tools/assert-package.cjs）')
   assert.match(release, /const ymlVersion = \(\/\^version:\\s\*\(\\S\+\)\/mu\.exec\(ymlText\) \|\| \[\]\)\[1\] \|\| ''/, '要读 yml 里的版本号')
   assert.match(release, /if \(ymlVersion !== version\) \{/, 'yml 版本必须与 package.json 一致（防旧产物）')
   assert.match(release, /if \(!ymlText\.includes\(exe\)\) \{/, 'yml 必须指向这次的安装包')

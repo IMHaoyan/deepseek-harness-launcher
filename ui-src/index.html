@@ -89,6 +89,7 @@
       <div class="row version-row">
         <span class="label">DSH版本</span>
         <span class="version-value link" id="dshVersion" title="在浏览器打开 GitHub Release 页面">检测中…</span>
+        <span class="version-target hidden" id="dshUpdTarget"></span>
         <span class="version-hint" id="dshUpdRowHint"></span>
         <button class="btn sm check-now" id="btnDshCheckHover" title="检查 DSH 更新">检查更新</button>
         <button class="btn sm primary hidden" id="btnDshUpdateNow" title="检测到 DSH 新版本">立即更新</button>
@@ -195,7 +196,7 @@
           <button class="btn sm" id="btnOpenEnv">打开运行环境</button>
         </div>
       </div>
-      <div class="row" title="latest：跟随 npm latest（默认）；alpha：跟随 npm alpha，可提前拿到预览版。切换后立即按新渠道重新检查。">
+      <div class="row" title="latest：跟随 npm latest（默认）；alpha：预览线，取 npm alpha 与 next(rc) 里更高的那个，可提前拿到预览版；版本只挂在 next 上时会在版本号后标 (next)，上游把它推到 alpha/latest 后该标记在下次检查自动消失。切换后立即按新渠道重新检查。">
         <span class="label">DSH 更新渠道</span>
         <div class="chips" id="dshChannelChips"></div>
       </div>

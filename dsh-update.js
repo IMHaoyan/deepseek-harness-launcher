@@ -15,6 +15,7 @@ const path = require('path')
 const fs = require('fs')
 const os = require('os')
 const semver = require('semver')
+const { redact } = require('./redact')
 
 // 检查的最小间隔地板 —— **不是**检查节奏（节奏是 main.js 按 checkTickMs() 武装的周期定时器）。
 // 它只防一种情况：启动器被反复重启（dev 热重启 / 崩溃后重启 / 用户来回重启托盘）时，每次启动都联网查一遍；
@@ -54,6 +55,7 @@ const state = {
   current: '',
   latest: '',
   latestChannel: '', // latest 这个版本号是从哪个渠道取来的（缓存与渠道同源；换渠道必须作废）
+  latestTag: '', // latest 这个版本号来自哪个 npm tag（alpha | next | latest）：只驱动界面上的 (next) 标记，每次检查重算
   kind: '', // 当前安装形态（source | managed | global | npx）：source 不支持自动更新，UI 按此区分
   error: '',
   prewarmed: false, // 新版依赖树是否已就绪（npm/npx 缓存预热，或整树预装完成）
@@ -76,6 +78,33 @@ let userSwitchedChannel = ''
 // 更新渠道：latest（默认，跟随 npm latest）/ alpha（跟随 npm alpha，提前拿预览版）
 function channelOf() {
   return Config && Config.dshChannel === 'alpha' ? 'alpha' : 'latest'
+}
+
+// 渠道 → 实际查询的 npm dist-tag。alpha 是"预览线"：上游可能只把 rc 推到 next（0.1.7-rc.1 就是这样），
+// 只读 alpha 会让预览线用户看不到 rc —— 所以在同一个源里取两个 tag 的最高版本。
+// next 不是渠道名（配置里写 next 仍回落到 latest，见 tests/dsh-update-channel.test.js），
+// 它只是 alpha 渠道的第二个 tag。
+const CHANNEL_TAGS = { latest: ['latest'], alpha: ['alpha', 'next'] }
+function channelTags(channel) {
+  return CHANNEL_TAGS[channel] || CHANNEL_TAGS.latest
+}
+
+/**
+ * 在一个 registry 的一次回答里挑出该关注的版本（纯函数，供测试直接验证）。
+ * 同版本同时挂在多个 tag 时优先取本渠道的主 tag —— 这一条决定了"该版本是不是 next-only"，
+ * 也就是界面上要不要标 (next)：上游把它推到 alpha/latest 之后，标记在下次检查就消失。
+ * @param {Array<{version:string, tag:string}>} entries 本次查到的候选（可能为空或含非法值）
+ * @param {string} preferredTag 本渠道主 tag，平票时优先
+ * @returns {{version:string, tag:string}|null} 最高的那个，或没有可用候选时的 null
+ */
+function pickHighestTagged(entries, preferredTag) {
+  let best = null
+  for (const entry of entries || []) {
+    if (!entry || !semver.valid(entry.version)) continue
+    if (!best || semver.gt(entry.version, best.version)) { best = { version: entry.version, tag: entry.tag }; continue }
+    if (semver.eq(entry.version, best.version) && entry.tag === preferredTag) best = { version: entry.version, tag: entry.tag }
+  }
+  return best
 }
 
 // 当前渠道的检查周期。查不到就回落到 latest：宁可少查，也不能让脏配置把周期变成 undefined
@@ -417,7 +446,44 @@ function quoteArg(a) {
   return /\s|&/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s
 }
 
+// 正在跑的"会写盘"的 npm 调用数（全局安装 / 预装 / 缓存预热）。只读的 npm view 撞上它就直接跳过本轮：
+// 同一份 npm 共享缓存上并发跑多个 npm，是"装到一半即刻失败、隔一会儿重试就好"的常见来源。
+let npmMutations = 0
+// 最近一次取版本是否因为"npm 忙"而没查成：这不算失败，不该给用户弹错误态（main 只在真失败时进 error）
+let lastFetchBusy = false
+
+/** 取文本末尾若干字符（失败诊断用；空白折叠成一行。纯函数，供测试）。 */
+function tail(text, max = 400) {
+  const value = String(text == null ? '' : text).replace(/\s+/g, ' ').trim()
+  return value.length <= max ? value : '…' + value.slice(-max)
+}
+
+/** 失败时把 npm 自己的报错尾部记进日志：npm 的 _logs 有时根本没落盘（早期退出/被杀），只留退出码无法自证。 */
+function logNpmFailure(args, error, stderr) {
+  log(`dsh-update: npm ${args.slice(0, 4).join(' ')} 失败（${error}）：${redact(tail(stderr)) || '(stderr 为空)'}`)
+}
+
+/**
+ * 跑一次 npm。会写盘的调用（安装 / 预装 / 预热）必须带 `mutation: true`：
+ * 它运行期间所有只读调用（npm view）立刻返回 busy，不与安装争抢同一份共享缓存。
+ * @param {string[]} args npm 参数（自动前置 --no-update-notifier）
+ * @param {{nodeBin?:string, timeoutMs?:number, mutation?:boolean}} opts 调用选项
+ * @returns {Promise<{ok:boolean, error:string, stdout:string, stderr:string, busy?:boolean}>} 结果；busy=true 表示被让路，不是失败
+ */
 async function runNpm(args, opts = {}) {
+  const mutation = opts.mutation === true
+  if (!mutation && npmMutations > 0) {
+    return { ok: false, busy: true, error: 'npm 忙（正在安装），本轮跳过', stdout: '', stderr: '' }
+  }
+  if (mutation) npmMutations += 1
+  try {
+    return await spawnNpm(args, opts)
+  } finally {
+    if (mutation) npmMutations -= 1
+  }
+}
+
+async function spawnNpm(args, opts = {}) {
   const { nodeBin, timeoutMs = 90000 } = opts
   const fullArgs = ['--no-update-notifier', ...args]
   // 优先用 node 同目录自带的 npm-cli.js（PATH 上的裸 'node' 先解析真实路径，MSI/nvm 发行版都自带）
@@ -447,6 +513,7 @@ async function runNpm(args, opts = {}) {
         child = spawn('npm', fullArgs, { stdio: ['ignore', 'pipe', 'pipe'], env })
       }
     } catch (err) {
+      logNpmFailure(args, err.message, '')
       return resolve({ ok: false, error: err.message, stdout: '', stderr: '' })
     }
     let stdout = ''
@@ -454,10 +521,16 @@ async function runNpm(args, opts = {}) {
     const t = setTimeout(() => { try { child.kill() } catch { /* noop */ } }, timeoutMs)
     child.stdout.on('data', (d) => { stdout += String(d) })
     child.stderr.on('data', (d) => { stderr += String(d) })
-    child.on('error', (err) => { clearTimeout(t); resolve({ ok: false, error: err.message, stdout, stderr }) })
+    child.on('error', (err) => {
+      clearTimeout(t)
+      logNpmFailure(args, err.message, stderr)
+      resolve({ ok: false, error: err.message, stdout, stderr })
+    })
     child.on('exit', (code) => {
       clearTimeout(t)
-      resolve({ ok: code === 0, error: code === 0 ? '' : `npm 退出码 ${code}`, stdout, stderr })
+      const error = code === 0 ? '' : `npm 退出码 ${code}`
+      if (error) logNpmFailure(args, error, stderr)
+      resolve({ ok: code === 0, error, stdout, stderr })
     })
   })
 }
@@ -483,21 +556,77 @@ function noteRegistryOk(registry) {
 
 async function fetchLatest(nodeBin) {
   const channel = channelOf()
+  const tags = channelTags(channel)
   lastFetchError = ''
+  lastFetchBusy = false // 每次重新判定：本轮是不是因为"有安装在跑"而让路
   for (const registry of registries()) {
-    const args = ['view', `@deepseek-ai/dsh@${channel}`, 'version']
+    const args = ['view', '@deepseek-ai/dsh', 'dist-tags', '--json']
     if (registry) args.push('--registry', registry)
     const r = await runNpm(args, { nodeBin })
-    if (r.ok) {
-      const line = String(r.stdout).trim().split(/\r?\n/)[0].trim()
-      if (semver.valid(line)) { noteRegistryOk(registry); return { version: line, registry, channel } }
-      log(`dsh-update: npm view 输出异常：${line || '(空)'}`)
-      return null
+    // npm 忙（有安装/预装在跑）：让路，本轮跳过 —— 这不是检查失败，别给用户弹错误态
+    if (r.busy) { lastFetchBusy = true; log('dsh-update: npm 忙（正在安装），本轮检查跳过'); continue }
+    if (!r.ok) {
+      // 404 = 该源上没有这个包，不是网络问题
+      lastFetchError = /404/.test(r.error || '') ? `渠道 ${channel} 暂无可用版本` : (r.error || '网络错误')
+      log(`dsh-update: npm view dist-tags 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
+      continue
     }
-    lastFetchError = /404/.test(r.error || '') ? `渠道 ${channel} 暂无可用版本` : (r.error || '网络错误')
-    log(`dsh-update: npm view 失败（registry=${registry || '默认'}, channel=${channel}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
+    // 一次调用拿全部 tag（alpha / next / latest），目标版本与"是否已转正"都来自同一份响应：
+    // 检查耗时 = 1 次 npm（约 1.6 秒），而不是每个 tag 一次串行（3 次约 4.5 秒）。
+    const distTags = parseDistTags(r.stdout)
+    if (!distTags) {
+      lastFetchError = 'npm view 输出异常'
+      log(`dsh-update: npm view dist-tags 输出异常：${tail(r.stdout, 200) || '(空)'}`)
+      continue
+    }
+    const found = tags
+      .map((tag) => ({ version: distTags[tag], tag }))
+      .filter((entry) => semver.valid(entry.version))
+    // 同一份响应内部比较：天然同一个快照，不存在跨源/跨时刻混搭
+    const best = pickHighestTagged(found, tags[0])
+    if (best) {
+      noteRegistryOk(registry)
+      return { version: best.version, tag: tagForDisplay(best, distTags.latest || ''), registry, channel }
+    }
+    lastFetchError = `渠道 ${channel} 暂无可用版本`
+    log(`dsh-update: 渠道 ${channel} 无可用版本（registry=${registry || '默认'}）${registry ? '，回退官方源重试' : ''}`)
   }
   return null
+}
+
+/**
+ * 版本来源的最终定性（纯函数，供测试直接验证）：只挂 next 的版本，一旦 latest 也指向它，
+ * 就不再算 next —— 界面上的 (next) 标记随之消失（下一次检查就会重算到这一步）。
+ * latest 读不到时保守地仍按 next 标：宁可多标一次，也不谎报"已转正"。
+ * @param {{version:string, tag:string}|null} best 本次选中的版本与来源 tag
+ * @param {string} latestVersion npm latest 当前指向的版本（读不到给空串）
+ * @returns {string} 'alpha' | 'next' | 'latest'；best 为空时给空串
+ */
+function tagForDisplay(best, latestVersion) {
+  if (!best) return ''
+  if (best.tag !== 'next') return best.tag
+  return latestVersion && semver.eq(latestVersion, best.version) ? 'latest' : 'next'
+}
+
+/**
+ * 解析 `npm view @deepseek-ai/dsh dist-tags --json` 的输出（纯函数，供测试）。
+ * 容忍输出前后混入的提示行；只保留 semver 合法的 tag；不是 JSON 对象就返回 null（调用方按"输出异常"处理）。
+ * @param {string} stdout npm 的 stdout
+ * @returns {Record<string,string>|null} tag → version，或 null
+ */
+function parseDistTags(stdout) {
+  const text = String(stdout == null ? '' : stdout)
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return null
+  let value
+  try { value = JSON.parse(text.slice(start, end + 1)) } catch { return null }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const tags = {}
+  for (const [tag, version] of Object.entries(value)) {
+    if (typeof version === 'string' && semver.valid(version)) tags[tag] = version
+  }
+  return tags
 }
 
 // 全局 npm 更新：npm i -g --prefix <全局根> @deepseek-ai/dsh@<版本>（npmmirror 优先、官方回退）
@@ -510,7 +639,7 @@ async function runGlobalUpdate(nodeBin, globalRoot, version) {
     const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund', '--prefer-offline']
     if (registry) args.push('--registry', registry)
     // 用当前环境 npm（用户级/系统均可）并显式指定全局根，确保落在与 npm i -g 相同的目录
-    const r = await runNpm(args, { nodeBin, timeoutMs: 25 * 60 * 1000 })
+    const r = await runNpm(args, { nodeBin, timeoutMs: 25 * 60 * 1000, mutation: true })
     if (r.ok) { noteRegistryOk(registry); return r }
     log(`dsh-update: npm install -g 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
   }
@@ -678,7 +807,7 @@ async function stageLatest(version, nodeBin, kind, installDir) {
   for (const registry of registries()) {
     const args = ['install', '-g', '--prefix', paths.stagePrefix, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund', '--prefer-offline']
     if (registry) args.push('--registry', registry)
-    last = await runNpm(args, { nodeBin, timeoutMs: STAGE_TIMEOUT_MS })
+    last = await runNpm(args, { nodeBin, timeoutMs: STAGE_TIMEOUT_MS, mutation: true })
     if (last.ok) { noteRegistryOk(registry); break }
     log(`dsh-update: stage install failed (registry=${registry || '默认'}): ${last.error}`)
   }
@@ -835,7 +964,7 @@ async function warmLatest(latest, nodeBin, kind, installDir) {
         for (const registry of registries()) {
           const args = ['install', '--prefix', tmp, `@deepseek-ai/dsh@${latest}`, '--ignore-scripts', '--no-audit', '--no-fund']
           if (registry) args.push('--registry', registry)
-          const r = await runNpm(args, { nodeBin, timeoutMs: 15 * 60 * 1000 })
+          const r = await runNpm(args, { nodeBin, timeoutMs: 15 * 60 * 1000, mutation: true })
           if (r.ok) { ok = true; break }
           log(`dsh-update: warm failed (registry=${registry || '默认'}): ${r.error}`)
         }
@@ -907,6 +1036,12 @@ async function checkOnce(reason, force) {
     Config.dshUpdateCheckedAt = now
     try { saveConfig() } catch { /* noop */ }
     if (!latest) {
+      // 有安装在跑 → 本轮让路：保持 idle，不报错（下一个周期，或安装结束后自然会有结果）
+      if (lastFetchBusy) {
+        log('dsh-update: 有 npm 安装在跑，本轮检查跳过（不算失败）')
+        setState({ status: 'idle' })
+        return
+      }
       log('dsh-update: fetch latest failed, check aborted')
       setState(force ? { status: 'error', error: '检查失败：' + (lastFetchError || '无法获取最新版本（网络错误）') } : { status: 'idle' })
       return
@@ -914,10 +1049,10 @@ async function checkOnce(reason, force) {
     // prevLatest 必须在 setState 之前取：setState 之后 state.latest 已经是新版本，
     // 再比就成了死比较（恒为 false），prewarmed 永远停在 true，新版本再也不会被预热。
     const prevLatest = state.latest
-    setState({ current, latest: latest.version, kind: plan.kind, latestChannel: latest.channel || channelOf() })
+    setState({ current, latest: latest.version, kind: plan.kind, latestChannel: latest.channel || channelOf(), latestTag: latest.tag || '' })
     const installDir = (report.dsh && report.dsh.dir) || ''
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
-      log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, reason=${reason || 'timer'})`)
+      log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, tag=${latest.tag || '?'}, reason=${reason || 'timer'})`)
       const newVersionSeen = prevLatest !== latest.version
       // 换了目标版本：上一版的预装树作废（暂存目录名就是版本号，stageLatest 会自己清场）
       if (newVersionSeen) staging = null
@@ -1228,6 +1363,12 @@ module.exports = {
   decideRollback,
   decideUpdateTarget,
   decideUpdateOutcome,
+  // 渠道 → npm tag 映射，以及"一个源内取最高版本 / 该版本算不算 next"的纯判定（供测试验证 (next) 标记）
+  channelTags,
+  pickHighestTagged,
+  tagForDisplay,
+  parseDistTags,
+  tail,
   // 预装/改名切换（纯函数，供测试直接验证判定逻辑）
   npmPrefixOf,
   stageRootOf,
