@@ -25,6 +25,7 @@ const health = require('./health')
 const diagnostics = require('./diagnostics')
 const market = require('./market')
 const pluginSwitch = require('./plugin-switch')
+const pluginCompat = require('./dsh-plugin-compat')
 const stopGuard = require('./service-stop-guard')
 const handover = require('./service-handover')
 const trust = require('./trust')
@@ -4070,6 +4071,47 @@ function dshUpdateInfo() {
   } catch { return { latest: '', ready: false, kind: '', prewarmed: false } }
 }
 
+// 升级代价预判（只读）：目标 DSH 版本下哪些已装插件会被门禁拒绝。
+// 跨 minor 升级会让只声明 ^0.1.x 的插件在升级后静默失效（bundle 被跳过、行被禁用），而服务本身
+// 一切正常 —— 所以必须在点「立即更新」之前把代价摆出来，不能等用户事后自己发现。
+// 按「目标版本 + profile 两个清单的 mtime」缓存：webPushState 调用很频繁，不能每次都读盘。
+// 读不到 / 判不了都返回 ok:false，界面按「未能确认」呈现（fail-closed），绝不假装兼容。
+const PLUGIN_COMPAT_TTL_MS = 60 * 1000
+let pluginCompatCache = { key: '', at: 0, report: null }
+
+function dshInstallModulesDirs() {
+  try {
+    const plan = (envReport && envReport.plan) || null
+    return plan ? pluginCompat.installModulesDirsFromDshBin(plan.dshBin) : []
+  } catch { return [] }
+}
+
+function dshPluginCompat() {
+  let targetVersion = ''
+  try {
+    const d = dshUpdater.getState() || {}
+    if (d.status !== 'available' || !d.latest) return null
+    targetVersion = String(d.latest)
+    const stamp = (file) => { try { return fs.statSync(file).mtimeMs } catch { return 0 } }
+    // compatibility.json 也要进 key：用户刚授权/撤销豁免时，那行提示必须立刻跟着变
+    const key = [targetVersion, stamp(DSH_PROFILE_PACKAGE), stamp(DSH_PROFILE_PATCH), stamp(path.join(DSH_PROFILE_DIR, 'compatibility.json'))].join('|')
+    if (pluginCompatCache.key === key && Date.now() - pluginCompatCache.at < PLUGIN_COMPAT_TTL_MS) return pluginCompatCache.report
+    const report = pluginCompat.checkProfileCompat({
+      profileDir: DSH_PROFILE_DIR,
+      installModulesDirs: dshInstallModulesDirs(),
+      targetVersion,
+    })
+    pluginCompatCache = { key, at: Date.now(), report }
+    if (report && report.ok === true && report.incompatible.length) {
+      log(`dsh-plugin-compat: 目标 v${targetVersion} 下 ${report.incompatible.length} 个插件会被禁用：` + report.incompatible.map((x) => x.name).join(', '))
+    }
+    return report
+  } catch (err) {
+    log('dsh-plugin-compat: 预判失败（界面按未能确认处理）：' + (err && err.message ? err.message : String(err)))
+    return { ok: false, reason: 'internal-error', targetVersion }
+  }
+}
+
 /**
  * 徽标两档判定（纯函数，便于测试）：
  *   'ready'   —— 全部"看得见的更新"都已就绪：启动器已下载 / DSH 已预装。点一下就是最快路径。
@@ -4743,7 +4785,8 @@ function stateJson() {
     webZoom: Config.webZoom,
     theme: Config.theme,
     env: envDetect.envSummary(envReport),
-    dshUpdate: dshUpdater.getState(),
+    // 升级代价预判（只读）：目标版本下哪些插件会被 DSH 门禁拒绝；没有待升级版本时为 null
+    dshUpdate: Object.assign({}, dshUpdater.getState(), { pluginCompat: dshPluginCompat() }),
     launcherChannel: Config.launcherChannel,
     log: logTail,
     // 稳定性状态（控制台"上次未正常退出/已回退配置"提示用）

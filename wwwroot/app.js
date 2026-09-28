@@ -1452,6 +1452,26 @@ function renderDshUpdate(u) {
     }
   }
 
+  // 升级代价（只读预判，来自主进程）：目标版本下会被 DSH 门禁拒绝的插件。
+  // 只在"真有插件会失效"或"判不了"时占版面；全部兼容时这行不存在 —— 常规升级不多一行噪音。
+  const compatEl = $('dshUpdCompat');
+  if (compatEl) {
+    const c = u && u.pluginCompat ? u.pluginCompat : null;
+    const bad = c && c.ok === true && Array.isArray(c.incompatible) ? c.incompatible : [];
+    const unknown = c && c.ok === true && Array.isArray(c.unknown) ? c.unknown : [];
+    let text = '';
+    if (status === 'available' && bad.length) {
+      const names = bad.map((x) => x.name).join('、');
+      text = `⚠ 升级后 ${bad.length} 个插件会失效：${names}。插件不会被动到；等作者发布兼容版后在插件页更新即可，也可逐条授权豁免`;
+    } else if (status === 'available' && unknown.length) {
+      text = `⚠ 未能确认 ${unknown.length} 个插件的兼容性：${unknown.map((x) => x.name).join('、')}`;
+    } else if (status === 'available' && c && c.ok === false) {
+      text = '⚠ 未能确认已装插件在新版本下的兼容性（读不到 profile 或目标版本非法）';
+    }
+    compatEl.textContent = text;
+    compatEl.classList.toggle('hidden', !text);
+  }
+
   // 悬停"检查更新"按钮：已有更新/更新中时隐藏；检查中显示"检查中…"并禁用
   // 失败态（error）保留这个按钮：更新被拦下（目标版本低于当前/缓存已作废）时，用户需要一条"重新检查"的路，
   // 否则失败态下只剩「重试」，而重试走的是同一条被拦下的判定。

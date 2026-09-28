@@ -470,6 +470,21 @@ body.console-surface {
 
 [data-theme="dark"] .plugin-env-bar { background: rgba(239, 68, 68, 0.14); }
 
+/* 升级代价提示行：只有真有插件会在目标版本下失效（或判不了）时才出现，全兼容时这行不存在。
+   用 warn 色（黄）而不是 error 色（红）：插件不加载不是故障，是这次升级的代价。 */
+.upgrade-cost {
+  display: block;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.12);
+  font-size: 12.5px;
+  line-height: 19px;
+}
+
+.upgrade-cost.hidden { display: none; }
+
+[data-theme="dark"] .upgrade-cost { background: rgba(245, 158, 11, 0.18); }
+
 .plugin-page-summary {
   flex: none;
   padding: 5px 11px;
