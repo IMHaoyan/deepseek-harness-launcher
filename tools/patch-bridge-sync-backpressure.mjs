@@ -122,10 +122,15 @@ function patchRun(src, patch) {
   return { src: lines.join('\n'), changed: true }
 }
 
+// 2.0.0+dshl.uiN（上游 2.0.0 + 界面补丁）之后，统一转到 dshl 自己的 2.0.0-dev.N 计数上继续：
+// bridge-sync 测试要求 payload 版本是 ...-dev.N 且 N≥4，而界面补丁把它写成了 2.0.0+dshl.ui1。
+// dev.6 是上一个已验证基线，故这一线从 dev.7 起算。
 function bumpDev(version) {
-  const m = /^(.*-dev\.)(\d+)$/u.exec(String(version || ''))
-  if (!m) throw new Error(`payload 版本 ${version} 不是 ...-dev.N 形态，需人工决定新版本号后再改本脚本`)
-  return m[1] + (Number(m[2]) + 1)
+  const v = String(version || '')
+  const m = /^(.*-dev\.)(\d+)$/u.exec(v)
+  if (m) return m[1] + (Number(m[2]) + 1)
+  if (/^2\.0\.0(?:\+dshl\.ui\d+)?$/u.test(v)) return '2.0.0-dev.7'
+  throw new Error(`payload 版本 ${v} 不认识，需人工决定新版本号后再改本脚本`)
 }
 
 const meta = JSON.parse(readFileSync(metaPath, 'utf8'))

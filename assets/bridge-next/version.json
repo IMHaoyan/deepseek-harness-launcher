@@ -1,10 +1,10 @@
 {
-  "version": "2.0.0+dshl.ui1",
-  "sha256": "b156aeb62dc3c6e6d3ec9cf20de1c88c7b86bcae45c44041780a59e533e6c0f0",
+  "version": "2.0.0-dev.9",
+  "sha256": "d092755d83d9bd2b9b54454402ded54ad353c305ade542e836193b98ea928e5d",
   "tarball": "bridge-next.tgz",
   "package": {
     "name": "@agents-anywhere/dsh-bridge-next",
-    "version": "2.0.0+dshl.ui1"
+    "version": "2.0.0-dev.9"
   },
   "source": "npm @agents-anywhere/dsh-bridge-next@2.0.0",
   "experiment": {
@@ -25,9 +25,9 @@
     "rollback": "node tools/switch-bridge-payload-upstream.mjs --rollback"
   },
   "patched": {
-    "by": "dshl tools/patch-bridge-settings-entry.mjs",
-    "why": "将手机连接从 sidebar.footer.action 迁至 settings.section；仅对本栏目呈现手机图标",
-    "appliedAt": "2026-09-24T07:55:55.569Z",
+    "by": "dshl tools/patch-bridge-sync-backpressure.mjs",
+    "why": "背压溢出会 fail() 整条流 → 溢出窗口的增量没人消费 → 网页端收不到回复。A 溢出改为丢 refresh/最旧条目、B 上限抬到 5e4/64MiB、C 中断原因以 error 落盘、D 未知操作 kind 宽容跳过",
+    "appliedAt": "2026-09-28T15:21:29.491Z",
     "inputSha256": "b234d834af44d5f37410d238588c6525a4a506d1349955d30b776290f46f209b",
     "history": [
       {
@@ -38,7 +38,42 @@
           "client.js settings.section",
           "client.js settings.action phone icon"
         ]
+      },
+      {
+        "by": "dshl tools/patch-bridge-sync-ack-compat.mjs",
+        "why": "P1+P2+P3 同步 ack 宽容化；payload 版本 2.0.0+dshl.ui1 → 2.0.0-dev.7（触发启动器重装）",
+        "appliedAt": "2026-09-28T15:21:23.443Z",
+        "inputSha256": "b156aeb62dc3c6e6d3ec9cf20de1c88c7b86bcae45c44041780a59e533e6c0f0",
+        "sites": [
+          "lib/index.js: P1 路由 runtime.sync.ack：失效流的确认幂等成功",
+          "lib/index.js: P2 Feed.ack：越界/重复序号不再抛错",
+          "lib/bundled-connector/connector/runtimes/dsh/bridge/sync.py: P3 connector：乱序批次重新对齐而非退出"
+        ]
+      },
+      {
+        "by": "dshl tools/patch-bridge-sync-health-compat.mjs",
+        "why": "P1+P2 健康上报跃迁与未知通知容忍；payload 版本 2.0.0-dev.7 → 2.0.0-dev.8（触发启动器重装）",
+        "appliedAt": "2026-09-28T15:21:26.477Z",
+        "inputSha256": "91c4631243c8c2ba0fc6bb5c607e0e7621f097a46eac27b83a63d023dfc6934e",
+        "sites": [
+          "P1a consume()：初始化一次性上报标记",
+          "P1b consume()：首个 ack 成功后上报 running",
+          "P2 未知通知：记 warning 后忽略"
+        ]
+      },
+      {
+        "by": "dshl tools/patch-bridge-sync-backpressure.mjs",
+        "why": "A+B+C+D 背压与容错；payload 版本 2.0.0-dev.8 → 2.0.0-dev.9（触发启动器重装）",
+        "appliedAt": "2026-09-28T15:21:29.491Z",
+        "inputSha256": "a6774d9c71854efe8a975e20754deacbad9faa7dfa16eec92eab85fbc9e3e521",
+        "sites": [
+          "A 溢出不再作废整条流（丢 refresh / 最旧条目）",
+          "B 条数上限 1e4 → 5e4",
+          "C 同步中断的失败日志改为可落盘的 error 并带原因",
+          "D 未知操作 kind 只记 warning 不打死消费循环"
+        ]
       }
-    ]
+    ],
+    "upstreamSha256": "b156aeb62dc3c6e6d3ec9cf20de1c88c7b86bcae45c44041780a59e533e6c0f0"
   }
 }
