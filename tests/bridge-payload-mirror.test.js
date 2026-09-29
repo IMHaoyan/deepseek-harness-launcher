@@ -162,6 +162,41 @@ test('解析镜像：profile 侧缺件时从 dsh 安装树补上（这就是"装
   }
 })
 
+test('解析镜像：入口是 shim 时也能靠 env 的 dsh.dir 找到安装树（14178 那台机器的布局）', () => {
+  const root = tmpRoot()
+  try {
+    const home = path.join(root, 'home')
+    const { linkDir, keyDir } = makePayload(home, { peers: { '@deepseek-ai/dsh-session-title': '>=0.1.5-rc.1' } })
+    // npm 全局装的形态：包嵌在 <prefix>\node_modules\@deepseek-ai\dsh\node_modules 下
+    const prefix = path.join(root, 'npm')
+    const dshDir = path.join(prefix, 'node_modules', '@deepseek-ai', 'dsh')
+    const nested = path.join(dshDir, 'node_modules', '@deepseek-ai', 'dsh-session-title')
+    fs.mkdirSync(nested, { recursive: true })
+    fs.writeFileSync(path.join(nested, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-session-title', version: '0.2.0-rc.2' }))
+    // 入口是 shim（自身不在 node_modules 里，往上也没有 node_modules\@deepseek-ai）：
+    // 从它反推不出任何东西 —— 这正是 dshl 托管 dsh 时的形态。
+    const shimBin = path.join(root, 'shim', 'bin', 'dsh.cmd')
+    fs.mkdirSync(path.dirname(shimBin), { recursive: true })
+    fs.writeFileSync(shimBin, '')
+
+    bridge.initBridge({ home, payloadRoot: '', log: () => {} })
+    assert.equal(bridge.repairPayloadScopeMirror(linkDir).missing.includes('@deepseek-ai/dsh-session-title'), true,
+      '还没有安装树来源时应当算缺件')
+
+    const dirs = bridge.cacheInstallModulesDirs({ plan: { dshBin: shimBin }, dsh: { dir: dshDir, root: prefix } })
+    assert.ok(dirs.length > 0, 'shim 入口下也要能从 dsh.dir/dsh.root 推出安装树来源')
+    assert.equal(bridge.repairPayloadScopeMirror(linkDir).missing.includes('@deepseek-ai/dsh-session-title'), false,
+      '安装树里有的包不该再算缺件')
+    assert.equal(
+      fs.statSync(path.join(keyDir, 'node_modules', '@deepseek-ai', 'dsh-session-title', 'package.json')).isFile(),
+      true,
+      '镜像里应当补上这个 junction',
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('entryImportSpecifiers：只认入口真正 import 的裸包（相对路径 / node: 不算）', () => {
   const root = tmpRoot()
   try {

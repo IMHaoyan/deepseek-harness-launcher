@@ -206,11 +206,25 @@ function deriveInstallModulesDirs(dshBin) {
   return []
 }
 
-/** 缓存 dsh 安装树的解析来源（从 dshBin 推导）；探测失败就退回原来的两个来源。 */
+/** 缓存 dsh 安装树的解析来源；探测失败就退回原来的两个来源。
+ *
+ * 入口形态靠不住：启动器托管的 dsh 入口可能是 shim（`…\resources\runtime\cli\bin\dsh.cmd`），
+ * 从它反推不出任何 node_modules。所以以 env 报告里的 **dsh.dir**（dsh 包目录）与 **dsh.root**（npm 前缀）
+ * 为准 —— 那台 14178 机器上出问题的包就在 `<dsh.dir>\node_modules\@deepseek-ai\*` 里。
+ */
 function cacheInstallModulesDirs(env) {
   try {
+    const out = new Set()
     const dshBin = env && env.plan && env.plan.dshBin
-    installModulesDirs = dshBin ? deriveInstallModulesDirs(dshBin) : []
+    for (const dir of deriveInstallModulesDirs(dshBin)) out.add(dir)
+    const dshDir = env && env.dsh && env.dsh.dir // <prefix>\node_modules\@deepseek-ai\dsh
+    if (dshDir) {
+      out.add(path.join(dshDir, 'node_modules')) // dsh 自己那份（嵌套依赖：dsh-session-title 等）
+      out.add(path.dirname(path.dirname(dshDir))) // <prefix>\node_modules
+    }
+    const dshRoot = env && env.dsh && env.dsh.root // npm 前缀
+    if (dshRoot) out.add(path.join(dshRoot, 'node_modules'))
+    installModulesDirs = [...out].filter((d) => !!d)
   } catch { installModulesDirs = [] }
   return installModulesDirs
 }
