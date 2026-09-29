@@ -26,7 +26,7 @@ function tmpRoot() {
  *   <key>/bridge-next.tgz/lib/…    ← 入口产物
  *   <key>/bridge-next.tgz/node_modules → <key>/deps/node_modules 的 junction（pnpm 装的 4 个运行时依赖）
  */
-function makePayload(home) {
+function makePayload(home, opts = {}) {
   const keyDir = path.join(home, 'dshl', 'bridge-payloads', '2.0.0-dev.9-deadbeefcafe')
   const depsModules = path.join(keyDir, 'deps', 'node_modules')
   const linkDir = path.join(keyDir, 'bridge-next.tgz')
@@ -37,7 +37,7 @@ function makePayload(home) {
     version: '2.0.0-dev.9',
     main: './lib/index.js',
     dependencies: { qrcode: '1.5.4' },
-    peerDependencies: { '@deepseek-ai/cordis': '4.0.2', react: '^18.3.1' },
+    peerDependencies: Object.assign({ '@deepseek-ai/cordis': '4.0.2', react: '^18.3.1' }, opts.peers || {}),
   }, null, 2))
   fs.writeFileSync(path.join(linkDir, 'lib', 'index.js'), 'export const name = "x"\n')
   fs.symlinkSync(depsModules, path.join(linkDir, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
@@ -125,6 +125,56 @@ test('解析镜像：解析不到的包点名上报（这正是启动时 failed 
     assert.ok(result.missing.includes('react'), 'peer 解析不到要出现在 missing 里')
     assert.ok(result.missing.includes('qrcode'), 'dependencies 解析不到同样要报')
     assert.ok(!result.missing.includes('@deepseek-ai/cordis'), '能镜像的不该被报成缺口')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('解析镜像：profile 侧缺件时从 dsh 安装树补上（这就是"装了却 failed to import"的修复）', () => {
+  const root = tmpRoot()
+  try {
+    const home = path.join(root, 'home')
+    // 这个 peer 只存在于下面的"安装树"里：profile 与共享 fallback 都没有它
+    const { linkDir, keyDir } = makePayload(home, { peers: { '@deepseek-ai/dsh-session-title': '>=0.1.5-rc.1' } })
+    // 只在 dsh 安装树里放这个包：profile 与共享 fallback 都没有它
+    const tree = path.join(root, 'install', 'node_modules')
+    const appModules = path.join(tree, '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-session-title')
+    fs.mkdirSync(appModules, { recursive: true })
+    fs.writeFileSync(path.join(appModules, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-session-title', version: '0.2.0-rc.2' }))
+    fs.mkdirSync(path.join(tree, '@deepseek-ai', 'dsh', 'lib'), { recursive: true })
+    const dshBin = path.join(tree, '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    fs.writeFileSync(dshBin, '')
+
+    bridge.initBridge({ home, payloadRoot: '', log: () => {} })
+    assert.equal(bridge.repairPayloadScopeMirror(linkDir).missing.includes('@deepseek-ai/dsh-session-title'), true,
+      '还不知道安装树时，它应当算缺件')
+
+    assert.ok(bridge.cacheInstallModulesDirs({ plan: { dshBin } }).length > 0, '安装树来源要能推导出来')
+    const after = bridge.repairPayloadScopeMirror(linkDir)
+    assert.equal(after.missing.includes('@deepseek-ai/dsh-session-title'), false, '安装树里有的包不该再算缺件')
+    assert.equal(
+      fs.statSync(path.join(keyDir, 'node_modules', '@deepseek-ai', 'dsh-session-title', 'package.json')).isFile(),
+      true,
+      '镜像里应当补上这个 junction',
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('entryImportSpecifiers：只认入口真正 import 的裸包（相对路径 / node: 不算）', () => {
+  const root = tmpRoot()
+  try {
+    const home = path.join(root, 'home')
+    const { linkDir } = makePayload(home)
+    fs.writeFileSync(path.join(linkDir, 'lib', 'index.js'), [
+      'import { Service } from "@deepseek-ai/cordis";',
+      'import "./local.js";',
+      'import { readFile } from "node:fs/promises";',
+      'import z from "@deepseek-ai/schemastery";',
+    ].join('\n'))
+    assert.deepEqual(bridge.entryImportSpecifiers(linkDir).sort(), ['@deepseek-ai/cordis', '@deepseek-ai/schemastery'])
+    assert.deepEqual(bridge.entryImportSpecifiers(path.join(root, 'nope')), [], '读不到入口时返回空数组，不抛错')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

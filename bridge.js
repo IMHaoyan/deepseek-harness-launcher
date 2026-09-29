@@ -26,6 +26,7 @@ const zlib = require('zlib')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
 const { pathToFileURL } = require('url')
+const pluginCompat = require('./dsh-plugin-compat')
 
 const PLUGIN_NAME = '@agents-anywhere/dsh-bridge-next'
 const PROFILE_NAME = 'web'
@@ -175,12 +176,54 @@ function ensureJunction(link, target) {
   fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir')
 }
 
+// dsh 安装树里的 node_modules：payload 的 peer 全是 dsh 自己的包，profile 里缺/悬空时这里一定有。
+// 由 env 探测缓存（resolveFallbackPackage 是同步的，不能现探）；探测失败就退回原来的两个来源。
+let installModulesDirs = []
+
+/**
+ * 从 dsh 入口反推安装树的 node_modules，兼容两种布局：
+ *   - npm 全局装：<prefix>\node_modules\@deepseek-ai\dsh\lib\bin.js（交给 dsh-plugin-compat 的推导）
+ *   - 启动器自带 runtime：<install>\resources\runtime\cli\bin\dsh.cmd —— 入口自己不在 node_modules 里，
+ *     包在 <…>\cli\node_modules，所以要**从入口往上找**最近的 node_modules\@deepseek-ai。
+ * 少了后一种，镜像的第三个来源在启动器托管安装上恒为空 —— 而那正是"profile 侧缺件就再无兜底"的场景。
+ */
+function deriveInstallModulesDirs(dshBin) {
+  const dirs = pluginCompat.installModulesDirsFromDshBin(dshBin)
+  if (dirs.length > 0) return dirs
+  let dir = path.dirname(String(dshBin || ''))
+  for (let i = 0; i < 6 && dir && path.dirname(dir) !== dir; i += 1) {
+    const nm = path.join(dir, 'node_modules')
+    try {
+      if (fs.statSync(path.join(nm, '@deepseek-ai')).isDirectory()) {
+        const out = [nm]
+        const appDir = path.join(nm, '@deepseek-ai', 'dsh', 'node_modules')
+        try { if (fs.statSync(appDir).isDirectory()) out.push(appDir) } catch { /* 布局不同就只留顶层 */ }
+        return out
+      }
+    } catch { /* 继续往上 */ }
+    dir = path.dirname(dir)
+  }
+  return []
+}
+
+/** 缓存 dsh 安装树的解析来源（从 dshBin 推导）；探测失败就退回原来的两个来源。 */
+function cacheInstallModulesDirs(env) {
+  try {
+    const dshBin = env && env.plan && env.plan.dshBin
+    installModulesDirs = dshBin ? deriveInstallModulesDirs(dshBin) : []
+  } catch { installModulesDirs = [] }
+  return installModulesDirs
+}
+
 function resolveFallbackPackage(name) {
   const roots = []
   // DSH 注入包在 profiles/node_modules 里由 DSH 自己维护，比 profile 依赖树稳定；
   // 市场操作会剪掉 profile/node_modules，因此 @deepseek-ai/* 必须先查共享 fallback。
   if (String(name).startsWith('@deepseek-ai/')) roots.push(path.join(HOME, 'profiles', 'node_modules'))
   roots.push(path.join(profileDir(), 'node_modules'), path.join(HOME, 'profiles', 'node_modules'))
+  // 最后再看 dsh 安装树：2026-09-29 实测，另一台机器上 profile 侧缺件导致 payload `failed to import`，
+  // 而同一个包在安装树里是齐的 —— 少这个来源就只能等宿主兜底，兜不住就是"装了永远不生效"。
+  roots.push(...installModulesDirs)
   for (const root of [...new Set(roots)]) {
     const dir = path.join(root, ...name.split('/'))
     try {
@@ -188,6 +231,27 @@ function resolveFallbackPackage(name) {
     } catch { /* 继续找下一个 root */ }
   }
   return ''
+}
+
+/**
+ * 纯函数：payload 入口文件里真正 import 的裸包名（相对路径/node: 前缀不算）。
+ * 用来把"镜像缺口"日志收敛到**真正会让导入失败**的那几个 —— 声明的依赖/peer 里
+ * 有些（react、@dataiku/uv…）宿主半边根本不 import，报出来只会误导。
+ */
+function entryImportSpecifiers(dir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+    const entry = entryFileOf(pkg)
+    if (!entry) return []
+    const code = fs.readFileSync(path.join(dir, entry), 'utf8')
+    const out = new Set()
+    for (const m of code.matchAll(/^\s*import\s+(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]/gmu)) {
+      const spec = m[1]
+      if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('node:')) continue
+      out.add(spec)
+    }
+    return [...out]
+  } catch { return [] }
 }
 
 /**
@@ -242,8 +306,12 @@ function ensurePayloadRuntimeDeps(target) {
 function repairPayloadScopeMirror(target) {
   try {
     const result = ensurePayloadRuntimeDeps(target)
-    if (result.missing.length > 0) {
-      log('payload 解析镜像不完整（宿主兜底失败时会 failed to import）：' + result.missing.join('、'))
+    // 只报"入口真正 import、而且哪个来源都找不到"的那些包：其余（react、@dataiku/uv 之类）
+    // 宿主半边不 import，报出来只会把真正的缺口淹掉。
+    const needed = new Set(entryImportSpecifiers(target))
+    const fatal = result.missing.filter((name) => needed.has(name))
+    if (fatal.length > 0) {
+      log('payload 解析镜像缺件（这些包 import 不到，插件启动时会 failed to import）：' + fatal.join('、'))
     }
     return result
   } catch (e) {
@@ -620,6 +688,7 @@ async function runCliOnce(args) {
   if (!envDetect) throw new Error('bridge: envDetect 未初始化')
   const env = await envDetect.detectEnv(false)
   if (!env || !env.plan) throw new Error('运行环境未就绪，无法安装远程连接插件')
+  cacheInstallModulesDirs(env) // 解析镜像的第三个来源：dsh 安装树
   if (!pnpmReady(env)) {
     const detail = env.pnpm ? (env.pnpm.detail || '未就绪') : '未检测到 pnpm'
     throw new Error('pnpm 未就绪：' + detail + '。请先在运行环境页安装/修复 pnpm。')
@@ -676,6 +745,7 @@ async function runPnpm(args, cwd) {
   if (!envDetect) throw new Error('bridge: envDetect 未初始化')
   const env = await envDetect.detectEnv(false)
   if (!env || !env.plan) throw new Error('运行环境未就绪，无法准备远程连接插件依赖')
+  cacheInstallModulesDirs(env)
   if (!pnpmReady(env)) {
     const detail = env.pnpm ? (env.pnpm.detail || '未就绪') : '未检测到 pnpm'
     throw new Error('pnpm 未就绪：' + detail + '。请先在运行环境页安装/修复 pnpm。')
@@ -753,8 +823,10 @@ async function installPayloadDependencies() {
 /** 启动前自愈：重建被市场操作剪掉/悬空的 runtime dependency junction，并把解析缺口写进日志。 */
 async function ensureRuntimeDeps() {
   if (!payload) return false
+  // 先把 dsh 安装树记下来再建镜像：profile 侧缺件时它是唯一还找得到的来源
+  try { cacheInstallModulesDirs(await envDetect.detectEnv(false)) } catch { /* 探测失败就退回原来源 */ }
   const dir = materializePayload()
-  repairPayloadScopeMirror(dir) // 解析不到的包 = 启动时 failed to import 的候选，必须在启动器日志里点名
+  repairPayloadScopeMirror(dir) // 只报"入口真正 import 却找不到"的包，避免把宿主不 import 的依赖误报成缺口
   await installPayloadDependencies()
   return true
 }
@@ -854,6 +926,8 @@ async function install(opts = {}) {
   try {
     if (!payload) throw new Error('远程连接插件 payload 不可用：' + (payloadError || '未知原因'))
     if (!verifyPayload()) throw new Error(payloadError || 'payload 校验失败')
+    // 建镜像前先记下 dsh 安装树（profile 侧缺件时它是最后的来源）
+    try { cacheInstallModulesDirs(await envDetect.detectEnv(false)) } catch { /* 退回原来源 */ }
     materializePayload()
     await installPayloadDependencies()
     const want = { version: payload.version, spec: expectedSpec() }
@@ -933,6 +1007,8 @@ module.exports = {
   verifyPluginManifest,
   entryFileOf,
   repairPayloadScopeMirror,
+  cacheInstallModulesDirs,
+  entryImportSpecifiers,
   importCheckPayload,
   importCheckArgs,
   importCheckResult,
