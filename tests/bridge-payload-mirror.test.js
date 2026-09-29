@@ -52,6 +52,23 @@ function makeInjectedScope(home, scopeName) {
   return dir
 }
 
+/**
+ * 把 %APPDATA% 指到空目录并清空安装树缓存：镜像的第三个来源现在也含 npm 默认全局前缀，
+ * 不隔离的话"应当缺件"的断言会被本机真实的 npm 安装（确实有这些包）推翻。
+ * @returns {() => void} 复原函数
+ */
+function neutralizeInstallTree() {
+  const prev = process.env.APPDATA
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-empty-appdata-'))
+  process.env.APPDATA = empty
+  bridge.cacheInstallModulesDirs({})
+  return () => {
+    if (prev === undefined) delete process.env.APPDATA
+    else process.env.APPDATA = prev
+    fs.rmSync(empty, { recursive: true, force: true })
+  }
+}
+
 test('entryFileOf：默认 ./lib/index.js，绝对路径/上跳路径 fail-closed', () => {
   assert.equal(bridge.entryFileOf({}), 'lib/index.js')
   assert.equal(bridge.entryFileOf({ main: './lib/main.js' }), 'lib/main.js')
@@ -132,6 +149,7 @@ test('解析镜像：解析不到的包点名上报（这正是启动时 failed 
 
 test('解析镜像：profile 侧缺件时从 dsh 安装树补上（这就是"装了却 failed to import"的修复）', () => {
   const root = tmpRoot()
+  const restore = neutralizeInstallTree()
   try {
     const home = path.join(root, 'home')
     // 这个 peer 只存在于下面的"安装树"里：profile 与共享 fallback 都没有它
@@ -158,12 +176,14 @@ test('解析镜像：profile 侧缺件时从 dsh 安装树补上（这就是"装
       '镜像里应当补上这个 junction',
     )
   } finally {
+    restore()
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
 test('解析镜像：入口是 shim 时也能靠 env 的 dsh.dir 找到安装树（14178 那台机器的布局）', () => {
   const root = tmpRoot()
+  const restore = neutralizeInstallTree()
   try {
     const home = path.join(root, 'home')
     const { linkDir, keyDir } = makePayload(home, { peers: { '@deepseek-ai/dsh-session-title': '>=0.1.5-rc.1' } })
@@ -193,7 +213,24 @@ test('解析镜像：入口是 shim 时也能靠 env 的 dsh.dir 找到安装树
       '镜像里应当补上这个 junction',
     )
   } finally {
+    restore()
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('安装树候选：没有 env 线索时也包含 npm 默认全局前缀（顶层 + dsh 嵌套那两份）', () => {
+  const prev = process.env.APPDATA
+  process.env.APPDATA = path.join('C:', 'Users', 'x', 'AppData', 'Roaming')
+  try {
+    const dirs = bridge.installTreeCandidates({})
+    assert.ok(dirs.includes(path.join(process.env.APPDATA, 'npm', 'node_modules')), 'npm 全局顶层')
+    assert.ok(
+      dirs.includes(path.join(process.env.APPDATA, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules')),
+      'dsh 自己那份（14178 那台机器上 dsh-session-title 就在这里）',
+    )
+  } finally {
+    if (prev === undefined) delete process.env.APPDATA
+    else process.env.APPDATA = prev
   }
 })
 

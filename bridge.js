@@ -206,25 +206,44 @@ function deriveInstallModulesDirs(dshBin) {
   return []
 }
 
-/** 缓存 dsh 安装树的解析来源；探测失败就退回原来的两个来源。
+/**
+ * 安装树候选目录（**纯函数**，便于测试与日志）：不依赖任何单一线索，把所有已知布局都列出来。
  *
- * 入口形态靠不住：启动器托管的 dsh 入口可能是 shim（`…\resources\runtime\cli\bin\dsh.cmd`），
- * 从它反推不出任何 node_modules。所以以 env 报告里的 **dsh.dir**（dsh 包目录）与 **dsh.root**（npm 前缀）
- * 为准 —— 那台 14178 机器上出问题的包就在 `<dsh.dir>\node_modules\@deepseek-ai\*` 里。
+ * 为什么不能只信 env：`plan.dshBin` 可能是 shim（启动器托管的 dsh 入口在 `…\resources\runtime\cli\bin\`，
+ * 自己不在 node_modules 里）；`dsh.dir/dsh.root` 在不同机器上也可能指向别的安装。而 14178 那台机器实测
+ * 出问题的包就躺在 **npm 默认全局前缀**下：`%APPDATA%\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\*`。
+ * 所以：env 线索 + npm 前缀（显式给的、以及 %APPDATA%\npm 这个 Windows 默认值）全都作为候选，
+ * 用的时候逐个 stat 校验，命中即用。
  */
+function installTreeCandidates(env) {
+  const out = new Set()
+  const add = (dir) => { if (dir) out.add(dir) }
+  const dshBin = env && env.plan && env.plan.dshBin
+  for (const dir of deriveInstallModulesDirs(dshBin)) add(dir)
+  const dshDir = env && env.dsh && env.dsh.dir // <prefix>\node_modules\@deepseek-ai\dsh
+  if (dshDir) {
+    add(path.join(dshDir, 'node_modules')) // dsh 自己那份（嵌套依赖：dsh-session-title 等）
+    add(path.dirname(path.dirname(dshDir))) // <prefix>\node_modules
+  }
+  const dshRoot = env && env.dsh && env.dsh.root // env 报告里的 npm 前缀
+  if (dshRoot) add(path.join(dshRoot, 'node_modules'))
+  const npmPrefix = env && env.npmPrefix // 有的机器上只给了这个
+  if (npmPrefix) add(path.join(npmPrefix, 'node_modules'))
+  const appData = process.env.APPDATA || '' // Windows 上 npm 的默认全局前缀
+  if (appData) {
+    add(path.join(appData, 'npm', 'node_modules'))
+    // 很多包不落在顶层，而是嵌在 dsh 自己的 node_modules 下（14178 那台就是这样）
+    add(path.join(appData, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules'))
+  }
+  return [...out]
+}
+
+/** 缓存安装树来源；探测失败就退回原来的两个来源。 */
 function cacheInstallModulesDirs(env) {
   try {
-    const out = new Set()
-    const dshBin = env && env.plan && env.plan.dshBin
-    for (const dir of deriveInstallModulesDirs(dshBin)) out.add(dir)
-    const dshDir = env && env.dsh && env.dsh.dir // <prefix>\node_modules\@deepseek-ai\dsh
-    if (dshDir) {
-      out.add(path.join(dshDir, 'node_modules')) // dsh 自己那份（嵌套依赖：dsh-session-title 等）
-      out.add(path.dirname(path.dirname(dshDir))) // <prefix>\node_modules
-    }
-    const dshRoot = env && env.dsh && env.dsh.root // npm 前缀
-    if (dshRoot) out.add(path.join(dshRoot, 'node_modules'))
-    installModulesDirs = [...out].filter((d) => !!d)
+    installModulesDirs = installTreeCandidates(env).filter((d) => {
+      try { return fs.statSync(d).isDirectory() } catch { return false }
+    })
   } catch { installModulesDirs = [] }
   return installModulesDirs
 }
@@ -325,7 +344,9 @@ function repairPayloadScopeMirror(target) {
     const needed = new Set(entryImportSpecifiers(target))
     const fatal = result.missing.filter((name) => needed.has(name))
     if (fatal.length > 0) {
-      log('payload 解析镜像缺件（这些包 import 不到，插件启动时会 failed to import）：' + fatal.join('、'))
+      // 一条日志把"缺什么"和"查过哪儿"都说清：否则只能靠人再到那台机器上复现
+      log('payload 解析镜像缺件（这些包 import 不到，插件启动时会 failed to import）：' + fatal.join('、')
+        + '；已查来源：' + (installModulesDirs.length ? installModulesDirs.join(' | ') : '（安装树未探测到，仅 profile 侧）'))
     }
     return result
   } catch (e) {
@@ -1022,6 +1043,7 @@ module.exports = {
   entryFileOf,
   repairPayloadScopeMirror,
   cacheInstallModulesDirs,
+  installTreeCandidates,
   entryImportSpecifiers,
   importCheckPayload,
   importCheckArgs,
