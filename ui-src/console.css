@@ -305,7 +305,8 @@ body.console-surface {
 .logs-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
 .logs-head .recovery-title { margin: 0; }
 .logs-head #logHint { margin-left: auto; }
-.logs-card pre { height: min(52vh, 560px); min-height: 220px; overflow: auto; }
+/* 运行日志容器（.logs-card pre）的样式只有一处声明：见下方「日志与反馈」段。
+   这里原来还写过一条 height/min-height/overflow，与那段重复且从未生效（后者覆盖前者）。 */
 
 /* 服务侧失败的一句话原因：只有真的出过事时才占版面（就绪后主进程会清掉 serviceError） */
 .logs-cause {
@@ -950,10 +951,19 @@ body.console-surface {
 /* ---------- 日志与反馈 ---------- */
 
 .logs-card { display: flex; flex-direction: column; }
+/* 运行日志：可选中 + 自动换行（与 #envLog / #wizardLog 同一套写法）。
+   ① 可选中：body 上是 user-select:none，日志是拿来复制粘贴/贴进工单的，必须显式开回来；
+   ② 自动换行：<pre> 默认 white-space:pre，长路径/URL/堆栈只会在右边横向滚出去，
+      右侧内容看不见也选不到；折行后纵向滚动即可看全。 */
 .logs-card pre {
   height: calc(100vh - 200px);
   min-height: 260px;
   overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 .feedback-card {

@@ -1570,6 +1570,8 @@ function pluginCardEl(p) {
   const statePill = document.createElement('span');
   statePill.className = 'plugin-state-pill ' + ((p.status && p.status.tone) || 'muted');
   statePill.textContent = (p.status && p.status.label) || (active ? '已启用' : '未安装');
+  // 「未生效」这类判定要能展开看原因原文（长尾留 tooltip，不抢版面）
+  if (p.status && p.status.title) statePill.title = p.status.title;
 
   const actions = document.createElement('div'); actions.className = 'plugin-actions';
   // 版本提示：只有拿到 npm 侧最新版时才显示，避免「已是最新」是伪结论
@@ -1604,7 +1606,10 @@ function pluginCardEl(p) {
   footer.appendChild(p.toggleAction ? switchWrap : statePill); footer.appendChild(actions);
 
   const feedback = document.createElement('div'); feedback.className = 'plugin-feedback';
-  const feedbackText = p.error ? '✕ ' + p.error : (p.lastChange ? '✓ ' + p.lastChange : '');
+  // 启动时没起来（bundle 被跳过 / 行没激活）与"操作失败"是两回事：前者服务照常运行、
+  // 重启也不会改变，所以单独一行说出来，并用 ⚠ 与 ✕ 区分开。
+  const feedbackText = p.error ? '✕ ' + p.error
+    : (p.activation ? '⚠ ' + p.activation : (p.lastChange ? '✓ ' + p.lastChange : ''));
   feedback.textContent = feedbackText;
   feedback.classList.toggle('hidden', !feedbackText);
 

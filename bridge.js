@@ -136,13 +136,28 @@ function payloadLinkDir(version, sha256) {
   return path.join(HOME, 'dshl', 'bridge-payloads', key, PAYLOAD_LINK_BASENAME)
 }
 
+/** 纯函数：从 manifest 取入口产物相对路径（默认 ./lib/index.js）；非法路径 fail-closed 返回空串。 */
+function entryFileOf(pkg) {
+  const raw = (pkg && typeof pkg.main === 'string' && pkg.main.trim()) ? pkg.main.trim() : './lib/index.js'
+  const rel = raw.replace(/\\/gu, '/').replace(/^\.\//u, '')
+  if (!rel || rel.startsWith('/') || /^[A-Za-z]:/u.test(rel)) return ''
+  if (rel.split('/').some((part) => !part || part === '.' || part === '..')) return ''
+  return rel
+}
+
 function isMaterializedPayloadValid(dir) {
   if (!payload || !dir) return false
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
     verifyPluginManifest(pkg, { version: payload.version })
     const st = fs.statSync(path.join(dir, BUNDLE_PATCH.replace(/^\.\//u, '')))
-    return st.isFile()
+    if (!st.isFile()) return false
+    // 入口产物也要在。package.json + cordis.patch.yml 齐全、lib/index.js 缺失时，
+    // DSH 只会在 stderr 打一行 `failed to import`（服务照常就绪），用户侧看到的却是
+    // 「插件市场说已安装、重启后生效，重启永远不生效」（2026-09-29 实测事故）。
+    const entry = entryFileOf(pkg)
+    if (!entry) return false
+    return fs.statSync(path.join(dir, entry)).isFile()
   } catch { return false }
 }
 
@@ -175,9 +190,13 @@ function resolveFallbackPackage(name) {
 }
 
 /**
- * Node 从真实路径解析 ESM 依赖；缓存目录在 profile 外，parent 链里没有
+ * Node 从真实路径解析 ESM 依赖；缓存目录在 profile 外，父链里没有
  * $DSH_HOME/profiles/node_modules，所以把 Bridge 的直接依赖/peer 以 junction
- * 合并进缓存目录自己的 node_modules。
+ * 合并进缓存目录**旁边**的 node_modules（payload 自己那个 node_modules 是 deps 的 junction，
+ * 里面只有 4 个运行时依赖）。镜像地址必须写真实路径：共享 fallback 里那些 @deepseek-ai/*
+ * 本身也是 junction，DSH 升级/清理会重新指向甚至删掉它们，镜像跟着悬空就等于没镜像
+ * ——宿主兜底又随 dsh 版本变（0.1.7-rc.2 上 bridge 就是这样 `failed to import` 的）。
+ * @returns {{mirrored:string[], missing:string[]}} missing = 声明了却哪个 fallback 都解析不到的包
  */
 function ensurePayloadRuntimeDeps(target) {
   const pkg = JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8'))
@@ -200,9 +219,35 @@ function ensurePayloadRuntimeDeps(target) {
     if (st.isSymbolicLink()) fs.unlinkSync(modulesDir)
   } catch { /* 不存在 */ }
   fs.mkdirSync(modulesDir, { recursive: true })
+  const mirrored = []
+  const missing = []
   for (const name of names) {
     const found = resolveFallbackPackage(name)
-    if (found) ensureJunction(path.join(modulesDir, ...name.split('/')), found)
+    if (!found) { missing.push(name); continue }
+    let real = found
+    try { real = fs.realpathSync(found) } catch { /* 悬空来源：按原路径建，下一次启动会重试 */ }
+    ensureJunction(path.join(modulesDir, ...name.split('/')), real)
+    mirrored.push(name)
+  }
+  return { mirrored, missing }
+}
+
+/**
+ * 幂等重建 payload 自己的解析镜像（见 ensurePayloadRuntimeDeps）。失败只记账、不上抛：
+ * 镜像缺失时插件仍可能被宿主兜住，真正"没起来"由启动后的激活信号负责暴露。
+ * 解析不到的包必须点名写日志：它们正是启动时 `failed to import` 的候选，
+ * 而 DSH 只会回一句 `failed to import`，不告诉你缺的是哪个模块。
+ */
+function repairPayloadScopeMirror(target) {
+  try {
+    const result = ensurePayloadRuntimeDeps(target)
+    if (result.missing.length > 0) {
+      log('payload 解析镜像不完整（宿主兜底失败时会 failed to import）：' + result.missing.join('、'))
+    }
+    return result
+  } catch (e) {
+    log('payload 解析镜像修复失败（不阻断启动）：' + ((e && e.message) || String(e)))
+    return { mirrored: [], missing: [], error: (e && e.message) || String(e) }
   }
 }
 
@@ -704,10 +749,11 @@ async function installPayloadDependencies() {
   ensureJunction(localModules, modulesDir)
 }
 
-/** 启动前自愈：重建被市场操作剪掉/悬空的 runtime dependency junction。 */
+/** 启动前自愈：重建被市场操作剪掉/悬空的 runtime dependency junction，并把解析缺口写进日志。 */
 async function ensureRuntimeDeps() {
   if (!payload) return false
-  materializePayload()
+  const dir = materializePayload()
+  repairPayloadScopeMirror(dir) // 解析不到的包 = 启动时 failed to import 的候选，必须在启动器日志里点名
   await installPayloadDependencies()
   return true
 }
@@ -808,6 +854,8 @@ module.exports = {
   parseReleaseAgeEntries,
   satisfied,
   verifyPluginManifest,
+  entryFileOf,
+  repairPayloadScopeMirror,
   readPackageFromTarball,
   readMaterializedPackageState,
   materializePayload,

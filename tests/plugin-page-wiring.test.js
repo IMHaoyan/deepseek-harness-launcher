@@ -365,10 +365,17 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     npmVersionCache: new Map(),
     semver: { valid: () => true, lt: () => false },
     pluginAutoDeclined: () => false,
+    // 「插件没生效」的证据注入点：默认没有（见下面第二个用例）
+    bridge: require('../bridge'),
+    pluginActivation: require('../plugin-activation'),
+    activationIssueOf: (name) => (typeof activationStub === 'function' ? activationStub(name) : undefined),
   }
+  let activationStub = null
   const names = Object.keys(ctx)
   const build = new Function(...names, src + '\nreturn buildPluginCatalog')(...names.map((k) => ctx[k]))
-  const catalog = build({ installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }, { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }, {})
+  const marketArg = { installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }
+  const bridgeArg = { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }
+  const catalog = build(marketArg, bridgeArg, {})
 
   assert.equal(catalog.length, registry.length + 2, '插件页应渲染「插件市场 + 手机连接 + 全部推荐插件」')
   for (const d of registry) {
@@ -417,6 +424,22 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.equal(busyCard.status.label, '卸载中…', '忙态文案应说清在做哪个动作')
   assert.equal(busyCard.status.tone, 'busy', '忙态胶囊应是 busy 色调')
   assert.deepEqual(busyCard.actions, [], '忙态下不许再给按钮（此刻再点会撞 profile 锁）')
+
+  // 3c. 「未生效」必须盖过"已开启/已安装"这类清单态：DSH 对 bundle 被跳过 / 行没激活
+  //     只写 stderr、服务照常就绪，于是插件市场一直说"重启后生效"、重启永远不改变它。
+  ctx.pluginActionBusy.clear()
+  const target = registry[0]
+  activationStub = (name) => (name === target.npm
+    ? { kind: 'inactive', packageName: name, entryId: 'some-entry', detail: 'failed to import', services: [] }
+    : undefined)
+  const issueCatalog = build(marketArg, bridgeArg, {})
+  const issueCard = issueCatalog.find((c) => c.id === target.id)
+  assert.equal(issueCard.status.label, '未生效', '清单态说"已安装"、运行态没起来时必须说未生效')
+  assert.equal(issueCard.status.tone, 'warn')
+  assert.equal(issueCard.activation, '启动时未激活：failed to import', '卡片要带上原因文案')
+  assert.match(issueCard.status.title, /重启不会改变/, 'tooltip 要说清为什么重启没用')
+  assert.equal(issueCatalog.find((c) => c.id === 'bridge-next').activation, '', '没有证据的插件不该被判成未生效')
+  activationStub = null
   ctx.pluginActionBusy.delete('better-sidebar')
   assert.deepEqual(
     build({ installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }, { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }, {})

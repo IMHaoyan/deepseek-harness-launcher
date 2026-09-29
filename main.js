@@ -36,6 +36,7 @@ const notifyPolicy = require('./notify-policy')
 const crashNote = require('./crash-note')
 const startProgress = require('./start-progress')
 const bridge = require('./bridge')
+const pluginActivation = require('./plugin-activation')
 const bootFailure = require('./boot-failure')
 
 const IS_WIN = process.platform === 'win32'
@@ -574,6 +575,11 @@ const server = {
   phaseLine: '', // 启动期"当前环节"：服务进程最近一条插件日志（说明页在"等待端口就绪"后面显示它）
   phaseAt: 0, // 上面那行到达的时间（页面据此显示"（N 秒前）"，避免把已过去的事说成"正在"）
   errTail: [], // 子进程 stderr 尾部若干行：**失败原因的唯一来源**（server.err.log 是同一份证据的落盘）
+  // 插件没生效的证据：DSH 对「bundle 被跳过 / 行没激活」只写 stderr、不影响启动，
+  // 于是服务一切正常、插件页却显示"已安装"，重启永远不生效（2026-09-29 事故）。
+  // 逐行增量解析：errTail 是 60 行环形缓冲，几秒后就可能把启动期那几行挤掉。
+  activationWindow: [], // 最近几行 stderr 的滑动窗口（warning 头 + 紧随的条目行要一起看）
+  activationIssues: [], // 本轮启动里解析出的问题条目（去重，随世代清空）
   startPromise: null, // 进行中的启动：并发调用共用同一次启动，不再 spawn 第二个 dsh web 抢同一个端口
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
@@ -1020,6 +1026,8 @@ async function startServerInner(occupantRetry = 0) {
   server.phaseLine = '' // 新进程的"当前环节"从零开始（上一轮的最后一条日志不能说成这一轮的动静）
   server.phaseAt = 0
   server.errTail = [] // 上一代的 stderr 不能当成本代的失败原因
+  server.activationWindow = []
+  server.activationIssues = []
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
   try {
@@ -1113,6 +1121,7 @@ async function startServerInner(occupantRetry = 0) {
     for (const line of String(d).split(/\r?\n/)) {
       if (!line.trim()) continue
       server.errTail.push(line)
+      noteActivationEvidence(line) // 启动期就记下"哪个插件没起来"，别等 60 行缓冲把它挤掉
     }
     if (server.errTail.length > ERR_TAIL_LINES) server.errTail.splice(0, server.errTail.length - ERR_TAIL_LINES)
     if (bindErr) return
@@ -1326,6 +1335,13 @@ function markReady(child, ownerVerdict) {
   readySince = Date.now()
   autoRestartStopped = false
   clearServiceFailureTracking() // 起来了 = 上一轮的失败证据作废，连续计数归零
+  // 服务起来了 ≠ 插件起来了：DSH 对「bundle 被跳过 / 行没激活」只写 stderr，不崩、退出码也是 0。
+  // 这里补一条日志把整句话说完；界面由插件卡片的「未生效」态呈现（重启不会改变它）。
+  const activationIssues = server.activationIssues || []
+  if (activationIssues.length) {
+    log('插件未生效（重启不会改变）：' + activationIssues
+      .map((it) => it.packageName + ' → ' + pluginActivation.describeActivationIssue(it)).join('；'))
+  }
   return true
 }
 
@@ -1541,6 +1557,8 @@ let readySince = 0 // 本轮服务就绪时刻（0 = 未就绪）
 // 失败原因证据：子进程 stderr 的尾部若干行。落盘那份（server.err.log）用户看不到，
 // 这里留一份内存副本，用于「通知里写清原因」与「确定性失败判定」。
 const ERR_TAIL_LINES = 60
+// 激活证据的滑动窗口：warning 头 + 紧随的条目行要一起看（条目数与插件数同阶，8 行足够）
+const ACTIVATION_WINDOW_LINES = 8
 // 同一签名的失败连续出现几次（{ signature, count }）；见 boot-failure.js
 let lastBootFailure = null
 let lastBootFailureInfo = null // 最近一次失败的分类结果（给界面/通知展示）
@@ -1599,6 +1617,40 @@ function haltAutoRestart(failure) {
     ? `自动恢复已停止：${why}。完整日志在 DSHL 控制台「日志与反馈」页（可切换查看服务日志）`
     : '自动恢复已停止：服务仍无法稳定运行，请打开 DSHL 控制台查看日志并手动处理', undefined, 'service')
   broadcastState()
+}
+
+// ---------- 插件没生效的证据（DSH 只在 stderr 里说，解析见 plugin-activation.js） ----------
+
+/**
+ * 逐行喂 stderr：命中「bundle 被跳过 / 行没激活」就记一条证据。
+ *
+ * 为什么逐行增量而不是就绪时扫 errTail：DSH 那两行出现在启动早期，
+ * 而 errTail 只有 60 行的环形缓冲，服务跑几秒就被插件日志挤掉了。
+ * 解析用滑动窗口（错误只在这里被吞：`failed to import` 后面没有任何栈）。
+ */
+function noteActivationEvidence(line) {
+  const win = server.activationWindow
+  win.push(String(line))
+  if (win.length > ACTIVATION_WINDOW_LINES) win.splice(0, win.length - ACTIVATION_WINDOW_LINES)
+  let found = []
+  try { found = pluginActivation.parseActivationIssues(win.join('\n')) } catch { return }
+  if (!found.length) return
+  let changed = false
+  for (const issue of found) {
+    const key = issue.kind + '\u0000' + issue.packageName + '\u0000' + issue.detail
+    if (server.activationIssues.some((it) => it.key === key)) continue
+    server.activationIssues.push(Object.assign({ key }, issue))
+    changed = true
+  }
+  if (!changed) return
+  log('插件未生效（服务照常运行，重启不会改变）：'
+    + server.activationIssues.map((it) => it.packageName + ' → ' + it.detail).join('；'))
+  broadcastState() // 插件卡片要立刻显示"未生效"，不能等下一次状态推送
+}
+
+/** 某个包本轮启动的未生效证据（没有则 undefined）。 */
+function activationIssueOf(packageName) {
+  return pluginActivation.findActivationIssue(server.activationIssues, packageName)
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
@@ -3036,16 +3088,29 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
   const bridgeOutdated = !!b.outdated
   const bridgePayloadReady = !!b.payloadReady
 
+  // 「未生效」优先于「已开启 / 已安装」这类清单态：后者读的是 profile 文件，前者是运行中的真相。
+  // DSH 对「bundle 被跳过 / 行没激活」只写 stderr、服务照常就绪，于是市场会一直说"重启后生效"，
+  // 而重启永远不会改变它 —— 界面上必须有一条与之对应的文案（证据解析见 plugin-activation.js）。
+  const unresolvedStatus = (packageName, status) => {
+    const issue = activationIssueOf(packageName)
+    if (!issue || status.tone === 'busy' || status.tone === 'error') return status
+    return { label: '未生效', tone: 'warn', title: pluginActivation.activationIssueHint(issue) }
+  }
+  const activationText = (packageName) => {
+    const issue = activationIssueOf(packageName)
+    return issue ? pluginActivation.describeActivationIssue(issue) : ''
+  }
+
   const marketDisabled = !!m.installed && pluginSwitch.isDisabled(market.PLUGIN_NAME)
   const marketToggle = !!m.installed && pluginSwitch.canToggle(market.PLUGIN_NAME)
-  const marketStatus = marketBusy
+  const marketStatus = unresolvedStatus(market.PLUGIN_NAME, marketBusy
     ? { label: marketAct ? pluginBusyLabel(marketAct) : (m.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
     : (m.error
       ? { label: '操作失败', tone: 'error' }
       : (m.installed
         ? (marketDisabled ? { label: '已关闭', tone: 'muted' } : { label: marketToggle ? '已启用' : '已安装', tone: 'ok' })
-        : { label: '未安装', tone: 'muted' }))
-  const bridgeStatus = bridgeBusy
+        : { label: '未安装', tone: 'muted' })))
+  const bridgeStatus = unresolvedStatus(bridge.PLUGIN_NAME, bridgeBusy
     ? { label: bridgeAct ? pluginBusyLabel(bridgeAct) : (b.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
     : (b.error
       ? { label: '操作失败', tone: 'error' }
@@ -3055,7 +3120,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
           ? { label: '需要安装', tone: 'warn' }
           : (bridgeEnabled && bridgeOutdated
             ? { label: '可更新', tone: 'warn' }
-            : (bridgeEnabled ? { label: '已开启', tone: 'ok' } : { label: '已关闭', tone: 'muted' })))))
+            : (bridgeEnabled ? { label: '已开启', tone: 'ok' } : { label: '已关闭', tone: 'muted' }))))))
 
   const marketActions = pluginCardActions({
     busy: marketBusy,
@@ -3100,13 +3165,13 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
         : installedVersion !== latest)
     const disabled = !!raw.installed && pluginSwitch.isDisabled(d.npm)
     const toggle = !!raw.installed && pluginSwitch.canToggle(d.npm)
-    const status = busy
+    const status = unresolvedStatus(d.npm, busy
       ? { label: busyText, tone: 'busy' }
       : (raw.error
         ? { label: '操作失败', tone: 'error' }
         : (raw.installed
           ? (disabled ? { label: '已关闭', tone: 'muted' } : (outdated ? { label: '可更新', tone: 'warn' } : { label: toggle ? '已启用' : '已安装', tone: 'ok' }))
-          : { label: '未安装', tone: 'muted' }))
+          : { label: '未安装', tone: 'muted' })))
     const actions = pluginCardActions({ busy, installed: !!raw.installed, outdated, latestVersion: latest, name: d.name })
     return {
       note: noteOf(d.id),
@@ -3129,6 +3194,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       payloadReady: true,
       busy: busy || '',
       error: raw.error || '',
+      activation: activationText(d.npm),
       lastChange: raw.lastChange || '',
       autoInstall: !!(d.autoInstall && !pluginAutoDeclined(d.id)),
       autoInstallLabel: d.autoInstall ? (pluginAutoDeclined(d.id) ? '已关闭自动安装' : '预装 (推荐开启)') : '手动安装',
@@ -3158,6 +3224,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       payloadReady: true,
       busy: m.busy || '',
       error: m.error || '',
+      activation: activationText(market.PLUGIN_NAME),
       lastChange: m.lastChange || '',
       autoInstall: !Config.pluginMarketDeclined,
       autoInstallLabel: Config.pluginMarketDeclined ? '不自动安装' : '预装 (推荐开启)',
@@ -3184,6 +3251,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       payloadReady: bridgePayloadReady,
       busy: b.busy || '',
       error: b.error || (bridgeEnabled && !bridgePayloadReady ? (b.payloadError || '插件 payload 不可用') : ''),
+      activation: activationText(bridge.PLUGIN_NAME),
       lastChange: b.lastChange || '',
       autoInstall: bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
       autoInstallLabel: bridgeEnabled ? (bridgePayloadReady ? '预装 (推荐开启)' : 'payload 不可用') : '已关闭',
@@ -4261,7 +4329,9 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
     // 每次加载完成后应用当前设定（失败页/错误页会把缩放重置为 100%）
     try { wc.setZoomFactor(Config.webZoom / 100) } catch { /* noop */ }
     markBlank(false)
-    injectPaneOverlay(tab)
+    // 分屏浮层：功能恒关 → 不注入，只清历史残留（它一旦裸奔就是页面底部那坨怪 UI）
+    if (Config.tabsEnabled) injectPaneOverlay(tab)
+    else removePaneOverlay(tab)
     // 说明页刚加载完：补推一次当前步骤（推送是即时的，晚加载完的页面会错过）
     pushLoadingProgress(wc)
     // 健康门快路径：真实应用页面（非状态说明页）加载成功 = 本代服务健康的最强证据。
@@ -4334,8 +4404,16 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
 }
 
 // 分屏聚焦控件（Edge 式）：注入到每个标签页，聚焦侧右上角浮出 ✕（关闭此分屏）与 ⋯ 菜单（切换左右分屏 / 在新标签页中打开此网页）。
-// 与缩放浮层同一套路（executeJavaScript 注入，不受页面 CSP 限制）；动作经 browser-preload 桥回主进程。
+// 与缩放浮层同一套路（executeJavaScript 注入）；动作经 browser-preload 桥回主进程。
+//
+// 两个必须记住的前提（2026-09 线上复现的教训）：
+//   1) executeJavaScript 只绕过“脚本”的 CSP，注入的 <style> 仍受页面 style-src 约束。样式一被拦，
+//      “默认隐藏”就没了，裸 DOM 会落进文档流末尾 —— 页面滚到底时露出（底部左侧两颗按钮 + 三行菜单），
+//      页面还会被顶高约一个浮层的高度。所以隐藏态必须同时落在 DOM 上（root.hidden），不能只靠样式表。
+//   2) 分屏自 v1.1.7 起恒关（Config.tabsEnabled 常 false），这套控件已无任何可达的显示路径，
+//      连 ✕ 也是空点（trust.js 对标签页视图一律拒绝 browser:*）。功能关闭时既不注入、还要清掉历史残留。
 function injectPaneOverlay(tab) {
+  if (!Config.tabsEnabled) return // 功能恒关：不可达的浮层一律不注入（清理见 removePaneOverlay）
   const wc = tab.view && tab.view.webContents
   if (!wc || wc.isDestroyed()) return
   const paneId = tab.id
@@ -4354,6 +4432,9 @@ function injectPaneOverlay(tab) {
       '#__dshPaneMenu div:hover{background:rgba(255,255,255,0.08);}'
     ].join('');
     var root = document.createElement('div'); root.id = '__dshPaneRoot';
+    // 隐藏态同时落到 DOM（hidden 属性 → UA 的 [hidden]{display:none}）：
+    // 下面这段 <style> 若被页面 CSP 拦掉/被清掉，光靠它“默认不可见”就失效，裸 DOM 会随页面滚动露出来。
+    root.hidden = true;
     var st = document.createElement('style'); st.textContent = css;
     var bar = document.createElement('div'); bar.id = '__dshPaneBar';
     var btnMenu = document.createElement('button'); btnMenu.title = '更多分屏操作'; btnMenu.textContent = '\\u22EF';
@@ -4380,13 +4461,42 @@ function injectPaneOverlay(tab) {
   wc.executeJavaScript(js).catch(() => { /* 页面未就绪时静默，下次 did-finish-load 重试 */ })
 }
 
+// 清掉页面上残留的分屏浮层（裸 DOM + 随它注入的 <style>）。功能恒关时每次页面加载完都跑一遍：
+// 只删自己注入的节点、不改写页面内容；只有真删到了才记一行日志（残留属于异常，不该是常规噪音）。
+// 注入的 <style> 当年没设 id，只能按内容特征（含 __dshPaneRoot）识别。
+function removePaneOverlay(tab) {
+  const wc = tab.view && tab.view.webContents
+  if (!wc || wc.isDestroyed()) return
+  const js = `(function(){
+    var removed = 0;
+    var root = document.getElementById('__dshPaneRoot');
+    if (root && root.parentNode) { root.parentNode.removeChild(root); removed++; }
+    var styles = document.querySelectorAll('style');
+    for (var i = 0; i < styles.length; i++) {
+      var s = styles[i];
+      if (s.textContent && s.textContent.indexOf('__dshPaneRoot') >= 0 && s.parentNode) {
+        s.parentNode.removeChild(s);
+        removed++;
+      }
+    }
+    return removed;
+  })()`
+  let url = ''
+  try { url = wc.getURL() || '' } catch { /* 取不到 URL 就只记条数 */ }
+  wc.executeJavaScript(js)
+    .then((n) => { if (n) log('分屏浮层残留已清理：' + n + ' 个节点' + (url ? ' @ ' + url : '')) })
+    .catch(() => { /* 页面未就绪时静默 */ })
+}
+
 // 仅"分屏开启 + 本页是当前聚焦且正在展示的一侧"时显示控件（Edge 行为）
 function refreshPaneOverlays() {
+  if (!Config.tabsEnabled) return // 功能恒关：没有可显示的浮层，也不向页面下发任何指令
   for (const t of webTabs) {
     const wc = t.view && t.view.webContents
     if (!wc || wc.isDestroyed()) continue
     const shown = !!(webSplitOn && t.id === webFocusedId && (t.id === webActiveId || t.id === webRightId))
-    wc.executeJavaScript(`(function(){var el=document.getElementById('__dshPaneRoot');if(el){el.classList.toggle('show',${shown});}})()`).catch(() => { /* noop */ })
+    // 显隐同时落到 DOM（hidden）与样式类：只改 class 的话，样式表一旦没生效就永远显示着
+    wc.executeJavaScript(`(function(){var el=document.getElementById('__dshPaneRoot');if(el){var on=${shown};el.classList.toggle('show',on);el.hidden=!on;}})()`).catch(() => { /* noop */ })
   }
 }
 
