@@ -2,7 +2,8 @@
 //
 // 目的：验证「网页端收不到回复」是不是出在我们自己那 5 处行为补丁上。
 // 组成（只保留 dsh 兼容所需的 3 处）：
-//   1) peer 放宽：@deepseek-ai/dsh-typert-protocol 0.1.5-rc.2 → >=0.1.5-rc.1 <0.2.0（不放宽会被 dsh 兼容闸整个跳过）
+//   1) peer 放宽：@deepseek-ai/dsh-typert-protocol 0.1.5-rc.2 → >=0.1.5-rc.1（不放宽会被 dsh 兼容闸整个跳过；
+//      无上界，dsh 进新 minor 也不用再改这条）
 //   2) callid 兼容：tool/result 取值改 message-first（上游仍是 0.1.7 之前的 content[0] 形态）
 //   3) icon 兼容：两个图标名换成 0.1.7 上的 Regular 变体
 // 明确**不带**我们的 5 处行为补丁（ack 宽容 / 健康上报 / 通知与操作容错 / 背压不改作废 / 中断日志级别）——
@@ -32,7 +33,7 @@ const backupDir = join(repoRoot, '.alpha-notes', 'bridge-payload-backup-dev6')
 
 const UPSTREAM = '@agents-anywhere/dsh-bridge-next@2.0.0'
 const PEER = '@deepseek-ai/dsh-typert-protocol'
-const PEER_NEW = '>=0.1.5-rc.1 <0.2.0'
+const PEER_NEW = '>=0.1.5-rc.1'
 const CALLID_OLD = '\t\t\tconst value = event.data.message.content[0];\n' +
   '\t\t\tresult(value.toolCallId, value.content, value.isError === true || Boolean(event.data.error), event, event.data.meta, event.data.error);'
 const CALLID_NEW = '\t\t\tconst message = event.data.message;\n' +

@@ -39,9 +39,23 @@ test('payload 的 dsh peer 范围能通过兼容闸：0.1.5 ~ 0.1.9 全放行', 
   }
 })
 
-test('payload 的 peer 上界停在 0.2.0：下一个破坏性边界要 fail-closed，不许静默放行', () => {
+test('payload 的 dsh peer 没有上界：dsh 进新 minor/新主版本也不会被闸拦下（免得每次升级都要重打补丁）', () => {
+  // 2026-09-29 改：原先 `<0.2.0` 的上界让 dsh 一进新 minor 就被整条跳过（0.2.0-rc.2 实测复现），
+  // 于是每次 dsh 升级都要重打 patch-bridge-peer-compat 并抬一次 payload 版本。现在无上界。
+  for (const runtime of ['0.2.0-rc.1', '0.2.0-rc.2', '0.3.0', '1.0.0', '2.0.0-rc.1']) {
+    for (const [name, range] of dshPeers) {
+      assert.ok(semver.satisfies(runtime, range, { includePrerelease: true }),
+        `${name} 的 peer 范围 ${range} 不满足 dsh ${runtime} —— 又要重打补丁了`)
+    }
+  }
+  for (const [, range] of dshPeers) {
+    assert.doesNotMatch(range, /<\s*\d/u, `peer 范围 ${range} 又有上界了：dsh 一升 minor 就会被跳过`)
+  }
+})
+
+test('payload 的 peer 仍有下限：远古版本照旧拒绝（放宽不等于什么都不管）', () => {
   for (const [name, range] of dshPeers) {
-    assert.ok(!semver.satisfies('0.2.0', range, { includePrerelease: true }),
-      `${name} 的 peer 范围 ${range} 连 0.2.0 也放行 —— typert 协议若变，闸就形同虚设；确要放开请连同本测试一起改`)
+    assert.ok(!semver.satisfies('0.1.0', range, { includePrerelease: true }),
+      `${name} 的范围 ${range} 连 dsh 0.1.0 都放行 —— 下限被改没了`)
   }
 })

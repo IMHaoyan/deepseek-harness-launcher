@@ -1,10 +1,10 @@
 {
-  "version": "2.0.0-dev.9",
-  "sha256": "d092755d83d9bd2b9b54454402ded54ad353c305ade542e836193b98ea928e5d",
+  "version": "2.0.0-dev.10",
+  "sha256": "389acee66c5017cad36fd30179ab6336daac4a94b967ee04131faad7fe16e9da",
   "tarball": "bridge-next.tgz",
   "package": {
     "name": "@agents-anywhere/dsh-bridge-next",
-    "version": "2.0.0-dev.9"
+    "version": "2.0.0-dev.10"
   },
   "source": "npm @agents-anywhere/dsh-bridge-next@2.0.0",
   "experiment": {
@@ -25,9 +25,9 @@
     "rollback": "node tools/switch-bridge-payload-upstream.mjs --rollback"
   },
   "patched": {
-    "by": "dshl tools/patch-bridge-sync-backpressure.mjs",
-    "why": "背压溢出会 fail() 整条流 → 溢出窗口的增量没人消费 → 网页端收不到回复。A 溢出改为丢 refresh/最旧条目、B 上限抬到 5e4/64MiB、C 中断原因以 error 落盘、D 未知操作 kind 宽容跳过",
-    "appliedAt": "2026-09-28T15:21:29.491Z",
+    "by": "dshl tools/patch-bridge-peer-compat.mjs",
+    "why": "dsh 0.1.7-rc.1 新增插件兼容闸，payload 把 @deepseek-ai/dsh-typert-protocol 精确钉成 >=0.1.5-rc.1 <0.2.0 会被整体跳过；放宽为 >=0.1.5-rc.1，并抬 payload 版本以触发启动器重装",
+    "appliedAt": "2026-09-29T12:32:35.499Z",
     "inputSha256": "b234d834af44d5f37410d238588c6525a4a506d1349955d30b776290f46f209b",
     "history": [
       {
@@ -72,6 +72,12 @@
           "C 同步中断的失败日志改为可落盘的 error 并带原因",
           "D 未知操作 kind 只记 warning 不打死消费循环"
         ]
+      },
+      {
+        "by": "dshl tools/patch-bridge-peer-compat.mjs",
+        "why": "peer @deepseek-ai/dsh-typert-protocol: >=0.1.5-rc.1 <0.2.0 → >=0.1.5-rc.1；payload 版本 2.0.0-dev.9 → 2.0.0-dev.10（触发启动器重装）",
+        "appliedAt": "2026-09-29T12:32:35.499Z",
+        "inputSha256": "d092755d83d9bd2b9b54454402ded54ad353c305ade542e836193b98ea928e5d"
       }
     ],
     "upstreamSha256": "b156aeb62dc3c6e6d3ec9cf20de1c88c7b86bcae45c44041780a59e533e6c0f0"

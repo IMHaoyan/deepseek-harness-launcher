@@ -10,8 +10,13 @@
 //   插件页此时仍显示「已安装，重启后生效」（那是热挂载文案），重启永远不会生效。
 //   上游 @agents-anywhere/dsh-bridge-next@2.0.0 的同一 peer 也只是 0.1.5-rc.2 —— 升级上游同样过不了闸。
 //
-// 本补丁把该 peer 放宽为 `>=0.1.5-rc.1 <0.2.0`：覆盖 0.1.x 全部版本（含预发布），
-//   但 0.2.0 一到仍会被闸拦下 —— 那时才该重新确认 typert 协议兼容性，而不是静默放行。
+// 本补丁把该 peer 放宽为 `>=0.1.5-rc.1`（**无上界**）：
+//   2026-09-28 那一版先放宽成 `>=0.1.5-rc.1 <0.2.0`，覆盖 0.1.x；但 dsh 一进新 minor（0.2.0-rc.2 实测）
+//   整条 bundle 又被跳过，于是每次 dsh 升级都要重打这条补丁 + 抬一次 payload 版本 —— 这正是本次去掉上界的原因：
+//   下限保留只是挡住早已不存在的远古版本，上限不再由本文件维护。
+//   为什么不用 `workspace:*`（闸把它当"跟随运行时"）或 `*`：前者依赖闸里那段特判（哪天收紧就变成被跳过），
+//   后者过宽且读起来像"没有声明"；无上界的普通 semver 范围在「闸按运行中的 dsh 版本比」与
+//   「将来改成按 peer 真实版本比」两种口径下都恒放行，不需要再动。
 //
 // 产物影响：
 //   - payload 包版本 0.1.0-dev.2 → 0.1.0-dev.3。原因：main.js 只在「包版本变了」时才重装随包 payload
@@ -19,7 +24,7 @@
 //   - assets/bridge-next/bridge-next.tgz 重新打包（npm pack --ignore-scripts，白名单与产物一致）
 //   - assets/bridge-next/version.json 更新 version / package.version / sha256 与 patched 备注
 //
-// 何时删除本脚本：上游发布 peer 范围覆盖当前 dsh 的构建后（本脚本会判定为 no-op 并直接退出）。
+// 何时删除本脚本：上游发布的 peer 范围本身就没有上界（即不再需要这条补丁）时，本脚本会判定为 no-op 并直接退出。
 // 用法：node tools/patch-bridge-peer-compat.mjs
 'use strict'
 
@@ -41,8 +46,13 @@ const tgzPath = join(assetsDir, 'bridge-next.tgz')
 const metaPath = join(assetsDir, 'version.json')
 
 const PEER = '@deepseek-ai/dsh-typert-protocol'
-const RANGE_OLD = '0.1.5-rc.1'
-const RANGE_NEW = '>=0.1.5-rc.1 <0.2.0'
+/** 上游原样声明（精确钉版）：过不了任何新 dsh 的闸。 */
+const RANGE_UPSTREAM = '0.1.5-rc.1'
+/** 本脚本上一版产物写的范围（只覆盖 0.1.x）：dsh 进新 minor 就被整条跳过。 */
+const RANGE_OLD = '>=0.1.5-rc.1 <0.2.0'
+/** 目标：无上界 —— dsh 再升级也不需要重打这条补丁。 */
+const RANGE_NEW = '>=0.1.5-rc.1'
+const RANGE_INPUTS = [RANGE_UPSTREAM, RANGE_OLD]
 
 const sha256File = (p) => createHash('sha256').update(readFileSync(p)).digest('hex')
 
@@ -74,8 +84,8 @@ try {
     console.log('无需打补丁（peer 范围已是 ' + RANGE_NEW + '），未改动任何文件。')
     process.exit(0)
   }
-  if (range !== RANGE_OLD) {
-    throw new Error(`${PEER} 的 peer 范围是 ${JSON.stringify(range)}，既不是 ${RANGE_OLD} 也不是 ${RANGE_NEW} —— 上游产物结构变了，请人工检查后再打补丁`)
+  if (range !== RANGE_OLD && range !== RANGE_UPSTREAM) {
+    throw new Error(`${PEER} 的 peer 范围是 ${JSON.stringify(range)}，既不是 ${RANGE_INPUTS.join(' / ')} 也不是 ${RANGE_NEW} —— 上游产物结构变了，请人工检查后再打补丁`)
   }
 
   const newVersion = bumpDev(pkg.version)
