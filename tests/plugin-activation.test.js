@@ -118,3 +118,23 @@ test('hint 必须把"重启不会改变"说清楚，并带原因原文', () => {
   assert.match(hint, /failed to import/)
   assert.match(hint, /重启不会改变/)
 })
+
+test('启动器自检条目（import-check）：与 DSH 解析来的证据同形，但说明"发生在起服务之前"', () => {
+  const issue = activation.importCheckIssue(BRIDGE,
+    "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/dsh-session-title' imported from /x/lib/index.js")
+  assert.equal(issue.kind, 'import-check')
+  assert.equal(issue.packageName, BRIDGE)
+  const described = activation.describeActivationIssue(issue)
+  assert.match(described, /^启动前自检失败：/)
+  assert.match(described, /Cannot find package '@deepseek-ai\/dsh-session-title'/)
+  const hint = activation.activationIssueHint(issue)
+  assert.match(hint, /起服务之前/)
+  assert.match(hint, /重启不会改变/)
+  assert.equal(activation.findActivationIssue([issue], BRIDGE), issue)
+})
+
+test('importCheckIssue：空 detail 也不产出空冒号文案（fail-closed 兜底）', () => {
+  const described = activation.describeActivationIssue(activation.importCheckIssue(BRIDGE, ''))
+  assert.match(described, /启动前自检失败：/)
+  assert.doesNotMatch(described, /：$/u, '不能只留一个空冒号')
+})

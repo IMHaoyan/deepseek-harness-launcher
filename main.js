@@ -1028,6 +1028,7 @@ async function startServerInner(occupantRetry = 0) {
   server.errTail = [] // 上一代的 stderr 不能当成本代的失败原因
   server.activationWindow = []
   server.activationIssues = []
+  void runBridgeImportCheck() // 启动前自检：异步跑，不拖启动；结果只进日志与卡片
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
   try {
@@ -1651,6 +1652,31 @@ function noteActivationEvidence(line) {
 /** 某个包本轮启动的未生效证据（没有则 undefined）。 */
 function activationIssueOf(packageName) {
   return pluginActivation.findActivationIssue(server.activationIssues, packageName)
+}
+
+/**
+ * 启动前 import 自检：DSH 加载器对"插件模块导入失败"只回一句 `… : failed to import`，
+ * 真正的原因（缺哪个包 / 哪个命名导出没了 / Node 太老）被吞掉，"装了却永远不生效"于是只能靠人工复现。
+ * 这里用**运行中的 Node** 试一次 payload 入口，把原因带回日志与卡片。
+ * 只读、异步、失败不阻断启动。
+ */
+async function runBridgeImportCheck() {
+  try {
+    const snap = bridge.getState()
+    if (!snap.installed || !snap.payloadReady) return
+    const check = await bridge.importCheckPayload()
+    if (!check) return
+    if (check.ok) {
+      log('bridge: 启动前 import 自检通过（payload v' + (snap.installedPackageVersion || '') + '）')
+      return
+    }
+    const detail = redact(String(check.error || '').trim() || '未知原因')
+    log('bridge: 启动前 import 自检失败（重启不会改变，插件不会生效）：' + detail)
+    server.activationIssues.push(pluginActivation.importCheckIssue(bridge.PLUGIN_NAME, detail))
+    broadcastState() // 卡片立刻显示"未生效 + 真实原因"
+  } catch (err) {
+    log('bridge: 启动前 import 自检异常（不阻断启动）：' + ((err && err.message) || String(err)))
+  }
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。

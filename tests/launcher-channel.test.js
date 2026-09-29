@@ -34,7 +34,7 @@ test(' normalizeChannel：只认 latest / alpha，未知值回落 latest', () =>
 })
 
 test('updater：channel 与 allowPrerelease 成对设置，且默认仍是正式版', () => {
-  assert.match(updaterSrc, /channel: 'latest',\n\}/, 'state 里要带当前渠道（界面据此渲染选项）')
+  assert.match(updaterSrc, /channel: 'latest',/, 'state 里要带当前渠道（界面据此渲染选项）')
   assert.match(updaterSrc, /function applyChannel\(\) \{/, '应有统一的渠道落地函数')
   assert.match(updaterSrc, /autoUpdater\.channel = channel/, 'channel 要落到 electron-updater')
   assert.match(updaterSrc, /autoUpdater\.allowPrerelease = channel === 'alpha'/, 'allowPrerelease 必须跟着渠道走')

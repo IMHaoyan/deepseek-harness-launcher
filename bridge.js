@@ -25,6 +25,7 @@ const path = require('path')
 const zlib = require('zlib')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
+const { pathToFileURL } = require('url')
 
 const PLUGIN_NAME = '@agents-anywhere/dsh-bridge-next'
 const PROFILE_NAME = 'web'
@@ -758,6 +759,82 @@ async function ensureRuntimeDeps() {
   return true
 }
 
+// ---------- 启动前 import 自检 ----------
+
+/** 自检子进程的上限：比 CLI 短得多（这里只是 import 一个已经躺在磁盘上的模块）。 */
+const IMPORT_CHECK_TIMEOUT_MS = 60 * 1000
+
+/**
+ * 纯函数：自检用的 node 参数。用 `-e` 直接在命令行里跑，不留临时文件；
+ * 失败时把栈打到 stderr —— DSH 那句 `failed to import` 后面什么都没有。
+ * @param {string} entryUrl payload 入口的 file:// URL
+ * @returns {string[]}
+ */
+function importCheckArgs(entryUrl) {
+  return [
+    '--input-type=module',
+    '-e',
+    'import(process.argv[1]).then(()=>process.exit(0)).catch((e)=>{console.error(String((e&&(e.stack||e.message))||e));process.exit(1)})',
+    entryUrl,
+  ]
+}
+
+/**
+ * 纯函数：把自检子进程的结果翻成 `{ ok, error }`。
+ * 只留第一条有信息量的行（`Cannot find package …` / `does not provide an export named …` /
+ * `SyntaxError …`），别把整段栈塞进卡片。
+ */
+function importCheckResult(code, output) {
+  if (code === 0) return { ok: true, error: '' }
+  const lines = String(output == null ? '' : output).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  const informative = lines.find((l) => /(Error|Cannot find|does not provide|ERR_[A-Z_]+|not defined)/u.test(l))
+  return { ok: false, error: informative || lines[0] || ('自检进程退出码 ' + code) }
+}
+
+/**
+ * 用**运行中的 Node** 试着 import payload 入口（与 DSH 启动时的解析环境一致：cwd 在 payload 目录，
+ * 依赖走 payload 旁边的镜像）。
+ *
+ * 只读、失败只记账不抛。调用方负责把结果写进日志/卡片；失败绝不阻断服务启动。
+ * @param {string} [target] 要自检的 payload 目录；默认取当前 payload 的 link: 目录（测试可直接传目录）
+ * @returns {Promise<{ok:boolean, error:string}>}
+ */
+async function importCheckPayload(target) {
+  const dir = target || (payload && payload.linkDir) || ''
+  if (!dir) return { ok: false, error: payloadError || 'payload 不可用' }
+  if (!envDetect) return { ok: false, error: 'envDetect 未初始化' }
+  let pkg
+  try { pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) } catch (e) {
+    return { ok: false, error: '读不到 payload manifest：' + ((e && e.message) || String(e)) }
+  }
+  const entry = entryFileOf(pkg)
+  if (!entry) return { ok: false, error: 'payload manifest 的入口路径非法' }
+  let nodeCmd = ''
+  try {
+    const env = await envDetect.detectEnv(false)
+    nodeCmd = (env && env.plan && env.plan.nodeCmd) || ''
+  } catch (e) {
+    return { ok: false, error: '探测运行环境失败：' + ((e && e.message) || String(e)) }
+  }
+  if (!nodeCmd) return { ok: false, error: '未检测到可用的 Node，无法自检' }
+  const entryUrl = pathToFileURL(path.join(dir, entry)).href
+  let child
+  try {
+    child = spawn(nodeCmd, importCheckArgs(entryUrl), { cwd: dir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (e) {
+    return { ok: false, error: '自检进程无法启动：' + ((e && e.message) || String(e)) }
+  }
+  const killer = setTimeout(() => { try { child.kill() } catch { /* noop */ } }, IMPORT_CHECK_TIMEOUT_MS)
+  try {
+    const r = await captureProcess(child, 'payload import 自检')
+    return importCheckResult(r.code, r.output)
+  } catch (e) {
+    return importCheckResult(e && e.exitCode, (e && e.output) || (e && e.message))
+  } finally {
+    clearTimeout(killer)
+  }
+}
+
 // ---------- 安装 / 卸载 ----------
 
 /** 纯函数：判断是否需要安装 —— want.spec 为空（payload 不可用）时永不自动动 profile。 */
@@ -856,6 +933,9 @@ module.exports = {
   verifyPluginManifest,
   entryFileOf,
   repairPayloadScopeMirror,
+  importCheckPayload,
+  importCheckArgs,
+  importCheckResult,
   readPackageFromTarball,
   readMaterializedPackageState,
   materializePayload,

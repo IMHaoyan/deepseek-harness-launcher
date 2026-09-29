@@ -103,12 +103,34 @@ function shortDetail(text) {
 }
 
 /**
+ * 启动器自己做的**启动前 import 自检**的条目（不是从 DSH stderr 解析来的）。
+ *
+ * 为什么需要它：DSH 加载器对"插件模块导入失败"只回一句 `… : failed to import`，
+ * 真正的报错（缺哪个包 / 哪个命名导出没了 / Node 太老）被吞掉，"装了却永远不生效"
+ * 只能靠人工在那台机器上复现。启动器在起服务前用**同一个 Node** 试 import 一次，
+ * 把这个原因带回日志与卡片。
+ * @param {string} packageName 包名
+ * @param {string} detail 自检得到的错误原文（取第一条有信息量的行）
+ * @returns {object} 与 parseActivationIssues 的条目同形
+ */
+function importCheckIssue(packageName, detail) {
+  return {
+    kind: 'import-check',
+    packageName: String(packageName || ''),
+    entryId: '',
+    detail: String(detail == null ? '' : detail),
+    services: [],
+  }
+}
+
+/**
  * 一条证据 → 界面上的单行文案（与卡片状态一一对应，不写"重启后生效"这种会误导的话）。
- * @param {object} issue parseActivationIssues 的条目
+ * @param {object} issue parseActivationIssues / importCheckIssue 的条目
  * @returns {string}
  */
 function describeActivationIssue(issue) {
   const it = issue || {}
+  if (it.kind === 'import-check') return `启动前自检失败：${shortDetail(it.detail) || '原因见日志'}`
   if (it.kind === 'skipped') {
     const incompatible = INCOMPATIBLE_RE.exec(String(it.detail || ''))
     if (incompatible) return `启动时被跳过：与 dsh ${incompatible[1]} 不兼容`
@@ -131,12 +153,17 @@ function activationIssueHint(issue, extra) {
   const lines = [
     it.kind === 'skipped'
       ? 'DSH 启动时跳过了这个 bundle，原因原文：'
-      : 'DSH 启动时这一行没有激活，原因原文：',
+      : (it.kind === 'import-check'
+        ? '启动器在起服务之前试着导入这个插件，失败了（原因原文）：'
+        : 'DSH 启动时这一行没有激活，原因原文：'),
     String(it.detail || '').trim() || '（服务日志里没有留下原因原文）',
   ]
   if (Array.isArray(it.services) && it.services.length > 0) lines.push('缺的服务：' + it.services.join('、'))
-  lines.push('服务本身能正常启动（这是一条 warning），所以重启不会改变它：插件那一行始终不在运行中的组合树里，'
-    + '插件市场就会一直显示「重启后生效」。')
+  lines.push(it.kind === 'import-check'
+    ? '这一步发生在启动器起服务之前（插件自己的模块加载/解析失败），所以重启不会改变它；'
+      + '缺的依赖可由启动器在下次启动时自愈，若报的是"找不到包/没有这个导出"，则需要换一份能匹配当前 dsh 的 payload。'
+    : '服务本身能正常启动（这是一条 warning），所以重启不会改变它：插件那一行始终不在运行中的组合树里，'
+      + '插件市场就会一直显示「重启后生效」。')
   if (extra) lines.push(String(extra))
   return lines.join('\n')
 }
@@ -155,6 +182,7 @@ function findActivationIssue(issues, packageName) {
 
 module.exports = {
   parseActivationIssues,
+  importCheckIssue,
   describeActivationIssue,
   activationIssueHint,
   findActivationIssue,

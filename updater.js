@@ -15,6 +15,8 @@
 const { app } = require('electron')
 const { autoUpdater } = require('electron-updater')
 const semver = require('semver')
+const fs = require('fs')
+const path = require('path')
 
 let log = () => {}
 let onNotify = null // (title, message) => void
@@ -23,6 +25,7 @@ let sendToPanel = null // (json) => void
 let beforeInstall = null // () => Promise<void>（安装前收尾，如停掉自管的 DSH 服务）
 let onEvent = null // (event, detail) => void（生命周期事件，可选）
 let readChannel = () => 'latest' // () => 'latest' | 'alpha'（值来自配置，主进程说了算）
+let selfUpdatePath = '' // 自更新回执文件（userData 下）；空则跳过回执
 
 // 更新渠道只认这两个值；未知/缺失一律回落到 latest（fail-closed：绝不因为配置写坏就去拉预发布包）。
 const CHANNELS = ['latest', 'alpha']
@@ -37,6 +40,9 @@ const state = {
   percent: 0,
   error: '',
   channel: 'latest',
+  // 上一次"点更新→退出安装"的结果：{ target, applied, from }。用户报"点更新就闪退"时，
+  // 这条就是唯一能事后说清"到底装上了没有"的证据（见 recordSelfUpdate/readSelfUpdateOutcome）。
+  lastSelfUpdate: null,
 }
 
 let initDone = false
@@ -57,6 +63,42 @@ function setStatus(status, extra = {}) {
 
 function isPackaged() {
   try { return app.isPackaged } catch { return false }
+}
+
+// ---------- 自更新回执（"点更新 → 退出安装"到底成了没有） ----------
+//
+// 为什么要有它：`quitAndInstall` 会**先退出启动器**再静默跑安装包。安装包要是没跑起来
+// （被杀软拦下 / 下载物损坏 / 安装失败），用户看到的就是"点一下就闪退、再也不回来"，
+// 而日志里只有一行 `updater: quit and install now`，之后什么都没有 —— 事后无从判断。
+// 所以退出前落一份回执，下次启动比对版本号：对不上就是没装上，界面/通知直接说出来。
+
+/** 纯函数：回执 ⇄ 当前版本 → 结论。target 缺失或版本已对上分别返回 null / applied。 */
+function selfUpdateOutcome(receipt, currentVersion) {
+  if (!receipt || typeof receipt !== 'object') return null
+  const target = typeof receipt.target === 'string' ? receipt.target : ''
+  if (!target) return null
+  return {
+    target,
+    applied: String(currentVersion || '') === target,
+    from: typeof receipt.current === 'string' ? receipt.current : '',
+  }
+}
+
+function recordSelfUpdate(target) {
+  if (!selfUpdatePath || !target) return
+  try {
+    fs.writeFileSync(selfUpdatePath, JSON.stringify({ target, current: app.getVersion(), at: new Date().toISOString() }, null, 2))
+  } catch (err) {
+    log('updater: 写自更新回执失败（不影响安装）：' + ((err && err.message) || String(err)))
+  }
+}
+
+function readSelfUpdateOutcome() {
+  if (!selfUpdatePath) return null
+  let receipt = null
+  try { receipt = JSON.parse(fs.readFileSync(selfUpdatePath, 'utf8')) } catch { return null }
+  try { fs.unlinkSync(selfUpdatePath) } catch { /* noop */ }
+  return selfUpdateOutcome(receipt, app.getVersion())
 }
 
 /** 把配置里的渠道落到 electron-updater 上（channel + allowPrerelease 必须成对设置）。 */
@@ -100,6 +142,35 @@ function initUpdater(opts = {}) {
   onEvent = opts.onEvent || null
   readChannel = typeof opts.getChannel === 'function' ? opts.getChannel : readChannel
   state.current = opts.currentVersion || app.getVersion()
+  selfUpdatePath = opts.selfUpdatePath || ''
+  if (!selfUpdatePath) {
+    try { selfUpdatePath = path.join(app.getPath('userData'), 'pending-self-update.json') } catch { selfUpdatePath = '' }
+  }
+
+  // electron-updater 的内部失败（Cannot install / spawn 安装包失败 / blockmap 不符）默认只写
+  // 它自己的 logger = console —— 打包后完全看不见。挂到启动器日志上，这类"闪退"才有据可查。
+  autoUpdater.logger = {
+    info: (m) => log('[updater] ' + m),
+    warn: (m) => log('[updater][warn] ' + m),
+    error: (m) => log('[updater][error] ' + m),
+    debug: () => {}, // 逐块下载进度太吵：丢弃
+  }
+
+  // 上次"为装更新而退出"的回执：对不上就是没装上 —— 说出来，而不是让用户对着闪退发呆。
+  const outcome = readSelfUpdateOutcome()
+  if (outcome) {
+    state.lastSelfUpdate = outcome
+    if (outcome.applied) {
+      log(`updater: 自更新回执确认 —— v${outcome.target} 已生效`)
+    } else {
+      log(`updater: 上次自更新未生效 —— 目标是 v${outcome.target}，当前仍是 v${app.getVersion()}（安装包可能被杀软拦下或安装失败）`)
+      if (onNotify) {
+        onNotify('DeepSeek Harness Launcher',
+          `上次安装 v${outcome.target} 没有成功：当前仍是 v${app.getVersion()}。可在设置页重新点「更新到 v${outcome.target}」，或到发布页手动下载安装。`,
+          { version: 'selfupdate-failed-' + outcome.target })
+      }
+    }
+  }
 
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = true
@@ -196,8 +267,9 @@ async function installNow() {
   if (state.status !== 'downloaded') { await check(); return }
   log('updater: quit and install now')
   try { if (beforeInstall) await beforeInstall() } catch (err) { log('updater beforeInstall failed: ' + err.message) }
+  recordSelfUpdate(state.latest) // 退出前落回执：下次启动据此判断这次安装到底成没成
   // isSilent=false, isForceRunAfter=true：安装后自动重新拉起启动器
   setImmediate(() => autoUpdater.quitAndInstall(false, true))
 }
 
-module.exports = { initUpdater, getState, check, autoCheck, installNow, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS }
+module.exports = { initUpdater, getState, check, autoCheck, installNow, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome }
