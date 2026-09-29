@@ -303,6 +303,10 @@ function ensurePayloadRuntimeDeps(target) {
     ...Object.keys(pkg.optionalDependencies || {}),
     ...Object.keys(pkg.peerDependencies || {}),
   ])
+  // **入口真正 import 的包名**也要覆盖：payload 里 dsh-session-title / dsh-llm / dsh-session
+  // 根本没写进 dependencies/peerDependencies，却实实在在 import 了 —— 只看声明就会漏掉它们，
+  // 于是"声明齐全、导入失败"（2026-09-29 那台机器就是 This: Cannot find package '@deepseek-ai/dsh-session-title'）。
+  for (const spec of entryImportSpecifiers(target)) names.add(spec)
   // DSH runtime 注入的 @deepseek-ai/* 不一定写在 peerDependencies；
   // 把共享 fallback scope 整组镜像进来，避免宿主启动时才逐个 ENOENT。
   const injectedScope = path.join(HOME, 'profiles', 'node_modules', '@deepseek-ai')

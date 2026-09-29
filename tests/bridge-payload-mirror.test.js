@@ -234,6 +234,40 @@ test('安装树候选：没有 env 线索时也包含 npm 默认全局前缀（�
   }
 })
 
+test('解析镜像：入口 import 但 manifest 没声明的包也要补（dsh-session-title 就是这么漏的）', () => {
+  const root = tmpRoot()
+  const restore = neutralizeInstallTree()
+  try {
+    const home = path.join(root, 'home')
+    // manifest 里只声明 cordis/react/qrcode —— 没有 dsh-session-title
+    const { linkDir, keyDir } = makePayload(home)
+    fs.writeFileSync(path.join(linkDir, 'lib', 'index.js'),
+      'import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";\nexport const name = "x"\n')
+    // 它只在安装树里
+    const prefix = path.join(root, 'npm')
+    const dshDir = path.join(prefix, 'node_modules', '@deepseek-ai', 'dsh')
+    const nested = path.join(dshDir, 'node_modules', '@deepseek-ai', 'dsh-session-title')
+    fs.mkdirSync(nested, { recursive: true })
+    fs.writeFileSync(path.join(nested, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-session-title', version: '0.2.0-rc.2' }))
+
+    bridge.initBridge({ home, payloadRoot: '', log: () => {} })
+    assert.equal(bridge.repairPayloadScopeMirror(linkDir).missing.includes('@deepseek-ai/dsh-session-title'), true,
+      '没有安装树来源时应当算缺件')
+
+    bridge.cacheInstallModulesDirs({ dsh: { dir: dshDir, root: prefix } })
+    assert.equal(bridge.repairPayloadScopeMirror(linkDir).missing.includes('@deepseek-ai/dsh-session-title'), false,
+      '入口 import 的包要按包名去解析并补镜像，哪怕 manifest 没声明')
+    assert.equal(
+      fs.statSync(path.join(keyDir, 'node_modules', '@deepseek-ai', 'dsh-session-title', 'package.json')).isFile(),
+      true,
+      '镜像里应当补上这个 junction',
+    )
+  } finally {
+    restore()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('entryImportSpecifiers：只认入口真正 import 的裸包（相对路径 / node: 不算）', () => {
   const root = tmpRoot()
   try {
