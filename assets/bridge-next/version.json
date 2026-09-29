@@ -1,10 +1,10 @@
 {
-  "version": "2.0.0-dev.10",
-  "sha256": "389acee66c5017cad36fd30179ab6336daac4a94b967ee04131faad7fe16e9da",
+  "version": "2.0.0-dev.11",
+  "sha256": "53cc3cb6d53fa876f8eea6906d059ac0c972d145dba3481fa4e004cfad25ee6b",
   "tarball": "bridge-next.tgz",
   "package": {
     "name": "@agents-anywhere/dsh-bridge-next",
-    "version": "2.0.0-dev.10"
+    "version": "2.0.0-dev.11"
   },
   "source": "npm @agents-anywhere/dsh-bridge-next@2.0.0",
   "experiment": {
@@ -25,9 +25,9 @@
     "rollback": "node tools/switch-bridge-payload-upstream.mjs --rollback"
   },
   "patched": {
-    "by": "dshl tools/patch-bridge-peer-compat.mjs",
-    "why": "dsh 0.1.7-rc.1 新增插件兼容闸，payload 把 @deepseek-ai/dsh-typert-protocol 精确钉成 >=0.1.5-rc.1 <0.2.0 会被整体跳过；放宽为 >=0.1.5-rc.1，并抬 payload 版本以触发启动器重装",
-    "appliedAt": "2026-09-29T12:32:35.499Z",
+    "by": "dshl tools/patch-bridge-declare-peers.mjs",
+    "why": "入口 import 的 @deepseek-ai/dsh* 未在 manifest 声明，镜像按声明取材时会漏掉它们（部分机器因此 failed to import）；补齐为 peerDependencies >=0.1.5-rc.1，并抬 payload 版本以触发启动器重装",
+    "appliedAt": "2026-09-29T14:43:37.062Z",
     "inputSha256": "b234d834af44d5f37410d238588c6525a4a506d1349955d30b776290f46f209b",
     "history": [
       {
@@ -78,6 +78,12 @@
         "why": "peer @deepseek-ai/dsh-typert-protocol: >=0.1.5-rc.1 <0.2.0 → >=0.1.5-rc.1；payload 版本 2.0.0-dev.9 → 2.0.0-dev.10（触发启动器重装）",
         "appliedAt": "2026-09-29T12:32:35.499Z",
         "inputSha256": "d092755d83d9bd2b9b54454402ded54ad353c305ade542e836193b98ea928e5d"
+      },
+      {
+        "by": "dshl tools/patch-bridge-declare-peers.mjs",
+        "why": "声明缺失的入口依赖：@deepseek-ai/dsh-session-title、@deepseek-ai/dsh-llm、@deepseek-ai/dsh-session（peer >=0.1.5-rc.1）；payload 版本 2.0.0-dev.10 → 2.0.0-dev.11",
+        "appliedAt": "2026-09-29T14:43:37.062Z",
+        "inputSha256": "389acee66c5017cad36fd30179ab6336daac4a94b967ee04131faad7fe16e9da"
       }
     ],
     "upstreamSha256": "b156aeb62dc3c6e6d3ec9cf20de1c88c7b86bcae45c44041780a59e533e6c0f0"

@@ -824,11 +824,42 @@ function directDependencyReady(dir, name) {
   return false
 }
 
-/** link: 不会让 pnpm 安装被链接包自己的 dependencies；在不可变缓存里单独准备它们。 */
-async function installPayloadDependencies() {
+/** 入口真正 import、但 payload/deps、profile、安装树里都找不到的包 —— 这些正是 `failed to import` 的来源。 */
+function missingEntryImports(dir) {
+  if (!dir) return []
+  return entryImportSpecifiers(dir).filter((name) => {
+    if (directDependencyReady(dir, name)) return false
+    return !resolveFallbackPackage(name)
+  })
+}
+
+/**
+ * 纯函数：真缺件时的补装计划。
+ * 只补**与 dsh 同版本号体系**的 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*`（版本取运行中的 dsh 版本，
+ * 它们与运行时同步发布）；其他包不猜版本，列进 skipped 由日志交代。
+ * @returns {{extra:Object<string,string>, skipped:string[]}}
+ */
+function autoInstallPlan(names, dshVersion) {
+  const extra = {}
+  const skipped = []
+  const version = String(dshVersion || '')
+  for (const name of (Array.isArray(names) ? names : [])) {
+    const lockstep = name === '@deepseek-ai/dsh' || String(name).startsWith('@deepseek-ai/dsh-')
+    if (lockstep && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) extra[name] = version
+    else skipped.push(name)
+  }
+  return { extra, skipped }
+}
+
+/**
+ * link: 不会让 pnpm 安装被链接包自己的 dependencies；在不可变缓存里单独准备它们。
+ * @param {object} [extraDeps] 额外要装进 `<key>/deps` 的包（入口 import 却本地找不到的 lockstep 包，见 autoInstallPlan）
+ */
+async function installPayloadDependencies(extraDeps = {}) {
   if (!payload) return
   const dir = payload.linkDir
-  const missing = directDependencyNames().filter((name) => !directDependencyReady(dir, name))
+  const wanted = Object.assign({}, payload.pkg.dependencies || {}, extraDeps || {})
+  const missing = Object.keys(wanted).filter((name) => !directDependencyReady(dir, name))
   if (missing.length === 0) return
   log('准备远程连接插件依赖：' + missing.join('、'))
   const depsDir = path.join(path.dirname(dir), 'deps')
@@ -838,7 +869,7 @@ async function installPayloadDependencies() {
   fs.writeFileSync(path.join(depsDir, 'package.json'), JSON.stringify({
     name: 'dsh-bridge-next-deps',
     private: true,
-    dependencies: payload.pkg.dependencies || {},
+    dependencies: wanted,
   }, null, 2) + '\n')
   fs.writeFileSync(path.join(depsDir, 'pnpm-workspace.yaml'), 'packages:\n  - .\nnodeLinker: hoisted\nautoInstallPeers: false\n')
   await runPnpm([
@@ -849,7 +880,7 @@ async function installPayloadDependencies() {
     '--config.minimumReleaseAge=0',
     '--config.node-linker=hoisted',
   ], depsDir)
-  const stillMissing = directDependencyNames().filter((name) => !fs.existsSync(path.join(modulesDir, ...name.split('/'), 'package.json')))
+  const stillMissing = Object.keys(wanted).filter((name) => !fs.existsSync(path.join(modulesDir, ...name.split('/'), 'package.json')))
   if (stillMissing.length > 0) throw new Error('远程连接插件依赖安装不完整：' + stillMissing.join('、'))
   try {
     const st = fs.lstatSync(localModules)
@@ -859,14 +890,29 @@ async function installPayloadDependencies() {
   ensureJunction(localModules, modulesDir)
 }
 
-/** 启动前自愈：重建被市场操作剪掉/悬空的 runtime dependency junction，并把解析缺口写进日志。 */
+/** 启动前自愈：重建解析镜像与运行时依赖；真缺件时按 dsh 版本补装，并把缺口写进日志。 */
 async function ensureRuntimeDeps() {
   if (!payload) return false
   // 先把 dsh 安装树记下来再建镜像：profile 侧缺件时它是唯一还找得到的来源
-  try { cacheInstallModulesDirs(await envDetect.detectEnv(false)) } catch { /* 探测失败就退回原来源 */ }
+  let env = null
+  try { env = await envDetect.detectEnv(false) } catch { /* 探测失败就退回原来源 */ }
+  try { cacheInstallModulesDirs(env) } catch { /* 同上 */ }
   const dir = materializePayload()
   repairPayloadScopeMirror(dir) // 只报"入口真正 import 却找不到"的包，避免把宿主不 import 的依赖误报成缺口
-  await installPayloadDependencies()
+  // 入口 import 却哪儿都没有的包：能按 dsh 版本补的就补（只补 @deepseek-ai/dsh*），补不动就留给自检去点名
+  const plan = autoInstallPlan(missingEntryImports(dir), env && env.dsh && env.dsh.version)
+  if (plan.skipped.length > 0) {
+    log('bridge: 入口依赖本地找不到、也无法按 dsh 版本补装：' + plan.skipped.join('、'))
+  }
+  if (Object.keys(plan.extra).length > 0) {
+    log('bridge: 本地找不到这些入口依赖，按 dsh ' + env.dsh.version + ' 补装：' + Object.keys(plan.extra).join('、'))
+  }
+  try {
+    await installPayloadDependencies(plan.extra)
+  } catch (err) {
+    log('bridge: 运行时依赖准备失败（不阻断启动）：' + ((err && err.message) || String(err)))
+  }
+  repairPayloadScopeMirror(dir) // 装完再刷一次：新装的包也要进镜像
   return true
 }
 
@@ -1049,6 +1095,8 @@ module.exports = {
   cacheInstallModulesDirs,
   installTreeCandidates,
   entryImportSpecifiers,
+  missingEntryImports,
+  autoInstallPlan,
   importCheckPayload,
   importCheckArgs,
   importCheckResult,
