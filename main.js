@@ -27,6 +27,7 @@ const market = require('./market')
 const pluginSwitch = require('./plugin-switch')
 const pluginCompat = require('./dsh-plugin-compat')
 const stopGuard = require('./service-stop-guard')
+const { probePid, terminateProcess, waitForCompletion } = require('./service-termination')
 const handover = require('./service-handover')
 const trust = require('./trust')
 const { createConsoleSurface } = require('./console-surface')
@@ -38,6 +39,7 @@ const startProgress = require('./start-progress')
 const bridge = require('./bridge')
 const pluginActivation = require('./plugin-activation')
 const bootFailure = require('./boot-failure')
+const pageKeys = require('./page-keys')
 
 const IS_WIN = process.platform === 'win32'
 const IS_MAC = process.platform === 'darwin'
@@ -520,7 +522,7 @@ function beginServiceStop() {
   return stopGuard.beginStop({
     timeoutMs: STOP_WATCHDOG_MS,
     onTimeout: () => {
-      log(`stop watchdog fired after ${STOP_WATCHDOG_MS}ms：停止流程未在预期时间内结束，已强制复位（服务可能仍在运行，请查看日志/手动结束进程）`)
+      log(`stop watchdog fired after ${STOP_WATCHDOG_MS}ms：停止流程未在预期时间内结束，看门狗标志已复位；在途停止任务仍受保护（服务可能仍在运行，请查看日志/手动结束进程）`)
       try { lifecycle.emit('service.stopTimeout', { ms: STOP_WATCHDOG_MS }) } catch { /* noop */ }
       broadcastState()
     },
@@ -532,7 +534,7 @@ function endServiceStop() {
 }
 
 function serviceStopping() {
-  return stopGuard.isStopping()
+  return stopGuard.isStopping() || serviceStopPromise !== null
 }
 
 // DSH 自重启识别（详见 service-handover.js）：我们的 child 退出后，端口可能正被它克隆出的后继持有。
@@ -962,7 +964,8 @@ async function reportBindBlocked(code) {
  * 两条流程在"还没有 child"时都能通过它，于是两个进程同时 bind 同一个端口（server.err.log 里的
  * EADDRINUSE 就是这么来的）。这里把"启动中"显式化，后来者直接等前一次的结果。
  */
-function startServer(occupantRetry = 0) {
+function startServer(occupantRetry = 0, allowDuringUpdate = false) {
+  if (reallyExit || exitCleanupComplete || updater.isInstalling() || (!allowDuringUpdate && dshUpdater.getState().status === 'updating')) return Promise.resolve(false)
   if (server.startPromise) return server.startPromise
   const p = startServerInner(occupantRetry)
   server.startPromise = p
@@ -972,6 +975,7 @@ function startServer(occupantRetry = 0) {
 }
 
 async function startServerInner(occupantRetry = 0) {
+  const startGeneration = server.gen
   if (server.owned() || server.claimed()) return true // 已有我们负责的服务在跑（含认领的自重启后继）
   server.blockedReason = ''
   server.suggestedPort = 0
@@ -1014,6 +1018,8 @@ async function startServerInner(occupantRetry = 0) {
   } catch (err) {
     log('bridge: 启动前完整性检查失败：' + ((err && err.message) || String(err)))
   }
+  // 环境/插件准备期间也可能收到退出或停止，不能晚到再启动一个无人收尾的孩子。
+  if (reallyExit || serviceStopping() || server.gen !== startGeneration) return false
   const nodeCmd = plan.nodeCmd
   const env = { ...process.env, DSH_HOME: HOME }
   if (AGENTS_HOME) env.DSH_AGENTS_HOME = AGENTS_HOME
@@ -1187,7 +1193,11 @@ async function startServerInner(occupantRetry = 0) {
       if (verdict === 'ready' || verdict === 'ready-unverified') return markReady(child, verdict)
       const matched = await matchSuccessorPid(listener)
       claimSuccessor(matched, listener, { fromPid: child.pid, source: 'startup', elapsedMs: 0 })
-      abandonChild(child) // 我们的孩子从没绑上端口：留着只会反复抢端口（异步强杀，不阻塞裁决）
+      try { await abandonChild(child) } catch (err) {
+        lastServiceError = redact(err && err.message || String(err))
+        log('未就绪子进程清理失败：' + lastServiceError)
+        return false // 保留句柄，不把终止失败藏成已接管/已就绪
+      }
       if (server.claimed()) return true
       return handlePortOccupied('ready-refused')
     }
@@ -1201,23 +1211,85 @@ async function startServerInner(occupantRetry = 0) {
   log(`DSH did not become ready in ${READY_TIMEOUT_SEC}s, killing PID ${child.pid}`)
   lifecycle.emit('service.readyTimeout', { pid: child.pid, port: PORT, timeoutSec: READY_TIMEOUT_SEC })
   child.__starting = false
-  if (server.child === child) { server.child = null; server.launchUrl = null }
   if (healthTimer) { clearTimeout(healthTimer); healthTimer = null }
   server.stopping = true
-  try { await killPid(child.pid, true) } catch { /* noop */ }
-  server.stopping = false
+  try {
+    await stopPidVerified(child.pid, child, true)
+    if (server.child === child) server.child = null
+    server.launchUrl = null
+  } catch (err) {
+    lastServiceError = redact(err && err.message || String(err))
+    log('启动超时后的进程清理未确认：' + lastServiceError)
+  } finally { server.stopping = false }
   return false
 }
 
 function killPid(pid, force) {
   return new Promise((resolve) => {
-    if (IS_WIN) {
-      const a = force ? ['/F', '/T', '/PID', String(pid)] : ['/PID', String(pid)]
-      execFile('taskkill', a, { windowsHide: true, timeout: 8000 }, () => resolve())
-    } else {
-      try { process.kill(pid, force ? 'SIGKILL' : 'SIGTERM') } catch { /* noop */ }
-      resolve()
+    const done = (err) => {
+      const error = err ? redact(String(err.message || err)).slice(-600) : ''
+      if (error) log(`终止命令失败（PID ${pid}，force=${!!force}）：${error}`)
+      resolve({ ok: !err, error })
     }
+    try {
+      if (IS_WIN) {
+        const a = force ? ['/F', '/T', '/PID', String(pid)] : ['/PID', String(pid)]
+        execFile('taskkill', a, { windowsHide: true, timeout: 8000 }, done)
+      } else {
+        process.kill(pid, force ? 'SIGKILL' : 'SIGTERM')
+        done(null)
+      }
+    } catch (err) { done(err) }
+  })
+}
+
+async function readProcessIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null
+  if (IS_WIN) {
+    const r = await runPwsh(`$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop; if ($p) { [pscustomobject]@{ startedAt = [string]$p.CreationDate.ToUniversalTime().Ticks; cmdline = $p.CommandLine } | ConvertTo-Json -Compress }`, { timeoutMs: CMDLINE_TIMEOUT_MS })
+    if (!r.ok || r.stderr.trim()) return null
+    try {
+      const value = JSON.parse(r.stdout)
+      return value && /^\d+$/.test(value.startedAt) && typeof value.cmdline === 'string' ? value : null
+    } catch { return null }
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const startedAt = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+    const cmdline = await readCmdline(pid)
+    return /^\d+$/.test(startedAt) && cmdline ? { startedAt, cmdline } : null
+  } catch { return null }
+}
+
+async function stopPidVerified(pid, child, force = false) {
+  const exited = () => !!child && (child.exitCode != null || child.signalCode != null)
+  if (exited() || probePid(pid) === false) return { stopped: true, alreadyGone: true }
+  const identity = child ? null : await readProcessIdentity(pid)
+  if (!child && !identity) {
+    if (probePid(pid) === false) return { stopped: true, alreadyGone: true }
+    throw new Error(`无法核验服务进程身份（PID ${pid}），已拒绝终止`)
+  }
+  if (!child && server.claimedPid === pid && !handover.matchLaunchSig(identity.cmdline, server.launchSig).ok) {
+    throw new Error(`自管后继身份已变化（PID ${pid}），已拒绝终止`)
+  }
+  if (!child && server.adoptedPid === pid && (await findListenPid() !== pid || !(await probeDsh()).ok)) {
+    throw new Error(`外部服务归属无法确认（PID ${pid}），已拒绝终止`)
+  }
+  const probe = async () => {
+    if (exited()) return false
+    const alive = probePid(pid)
+    if (alive !== true || child) return alive
+    const current = await readProcessIdentity(pid)
+    if (!current) return probePid(pid) === false ? false : null
+    // 创建时刻变化：原目标已退出，新的同号进程不是我们的终止对象。
+    return current.startedAt === identity.startedAt
+  }
+  return terminateProcess(pid, {
+    force, probe,
+    send: async (forced) => {
+      if (await probe() !== true) return { ok: false, error: '目标已退出或身份无法确认，未发送终止命令' }
+      return killPid(pid, forced)
+    },
   })
 }
 
@@ -1309,8 +1381,7 @@ async function probeClaimedAuth(gen) {
 // 端口持有者能否被本轮启动签名解释（= 我们的后继）。
 // 已知持有者时只查那一个 PID 的命令行（PowerShell 冷启动慢，全表扫描留给"还没人绑端口"的情况）。
 // 取不到候选或读不到命令行一律返回 0：宁可判成外部实例，绝不误认领。
-async function matchSuccessorPid(listenerPid) {
-  const sig = server.launchSig
+async function matchSuccessorPid(listenerPid, sig = server.launchSig) {
   if (!sig || !sig.script) return 0
   if (listenerPid) {
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -1346,13 +1417,15 @@ function markReady(child, ownerVerdict) {
   return true
 }
 
-// 端口上的服务不属于我们时，我们那个从没绑上端口的孩子只会反复抢端口：摘句柄后强杀。
-// 先摘 server.child，让它自己的 exit 走"过期世代"分支（不触发崩溃路径，也不误关尾读窗口）。
-function abandonChild(child) {
+// 从没绑上端口的孩子会反复抢端口：确认终止后才摘句柄，失败仍保留责任 PID。
+// stopping 将退出归为受控清理，不触发崩溃恢复。
+async function abandonChild(child) {
   child.__starting = false
-  if (server.child === child) server.child = null
   server.stopping = true
-  return killPid(child.pid, true).then(() => { server.stopping = false })
+  try {
+    await stopPidVerified(child.pid, child, true)
+    if (server.child === child) server.child = null
+  } finally { server.stopping = false }
 }
 
 // 认领 DSH 自重启的后继：同一个端口、同一份数据，只是换了 PID。
@@ -1455,8 +1528,19 @@ function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
   void maybeAutoRestart()
 }
 
-// 返回 true = 本次真的执行了停止；false = 已有停止在进行（被防重入挡下）
-async function stopServer() {
+let serviceStopPromise = null
+
+// true = 已确认目标退出；false = 停止流程忙；失败抛错且保留未确认退出的 PID。
+function stopServer(options = {}) {
+  if (serviceStopPromise) return Promise.resolve(false)
+  const pending = stopServerInner(options)
+  serviceStopPromise = pending
+  const clear = () => { if (serviceStopPromise === pending) serviceStopPromise = null }
+  pending.then(clear, clear)
+  return pending
+}
+
+async function stopServerInner({ managedOnly = false, force = false } = {}) {
   // 诊断：每次进入都记（含调用栈），确认调用次数与来源
   if (process.env.DSHL_DEBUG_STOP === '1') log('stopServer enter\n' + new Error('enter').stack)
   // 幂等/防重入：停止过程中再次调用直接返回（由 beginServiceStop 判定并置位，含看门狗）
@@ -1467,52 +1551,86 @@ async function stopServer() {
   }
   broadcastState() // 立刻让控制台显示"正在停止服务…"并禁用按钮
   try {
-    // 交接裁决进行中：等它定案再动手，否则会"停了旧的、活着新的"（用户点停止却停不掉服务）
-    if (server.settling && server.handoverPromise) {
+    const pendingStart = server.startPromise
+    const wasSettling = server.settling
+    const launchSig = server.launchSig
+    server.gen++ // 立即取消还在 await 准备的启动世代，晚到的准备不得 spawn。
+    server.stopping = true
+    // 停止标志会取消常规交接裁决，因此这里独立复核同签名后继，不把未知进程当成自己的。
+    if (wasSettling && server.handoverPromise) {
       await Promise.race([server.handoverPromise.catch(() => {}), sleep(3000)])
-      server.settling = false
-      server.settlingServing = false
     }
+    if (wasSettling && !server.managed()) {
+      const listener = await findListenPid()
+      const matched = await matchSuccessorPid(listener)
+      if (matched) {
+        server.claimedPid = matched
+        server.claimedAlive = true
+      } else if (!listener) {
+        throw new Error('服务仍在自重启交接中，尚未确认后继进程已退出，请稍候重试')
+      }
+      // 不匹配的监听者属于外部进程；退出时不触碰，更新 DSH 则拒绝替换文件。
+      else if (!managedOnly) throw new Error('端口持有者不是已确认的自管后继，已暂停停止/更新')
+    }
+    server.settling = false
+    server.settlingServing = false
     if (process.env.DSHL_DEBUG_STOP === '1') log(`stopServer branch owned=${server.owned()} claimed=${server.claimed()} adopted=${server.adoptedPid} child=${server.child ? server.child.pid : 'null'} exitCode=${server.child ? server.child.exitCode : 'n/a'}`)
     if (server.owned()) {
       server.stopping = true
       const child = server.child
       const pid = child.pid
-      await killPid(pid, false) // 优雅停止；Windows taskkill 不带 /F
-      const exited = await new Promise((resolve) => {
-        const t0 = Date.now()
-        const iv = setInterval(() => {
-          if (child.exitCode !== null || Date.now() - t0 > 1500) { clearInterval(iv); resolve(child.exitCode !== null) }
-        }, 100)
-      })
-      if (!exited) await killPid(pid, true) // 超时强杀
-      server.child = null
-      server.stopping = false
+      await stopPidVerified(pid, child, force)
+      if (server.child === child) server.child = null
       log(`DSH stopped (PID ${pid})`)
-    } else if (server.claimed()) {
+    }
+    if (server.claimed()) {
       // 认领的自重启后继是我们这一代服务的一部分：按我们的服务停止它（它没有句柄，只能按 PID + 端口收敛判断）
       const pid = server.claimedPid
       cancelRestartRetry()
-      await killPid(pid, false)
-      await sleep(1000)
-      if (await portOpen()) await killPid(pid, true)
+      await stopPidVerified(pid, null, force)
       clearClaimed()
       server.launchUrl = null
       server.launchSig = null
       log(`DSH 自重启进程已停止 (PID ${pid})`)
-    } else if (server.adoptedPid !== 0) {
+    } else if (!managedOnly && server.adoptedPid !== 0) {
       const pid = server.adoptedPid
-      await killPid(pid, false)
-      await sleep(1000)
-      if (await portOpen()) await killPid(pid, true)
+      await stopPidVerified(pid, null, force)
       log(`adopted DSH stopped (PID ${pid})`)
       server.adoptedPid = 0
       server.adoptedAlive = false
     }
+    if (pendingStart && !await waitForCompletion(pendingStart, 5000)) {
+      throw new Error('启动准备尚未结束，已取消本次启动；请稍候再停止/更新')
+    }
+    // 旧 child 在停止中退出也可能留下自重启后继；不能因 exit handler 取消交接而漏查。
+    if (launchSig) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const listener = await findListenPid()
+        const matched = await matchSuccessorPid(listener, launchSig)
+        if (!matched) {
+          if (listener && !managedOnly) throw new Error('停止后端口仍有未确认归属的进程，已暂停更新/重启')
+          break
+        }
+        server.claimedPid = matched
+        server.claimedAlive = true // 失败时仍保留责任 PID，允许下一次重试。
+        server.launchSig = launchSig
+        if (attempt === 2) throw new Error('服务连续产生自重启后继，尚未确认全部停止，请稍候重试')
+        await stopPidVerified(matched, null, true)
+        clearClaimed()
+        log(`停止期间出现的 DSH 后继已停止 (PID ${matched})`)
+      }
+    }
+    server.launchSig = null
     return true
+  } catch (err) {
+    lastServiceError = redact(err && err.message || String(err))
+    log('停止服务失败：' + lastServiceError)
+    throw err
   } finally {
+    server.stopping = false
     endServiceStop()
     cancelRestartRetry() // 用户主动停止 = 取消待触的延后重启，看护不得把服务复活
+    broadcastState()
   }
 }
 
@@ -1531,7 +1649,7 @@ async function restartForAuth() {
 // 端口切换：重启我们负责的服务（自己拉起的或认领的自重启后继）到新端口，并把所有打开的标签页重载到新地址
 async function restartServerOnNewPort() {
   if (!server.managed()) return false
-  await stopServer()
+  if (await stopServer() !== true) return false
   const ok = await startServer()
   if (ok) {
     for (const t of webTabs) {
@@ -1982,7 +2100,7 @@ async function restoreCheckpoint(slotId) {
   try {
     if (server.running()) {
       webLoadTabs('recovery') // 页面切"正在应用配置…"说明页，回退期间不展示半死页面
-      await stopServer()
+      if (await stopServer() !== true) throw new Error('服务正在停止中，未确认停止，已暂停回退')
     }
     markLoadingProgress('restore') // 说明页步骤：写回健康检查点
     const r = health.restore(slotId)
@@ -2145,7 +2263,7 @@ async function applyPluginChange(verb, version, spec = {}) {
   lifecycle.emit('update.dsh', { step: verb + '-plugin', name })
   if (server.running()) {
     webLoadTabs('plugin')
-    await stopServer()
+    if (await stopServer() !== true) throw new Error('服务正在停止中，尚未确认停止，已暂停重启')
   }
   const ok = await handleStart()
   if (ok) {
@@ -3348,7 +3466,7 @@ function notifyStartResult(ok) {
 // 统一启动入口：控制台按钮 / 托盘菜单 / 启动时共用。
 // 返回 true = 服务确实在跑（自己拉起或接管外部实例）；false = 未就绪/环境未就绪/启动失败。
 // 调用方（尤其 dsh-update 的"更新后校验"）必须依赖返回值判定，而不是 try/catch——本函数不抛错。
-async function handleStart() {
+async function handleStart(allowDuringUpdate = false) {
   // 停止过程中点"启动"：直接拒绝（否则会在旧进程还没退干净时再 spawn 一个）
   if (serviceStopping()) {
     log('handleStart ignored (stop in progress)')
@@ -3368,7 +3486,7 @@ async function handleStart() {
     return false
   }
   startWhenReady = false
-  const ok = await startServer()
+  const ok = await startServer(0, allowDuringUpdate)
   notifyStartResult(ok)
   if (ok) refreshWebUiOnReady()
   else if (server.blockedReason && !SELF_TEST) showConsolePage('main') // 端口被其他程序占用：自动打开控制台（警示卡 + 一键换端口）
@@ -3582,6 +3700,7 @@ function migrateLegacyAutostart() {
 
 // ---------- DSHL 控制台（唯一窗口内的全页覆盖视图） ----------
 let reallyExit = false
+let ownsLauncherInstance = false
 
 // DeepSeek Harness 独立窗口默认尺寸：
 // 高 = 0.8 × 物理分辨率高（物理 = 逻辑 × 系统缩放，即窗口参数直接用 0.8 × 逻辑高）
@@ -4301,6 +4420,10 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       zoomFactor: Config.webZoom / 100,
       // 页面视图同样挂安全桥：供注入的分屏聚焦控件（✕/⋯）回传意图
       preload: path.join(__dirname, 'browser-preload.js'),
+      // 只把本机 DSH 地址交给 preload：它据此决定要不要暴露 dshDesktop 标记。
+      // sandbox preload 只能 require electron/events/timers/url，读不到本文件的 WEB_URL，
+      // 只能经 argv 带进去（外部网页与 file:// 说明页的 origin 对不上，因此拿不到标记）。
+      additionalArguments: [`--dshl-dsh-origin=${WEB_URL}`],
     },
   })
   const tab = {
@@ -4405,23 +4528,30 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       }
     }
   })
-  // 快捷键（焦点在页面内也生效）：Ctrl+F 页面查找、Ctrl+\ 分屏、Ctrl+Del 关闭聚焦分屏、
-  // Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页
+  // 快捷键（焦点在页面内也生效）：Ctrl+F 页面查找、Ctrl+\ 分屏（仅分屏开启时接管）、
+  // Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页。
+  // 归属判定全在 page-keys.js —— 那是唯一事实来源，也是"哪些键归 dshl、哪些必须让给 DSH"
+  // 的契约（由 tests/page-keys.test.js 的归属网格钉住，新增拦截会让测试变红）。
   wc.on('before-input-event', (_event, input) => {
-    if (input.type !== 'keyDown') return
-    const key = (input.key || '').toLowerCase()
-    const mod = input.control || input.meta
-    if (mod && key === 'f') { _event.preventDefault(); void webOpenFindFromPage(tab); return }
-    if (tab.findOpen) {
-      if (input.key === 'Escape') { _event.preventDefault(); webFindClose(tab); return }
-      if (input.key === 'F3') { _event.preventDefault(); void webFindFromInput(tab, false); return }
-      if (input.key === 'F4') { _event.preventDefault(); void webFindFromInput(tab, true); return }
-      if (tab.findInputFocused && input.key === 'Enter') { _event.preventDefault(); void webFindFromInput(tab, !input.shift); return }
+    const hit = pageKeys.routeKey(input, {
+      scope: pageKeys.SCOPE_PAGE,
+      tabsEnabled: Config.tabsEnabled,
+      findOpen: tab.findOpen,
+      findInputFocused: tab.findInputFocused,
+    })
+    if (hit === null) return
+    _event.preventDefault()
+    switch (hit.action) {
+      case 'find-open': void webOpenFindFromPage(tab); return
+      case 'find-close': webFindClose(tab); return
+      case 'find-prev': void webFindFromInput(tab, false); return
+      case 'find-next': void webFindFromInput(tab, true); return
+      case 'find-submit': void webFindFromInput(tab, hit.forward); return
+      case 'split-toggle': webToggleSplit(); return
+      case 'pane-close': webCloseFocused(); return
+      case 'pane-swap': webSwap(); return
+      case 'pane-reload': webReloadFocusedPane(); return
     }
-    if (input.control && key === '\\') { _event.preventDefault(); webToggleSplit() }
-    else if (input.control && input.key === 'Delete') { _event.preventDefault(); webCloseFocused() }
-    else if (input.shift && input.alt && key === 's') { _event.preventDefault(); webSwap() }
-    else if (input.key === 'F5' || (input.control && key === 'r')) { _event.preventDefault(); webReloadFocusedPane() }
   })
   if (opts.loading && !SELF_TEST) beginLoadingProgress(opts.loadingReason || reasonForPhase(servicePhase())) // 首屏说明页（启动流程）
   view.webContents.loadURL((opts.loading && !SELF_TEST) ? loadingUrl(opts.loadingReason || reasonForPhase(servicePhase()), id, loadingParams()) : (targetUrl || uiUrl())).catch(() => { /* 服务未启动时空白，由自愈兜底 */ })
@@ -4760,26 +4890,24 @@ function openWebUi(opts = {}) {
   webWin.webContents.on('zoom-changed', () => {
     try { webWin.webContents.setZoomLevel(0) } catch { /* noop */ }
   })
-  // 焦点在壳（标签栏）时 Ctrl+F 仍查找当前聚焦页面，F5 / Ctrl+R 仍刷新（默认菜单已移除，不会误触发壳重载）
+  // 焦点在壳（标签栏）时 Ctrl+F 仍查找当前聚焦页面，F5 / Ctrl+R 仍刷新（默认菜单已移除，不会误触发壳重载）。
+  // 归属判定与页面视图共用 page-keys.js，只是 scope 换成 shell：分屏一类在壳上没有上下文，不在这里接管。
   webWin.webContents.on('before-input-event', (_event, input) => {
     if (consoleIsOpen()) return // 控制台打开时不要刷新背后的 DSH 页面
-    const key = (input.key || '').toLowerCase()
-    if (input.type === 'keyDown' && (input.control || input.meta) && key === 'f') {
-      _event.preventDefault()
-      void webOpenFind()
-      return
-    }
-    if (input.type === 'keyDown') {
-      const tab = webFindFocusedTab()
-      if (tab && tab.findOpen) {
-        if (input.key === 'Escape') { _event.preventDefault(); webFindClose(tab); return }
-        if (input.key === 'F3') { _event.preventDefault(); void webFindFromInput(tab, false); return }
-        if (input.key === 'F4') { _event.preventDefault(); void webFindFromInput(tab, true); return }
-      }
-    }
-    if (input.type === 'keyDown' && (input.key === 'F5' || (input.control && key === 'r'))) {
-      _event.preventDefault()
-      webReloadFocusedPane()
+    const tab = webFindFocusedTab()
+    const hit = pageKeys.routeKey(input, {
+      scope: pageKeys.SCOPE_SHELL,
+      findOpen: !!(tab && tab.findOpen),
+      findInputFocused: false, // 壳侧没有查找输入框的上下文
+    })
+    if (hit === null) return
+    _event.preventDefault()
+    switch (hit.action) {
+      case 'find-open': void webOpenFind(); return
+      case 'find-close': webFindClose(tab); return
+      case 'find-prev': void webFindFromInput(tab, false); return
+      case 'find-next': void webFindFromInput(tab, true); return
+      case 'pane-reload': webReloadFocusedPane(); return
     }
   })
   attachContextMenu(webWin.webContents)
@@ -5348,10 +5476,10 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           // 不在这里置位：由 stopServer → beginServiceStop 统一置位（含看门狗）。
           // 先广播一次"停止中"由 stopServer 内部置位后负责，避免两处状态不同步。
           const ok = await stopServer()
-          if (ok !== false) notify('DeepSeek Harness', '服务已停止')
+          if (ok === true) notify('DeepSeek Harness', '服务已停止')
           broadcastState()
           if (process.env.DSHL_DEBUG_STOP === '1') log('stop handler done')
-          return JSON.stringify({ ok: true })
+          return JSON.stringify({ ok: ok === true, stopping: ok === false })
         }
         case 'openWeb': openDshOrConsole(); return '{}' // 环境未就绪/端口被占用时自动打开控制台
         case 'consoleClose': hideConsole(); return '{}'
@@ -5711,50 +5839,51 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         default: log('bridge: unknown command ' + name); return '{}'
       }
     } catch (err) {
-      log('bridge command failed: ' + err.message)
-      return '{}'
+      const error = redact(err && err.message || String(err))
+      log('bridge command failed: ' + error)
+      return JSON.stringify({ ok: false, error })
     }
   })
 }
 
-// 退出时的快速停止：强杀进程树，不等待优雅退出（DSH 无内存态需要保留，托盘退出必须秒退）
+// 退出/更新使用同一停止实现：仅自管服务，强杀后仍验证 PID 已退出。
 async function stopServerFast() {
-  server.settling = false
-  server.settlingServing = false
-  cancelRestartRetry()
-  const child = server.child
-  if (child && child.exitCode === null) {
-    server.stopping = true
-    const pid = child.pid
-    await killPid(pid, true)
-    server.child = null
-    server.stopping = false
-    log(`DSH force-stopped on exit (PID ${pid})`)
-  }
-  server.child = null
-  // 认领的自重启后继同样是我们负责的服务：退出前一并结束，否则留下无人看护的孤儿（下次只能无凭据接管）
-  if (server.claimed()) {
-    const pid = server.claimedPid
-    await killPid(pid, true)
-    clearClaimed()
-    server.launchSig = null
-    log(`DSH 自重启进程已随启动器退出 (PID ${pid})`)
-  }
+  if (serviceStopPromise) await serviceStopPromise
+  const stopped = await stopServer({ managedOnly: true, force: true })
+  if (stopped !== true) throw new Error('服务正在停止中，尚未确认退出，请稍候重试')
+  return true
 }
 
-// ---------- 退出（停止我们负责的服务：自己拉起的 + 认领的自重启后继） ----------
-async function requestExit() {
-  if (reallyExit) return
-  reallyExit = true
-  stopFlash()
-  saveWebWindowState() // 退出前落盘独立窗口几何（防抖定时器可能尚未触发）
-  if (server.managed()) await stopServerFast()
-  log('tray exiting')
-  try { saveConfig() } catch { /* noop */ }
-  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* 证据清理失败不阻断退出 */ }
-  lifecycle.emit('app.exit', { reason: 'tray' })
-  if (tray) { try { tray.destroy() } catch { /* noop */ } tray = null }
-  app.quit()
+// ---------- 退出（普通退出清理失败不阻断；更新安装必须有停服证据） ----------
+let exitPromise = null
+let exitCleanupComplete = false
+let systemSessionEnding = false
+function requestExit(reason = 'tray') {
+  if (exitPromise) return exitPromise
+  reallyExit = true // 首先禁止新启动与自动恢复
+  exitPromise = (async () => {
+    let stopped = false
+    try {
+      stopFlash()
+      saveWebWindowState()
+      await stopServerFast() // 包括正在启动/交接的世代；外部接管服务保持不动
+      stopped = true
+    } catch (err) {
+      log('退出收尾未确认成功；本次不安装更新：' + redact(err && err.message || String(err)))
+    } finally {
+      try { saveConfig() } catch { /* noop */ }
+      try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* 证据清理失败不阻断退出 */ }
+      try { lifecycle.emit('app.exit', { reason, serviceStopped: stopped }) } catch { /* noop */ }
+      if (tray) { try { tray.destroy() } catch { /* noop */ } tray = null }
+      exitCleanupComplete = true
+    }
+    // 库的无条件退出安装已关闭；只在收尾成功的普通退出上显式交接。
+    if (stopped && !systemSessionEnding && reason !== 'sigint' && reason !== 'sigterm') {
+      try { if (await updater.installOnExit()) return } catch (err) { log('退出安装失败：' + (err && err.message || String(err))) }
+    }
+    app.quit()
+  })()
+  return exitPromise
 }
 
 // ---------- 自检（对齐 C# selftest：READY / STOPPED / WEBVIEW OK） ----------
@@ -6545,7 +6674,7 @@ function init() {
       pushUpdateState() // 更新窗口若开着，进度与按钮状态同步刷新
       scheduleTrayRebuild() // 托盘"下载中 / 已就绪"行跟随更新状态
     },
-    beforeInstall: async () => { if (server.managed()) await stopServerFast() },
+    beforeInstall: () => stopServerFast(),
     onEvent: (event, detail) => lifecycle.emit(event, detail),
   })
   // DSH 更新（dsh-update.js）：检测全自动、更新全手动（主页卡片按钮触发）
@@ -6565,12 +6694,12 @@ function init() {
     refreshEnv,
     envInstall,
     envDetect,
-    getServerState: () => ({ running: server.running(), owned: server.owned() }),
+    getServerState: () => ({ running: server.running(), owned: server.owned(), stopping: serviceStopping(), settling: server.settling, starting: !!server.startPromise }),
     // 页面凭据状态：更新后若拿不到本轮 launch token（服务是被接管的外部实例），
     // 用户自己开的浏览器页面会停在 401 上，成功通知要给出"重新打开"的指引。
     getPageCredential: () => ({ hasToken: !!server.launchUrl }),
     stopService: () => stopServer(),
-    startService: () => handleStart(),
+    startService: () => handleStart(true), // 只有更新协调器允许在更新期启动校验/恢复服务
     loadWebTabs: (reason) => webLoadTabs(reason),
     reloadWebTabs: () => { void refreshWebUiOnReady(true) },
     markProgress: (key) => markLoadingProgress(key),
@@ -6655,12 +6784,14 @@ function init() {
 
 // ---------- 应用生命周期 ----------
 if (IS_WIN) { try { app.setAppUserModelId('com.dshl.launcher') } catch { /* noop */ } }
-app.on('before-quit', () => {
-  reallyExit = true
-  saveWebWindowState()
-  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ } // 覆盖更新安装等非托盘路径的退出
-  lifecycle.emit('app.exit', { reason: 'quit' })
-}) // 覆盖更新安装等非托盘路径的退出
+app.on('before-quit', (event) => {
+  if (exitCleanupComplete || systemSessionEnding || SELF_TEST || !ownsLauncherInstance) {
+    try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
+    return
+  }
+  event.preventDefault() // Electron 不等待异步监听器；完成统一收尾后再真正退出。
+  void requestExit('quit')
+})
 app.on('will-quit', () => {
   // 兜底：任何走到 will-quit 的路径都算受控退出（幂等，重复调用无副作用）
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
@@ -6678,22 +6809,19 @@ app.on('activate', () => openDshOrConsole()) // macOS Dock 点击
 // 主窗口常驻（close 只 hide，真退出才 destroy），所以挂在它上面即覆盖"关掉窗口只剩托盘"的情形；
 // 接线点在 openWebUi 创建窗口之后：webWin.on('session-end', onSessionEnd)。
 function onSessionEnd() {
+  systemSessionEnding = true // 系统关机不等待异步收尾，也不自动安装更新。
   reallyExit = true
   try { saveWebWindowState() } catch { /* noop */ }
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
   try { lifecycle.emit('app.exit', { reason: 'session-end' }) } catch { /* noop */ }
 }
 process.on('SIGTERM', () => {
-  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
-  try { lifecycle.emit('app.exit', { reason: 'sigterm' }) } catch { /* noop */ }
-  app.quit()
+  void requestExit('sigterm') // markClean 在统一收尾 finally 中执行，不抢先宣称完成。
 })
 // 控制台 Ctrl+C / VS Code 停止按钮：Windows 上映射为 SIGINT（不是 SIGTERM）。
 // 没有这个 handler 时会直接终止进程、不走 before-quit，同样留下假的崩溃证据。
 process.on('SIGINT', () => {
-  try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
-  try { lifecycle.emit('app.exit', { reason: 'sigint' }) } catch { /* noop */ }
-  app.quit()
+  void requestExit('sigint') // markClean 与停服等待共用同一 finally。
 })
 process.on('uncaughtException', (err) => {
   // 只记录，不清理 active-run marker：本进程未受控退出（随后可能被系统/用户强杀），
@@ -6708,6 +6836,7 @@ if (!SELF_TEST) {
   if (!app.requestSingleInstanceLock()) {
     app.quit()
   } else {
+    ownsLauncherInstance = true
     app.on('second-instance', () => {
       // 已有一个实例在跑：提示用户（避免"双击了新包但好像没反应"的困惑），并打开窗口
       notify('DeepSeek Harness', '启动器已在运行（托盘图标），本次双击未启动新实例')

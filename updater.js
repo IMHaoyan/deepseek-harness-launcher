@@ -47,6 +47,10 @@ const state = {
 
 let initDone = false
 let autoChecked = false
+let installOperation = null
+let installHandedOff = false
+let quitAfterAttempt = false
+function isInstalling() { return installOperation !== null || installHandedOff }
 
 function snapshot() {
   return JSON.stringify(Object.assign({}, state))
@@ -173,7 +177,8 @@ function initUpdater(opts = {}) {
   }
 
   autoUpdater.autoDownload = true
-  autoUpdater.autoInstallOnAppQuit = true
+  // 禁止库绕过异步收尾在 quit 事件里直接安装；普通退出由 main 验证后调用 installOnExit。
+  autoUpdater.autoInstallOnAppQuit = false
   applyChannel()
 
   autoUpdater.on('checking-for-update', () => setStatus('checking'))
@@ -207,6 +212,10 @@ function initUpdater(opts = {}) {
     }
   })
   autoUpdater.on('error', (err) => {
+    if (installHandedOff) {
+      installHandedOff = false
+      setStatus('downloaded', { error: '安装程序启动失败：' + (err && err.message || String(err)) })
+    }
     log('updater error: ' + (err && err.message ? err.message : String(err)))
     // 已下载完成后的退出安装类错误不应覆盖"已就绪"状态
     if (state.status !== 'downloaded') setStatus('error', { error: err && err.message ? err.message : String(err) })
@@ -262,14 +271,55 @@ function onChannelChanged() {
   return channel
 }
 
-async function installNow() {
-  if (!isPackaged()) { setStatus('dev'); return }
-  if (state.status !== 'downloaded') { await check(); return }
-  log('updater: quit and install now')
-  try { if (beforeInstall) await beforeInstall() } catch (err) { log('updater beforeInstall failed: ' + err.message) }
-  recordSelfUpdate(state.latest) // 退出前落回执：下次启动据此判断这次安装到底成没成
-  // isSilent=false, isForceRunAfter=true：安装后自动重新拉起启动器
-  setImmediate(() => autoUpdater.quitAndInstall(false, true))
+function installNow() {
+  if (installHandedOff) return Promise.resolve(false)
+  if (installOperation) return installOperation
+  const pending = installPreparedUpdate()
+  installOperation = pending
+  const clear = () => { if (installOperation === pending) installOperation = null }
+  pending.then(clear, clear)
+  return pending
 }
 
-module.exports = { initUpdater, getState, check, autoCheck, installNow, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome }
+async function installPreparedUpdate() {
+  if (!isPackaged()) { setStatus('dev'); return false }
+  if (state.status !== 'downloaded') { await check(); return false }
+  const target = state.latest
+  log('updater: preparing quit and install')
+  try {
+    if (typeof beforeInstall !== 'function' || await beforeInstall() !== true) {
+      throw new Error('尚未确认自管服务已停止')
+    }
+    if (state.status !== 'downloaded' || state.latest !== target) throw new Error('更新目标已变化，请重新检查更新')
+  } catch (err) {
+    const error = '更新已暂停，未启动安装程序：' + (err && err.message || String(err))
+    log('updater beforeInstall failed: ' + error)
+    // 保留已下载目标和重试按钮，不重下包、不落安装回执。
+    if (state.status === 'downloaded' && state.latest === target) setStatus('downloaded', { error })
+    if (onNotify) onNotify('DeepSeek Harness Launcher', error)
+    return false
+  }
+  setStatus('downloaded', { error: '' })
+  recordSelfUpdate(state.latest) // 退出前落回执：下次启动据此判断这次安装到底成没成
+  installHandedOff = true
+  // isSilent=false, isForceRunAfter=true：安装后自动重新拉起启动器
+  setImmediate(() => {
+    try { autoUpdater.quitAndInstall(false, true) } catch (err) {
+      installHandedOff = false
+      setStatus('downloaded', { error: '安装程序启动失败：' + (err && err.message || String(err)) })
+    } finally {
+      // 普通退出不能因安装器失败而留在“托盘已销毁、启动被禁止”的半退出状态。
+      if (quitAfterAttempt) app.quit()
+    }
+  })
+  return true
+}
+
+// 仅正常退出收尾成功后调用；安装器自身触发的退出不再次安装。
+function installOnExit() {
+  if (installHandedOff || state.status !== 'downloaded') return Promise.resolve(false)
+  quitAfterAttempt = true
+  return installNow()
+}
+
+module.exports = { initUpdater, getState, check, autoCheck, installNow, installOnExit, isInstalling, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome }

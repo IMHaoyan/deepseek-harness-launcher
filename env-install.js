@@ -168,50 +168,108 @@ function liveGlobalPrefix() {
 
 // ---------- 用户 PATH（HKCU\Environment；免管理员，仅 Windows） ----------
 
-// 读用户 PATH。ok=false 表示"查询失败"（reg 超时/被拦截/输出格式变化），调用方必须区分：
-// 此时绝不能把空值当成"用户 PATH 本来就是空的"写回去，否则会用只含 DSHL 目录的值覆盖整条用户 PATH。
-async function readUserPath() {
-  const out = { ok: false, type: 'REG_EXPAND_SZ', value: '' }
-  try {
-    const r = await runExec('reg', ['query', 'HKCU\\Environment', '/v', 'Path'], { timeout: 10000 })
-    const m = /Path\s+(REG_\w+)\s+(.*)$/m.exec(r.stdout)
-    if (m) { out.type = m[1]; out.value = m[2] }
-    // 查询命令成功执行即视为可信（值可能确实不存在 → 按新建处理）
-    out.ok = true
-  } catch (e) {
-    out.error = (e && e.message ? e.message : String(e))
-  }
-  return out
+// 仅接受 reg query 的明确单值布局。四个空格是列分隔符，不吞掉数据自己的
+// 前后空格；只有带数据列分隔符的空串才是可信空值。缺值/格式变化均不可写。
+function parseUserPathQuery(stdout) {
+  const fail = () => ({ ok: false, error: '用户 PATH 查询输出无法精确解析' })
+  if (typeof stdout !== 'string' || /\0|\uFFFD|\r(?!\n)/.test(stdout)) return fail()
+  const lines = stdout.split(/\r?\n/).filter((line) => line !== '')
+  if (lines.length !== 2 || !/^HKEY_CURRENT_USER\\Environment$/i.test(lines[0])) return fail()
+  const m = /^ {4}Path {4}(REG_SZ|REG_EXPAND_SZ) {4}(.*)$/i.exec(lines[1])
+  if (!m) return fail()
+  return { ok: true, type: m[1].toUpperCase(), value: m[2] }
 }
 
-// 把目录写入用户 PATH（默认追加；prepend=true 时置顶——用于 dshl 自装 Node 优先于过旧系统 Node）
-async function addToUserPath(job, dirs, opts = {}) {
-  if (!IS_WIN) { job.logLine('非 Windows 平台，跳过用户 PATH 写入'); return }
-  if (process.env.DSHL_SKIP_PATH === '1') { job.logLine('跳过用户 PATH 写入（DSHL_SKIP_PATH=1，测试模式）'); return }
-  const { ok, type, value, error } = await readUserPath()
-  if (!ok) {
-    // 失败关闭：宁可不动 PATH，也不拿空值覆盖用户环境变量
-    job.logLine('读取用户 PATH 失败，已跳过 PATH 写入（避免覆盖现有 PATH）：' + (error || '未知原因'))
-    job.logLine('如需手动添加：把以下目录加入用户 PATH —— ' + dirs.filter(Boolean).join('、'))
-    return
+// 普通查询失败（包括真实缺值）一律 fail-closed，不按本地化错误文字猜缺键。
+async function readUserPath(deps = {}) {
+  try {
+    const r = await (deps.runExec || runExec)('reg', ['query', 'HKCU\\Environment', '/v', 'Path'], { timeout: 10000 })
+    if (r.stderr) return { ok: false, error: '用户 PATH 查询包含异常输出' }
+    return parseUserPathQuery(r.stdout)
+  } catch (e) {
+    return { ok: false, error: e && e.message ? e.message : String(e) }
   }
-  const parts = value ? value.split(';').map((p) => p.trim()).filter(Boolean) : []
-  const norm = (p) => { try { return path.resolve(p.replace(/^"(.*)"$/, '$1')).toLowerCase() } catch { return p.toLowerCase() } }
+}
+
+function absoluteWindowsDirectory(p) {
+  // 根相对/驱动器相对路径不依赖当前目录解释；拒绝 PATH 分隔符和变量等歧义。
+  return typeof p === 'string' && !/[;"%<>|?*\x00-\x1f]/.test(p) &&
+    (/^[a-z]:[\\/]/i.test(p) || /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(p))
+}
+
+function userPathComparisonKey(value, type, env) {
+  let p = value.trim()
+  if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1)
+  if (type === 'REG_EXPAND_SZ' && p.includes('%')) {
+    // 只用于比较，永不把展开结果写回。未知/循环变量不能经 normalize 的 .. 消掉。
+    const vars = new Map(Object.entries(env).map(([k, v]) => [k.toLowerCase(), v]))
+    for (let i = 0; i < 16 && p.includes('%'); i++) {
+      let unknown = false
+      p = p.replace(/%([^%]+)%/g, (match, name) => {
+        const v = vars.get(name.toLowerCase())
+        if (typeof v !== 'string') { unknown = true; return match }
+        return v
+      })
+      if (unknown) return null
+    }
+  }
+  if (!absoluteWindowsDirectory(p)) return null
+  return path.win32.normalize(p).replace(/[\\/]+$/, '').toLowerCase()
+}
+
+// 纯规划：旧值始终是原始完整子串，不 trim/filter/reorder 旧 PATH 段。
+function planUserPath(snapshot, dirs, opts = {}, env = {}) {
+  if (!snapshot || snapshot.ok !== true || !['REG_SZ', 'REG_EXPAND_SZ'].includes(snapshot.type) ||
+      typeof snapshot.value !== 'string' || /[\0\r\n]/.test(snapshot.value)) {
+    return { status: 'skipped', reason: 'untrusted-read' }
+  }
+  if (!Array.isArray(dirs) || dirs.some((d) => !absoluteWindowsDirectory(d))) {
+    return { status: 'skipped', reason: 'invalid-directory' }
+  }
+  const keys = new Set(snapshot.value.split(';').map((p) => userPathComparisonKey(p, snapshot.type, env)).filter((p) => p !== null))
   const added = []
   for (const d of dirs) {
-    if (!d || parts.some((p) => norm(p) === norm(d))) continue
-    parts.push(d)
-    added.push(d)
+    const key = userPathComparisonKey(d, snapshot.type, env)
+    if (!keys.has(key)) { keys.add(key); added.push(d) }
   }
-  if (!added.length) { job.logLine('用户 PATH 已包含所需目录，无需修改'); return }
-  if (opts.prepend) {
-    // 置顶：新装 Node 应优先于系统里过旧的 Node
-    for (const d of added) { const i = parts.indexOf(d); if (i > 0) { parts.splice(i, 1); parts.unshift(d) } }
+  if (!added.length) return { status: 'unchanged', added, type: snapshot.type, value: snapshot.value }
+  const additions = added.join(';')
+  const value = snapshot.value === '' ? additions : opts.prepend ? additions + ';' + snapshot.value : snapshot.value + ';' + additions
+  return { status: 'planned', added, type: snapshot.type, value }
+}
+
+// 注入只用于隔离测试；实际调用仍使用原 runExec/广播。写后失败抛给安装任务，
+// 不做盲目回滚（期间其他程序可能已写入新值）。reg 没有 CAS，二次读取仅缩小竞争窗口。
+async function addToUserPath(job, dirs, opts = {}, deps = {}) {
+  const env = deps.env || process.env
+  if (!(deps.isWin === undefined ? IS_WIN : deps.isWin)) {
+    job.logLine('非 Windows 平台，跳过用户 PATH 写入')
+    return { status: 'skipped', reason: 'non-windows' }
   }
-  const newValue = parts.join(';')
-  await runExec('reg', ['add', 'HKCU\\Environment', '/v', 'Path', '/t', type, '/d', newValue, '/f'], { timeout: 15000 })
-  job.logLine(`用户 PATH 已更新：${added.join('、')}${opts.prepend ? '（置顶）' : ''}（新开终端生效）`)
-  broadcastEnvironmentChange()
+  if (env.DSHL_SKIP_PATH === '1') {
+    job.logLine('跳过用户 PATH 写入（DSHL_SKIP_PATH=1，测试模式）')
+    return { status: 'skipped', reason: 'test-mode' }
+  }
+  const before = await readUserPath(deps)
+  const plan = planUserPath(before, dirs, opts, env)
+  if (plan.status === 'skipped') {
+    job.logLine('已跳过用户 PATH 写入（避免覆盖现有 PATH）：' + (before.error || plan.reason))
+    return plan
+  }
+  if (plan.status === 'unchanged') { job.logLine('用户 PATH 已包含所需目录，无需修改'); return plan }
+  const current = await readUserPath(deps)
+  if (!current.ok || current.type !== before.type || current.value !== before.value) {
+    job.logLine('写入前无法确认用户 PATH 未被修改，已跳过 PATH 写入')
+    return { status: 'skipped', reason: current.ok ? 'conflict' : 'prewrite-read-failed' }
+  }
+  await (deps.runExec || runExec)('reg', ['add', 'HKCU\\Environment', '/v', 'Path', '/t', plan.type, '/d', plan.value, '/f'], { timeout: 15000 })
+  const after = await readUserPath(deps)
+  if (!after.ok || after.type !== plan.type || after.value !== plan.value) {
+    throw new Error('用户 PATH 写后验证失败（类型或原始值不符/读取失败）；未报告成功，未回滚以免覆盖其他程序的新值')
+  }
+  job.logLine(`用户 PATH 已更新并读回确认：${plan.added.join('、')}${opts.prepend ? '（置顶）' : ''}（新开终端生效）`)
+  ;(deps.broadcastEnvironmentChange || broadcastEnvironmentChange)()
+  return { ...plan, status: 'updated' }
 }
 
 // 广播 WM_SETTINGCHANGE：让 Explorer 立即重载环境变量（新终端无需注销即可看到新 PATH）
@@ -1875,4 +1933,6 @@ module.exports = {
   downloadToFile,
   decideUserNodeReuse,
   DEFAULT_DL_STALL_MS,
+  // 小范围测试入口：纯解析/规划及注入执行，测试不启动安装器、不访问真实注册表。
+  _userPath: { parseUserPathQuery, planUserPath, readUserPath, addToUserPath },
 }

@@ -1,0 +1,3 @@
+- insert:
+    - id: rider-dsh-ide
+      name: '@local/dsh-rider-ide'

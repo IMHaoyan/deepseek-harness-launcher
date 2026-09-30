@@ -1099,6 +1099,7 @@ async function updateNow() {
   updating = true
   rollbackUsed = false // 每个更新周期最多一次回滚
   let txInfo = null // 事务信息（catch 里写终态用：区分"失败"与"被中断"）
+  let swapState = null // catch 同样需要判断是否已经切换目录
   setState({ status: 'updating', error: '' })
   try {
     const report = await envDetect.detectEnv(false)
@@ -1124,23 +1125,29 @@ async function updateNow() {
     // 非升级（用户显式切渠道导致的版本号下降）也要在通知里说清楚，绝不静默
     const nonUpgrade = gate.nonUpgrade === true
     if (nonUpgrade) log(`dsh-update: non-upgrade install allowed by explicit channel choice (v${fromVersion} → v${latest})`)
+    // 在任何更新事务/包文件写入前完成停服；失败保持旧版，不留下待修复事务。
+    if (!['managed', 'global', 'npx'].includes(plan.kind)) {
+      throw new Error(plan.kind === 'source'
+        ? '源码安装请手动更新：git pull && pnpm run build（启动器不自动修改源码仓库）'
+        : `当前安装形态（${plan.kind}）不支持更新`)
+    }
+    const svc = getServerState ? getServerState() : { running: false }
+    const wasRunning = !!(svc.running || svc.starting || svc.settling) // 被取消的启动请求在更新后也应恢复
+    if (wasRunning || svc.stopping || svc.settling || svc.starting) {
+      log('dsh-update: stopping service before update')
+      if (typeof stopService !== 'function' || await stopService() !== true) {
+        throw new Error('更新已暂停：服务尚未确认停止，请稍候重试')
+      }
+    }
     // 更新事务状态：写入"从哪来"（回滚依据）
     try { writeUpdateState({ kind: plan.kind, from: fromVersion, to: latest, phase: 'start' }) } catch { /* noop */ }
     txInfo = { kind: plan.kind, from: fromVersion, to: latest }
     emitLifecycle('update.dsh', { step: 'start', from: fromVersion, to: latest, kind: plan.kind })
     let globalRootForRollback = ''
-    let swapState = null // 改成名切换成功后留下的切换现场（回滚/收尾都按它走）
-
-    const svc = getServerState ? getServerState() : { running: false }
-    const wasRunning = svc.running
 
     if (plan.kind === 'managed') {
       // 托管形态：更新走统一引擎（内部优先全局 npm，失败回退托管），失败旧版不动
       if (loadWebTabs) loadWebTabs('update') // 页面切"正在更新…"说明页，避免更新期间白屏
-      if (wasRunning) {
-        log('dsh-update: stopping service before update')
-        try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
-      }
       try {
         if (markProgress) markProgress('install')
         envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
@@ -1165,10 +1172,6 @@ async function updateNow() {
       // 旧进程+新文件会触发 DSH HMR 导致页面白屏且无自愈路径）；
       // 更新期间窗口显示"正在更新…"说明页（带进度条），完成后强制重载为新版页面
       if (loadWebTabs) loadWebTabs('update')
-      if (wasRunning) {
-        log('dsh-update: stopping service before global update')
-        try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
-      }
       const globalRoot = await envInstall.resolveGlobalRoot(plan.nodeCmd)
       globalRootForRollback = globalRoot
       if (markProgress) markProgress('install')
@@ -1193,10 +1196,6 @@ async function updateNow() {
     } else if (plan.kind === 'npx') {
       // npx 缓存：先迁移到全局 npm（统一渠道），失败回退 npx 预热
       if (loadWebTabs) loadWebTabs('update')
-      if (wasRunning) {
-        log('dsh-update: stopping service before migrate')
-        try { await stopService() } catch (err) { log('dsh-update: stop failed: ' + err.message) }
-      }
       let migrated = false
       try {
         if (markProgress) markProgress('install')
@@ -1255,6 +1254,10 @@ async function updateNow() {
         const why = decision.reason
         log(`dsh-update: v${latest} 启动失败/版本不符，回滚到 v${fromVersion} …（${why}）`)
         emitLifecycle('update.dsh', { step: 'rollback-start', from: fromVersion, to: latest, reason: why })
+        // 校验可能已启动新版；回滚换文件也必须重新确认停服。
+        if (typeof stopService !== 'function' || await stopService() !== true) {
+          throw new Error('回滚已暂停：新版服务尚未确认停止，已保留更新事务与备份')
+        }
         // 改名切换过的：旧树还在暂存目录里，改名回来就是回滚（省掉一次重装旧版的 40s）
         const rb = swapState
           ? await restoreSwap(swapState, plan.nodeCmd)
@@ -1306,6 +1309,9 @@ async function updateNow() {
         rollbackUsed = true
         log(`dsh-update: ${outcome.reason}，用改名把旧树恢复回来 …`)
         emitLifecycle('update.dsh', { step: 'rollback-start', from: fromVersion, to: latest, reason: outcome.reason })
+        if (typeof stopService !== 'function' || await stopService() !== true) {
+          throw new Error('恢复旧版已暂停：新版服务尚未确认停止，已保留更新事务与备份')
+        }
         const rb = await restoreSwap(swapState, plan.nodeCmd)
         if (rb.ok) {
           try { await refreshEnv(true) } catch { /* noop */ }

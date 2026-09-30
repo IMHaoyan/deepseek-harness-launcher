@@ -34,11 +34,15 @@ test('WebUI 页面视图挂载右键复制/粘贴/全选菜单', () => {
 })
 
 test('Ctrl+F 在页面与窗口壳都会打开查找条', () => {
+  // 2026-09-30 起居中到 page-keys.js（归属判定与副作用分离）。
+  // 这里守的是"接线不接错"：动作名 → 处理器；按键 → 动作名归 page-keys.test.js 管。
   const create = block(mainJs, 'function webCreateTab', '// 分屏聚焦控件')
-  assert.match(create, /key === 'f'[\s\S]*webOpenFindFromPage\(tab\)/, '焦点在页面内时 Ctrl+F 要优先读取选区并打开当前 tab 查找条')
+  assert.match(create, /case 'find-open': void webOpenFindFromPage\(tab\)/, '焦点在页面内时 Ctrl+F 要优先读取选区并打开当前 tab 查找条')
+  assert.match(create, /pageKeys\.routeKey\(input,[\s\S]{0,140}scope: pageKeys\.SCOPE_PAGE/, '页面视图必须走统一的归属判定')
 
   const shell = block(mainJs, "webWin.webContents.on('before-input-event'", 'attachContextMenu(webWin.webContents)')
-  assert.match(shell, /key === 'f'[\s\S]*webOpenFind\(\)/, '焦点在标签栏壳时 Ctrl+F 仍要查找当前页面')
+  assert.match(shell, /case 'find-open': void webOpenFind\(\)/, '焦点在标签栏壳时 Ctrl+F 仍要查找当前页面')
+  assert.match(shell, /scope: pageKeys\.SCOPE_SHELL/, '壳侧必须走同一份归属判定')
 })
 
 test('Ctrl+F 会读取页面选区并立即搜索', () => {
@@ -76,19 +80,35 @@ test('查找导航固定为 F3 上一个、F4 下一个', () => {
   assert.match(find, /e\.key === 'F4'[\s\S]{0,120}runSearch\(true\)/)
   assert.match(find, /e\.key === 'Enter'[\s\S]{0,120}runSearch\(!e\.shiftKey\)/)
 
+  // 页面内按键 → 动作 → 处理器：按键映射在 page-keys.js，这里守接线不接错。
   const create = block(mainJs, 'function webCreateTab', '// 分屏聚焦控件')
-  assert.match(create, /input\.key === 'F3'[\s\S]{0,120}webFindFromInput\(tab, false\)/)
-  assert.match(create, /input\.key === 'F4'[\s\S]{0,120}webFindFromInput\(tab, true\)/)
-  assert.match(create, /input\.key === 'Enter'[\s\S]{0,120}webFindFromInput\(tab, !input\.shift\)/)
+  assert.match(create, /case 'find-prev': void webFindFromInput\(tab, false\)/)
+  assert.match(create, /case 'find-next': void webFindFromInput\(tab, true\)/)
+  assert.match(create, /case 'find-submit': void webFindFromInput\(tab, hit\.forward\)/)
+
+  const keys = read('page-keys.js')
+  assert.match(keys, /input\.key === 'F3'[\s\S]{0,60}find-prev/)
+  assert.match(keys, /input\.key === 'F4'[\s\S]{0,60}find-next/)
+  assert.match(keys, /input\.key === 'Enter'[\s\S]{0,80}find-submit/)
 })
 
 test('查找框失焦后 F3/F4/Esc 仍作用于已打开的查找', () => {
   const create = block(mainJs, 'function webCreateTab', '// 分屏聚焦控件')
-  assert.doesNotMatch(create, /if \(tab\.findOpen && tab\.findInputFocused\)/, '不能只在输入框聚焦时处理查找快捷键')
-  assert.match(create, /if \(tab\.findOpen\)[\s\S]{0,260}input\.key === 'Escape'[\s\S]{0,260}input\.key === 'F3'[\s\S]{0,260}input\.key === 'F4'/)
+  assert.doesNotMatch(create, /findOpen && tab\.findInputFocused/, '不能只在输入框聚焦时处理查找快捷键')
+  assert.match(create, /findOpen: tab\.findOpen/, '查找条打开即接管，与输入框是否聚焦无关')
+  assert.match(create, /findInputFocused: tab\.findInputFocused/, '输入框聚焦只用于区分回车提交')
+
+  const keys = read('page-keys.js')
+  const modal = block(keys, 'if (opts.findOpen) {', 'if (scope === SCOPE_PAGE)')
+  assert.match(modal, /input\.key === 'Escape'[\s\S]{0,60}find-close/)
+  assert.match(modal, /input\.key === 'F3'[\s\S]{0,60}find-prev/)
+  assert.match(modal, /input\.key === 'F4'[\s\S]{0,60}find-next/)
 
   const shell = block(mainJs, "webWin.webContents.on('before-input-event'", 'attachContextMenu(webWin.webContents)')
-  assert.match(shell, /if \(tab && tab\.findOpen\)[\s\S]{0,180}input\.key === 'Escape'[\s\S]{0,180}input\.key === 'F3'[\s\S]{0,180}input\.key === 'F4'/, '焦点在窗口壳时也要处理')
+  assert.match(shell, /findOpen: !!\(tab && tab\.findOpen\)/, '焦点在窗口壳时也要处理')
+  assert.match(shell, /case 'find-close': webFindClose\(tab\)/)
+  assert.match(shell, /case 'find-prev': void webFindFromInput\(tab, false\)/)
+  assert.match(shell, /case 'find-next': void webFindFromInput\(tab, true\)/)
 })
 
 test('查找 IPC 只能操作发送方自身 tab，不进入 browser:* 控制域', () => {

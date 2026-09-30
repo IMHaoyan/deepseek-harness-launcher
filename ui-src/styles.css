@@ -95,6 +95,14 @@ body {
   line-height: 22px;
   padding: 16px;
   overflow-y: auto;
+  /* 控制台说明、状态、错误与版本默认可选；窗口拖拽由独立壳的标题栏负责。 */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* 仅操作控件禁选，不能把普通正文或输入框一起禁掉。 */
+button, button *, [role="button"], [role="button"] *, select,
+input[type="checkbox"], input[type="radio"], input[type="range"] {
   user-select: none;
   -webkit-user-select: none;
 }

@@ -2,7 +2,7 @@
 //
 // 契约来自用户直接提的诉求：控制台「日志与反馈」页的运行日志要能框选复制、
 // 长行要自动折行。两条都不能只靠"看起来对"：
-//   ① body 上是 user-select:none（拖拽窗口用），日志区必须显式开回来；
+//   ① 正文默认可选，日志区仍明确保留可选规则；拖拽窗口由独立标题栏负责；
 //   ② <pre> 默认 white-space:pre —— 不覆盖的话长路径/URL/堆栈只会从右边滚出去，
 //      右侧既看不见也选不到（这正是本次被报的问题）。
 'use strict'
@@ -39,9 +39,11 @@ test('运行日志的 <pre> 就在「运行日志」卡片里（规则打在 .lo
   assert.match(card[1], /运行日志/, '卡片标题应仍写「运行日志」')
 })
 
-test('可选中：覆盖 body 的 user-select:none', () => {
-  assert.match(stylesCss, /(^|\n)body \{[\s\S]{0,400}?user-select:\s*none;/u,
-    '前提变了：body 不再整页禁选，请重新确认这条规则的用意')
+test('普通正文默认可选，运行日志仍显式保留选择规则', () => {
+  const body = /(?:^|\n)body \{([\s\S]*?)\n\}/u.exec(stylesCss);
+  assert.ok(body, '应有 body 规则');
+  assert.match(body[1], /user-select:\s*text;/u, '不能全页禁止选中文字');
+  assert.match(body[1], /-webkit-user-select:\s*text;/u);
   const pre = ruleBlock(consoleCss, '.logs-card pre')
   assert.match(pre, /user-select:\s*text;/, '运行日志必须可选中')
   assert.match(pre, /-webkit-user-select:\s*text;/, 'Electron/Chromium 下要带 -webkit- 前缀')

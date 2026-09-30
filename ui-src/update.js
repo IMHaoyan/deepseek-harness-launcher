@@ -111,7 +111,7 @@ function renderLauncher(state) {
   if (status === 'downloaded' && s.latest) {
     const btn = document.createElement('button')
     btn.className = 'upd-btn primary'
-    btn.textContent = `更新到 v${s.latest}`
+    btn.textContent = s.error ? `重试更新到 v${s.latest}` : `更新到 v${s.latest}`
     btn.addEventListener('click', async () => {
       released.launcher = false
       busy.launcher = false
@@ -120,6 +120,13 @@ function renderLauncher(state) {
       await cmd('updaterInstall')
     })
     box.appendChild(btn)
+    if (s.error) {
+      const note = document.createElement('span')
+      note.className = 'upd-note'
+      note.textContent = '更新已暂停'
+      note.title = s.error
+      box.appendChild(note)
+    }
     return
   }
 

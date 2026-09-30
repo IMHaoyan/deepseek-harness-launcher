@@ -1176,12 +1176,25 @@ $('btnOpen').addEventListener('click', () => {
   if (env && !env.ready) { showPage('env'); return; }
   cmd('openWeb');
 });
-$('urlText').addEventListener('click', () => {
-  if (window._currentUrl) cmd('openUrlExternal');
+// 可复制的链接式文字：拖选文字时不打开网页，单击仍保留原动作。
+function selectedTextTouches(el) {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.toString()) return false;
+  for (let i = 0; i < selection.rangeCount; i++) {
+    if (selection.getRangeAt(i).intersectsNode(el)) return true;
+  }
+  return false;
+}
+$('urlText').addEventListener('click', (event) => {
+  if (!selectedTextTouches(event.currentTarget) && window._currentUrl) cmd('openUrlExternal');
 });
 // 两个具体版本号：分别打开 DSHL / DSH 仓库中对应版本的 GitHub Release
-$('launcherVersion').addEventListener('click', () => cmd('openLauncherRelease'));
-$('dshVersion').addEventListener('click', () => cmd('openDshRelease'));
+$('launcherVersion').addEventListener('click', (event) => {
+  if (!selectedTextTouches(event.currentTarget)) cmd('openLauncherRelease');
+});
+$('dshVersion').addEventListener('click', (event) => {
+  if (!selectedTextTouches(event.currentTarget)) cmd('openDshRelease');
+});
 // 启动/停止：启动失败不再静默 —— 按主进程回传的原因跳页或就地提示 8 秒
 let toggleHintTimer = null;
 function showToggleHint(text, kind) {
@@ -1814,7 +1827,10 @@ $('pluginCards').addEventListener('click', async (e) => {
   const verb = PLUGIN_ACTION_VERB[action] || '处理';
   btn.disabled = true;
   btn.textContent = '处理中…';
-  setPluginCardFeedback(btn, `正在${verb}「${name}」…（会重启 DSH 服务，约 10~60 秒）`);
+  const changeHint = (action === 'enable' || action === 'disable') && id !== 'bridge-next'
+    ? '修改启用状态后，需要手动重启服务生效'
+    : '会停止并重启 DSH 服务，进行中的会话会中断，约 10~60 秒';
+  setPluginCardFeedback(btn, `正在${verb}「${name}」…（${changeHint}）`);
   const r = await cmd('pluginAction', { id, action });
   if (!r || !r.ok) {
     const msg = (r && r.error) || '操作失败，请查看日志';
@@ -1841,10 +1857,20 @@ $('pluginCards').addEventListener('change', async (e) => {
   const turnOn = input.checked;
   const action = turnOn ? 'enable' : 'disable';
   input.disabled = true;
+  if (id === 'bridge-next') {
+    const ok = await confirmDialog({
+      title: turnOn ? '开启手机连接？' : '关闭手机连接？',
+      body: (turnOn ? '会安装手机连接插件' : '会卸载手机连接插件') + '，并停止、重新启动 DSH 服务；进行中的会话会中断。',
+      confirmText: turnOn ? '安装并开启' : '卸载并关闭',
+      danger: !turnOn,
+    });
+    if (!ok) { input.checked = !turnOn; input.disabled = false; return; }
+  }
   const r = await cmd('pluginAction', { id, action });
   if (r && r.ok) {
     const verb = turnOn ? '已开启' : '已关闭';
-    showConsoleToast(r.restartPending ? `插件${verb}；点顶部「立即重启生效」后生效` : `插件${verb}`);
+    showConsoleToast(r.restartPending ? `插件${verb}；点顶部「立即重启生效」后生效`
+      : id === 'bridge-next' ? `手机连接${verb}，服务已重启生效` : `插件${verb}`);
   }
   const fresh = await cmd('pluginsGetState');
   if (fresh) renderPlugins(fresh, true);
@@ -1879,7 +1905,7 @@ $('btnPluginsInstallAll').addEventListener('click', async () => {
   const btn = $('btnPluginsInstallAll');
   const ok = await confirmDialog({
     title: '一键安装所有预装插件？',
-    body: '会依次装好本页所有尚未安装的预装插件（插件市场、手机连接与各推荐插件）；中途不重启，装完后点顶部「立即重启生效」一次性生效。',
+    body: '会依次装好本页所有尚未安装的预装插件（插件市场、手机连接与各推荐插件）。安装前会先停止 DSH 服务，进行中的会话会中断；中途不重启，装完后点顶部「立即重启生效」重新启动服务。',
     confirmText: '开始安装',
   });
   if (!ok) return;

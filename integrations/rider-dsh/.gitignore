@@ -1,0 +1,4 @@
+rider-plugin/build/
+rider-plugin/.gradle/
+rider-plugin/*.zip
+dsh-plugin/node_modules/

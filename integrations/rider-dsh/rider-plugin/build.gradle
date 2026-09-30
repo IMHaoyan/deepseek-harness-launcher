@@ -1,0 +1,17 @@
+plugins {
+    id 'java'
+    id 'org.jetbrains.intellij' version '1.17.4'
+}
+
+group = 'local.dsh'
+version = '0.1.0'
+repositories { mavenCentral() }
+intellij {
+    localPath = 'C:/Program Files/JetBrains/JetBrains Rider 2023.3.4'
+    type = 'RD'
+}
+java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }
+tasks.patchPluginXml {
+    sinceBuild = '233'
+    untilBuild = ''
+}

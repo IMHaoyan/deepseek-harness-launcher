@@ -40,10 +40,10 @@ test('关机/注销/中断都算受控退出：session-end 必须挂在窗口上
   assert.match(main, /function onSessionEnd\(\)[\s\S]{0,600}?markClean\(\)/, 'session-end 处理体必须清标记')
 
   // 其余受控退出路径：控制台 Ctrl+C / VS Code 停止按钮在 Windows 上是 SIGINT（不是 SIGTERM）
-  assert.match(main, /process\.on\('SIGINT',[\s\S]{0,400}?markClean\(\)/, 'SIGINT 必须清理标记')
+  assert.match(main, /process\.on\('SIGINT',[\s\S]{0,400}?requestExit\('sigint'\)/, 'SIGINT 必须经过统一停服与标记清理')
   assert.match(main, /app\.on\('will-quit',[\s\S]{0,300}?markClean\(\)/, 'will-quit 作为兜底')
   assert.match(main, /app\.on\('before-quit',[\s\S]{0,400}?markClean\(\)/, 'before-quit 仍要清理')
-  assert.match(main, /process\.on\('SIGTERM',[\s\S]{0,400}?markClean\(\)/, 'SIGTERM 仍要清理')
+  assert.match(main, /process\.on\('SIGTERM',[\s\S]{0,400}?requestExit\('sigterm'\)/, 'SIGTERM 必须经过统一停服与标记清理')
 })
 
 test('漏掉 session-end 的关机也判得出来：随系统结束的运行不记崩溃', () => {
@@ -229,7 +229,7 @@ test('停服务失败时调用方必须中止（不得在别人占着依赖树�
 // ---------- 启动互斥 ----------
 
 test('启动互斥：并发启动共用同一次，绝不 spawn 两个抢同一端口', () => {
-  assert.match(main, /function startServer\(occupantRetry = 0\) \{\s*\n\s*if \(server\.startPromise\) return server\.startPromise/, 'startServer 必须是带互斥的包装')
+  assert.match(main, /function startServer\(occupantRetry = 0, allowDuringUpdate = false\) \{[\s\S]{0,300}?if \(server\.startPromise\) return server\.startPromise/, 'startServer 必须是带互斥的包装')
   assert.match(main, /async function startServerInner\(occupantRetry = 0\)/, '真正的实现应改名为 startServerInner')
   // 内部递归必须走 inner：走包装会 await 到自己这次 startPromise，直接死锁
   assert.match(main, /return startServerInner\(retryDepth \+ 1\)/, 'handlePortOccupied 的递归必须走 inner')

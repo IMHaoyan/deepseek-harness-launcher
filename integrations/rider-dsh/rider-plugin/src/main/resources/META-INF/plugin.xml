@@ -1,0 +1,21 @@
+<idea-plugin>
+  <id>local.dsh.rider.bridge</id>
+  <name>DSH Rider Bridge</name>
+  <version>0.1.2</version>
+  <idea-version since-build="262"/>
+  <vendor>Local</vendor>
+  <description>Send Rider editor selection to the currently open DSH chat composer.</description>
+  <depends>com.intellij.modules.platform</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <postStartupActivity implementation="local.dsh.rider.BridgeStartup"/>
+    <notificationGroup id="DshRiderBridge" displayType="BALLOON"/>
+  </extensions>
+  <actions>
+    <action id="local.dsh.rider.SendToDshAction" class="local.dsh.rider.SendToDshAction"
+            text="Send to DSH" description="Insert this file or selection into the DSH chat draft">
+      <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+    </action>
+  </actions>
+</idea-plugin>
+
+

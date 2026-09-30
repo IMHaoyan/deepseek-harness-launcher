@@ -952,7 +952,7 @@ body.console-surface {
 
 .logs-card { display: flex; flex-direction: column; }
 /* 运行日志：可选中 + 自动换行（与 #envLog / #wizardLog 同一套写法）。
-   ① 可选中：body 上是 user-select:none，日志是拿来复制粘贴/贴进工单的，必须显式开回来；
+   ① 可选中：正文默认可选，日志仍显式声明，避免后续局部样式退化；
    ② 自动换行：<pre> 默认 white-space:pre，长路径/URL/堆栈只会在右边横向滚出去，
       右侧内容看不见也选不到；折行后纵向滚动即可看全。 */
 .logs-card pre {

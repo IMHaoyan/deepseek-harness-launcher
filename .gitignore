@@ -9,6 +9,8 @@ Thumbs.db
 NAMES.md
 # 本地 agent 记忆（含使用者个人画像与排查现状，属个人数据，不随公开仓库发布）
 AGENTS.md
+# 本地交接文档（写给下一个接手的人，含内部排查现状与现场记录，不随公开仓库发布）
+HANDOFF.md
 # 飞书反馈通道 webhook：仅本地存在、随安装包分发，绝不进仓库（泄露面 = 向指定群发文本消息，可随时在群设置重置）
 assets/feishu-webhook.txt
 # 本地 npm 镜像配置（registry/electron_mirror），随网络环境而异，不进仓库
