@@ -455,7 +455,7 @@ function render(state) {
 
   // 插件页：卡片完全由 state.plugins 驱动；新增插件不需要改这里
   renderPlugins(state.plugins);
-  renderInstallAll(state.pluginInstallAll);
+  renderInstallAll(state.pluginInstallAll, state.plugins);
   renderPendingRestart(state.pluginPendingRestart);
   renderPluginEnvIssue(state.pluginEnvIssue, state.pluginEnvNote);
 
@@ -1526,6 +1526,11 @@ $('btnDshCheckHover').addEventListener('click', () => void cmd('dshCheckNow'));
 function pluginMatches(p, filter, query) {
   if (filter === 'installed' && !(p.installed || p.enabled)) return false;
   if (filter === 'available' && (p.installed || p.enabled)) return false;
+  // 归属标签筛选：按标签的 key 算（不是文案）——「已关闭自动安装」仍然算 DSHL 预装成员
+  const tags = Array.isArray(p.tags) ? p.tags : [];
+  if (filter === 'preinstall' && !tags.some((t) => t.key === 'preinstall')) return false;
+  if (filter === 'official' && !tags.some((t) => t.key === 'official')) return false;
+  if (filter === 'other' && tags.length) return false; // 「其他」= 两枚标签都不带的
   if (!query) return true;
   return [p.name, p.subtitle, p.description, p.id, p.category].some((v) => String(v || '').toLowerCase().includes(query));
 }
@@ -1535,9 +1540,18 @@ function pluginCardEl(p) {
   card.className = 'plugin-card' + (p.busy ? ' busy' : '');
   card.dataset.pluginId = p.id;
 
-  // 标题行：名称 + 版本（参考「设置 → 插件」的排版）
+  // 标题行：名称 + 版本（参考「设置 → 插件」的排版）。
+  // 声明了 GitHub 仓库的插件：标题本身是按钮，点了在系统默认浏览器打开它的发布页；
+  // 没有仓库的（手机连接）保持纯文本 —— 不留一块点了没反应的可点区域。
   const head = document.createElement('div'); head.className = 'plugin-card-head';
-  const name = document.createElement('span'); name.className = 'plugin-name'; name.textContent = p.name || p.id;
+  const repo = String(p.repo || '');
+  const name = document.createElement(repo ? 'button' : 'span');
+  name.className = 'plugin-name';
+  if (repo) {
+    name.type = 'button';
+    name.dataset.pluginOpen = p.id;
+    name.title = '在浏览器打开 GitHub 发布页：' + repo.replace(/^https:\/\//u, '');
+  }
   const ver = String(p.version || '').trim();
   const nameText = ver ? (p.name || p.id) + ' v' + ver : (p.name || p.id);
   name.textContent = nameText;
@@ -1547,17 +1561,25 @@ function pluginCardEl(p) {
   const subtitle = document.createElement('div'); subtitle.className = 'plugin-subtitle';
   subtitle.textContent = p.subtitle || p.id;
 
-  // 来源/代装说明放在标题行右端（原「添加备注」入口位置）：字号比标题大一号，
-  // 「预装 (推荐开启)」用绿色强调，其余（已关闭自动安装 / 已关闭 / payload 不可用）保持中性灰字。
-  const autoLabel = String(p.autoInstallLabel || '');
-  if (autoLabel && autoLabel !== '手动安装') {
-    const tag = document.createElement('span');
-    tag.className = 'plugin-badge-preinstall' + (p.autoInstall && autoLabel === '预装 (推荐开启)' ? '' : ' muted');
-    tag.textContent = autoLabel;
-    head.appendChild(tag);
+  // 归属标签（可多枚）放在标题行右端：DSHL预装 = 绿色，官方推荐 = 品牌蓝，
+  // 中性的状态说明（已关闭自动安装 / 不自动安装 / 已关闭 / payload 不可用）走 muted 灰。
+  const tags = Array.isArray(p.tags) ? p.tags : [];
+  if (tags.length) {
+    const wrap = document.createElement('span'); wrap.className = 'plugin-badges';
+    for (const t of tags) {
+      if (!t || !t.label) continue; // 没文案的标签不渲染空胶囊
+      const tag = document.createElement('span');
+      tag.className = (t.tone === 'official' ? 'plugin-badge-official' : 'plugin-badge-preinstall')
+        + (t.tone === 'muted' ? ' muted' : '');
+      tag.textContent = t.label;
+      wrap.appendChild(tag);
+    }
+    if (wrap.childNodes.length) head.appendChild(wrap);
   }
 
   const desc = document.createElement('div'); desc.className = 'plugin-description'; desc.textContent = p.description || '';
+  // 说明被两行截断（-webkit-line-clamp: 2）：完整文字挂到 title 上，鼠标悬停就能看全
+  if (p.description) desc.title = p.description;
 
   // 底部：启用开关 + 版本说明 + 操作按钮
   const footer = document.createElement('div'); footer.className = 'plugin-card-footer';
@@ -1658,7 +1680,7 @@ function renderPlugins(plugins, force) {
   for (const p of visible) cards.appendChild(pluginCardEl(p));
   const empty = $('pluginEmpty');
   if (empty) empty.classList.toggle('hidden', visible.length > 0);
-  renderInstallAll(installAll);
+  renderInstallAll(installAll, list);
 }
 
 /**
@@ -1702,21 +1724,45 @@ $('btnApplyRestart').addEventListener('click', async () => {
   }
 });
 
-function renderInstallAll(info) {
+/**
+ * 插件页两个批量按钮的进度与可用态（共用主进程同一份 pluginInstallAll 状态）：
+ * 跑的是哪一批由 kind 决定 —— 只有发起那批的按钮显示进度，另一个禁用但不假装在干活。
+ * 没在跑时，「一键更新」按当前有没有可更新的卡片决定能不能点（没得更新就不给一个点了没反应的按钮）。
+ */
+function renderInstallAll(info, list) {
   window._pluginInstallAll = info || null;
-  const btn = $('btnPluginsInstallAll');
-  if (!btn) return;
   const running = !!(info && info.running);
+  const kind = (info && info.kind) || '';
   const total = (info && info.target) || 0;
   const done = (info && info.done) || 0;
-  if (running) {
-    const current = info && info.current ? ' · ' + info.current : '';
-    btn.textContent = '安装中 (' + done + '/' + total + ')' + current + '…';
-    btn.disabled = true;
-    return;
+  const current = info && info.current ? ' · ' + info.current : '';
+
+  const installBtn = $('btnPluginsInstallAll');
+  if (installBtn) {
+    installBtn.disabled = running;
+    installBtn.textContent = running && kind !== 'update'
+      ? '安装中 (' + done + '/' + total + ')' + current + '…'
+      : '一键安装所有预装插件';
   }
-  btn.textContent = '一键安装所有预装插件';
-  btn.disabled = false;
+
+  const updateBtn = $('btnPluginsUpdate');
+  if (updateBtn) {
+    const outdated = (Array.isArray(list) ? list : []).filter((p) => p && p.outdated);
+    updateBtn.textContent = '一键更新';
+    if (running && kind === 'update') {
+      updateBtn.textContent = '更新中 (' + done + '/' + total + ')' + current + '…';
+      updateBtn.disabled = true;
+      updateBtn.title = '正在更新可更新的插件；全部完成后会自动重启一次 DSH';
+    } else if (running) {
+      updateBtn.disabled = true;
+      updateBtn.title = '另一个插件批量操作正在进行中';
+    } else {
+      updateBtn.disabled = !outdated.length;
+      updateBtn.title = outdated.length
+        ? '更新 ' + outdated.length + ' 个可更新的插件（' + outdated.map((p) => p.name).join('、') + '）；全部完成后自动重启一次 DSH 生效'
+        : '当前没有可更新的插件';
+    }
+  }
 }
 
 /**
@@ -1809,6 +1855,13 @@ function setPluginCardFeedback(btn, text) {
 }
 
 $('pluginCards').addEventListener('click', async (e) => {
+  // 标题即入口：声明了仓库的插件，点标题在系统默认浏览器打开它的 GitHub 发布页
+  const open = e.target.closest('button[data-plugin-open]');
+  if (open) {
+    const r = await cmd('openPluginRepo', { id: open.dataset.pluginOpen });
+    if (r && !r.ok) showConsoleToast('✕ ' + (r.error || '打开 GitHub 发布页失败'));
+    return;
+  }
   const btn = e.target.closest('button[data-plugin-action]');
   if (!btn) return;
   const id = btn.dataset.pluginId;
@@ -1916,6 +1969,28 @@ $('btnPluginsInstallAll').addEventListener('click', async () => {
     btn.textContent = (r && r.error) || '启动失败';
     btn.disabled = false;
     setTimeout(() => { btn.textContent = '一键安装所有预装插件'; }, 2500);
+  }
+});
+
+// 一键更新：把所有「可更新」的插件更新一遍 —— 中途不重启，全部更新完自动重启一次 DSH 生效
+$('btnPluginsUpdate').addEventListener('click', async () => {
+  const btn = $('btnPluginsUpdate');
+  const targets = (window._plugins || []).filter((p) => p && p.outdated);
+  if (!targets.length) return;
+  const ok = await confirmDialog({
+    title: '更新所有可更新的插件？',
+    body: '会依次更新本页 ' + targets.length + ' 个可更新的插件（' + targets.map((p) => p.name).join('、') + '）。'
+      + '开始前会先停止 DSH 服务，进行中的会话会中断；中途不重启，全部更新完自动重启一次 DSH 生效。',
+    confirmText: '开始更新',
+  });
+  if (!ok) return;
+  btn.disabled = true;
+  btn.textContent = '启动中…';
+  const r = await cmd('pluginsUpdateAll');
+  if (!r || !r.ok) {
+    btn.textContent = (r && r.error) || '启动失败';
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = '一键更新'; }, 2500);
   }
 });
 

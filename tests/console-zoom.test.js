@@ -48,6 +48,49 @@ test('两个缩放默认值同源，且都可恢复默认', () => {
   assert.match(main, /function defaultWebZoomPct\(\) \{[\s\S]{0,180}?systemZoom\(\)/, '默认值仍按系统 DPI 独立计算')
 })
 
+test('默认缩放：按系统缩放收敛到 100–125%，高 DPI（225%/250%）不再掉回 100%', () => {
+  const main = read('main.js')
+  const slice = (sig) => {
+    const start = main.indexOf(sig)
+    assert.ok(start > 0, '找不到 ' + sig)
+    return main.slice(start, main.indexOf('\n}\n', start) + 3)
+  }
+  const src = slice('function systemZoom() {') + '\n' + slice('function defaultWebZoomPct() {')
+  const disp = { scaleFactor: 1 }
+  const ctx = { IS_WIN: true, screen: { getPrimaryDisplay: () => disp } }
+  const names = Object.keys(ctx)
+  const ev = new Function(...names, src + '\nreturn { systemZoom, defaultWebZoomPct }')(...names.map((k) => ctx[k]))
+
+  // 真函数跑表：默认缩放 = clamp(round(系统缩放 ÷ 1.2), 100, 125)
+  for (const [scale, expected] of [
+    [75, 100], [100, 100], [120, 100], // 低缩放全被下限收敛到 100
+    [125, 104], [130, 108], [135, 113], [140, 117], // 中间档按比例
+    [150, 125], [160, 125], [175, 125], [200, 125], // 150% 起被上限收敛到 125
+    [225, 125], [250, 125], [300, 125], [500, 125], // ← 修复点：以前 225% 以上会被当成异常读数掉回 100%
+  ]) {
+    disp.scaleFactor = scale / 100
+    assert.equal(ev.systemZoom(), scale, `系统 ${scale}% 应被当成合法缩放值`)
+    assert.equal(ev.defaultWebZoomPct(), expected, `系统 ${scale}% → 默认 ${expected}%`)
+  }
+
+  // 异常读数（失败、0、明显不是缩放值）：fail-closed 回退 100%，不抛错也不算出离谱的值
+  for (const bad of [0, 0.5, NaN, 6]) {
+    disp.scaleFactor = bad
+    assert.equal(ev.systemZoom(), 100, `异常读数 ${bad} 应回退 100`)
+    assert.equal(ev.defaultWebZoomPct(), 100)
+  }
+  const throwing = new Function(names[0], names[1], src + '\nreturn defaultWebZoomPct')(
+    true, { getPrimaryDisplay: () => { throw new Error('no display') } },
+  )
+  assert.equal(throwing(), 100, '读显示器失败也要有确定结果')
+
+  // 非 Windows：不读系统缩放，恒 100%
+  const mac = new Function(names[0], names[1], src + '\nreturn defaultWebZoomPct')(
+    false, { getPrimaryDisplay: () => ({ scaleFactor: 2 }) },
+  )
+  assert.equal(mac(), 100, 'mac / Linux 不做 DPI 校正')
+})
+
 test('控制台缩放控件可见，且 wwwroot 与源码同步', () => {
   const html = read('ui-src/index.html')
   const app = read('ui-src/app.js')

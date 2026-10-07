@@ -510,8 +510,19 @@ body.console-surface {
 
 .plugin-filters {
   display: flex;
+  flex: none; /* 不参与挤压：窗口窄时整组换行，而不是把 chip 压扁 */
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+
+/* 同一行里的两个维度之间（标签筛选 ｜ 安装状态筛选）：一条细分隔，免得读成一串同义选项 */
+.plugin-filter-sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--border);
 }
 
 .plugin-grid {
@@ -668,7 +679,8 @@ body.console-surface {
 }
 
 .plugin-toolbar .plugin-search {
-  flex: 1 1 320px;
+  /* 独占一行：flex-basis 100% 保证它总是换到筛选/操作按钮的下一行，而不是挤在它们中间 */
+  flex: 1 1 100%;
   min-width: 200px;
   width: auto;
   height: 36px;
@@ -682,6 +694,7 @@ body.console-surface {
   align-items: center;
   gap: 8px;
   flex: none;
+  margin-left: auto; /* 与筛选按钮同一行，贴右端 */
 }
 
 .plugin-toolbar-actions .btn { height: 36px; border-radius: 10px; }
@@ -740,6 +753,22 @@ body.console-surface {
   white-space: nowrap;
 }
 
+/* 可点的标题（声明了 GitHub 仓库的插件）：清掉按钮的 UA 外观，排版仍与 .plugin-name 一致 */
+button.plugin-name {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 14.5px;
+  font-weight: 650;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.plugin-name:hover { color: var(--brand); text-decoration: underline; text-underline-offset: 2px; }
+button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 4px; }
+
 .plugin-card-head .plugin-status { flex: none; }
 
 .plugin-subtitle {
@@ -752,7 +781,30 @@ body.console-surface {
   white-space: nowrap;
 }
 
-/* 标题行右端的来源/代装标签（原「添加备注」入口位置）：字号比 .plugin-name 大一号 */
+/* 标题行右端的标签组：一枚插件可以同时挂「DSHL预装」与「官方推荐」 */
+.plugin-badges {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Deepseek 官方推荐：与「DSHL预装」同形状，只换色调（品牌蓝），两种标签一眼能分开 */
+.plugin-badge-official {
+  flex: none;
+  padding: 3px 12px;
+  border-radius: 999px;
+  color: #1D4ED8;
+  background: rgba(77, 107, 254, 0.13);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+[data-theme="dark"] .plugin-badge-official { color: #7C9CFF; }
+
+/* 标题行右端的归属标签（原「添加备注」入口位置）：字号比 .plugin-name 大一号 */
 .plugin-badge-preinstall {
   flex: none;
   padding: 3px 12px;
@@ -767,7 +819,7 @@ body.console-surface {
 
 [data-theme="dark"] .plugin-badge-preinstall { color: #4ADE80; }
 
-/* 非「预装 (推荐开启)」的状态说明（已关闭自动安装 / 已关闭 / payload 不可用）：中性灰，不用绿色 */
+/* 不是「正常预装」的状态说明（已关闭自动安装 / 不自动安装 / 已关闭 / payload 不可用）：中性灰，不用绿色 */
 .plugin-badge-preinstall.muted { color: var(--text-secondary); background: var(--ghost-hover); }
 [data-theme="dark"] .plugin-badge-preinstall.muted { color: var(--text-tertiary); }
 

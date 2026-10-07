@@ -25,6 +25,7 @@ const health = require('./health')
 const diagnostics = require('./diagnostics')
 const market = require('./market')
 const pluginSwitch = require('./plugin-switch')
+const pluginRepo = require('./plugin-repo')
 const pluginCompat = require('./dsh-plugin-compat')
 const stopGuard = require('./service-stop-guard')
 const { probePid, terminateProcess, waitForCompletion } = require('./service-termination')
@@ -2590,7 +2591,8 @@ function cleanInstalledVersion(spec) {
 // autoInstall: true 表示「默认代装」：首次运行或升级到本版本时由启动器自动补装一次
 //（见 maybeAutoInstallRecommendedPlugins）；用户手动卸载过就不再自动装回来。
 // 当前默认代装集合：用量与计费 / 技能管理 / 对话回退。
-// 不代装的（卡片标「手动安装」，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、会话导入。
+// 不代装的（卡片不显示预装标签，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、
+// 会话导入、上下文洞察。
 // 从本版本起摘出注册表的两个（会话归档 / MCP Lens）只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
 // 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
 // tests/plugin-page-wiring.test.js 的默认代装断言与 README「预装插件」小节。
@@ -2604,6 +2606,8 @@ const MANAGED_NPM_PLUGINS = [
     description: '把 DSH 的右侧栏变成 VSCode 式工作区：资源管理器、编辑器、终端、Git 和内置浏览器，按会话隔离。',
     icon: '🗂️',
     category: '界面增强',
+    repo: 'https://github.com/omdsh-dev/DSH-better-sidebar',
+    official: true, // Deepseek 官方推荐（它是手动安装项，所以只挂这一枚标签）
   },
   {
     id: 'codex-ui',
@@ -2614,6 +2618,7 @@ const MANAGED_NPM_PLUGINS = [
     description: '把 DSH Web 左侧栏换成 Codex 风格：项目 / 会话树、置顶与未读标记、全局搜索，长对话可按轮次跳回之前的提问。',
     icon: '🎨',
     category: '界面增强',
+    repo: 'https://github.com/MichengAI/dsh-codex-ui',
   },
   {
     id: 'usage-billing',
@@ -2625,6 +2630,7 @@ const MANAGED_NPM_PLUGINS = [
     description: '按会话日志聚合真实用量，给出侧边栏成本指标和完整的多供应商计费面板。',
     icon: '📊',
     category: '用量统计',
+    repo: 'https://github.com/kenz1117/dsh-ui-usage-billing',
   },
   {
     id: 'chat-import',
@@ -2635,6 +2641,7 @@ const MANAGED_NPM_PLUGINS = [
     description: '把 Claude Code、Codex、ChatGPT、Cursor、Gemini 等历史对话导入 DSH，变成可继续的会话。',
     icon: '📥',
     category: '数据迁移',
+    repo: 'https://github.com/Nwflower/dsh-chat-import',
   },
   {
     id: 'skills-manager',
@@ -2646,6 +2653,7 @@ const MANAGED_NPM_PLUGINS = [
     description: '把散落在本机与项目里的 Agent 技能集中到 DSH：按来源搜索、查看正文、控制启停（不改来源文件），也能创建 / 导入技能，误删可从回收站恢复。',
     icon: '🧠',
     category: '技能管理',
+    repo: 'https://github.com/MichengAI/dsh-skills-manager',
   },
   {
     id: 'sidebar-qa',
@@ -2656,6 +2664,7 @@ const MANAGED_NPM_PLUGINS = [
     description: '在对话里划选文本 → 右侧面板内嵌问答：自动开一个同工作区的独立会话，主对话零打断。依赖「增强侧边栏」。',
     icon: '💬',
     category: '界面增强',
+    repo: 'https://github.com/ChenRuoT/dsh-sidebar-qa',
   },
   {
     id: 'rewind',
@@ -2667,8 +2676,58 @@ const MANAGED_NPM_PLUGINS = [
     description: '一键就地回退到任意更早的用户消息：同窗口完成、不新建分支，可连同工作区文件一起还原（完整 Claude Code /rewind 语义）。',
     icon: '⏪',
     category: '会话管理',
+    repo: 'https://github.com/SiriLee/dsh-rewind',
+  },
+  {
+    id: 'context',
+    order: 80,
+    npm: 'dsh-context',
+    name: '上下文洞察',
+    subtitle: 'dsh-context',
+    description: '跨会话的上下文仪表盘、上下文浏览器与 /context 命令：看清上下文由什么构成、怎么演变。',
+    icon: '🧭',
+    category: '上下文管理',
+    repo: 'https://github.com/bowenliang123/dsh-context',
+    official: true, // Deepseek 官方推荐（手动安装项）
   },
 ]
+
+// 插件市场不在上面这份注册表里（它有自己的安装/卸载流程），仓库单独声明一处，卡片与跳转共用。
+const PLUGIN_MARKET_REPO = 'https://github.com/dsh-market/dsh-market'
+
+/**
+ * 卡片标题要跳转的 GitHub 仓库（归一化后的 https 地址；没有就返回空串）。
+ * 只在注册表与本文件的声明里找，不做任何猜测 —— 拿不到地址的卡片标题保持不可点的纯文本
+ * （手机连接随启动器分发、没有公开仓库，就是这种）。
+ */
+function pluginRepoOf(id) {
+  const pid = String(id || '')
+  if (pid === 'dshmarket') return pluginRepo.normalizeRepo(PLUGIN_MARKET_REPO)
+  const def = MANAGED_NPM_PLUGINS.find((d) => d.id === pid)
+  return pluginRepo.normalizeRepo(def ? def.repo : '')
+}
+
+/**
+ * 卡片上的归属标签（一枚或多枚，筛选就按 key 算）：
+ *   preinstall —— DSHL 预装集合：注册表声明 autoInstall 的那批 + 插件市场 + 手机连接。
+ *   official   —— Deepseek 官方推荐：注册表里声明 official 的那几个（插件市场也在内）。
+ * key 是筛选依据、label 只给人看：用户把某个预装插件的自动安装关掉后，label 换成中性的状态说明
+ * （已关闭自动安装 / 不自动安装 / payload 不可用 / 已关闭），但它**仍然算预装集合成员** ——
+ * 否则一次关闭就把它从「DSHL预装」里筛没了，与「按注册表意图分组」这套口径对不上。
+ */
+function pluginTagsOf(opts) {
+  const o = opts || {}
+  const out = []
+  if (o.preset) {
+    out.push({
+      key: 'preinstall',
+      label: o.autoInstall ? 'DSHL预装' : String(o.offLabel || '已关闭自动安装'),
+      tone: o.autoInstall ? 'preinstall' : 'muted',
+    })
+  }
+  if (o.official) out.push({ key: 'official', label: '官方推荐', tone: 'official' })
+  return out
+}
 
 // npm 侧最新版本缓存：只影响卡片上「可更新」提示，不阻塞渲染；进插件页/点刷新时补一次。
 const npmVersionCache = new Map() // npm 包名 -> { version, at }
@@ -2678,6 +2737,10 @@ const NPM_VERSION_TTL_MS = 10 * 60 * 1000
 
 // 「一键安装所有预装插件」进度：主进程持状态、前台只读，窗口重开也能接上进度显示。
 let pluginInstallAllRunning = false
+// 这一批在做什么：'install'（一键安装 —— 装完把重启留给用户点「立即重启生效」）
+// 或 'update'（一键更新 —— 全部更新完由流程自己重启一次，见 updateAllManagedPlugins）。
+// 两个入口共用同一把锁和同一份进度，所以页面上两个按钮不会各跑各的、也不会同时改写同一份 profile。
+let pluginBatchKind = ''
 let pluginInstallAllTarget = 0
 let pluginInstallAllDone = 0
 let pluginInstallAllCurrent = ''
@@ -2812,6 +2875,7 @@ async function installAllManagedPlugins() {
   const releaseProfileOp = tryBeginProfileOp('一键安装所有预装插件')
   if (!releaseProfileOp) return profileBusyError()
   pluginInstallAllRunning = true
+  pluginBatchKind = 'install'
   pluginInstallAllTarget = 0
   pluginInstallAllDone = 0
   pluginInstallAllCurrent = ''
@@ -2859,6 +2923,7 @@ async function installAllManagedPlugins() {
     }
   } finally {
     pluginInstallAllRunning = false
+    pluginBatchKind = ''
     pluginInstallAllCurrent = ''
     pluginInstallAllError = stopFailed || (failed.length ? failed.join('；') : '')
     releaseProfileOp()
@@ -2871,6 +2936,96 @@ async function installAllManagedPlugins() {
   if (failed.length) return { ok: false, error: failed.join('；'), installed, skipped, failed: failed.length }
   if (!installed && !skipped) return { ok: true, installed: 0, skipped: 0, message: '所有插件都已安装' }
   return { ok: true, installed, skipped, pendingRestart: installed > 0 }
+}
+
+/** 本页所有「可更新」的插件。目标与卡片同源：都来自 buildPluginCatalog 的 outdated。 */
+function outdatedManagedPluginTargets() {
+  const targets = []
+  for (const card of buildPluginCatalog(market.getState(), bridge.getState(), Config.pluginNotes)) {
+    if (!card.outdated) continue
+    const def = MANAGED_NPM_PLUGINS.find((d) => d.id === card.id)
+    if (def) targets.push({ key: def.id, label: def.name, run: () => runNpmPluginAction(def, 'update', { defer: true }) })
+    else if (card.id === 'bridge-next') targets.push({ key: 'bridge-next', label: '手机连接', run: () => reinstallRemoteConnectManaged({ defer: true }) })
+  }
+  return targets
+}
+
+/**
+ * 「一键更新」：把所有**可更新**的插件更新一遍 —— 全程只停一次服务、中途不重启，
+ * **全部完成后统一重启一次** DSH 生效（这是它与「一键安装」的唯一区别：后者把重启留给用户点）。
+ * 目标清单来自 buildPluginCatalog 的 outdated，与卡片上写着「可更新到 vX」的那批永远同一份，
+ * 所以按钮不会去动一张没标可更新的卡片。
+ */
+async function updateAllManagedPlugins() {
+  if (pluginInstallAllRunning) return { ok: false, error: '插件批量操作正在进行中' }
+  // 同步占锁（在第一个 await 之前）：与 IPC 入口的检查之间没有可插入的窗口
+  const releaseProfileOp = tryBeginProfileOp('一键更新所有插件')
+  if (!releaseProfileOp) return profileBusyError()
+  pluginInstallAllRunning = true
+  pluginBatchKind = 'update'
+  pluginInstallAllTarget = 0
+  pluginInstallAllDone = 0
+  pluginInstallAllCurrent = ''
+  pluginInstallAllError = ''
+  broadcastState()
+  const failed = []
+  let updated = 0
+  let stopFailed = null
+  try {
+    // 先把 npm 侧最新版补齐再挑目标：缓存过期或从没查过时，「可更新」判定会漏掉插件，
+    // 点一下按钮却什么都没发生是最难解释的那种失败。
+    await checkManagedPluginUpdates()
+    const targets = outdatedManagedPluginTargets()
+    pluginInstallAllTarget = targets.length
+    if (targets.length) {
+      // 只在最开始停一次服务；之后的更新都在服务停止状态下进行
+      const stop = await stopServiceForPluginChange()
+      if (!stop.ok) {
+        stopFailed = stop.error
+        log('[plugins] 一键更新中止：' + stop.error)
+      } else {
+        for (const target of targets) {
+          pluginInstallAllCurrent = target.label
+          broadcastState()
+          let r
+          try { r = await target.run() } catch (e) { r = { ok: false, error: (e && e.message) || String(e) } }
+          if (r && r.ok) {
+            updated++
+            clearPluginEnvFailure(target.key)
+            notePluginReleaseAgeRetry(r.releaseAge)
+          } else {
+            failed.push(target.label + '：' + ((r && r.error) || '未知原因'))
+            notePluginEnvFailure(target.key, 'update', (r && r.env) || market.classifyEnvFailure(String((r && r.error) || '')))
+            log('[plugins] 一键更新失败 ' + target.label + '：' + ((r && r.error) || '未知原因'))
+          }
+          pluginInstallAllDone++
+          broadcastState()
+        }
+      }
+    }
+  } finally {
+    pluginInstallAllRunning = false
+    pluginBatchKind = ''
+    pluginInstallAllCurrent = ''
+    pluginInstallAllError = stopFailed || (failed.length ? failed.join('；') : '')
+    releaseProfileOp()
+    broadcastState()
+  }
+  if (stopFailed) return { ok: false, error: stopFailed, updated }
+  if (!updated) {
+    // 一个都没更新成：没有可更新的（正常收尾）或全失败了（报错），两种情况都不重启
+    if (failed.length) return { ok: false, error: failed.join('；'), updated: 0, failed: failed.length }
+    return { ok: true, updated: 0, message: '所有插件都已是最新' }
+  }
+  // 全部更新完 → 只在这里重启一次，这就是「更新完所有的一起重启」的落点
+  const applied = await applyPendingPluginChanges()
+  broadcastState()
+  const restarted = !!(applied && applied.ok)
+  notify('DeepSeek Harness', restarted
+    ? ('已更新 ' + updated + ' 个插件，服务已重启生效')
+    : ('已更新 ' + updated + ' 个插件，但重启失败，请到控制台重试'), undefined, 'recovery')
+  if (failed.length) return { ok: false, error: failed.join('；'), updated, restarted, failed: failed.length }
+  return { ok: restarted, updated, restarted, error: restarted ? '' : '重启失败' }
 }
 
 // ---------- 推荐插件（npm 分发）：默认自动安装 ----------
@@ -3317,6 +3472,8 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
           ? (disabled ? { label: '已关闭', tone: 'muted' } : (outdated ? { label: '可更新', tone: 'warn' } : { label: toggle ? '已启用' : '已安装', tone: 'ok' }))
           : { label: '未安装', tone: 'muted' })))
     const actions = pluginCardActions({ busy, installed: !!raw.installed, outdated, latestVersion: latest, name: d.name })
+    // 自动安装是否仍然生效（用户手动卸载过就不再自动装回）：卡片字段与标签文案共用这一份判断
+    const autoOn = !!(d.autoInstall && !pluginAutoDeclined(d.id))
     return {
       note: noteOf(d.id),
       id: d.id,
@@ -3330,6 +3487,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       icon: d.icon,
       category: d.category,
       sourceLabel: 'npm 官方源',
+      repo: pluginRepoOf(d.id),
       installed: !!raw.installed,
       enabled: !!raw.installed && !disabled,
       version: installedVersion, // 展示真实版本，不展示 ^1.2.6 这种依赖范围
@@ -3340,8 +3498,8 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       error: raw.error || '',
       activation: activationText(d.npm),
       lastChange: raw.lastChange || '',
-      autoInstall: !!(d.autoInstall && !pluginAutoDeclined(d.id)),
-      autoInstallLabel: d.autoInstall ? (pluginAutoDeclined(d.id) ? '已关闭自动安装' : '预装 (推荐开启)') : '手动安装',
+      autoInstall: autoOn,
+      tags: pluginTagsOf({ preset: !!d.autoInstall, official: !!d.official, autoInstall: autoOn }),
       toggleAction: toggle ? 'toggle' : '', // 装/卸走下方按钮；开关走 user patch layer 的真实启停
       status,
       actions,
@@ -3360,6 +3518,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       icon: '🧩',
       category: '发现与管理',
       sourceLabel: 'npm 官方源',
+      repo: pluginRepoOf('dshmarket'),
       installed: !!m.installed,
       enabled: !!m.installed && !marketDisabled,
       version: m.version || '',
@@ -3371,7 +3530,12 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       activation: activationText(market.PLUGIN_NAME),
       lastChange: m.lastChange || '',
       autoInstall: !Config.pluginMarketDeclined,
-      autoInstallLabel: Config.pluginMarketDeclined ? '不自动安装' : '预装 (推荐开启)',
+      tags: pluginTagsOf({
+        preset: true, // 随启动器代装
+        official: true, // Deepseek 官方推荐
+        autoInstall: !Config.pluginMarketDeclined,
+        offLabel: '不自动安装',
+      }),
       toggleAction: marketToggle ? 'toggle' : '',
       status: marketStatus,
       actions: marketActions,
@@ -3387,6 +3551,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       icon: '📱',
       category: '远程连接',
       sourceLabel: '随启动器分发',
+      repo: '', // 随启动器分发、没有公开仓库：标题保持不可点
       installed: bridgeInstalled,
       enabled: bridgeEnabled,
       version: b.installedPackageVersion || b.version || '',
@@ -3398,15 +3563,22 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       activation: activationText(bridge.PLUGIN_NAME),
       lastChange: b.lastChange || '',
       autoInstall: bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
-      autoInstallLabel: bridgeEnabled ? (bridgePayloadReady ? '预装 (推荐开启)' : 'payload 不可用') : '已关闭',
+      tags: pluginTagsOf({
+        preset: true, // 随启动器分发
+        autoInstall: bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
+        offLabel: bridgeEnabled ? (bridgePayloadReady ? '已关闭自动安装' : 'payload 不可用') : '已关闭',
+      }),
       toggleAction: 'toggle', // 开关有真实语义：开启=装插件，关闭=卸载插件
       status: bridgeStatus,
       actions: bridgeActions,
     },
     ...npmEntries,
-    // 排序契约：预装集合（插件市场、手机连接 + 注册表声明 autoInstall 的那批）排前面，手动安装的排后面，
-    // 各组内按注册表的 order。这样用户一眼看到的就是「默认会给我装什么」，而不是一张混排清单。
-  ].sort((a, z) => (a.preset === z.preset ? a.order - z.order : (a.preset ? -1 : 1)))
+    // 排序契约：**已安装的一律排前面**（主键，与右上角「N 个已安装」同一个口径：都按 installed 字段算），
+    // 其次才是预装集合（插件市场、手机连接 + 注册表声明 autoInstall 的那批）排在手动安装的前面，
+    // 同组内按注册表的 order。未安装的卡片一律沉到底部，不会插在已安装的中间。
+  ].sort((a, z) => (a.installed === z.installed
+    ? (a.preset === z.preset ? a.order - z.order : (a.preset ? -1 : 1))
+    : (a.installed ? -1 : 1)))
 }
 
 // ---------- 通知 ----------
@@ -5078,6 +5250,7 @@ function stateJson() {
     plugins: buildPluginCatalog(marketState, bridgeState, Config.pluginNotes),
     pluginInstallAll: {
       running: pluginInstallAllRunning,
+      kind: pluginBatchKind, // 'install' | 'update'：两个按钮据此决定谁显示进度
       target: pluginInstallAllTarget,
       done: pluginInstallAllDone,
       current: pluginInstallAllCurrent,
@@ -5517,6 +5690,13 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
 
         case 'openChangelog': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher/releases') } catch { /* noop */ } return '{}'
+        case 'openPluginRepo': {
+          // 只收插件 id、不收 URL：跳转地址在主进程按注册表拼，渲染层无法借这条命令打开任意站点。
+          const url = pluginRepo.releasesUrl(pluginRepoOf(value && value.id))
+          if (!url) return JSON.stringify({ ok: false, error: '该插件没有声明 GitHub 仓库' })
+          try { shell.openExternal(url) } catch { /* noop */ }
+          return JSON.stringify({ ok: true, url })
+        }
         case 'toggleAutostart': setAutostart(!autostartEnabled()); broadcastState(); return '{}'
         case 'testNotify': notify('DeepSeek Harness', '测试通知：链路正常，点击本通知打开 DeepSeek Harness', WEB_URL); return '{}'
         case 'setZoom': {
@@ -5778,11 +5958,18 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'pluginSetNote': return JSON.stringify(setManagedPluginNote(value && value.id, value && value.text))
         case 'pluginsApplyRestart': return JSON.stringify(await withProfileOp('重启生效', () => applyPendingPluginChanges()))
         case 'pluginsInstallAll': {
-          if (pluginInstallAllRunning) return JSON.stringify({ ok: false, error: '一键安装正在进行中' })
+          if (pluginInstallAllRunning) return JSON.stringify({ ok: false, error: '插件批量操作正在进行中' })
           if (profileOpBusy()) return JSON.stringify(profileBusyError())
           // 后台跑：立刻回执让按钮进入进度态，安装明细随后由 state 推送刷新。
           // 锁由 installAllManagedPlugins 自己在第一个 await 之前同步占用。
           void installAllManagedPlugins()
+          return JSON.stringify({ ok: true, started: true })
+        }
+        case 'pluginsUpdateAll': {
+          if (pluginInstallAllRunning) return JSON.stringify({ ok: false, error: '插件批量操作正在进行中' })
+          if (profileOpBusy()) return JSON.stringify(profileBusyError())
+          // 同上：后台跑、进度由 state 推送；更新完由流程自己重启一次服务（不是留给用户点）
+          void updateAllManagedPlugins()
           return JSON.stringify({ ok: true, started: true })
         }
         case 'pluginAction': {
@@ -6493,7 +6680,11 @@ function systemZoom() {
   try {
     if (IS_WIN) {
       const pct = Math.round(screen.getPrimaryDisplay().scaleFactor * 100)
-      if (pct >= 75 && pct <= 200) return pct
+      // 75–500 是「这确实是个缩放值」的合法区间（Windows 自定义缩放上限就是 500%），
+      // 挡在这里的只有异常读数，挡下来就 fail-closed 回退 100%。
+      // 上界曾经卡在 200，于是 225%/250% 这些合法值被当成异常 → 回退 100% →
+      // 4K 笔记本（Windows 推荐 250%）的默认缩放反而比 1080p 笔记本（125%）还小，正好反了。
+      if (pct >= 75 && pct <= 500) return pct
     }
   } catch { /* noop */ }
   return 100
@@ -6501,6 +6692,7 @@ function systemZoom() {
 
 // 对话界面默认缩放：仍按系统 DPI 收敛到 100–125%；控制台缩放不参与这个推导。
 // 锚点：系统 150% → 125%，避免 100% 系统缩到 83%、200% 系统放到 167%。
+// 「控制台缩放」和「对话界面缩放」的默认值都取自这里（见 init()），两者同源同值。
 function defaultWebZoomPct() {
   const corrected = Math.round(systemZoom() * (IS_WIN ? 100 / 120 : 1))
   return Math.min(Math.max(corrected, 100), 125)

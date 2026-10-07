@@ -11,6 +11,7 @@ const html = read('ui-src/index.html')
 const app = read('ui-src/app.js')
 const main = read('main.js')
 const css = read('ui-src/console.css')
+const pluginRepo = require('../plugin-repo')
 
 test('左侧新增插件导航，插件页容器与搜索/筛选入口齐全', () => {
   assert.match(html, /id="navPlugins"[^>]*data-page="plugins"/, '应有插件一级导航')
@@ -20,31 +21,36 @@ test('左侧新增插件导航，插件页容器与搜索/筛选入口齐全', (
   assert.match(html, /data-plugin-filter="all"/, '应支持按安装状态筛选')
   assert.match(html, /id="btnPluginsInstallAll"/, '顶部应有一键安装按钮')
   assert.match(html, /一键安装所有预装插件/, '顶部按钮应写明「一键安装所有预装插件」')
+  assert.match(html, /id="btnPluginsUpdate"/, '顶部应有一键更新按钮')
+  assert.match(html, /id="btnPluginsUpdate"[^>]*>一键更新</, '一键更新按钮文案')
   assert.match(html, /id="btnPluginsRefresh"/, '工具栏应有刷新按钮')
-  assert.match(html, /class="plugin-toolbar-actions"/, '操作按钮应与搜索/筛选同排')
+  assert.match(html, /class="plugin-toolbar-actions"/, '应有操作按钮组')
   assert.match(html, /id="navPlugins"[^>]*title="预装插件"/, '导航应叫「预装插件」')
   assert.match(html, /<span>预装插件<\/span>/, '导航文字应为「预装插件」')
   assert.match(html, /<span class="page-title">预装插件<\/span>/, '页面标题应为「预装插件」')
 })
 
-test('预装插件页：定位说明 + 绿色「预装 (推荐开启)」标签', () => {
+test('预装插件页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方推荐」两枚标签', () => {
   assert.match(html, /class="plugin-page-intro"/, '页面应有定位说明条')
   assert.match(html, /不是插件管理器/, '说明里要写清本页不是插件管理器')
   assert.match(html, /DSH 窗口内的「插件市场」/, '说明里要指路 DSH 内置插件市场')
   assert.doesNotMatch(html, /btnOpenDshMarket/, '说明条不再放跳转按钮（已按用户要求去掉）')
   assert.doesNotMatch(main, /openDshPluginMarket/, '不应保留页面驱动的市场跳转实现')
   assert.doesNotMatch(app, /btnOpenDshMarket/, '渲染层不应再有跳转按钮接线')
-  assert.match(main, /'预装 \(推荐开启\)'/, '默认代装标签应为「预装 (推荐开启)」')
-  assert.match(main, /bridgePayloadReady \? '预装 \(推荐开启\)' : 'payload 不可用'/, '手机连接（远程连接）也要标预装')
-  assert.match(app, /plugin-badge-preinstall/, '来源/代装标签应渲染绿色胶囊')
+  assert.match(main, /label: o\.autoInstall \? 'DSHL预装' : String\(o\.offLabel/, 'DSHL 预装这枚标签应叫「DSHL预装」')
+  assert.match(main, /key: 'official', label: '官方推荐', tone: 'official'/, '官方推荐是第二枚标签')
+  assert.match(main, /bridgePayloadReady \? '已关闭自动安装' : 'payload 不可用'/, '手机连接（远程连接）也是预装集合成员')
+  assert.match(app, /plugin-badge-preinstall/, 'DSHL预装标签应渲染绿色胶囊')
+  assert.match(app, /plugin-badge-official/, '官方推荐标签要渲染另一种胶囊')
   assert.match(css, /\.plugin-badge-preinstall \{\n  flex: none;/, '标签应是标题行右端的胶囊（不再跟在包名后面）')
   assert.match(css, /\.plugin-badge-preinstall \{[^}]*font-size: 15px;/, '标签字号应比标题（14.5px）大一号')
-  assert.match(css, /\.plugin-badge-preinstall\.muted/, '非「预装 (推荐开启)」的状态说明应有中性灰样式')
+  assert.match(css, /\.plugin-badge-official \{[^}]*font-size: 15px;/, '官方推荐与预装标签同尺寸，只换色调')
+  assert.match(css, /\.plugin-badge-preinstall\.muted/, '非正常预装的状态说明应有中性灰样式')
   // 卡片紧凑版契约：自适应列宽 + 说明最多两行 + 小一档的按钮 + 标签挂在标题行
   assert.match(css, /repeat\(auto-fill, minmax\(320px, 1fr\)\)/, '卡片网格应按最小 320px 自适应列宽')
   assert.match(css, /-webkit-line-clamp: 2/, '插件说明最多两行（长描述不撑高卡片）')
   assert.match(css, /\.plugin-action-btn \{ height: 30px;/, '操作按钮比全局 .btn 小一档')
-  assert.match(app, /head\.appendChild\(tag\)/, '来源标签应挂在标题行右端')
+  assert.match(app, /head\.appendChild\(wrap\)/, '标签组应挂在标题行右端')
   // 备注编辑已按用户要求整体移除，避免留下点不到的入口
   assert.doesNotMatch(app, /plugin-note-toggle/, '渲染层不应再有备注入口')
   assert.doesNotMatch(app, /pluginSetNote/, '渲染层不应再调用备注保存命令')
@@ -84,7 +90,7 @@ test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.ok(!/dataset\.mode = mode/.test(app), '提示条不应再按模式切换')
   assert.match(app, /'立即重启生效'/, '按钮文案统一为立即重启生效')
   assert.match(main, /toggleAction: toggle \? 'toggle' : ''/, '可识别的 npm 插件安装后应显示真实开关')
-  assert.match(app, /function renderInstallAll\(info\)/, '控制台应渲染一键安装进度')
+  assert.match(app, /function renderInstallAll\(info, list\)/, '控制台应渲染一键安装进度')
 })
 
 test('插件动作全程有反馈：点击即说明在做什么，结束必须给结果（成功/失败都要说）', () => {
@@ -292,7 +298,7 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
   assert.deepEqual(deferCalls, [], '停不下来就一个都别装')
 })
 
-test('推荐插件注册表：七个 npm 插件 + 通用动作/更新检查', () => {
+test('推荐插件注册表：八个 npm 插件 + 通用动作/更新检查', () => {
   assert.match(main, /const MANAGED_NPM_PLUGINS = \[/, '主进程应有推荐插件注册表')
   for (const npm of [
     'dsh-better-sidebar',
@@ -302,6 +308,7 @@ test('推荐插件注册表：七个 npm 插件 + 通用动作/更新检查', ()
     '@michengai/dsh-skills-manager',
     'dsh-sidebar-qa',
     'dsh-rewind-plugin',
+    'dsh-context',
   ]) {
     assert.ok(main.includes("'" + npm + "'"), '注册表缺少 ' + npm)
   }
@@ -321,8 +328,13 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.ok(regStart > 0 && regEnd > regStart, '找不到 MANAGED_NPM_PLUGINS 字面量')
   const registry = new Function(main.slice(regStart, regEnd) + '; return MANAGED_NPM_PLUGINS')()
 
+  // 插件市场的仓库声明在注册表外（它有自己的安装/卸载流程）：取真值，避免测试里再抄一份 URL
+  const marketRepoMatch = /const PLUGIN_MARKET_REPO = '([^']+)'/u.exec(main)
+  assert.ok(marketRepoMatch, '找不到 PLUGIN_MARKET_REPO')
+  const marketRepo = marketRepoMatch[1]
+
   // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
-  assert.equal(registry.length, 7, '推荐插件（npm 分发）应为 7 个（会话归档 / MCP Lens 已摘出）')
+  assert.equal(registry.length, 8, '推荐插件（npm 分发）应为 8 个（会话归档 / MCP Lens 已摘出）')
   assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
   assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
   for (const d of registry) {
@@ -330,6 +342,10 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
       assert.ok(String(d[field] === undefined ? '' : d[field]).trim() !== '', `${d.id} 缺少字段 ${field}`)
     }
     assert.match(d.npm, /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u, `${d.id} 的 npm 包名不合法：${d.npm}`)
+    // 标题要跳到 GitHub 发布页：每条推荐插件都得声明仓库，且存的就是归一化形式
+    // （不合法/缺失都会被解析成空串，标题就不再可点 —— 这里把它钉成契约，别让卡片悄悄少一个入口）
+    assert.ok(d.repo, `${d.id} 缺少 repo（标题会不可点）`)
+    assert.equal(pluginRepo.normalizeRepo(d.repo), d.repo, `${d.id} 的 repo 应是归一化的 GitHub 仓库地址：${d.repo}`)
   }
 
   // 3. 真 buildPluginCatalog + 真 pluginCardActions：每个注册项都必须渲染成一张卡片
@@ -343,11 +359,15 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     sliceFn('function cleanInstalledVersion(spec) {', '\n}\n'),
     sliceFn('function pluginBusyLabel(action) {', '\n}\n'),
     sliceFn('function pluginCardActions(opts) {', '\n}\n'),
+    sliceFn('function pluginRepoOf(id) {', '\n}\n'),
+    sliceFn('function pluginTagsOf(opts) {', '\n}\n'),
     sliceFn('function buildPluginCatalog(marketState, bridgeState, notes) {', '\n}\n'),
   ].join('\n')
   const installed = new Set(registry.map((d) => d.npm))
   const ctx = {
     MANAGED_NPM_PLUGINS: registry,
+    PLUGIN_MARKET_REPO: marketRepo,
+    pluginRepo,
     Config: { pluginMarketDeclined: false, pluginNotes: {}, remoteConnect: { enabled: true, declined: false } },
     pluginActionBusy: new Map(),
     market: {
@@ -382,10 +402,13 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     const card = catalog.find((c) => c.id === d.id)
     assert.ok(card, '注册表里的 ' + d.id + ' 没有渲染成卡片')
     assert.equal(card.name, d.name, d.id + ' 卡片标题应与注册表一致')
+    assert.equal(card.repo, d.repo, d.id + ' 卡片要带上注册表声明的仓库（标题据此可点）')
     assert.ok(card.status && card.status.label, d.id + ' 卡片缺少状态文案')
     assert.ok(card.actions.length >= 1, d.id + ' 卡片缺少操作按钮')
     assert.ok(card.icon && card.category && card.description, d.id + ' 卡片缺少图标/分类/说明')
   }
+  assert.equal(catalog.find((c) => c.id === 'dshmarket').repo, marketRepo, '插件市场卡片要带上它的仓库')
+  assert.equal(catalog.find((c) => c.id === 'bridge-next').repo, '', '没有仓库的卡片给空串：标题保持不可点')
   // 排序契约：预装（插件市场 / 手机连接 / 注册表声明 autoInstall 的那批）排前面，手动安装的排后面，
   // 各组内按注册表 order —— 用户一眼看到的就是「默认会给我装什么」。
   assert.deepEqual(catalog.map((c) => c.id), [
@@ -398,9 +421,10 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'codex-ui',
     'chat-import',
     'sidebar-qa',
+    'context',
   ], '卡片顺序应为「预装在前、手动在后」，各组内按 order')
   assert.deepEqual(catalog.filter((c) => !c.preset).map((c) => c.id), [
-    'better-sidebar', 'codex-ui', 'chat-import', 'sidebar-qa',
+    'better-sidebar', 'codex-ui', 'chat-import', 'sidebar-qa', 'context',
   ], 'preset=false 的应恰好是手动安装的那批')
   assert.equal(catalog.findIndex((c) => !c.preset), catalog.filter((c) => c.preset).length,
     '预装卡片必须全部连续排在前面（不与手动项交错）')
@@ -448,6 +472,56 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     '忙态释放后按钮要回来',
   )
 
+  // 3d. 排序契约：**已安装的一律排前面**（与右上角「N 个已安装」同一个口径），
+  //     未安装的沉底、不许插在已安装的中间；同一组内仍是「预装 → 手动」+ 注册表 order。
+  assert.match(main, /\.sort\(\(a, z\) => \(a\.installed === z\.installed/, '排序主键必须是 installed')
+  assert.match(main, /a\.preset === z\.preset \? a\.order - z\.order : \(a\.preset \? -1 : 1\)/, '次键仍是「预装 → 手动」+ order')
+  assert.match(app, /const installedCount = list\.filter\(\(p\) => p\.installed\)\.length/,
+    '右上角计数与置顶分组必须同一个口径，否则「N 个已安装」会和排在上面的卡片数对不上')
+
+  const notInstalled = ['@michengai/dsh-codex-ui', 'dsh-chat-import', 'dsh-sidebar-qa']
+  for (const npm of notInstalled) installed.delete(npm)
+  const mixed = build(marketArg, bridgeArg, {})
+  assert.deepEqual(mixed.map((c) => c.id), [
+    'dshmarket',
+    'bridge-next',
+    'usage-billing',
+    'skills-manager',
+    'rewind',
+    'better-sidebar',
+    'context', // 手动安装但已装上 → 排在未安装的三张之前（这就是「已安装优先」要的效果）
+    'codex-ui',
+    'chat-import',
+    'sidebar-qa',
+  ], '已安装的在前；已安装组内「预装 → 手动」，未安装组内同样')
+  const installedCount = mixed.filter((c) => c.installed).length
+  assert.equal(installedCount, 7, '这组夹具里应有 7 个已安装')
+  assert.equal(mixed.findIndex((c) => !c.installed), installedCount,
+    '已安装卡片必须全部连续排在未安装之前（不与未安装项交错）')
+
+  // 3e. 归属标签：一枚插件可以挂多枚（key 是筛选依据，label 只给人看）
+  const tagKeys = (id) => catalog.find((c) => c.id === id).tags.map((t) => t.key)
+  assert.deepEqual(tagKeys('dshmarket'), ['preinstall', 'official'], '插件市场：DSHL预装 + 官方推荐 两枚都有')
+  assert.deepEqual(tagKeys('bridge-next'), ['preinstall'], '手机连接：只有 DSHL预装')
+  assert.deepEqual(tagKeys('usage-billing'), ['preinstall'])
+  assert.deepEqual(tagKeys('better-sidebar'), ['official'], '增强侧边栏是手动安装项，只挂官方推荐')
+  assert.deepEqual(tagKeys('context'), ['official'], '上下文洞察同上')
+  for (const id of ['codex-ui', 'chat-import', 'sidebar-qa']) {
+    assert.deepEqual(tagKeys(id), [], id + '：两枚标签都不带（落进「其他」）')
+  }
+  for (const card of catalog) {
+    for (const t of card.tags) assert.ok(t.key && t.label && t.tone, card.id + ' 的标签缺少 key/label/tone')
+  }
+  // 关掉自动安装之后：label 换成中性状态说明，但 key 还在 —— 不会被「DSHL预装」筛没
+  const tagsOf = new Function(...names, src + '\nreturn pluginTagsOf')(...names.map((k) => ctx[k]))
+  assert.deepEqual(tagsOf({ preset: true, autoInstall: true }), [{ key: 'preinstall', label: 'DSHL预装', tone: 'preinstall' }])
+  assert.deepEqual(tagsOf({ preset: true, autoInstall: false }), [{ key: 'preinstall', label: '已关闭自动安装', tone: 'muted' }])
+  assert.deepEqual(tagsOf({ preset: true, autoInstall: false, offLabel: 'payload 不可用' })[0].label, 'payload 不可用',
+    '关掉自动安装时用调用方给的状态文案')
+  assert.deepEqual(tagsOf({ preset: true, official: true, autoInstall: true }).map((t) => t.label),
+    ['DSHL预装', '官方推荐'], '两枚标签的顺序：先预装、后官方推荐')
+  assert.deepEqual(tagsOf({ preset: false, official: false }), [], '既不是预装也没被官方推荐 → 没有标签')
+
   // 4. 真 pendingAutoInstallPlugins：默认代装集合 = 注册表里 autoInstall 的那批，且只挑缺失的
   const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
   assert.deepEqual(autoIds, [
@@ -457,7 +531,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   ], '默认代装集合应保持稳定（会话归档 / MCP Lens 摘出注册表后只剩这 3 个）')
   for (const d of registry.filter((x) => x.autoInstall)) {
     const card = catalog.find((c) => c.id === d.id)
-    assert.equal(card.autoInstallLabel, '预装 (推荐开启)', d.id + ' 卡片应标「预装 (推荐开启)」')
+    assert.deepEqual(card.tags.map((t) => t.label), ['DSHL预装'], d.id + ' 卡片应标「DSHL预装」')
     assert.match(card.status.label, /已启用|已安装/, d.id + ' 已装时状态应为已启用/已安装')
   }
 
@@ -478,12 +552,207 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.deepEqual(declinedPending().map((d) => d.id), [], '手动卸载过的插件不应再自动补装')
 })
 
+test('点插件标题 → 系统默认浏览器打开它的 GitHub 发布页（渲染层只发 id，地址在主进程拼）', () => {
+  assert.match(main, /function pluginRepoOf\(id\) \{/, '主进程应有唯一的仓库解析入口')
+  assert.match(main, /case 'openPluginRepo': \{/, '应有打开发布页的命令')
+  assert.match(main, /const url = pluginRepo\.releasesUrl\(pluginRepoOf\(value && value\.id\)\)/, '命令必须按插件 id 解析地址')
+  assert.match(main, /shell\.openExternal\(url\)/, '解析出的地址走系统默认浏览器')
+  assert.match(main, /if \(!url\) return JSON\.stringify\(\{ ok: false, error: '该插件没有声明 GitHub 仓库' \}\)/, '没有仓库时明确拒绝，不静默打开别的地址')
+  assert.ok(!require('../trust').LOADING_PAGE_COMMANDS.has('openPluginRepo'),
+    '这条命令不能进说明页白名单：DSH 页面（或它跳转到的站点）拿不到这份信任')
+
+  assert.match(app, /const repo = String\(p\.repo \|\| ''\)/, '渲染层按卡片字段决定标题是否可点')
+  assert.match(app, /document\.createElement\(repo \? 'button' : 'span'\)/, '有仓库才是按钮，没有就是纯文本')
+  assert.match(app, /name\.dataset\.pluginOpen = p\.id/, '可点标题只挂插件 id')
+  assert.match(app, /e\.target\.closest\('button\[data-plugin-open\]'\)/, '点击走卡片容器的既有委托')
+  assert.match(app, /cmd\('openPluginRepo', \{ id: open\.dataset\.pluginOpen \}\)/, '点击只把 id 交给主进程')
+  assert.doesNotMatch(app, /openPluginRepo', \{[^}]*url/u, '渲染层不得把 URL 交给主进程（那等于开放任意跳转）')
+  assert.match(app, /name\.title = '在浏览器打开 GitHub 发布页：'/, '可点标题要说明点了去哪儿')
+  assert.match(css, /button\.plugin-name \{[\s\S]{0,120}?border: 0;/, '按钮要清掉 UA 外观，否则标题会变成带边框的按钮')
+  assert.match(css, /button\.plugin-name:hover/, '可点标题要有 hover 反馈')
+})
+
+test('筛选按钮：六档单选（全部 / DSHL预装 / Deepseek 官方推荐 / 其他 / 已安装 / 未安装），默认全部', () => {
+  for (const f of ['all', 'preinstall', 'official', 'other', 'installed', 'available']) {
+    assert.match(html, new RegExp('data-plugin-filter="' + f + '"'), '筛选按钮缺少 ' + f)
+  }
+  assert.match(html, /class="chip checked" data-plugin-filter="all">全部</, '默认（未点击前）选中的是「全部」')
+  assert.match(html, /data-plugin-filter="preinstall">DSHL预装</, '预装筛选按钮文案应为「DSHL预装」')
+  assert.match(html, /data-plugin-filter="official">Deepseek 官方推荐</, '官方推荐筛选按钮文案')
+  assert.match(html, /data-plugin-filter="other">其他</, '「其他」按钮文案')
+  assert.ok(html.indexOf('id="pluginFilters"') < html.indexOf('id="pluginSearch"'), '筛选按钮组要排在搜索框之前')
+  // 工具栏两行布局：第一行「筛选（左）+ 操作按钮（贴右）」，搜索框独占第二行
+  assert.ok(html.indexOf('class="plugin-toolbar-actions"') < html.indexOf('id="pluginSearch"'),
+    '操作按钮要排在搜索框之前，换行后搜索框才落在下一行')
+  assert.match(css, /\.plugin-toolbar \.plugin-search \{\n  [^}]*flex: 1 1 100%;/,
+    '搜索框要独占一行（flex-basis 100%），否则宽窗口下又会挤回第一行')
+  assert.match(css, /\.plugin-toolbar-actions \{[\s\S]{0,140}?margin-left: auto;/,
+    '操作按钮在同一行贴右对齐')
+  assert.match(css, /\.plugin-filter-sep \{/, '标签维与安装状态维之间要有分隔，免得读成一串同义选项')
+
+  // 跑真 pluginMatches：六档筛选语义逐条核对
+  const start = app.indexOf('function pluginMatches(p, filter, query) {')
+  assert.ok(start > 0, '找不到 pluginMatches')
+  const matches = new Function(app.slice(start, app.indexOf('\n}\n', start) + 3) + '\nreturn pluginMatches')()
+  const P = (over) => Object.assign({ name: 'pkg', subtitle: '', description: '', id: 'pkg', category: '' }, over)
+  const both = P({ installed: true, tags: [{ key: 'preinstall' }, { key: 'official' }] })
+  const officialOnly = P({ installed: false, tags: [{ key: 'official' }] })
+  const presetOff = P({ installed: false, tags: [{ key: 'preinstall', tone: 'muted' }] })
+  const bare = P({ installed: false, tags: [] })
+  assert.equal(matches(both, 'all', ''), true, '「全部」不过滤')
+  assert.equal(matches(both, 'preinstall', ''), true)
+  assert.equal(matches(both, 'official', ''), true, '一枚插件能同时命中两档标签筛选')
+  assert.equal(matches(both, 'other', ''), false, '带标签的不进「其他」')
+  assert.equal(matches(officialOnly, 'preinstall', ''), false, '官方推荐 ≠ DSHL预装')
+  assert.equal(matches(presetOff, 'preinstall', ''), true, '关掉自动安装的仍算 DSHL 预装成员')
+  assert.equal(matches(bare, 'other', ''), true, '「其他」= 两枚标签都不带')
+  assert.equal(matches(officialOnly, 'installed', ''), false, '安装状态档照旧')
+  assert.equal(matches(officialOnly, 'available', ''), true)
+  assert.equal(matches(officialOnly, 'official', 'zzz'), false, '筛选与搜索是叠加的')
+  assert.equal(matches(officialOnly, 'official', 'pkg'), true, '搜索命中就显示')
+  // query 的小写化在调用方做（pluginMatches 收的就是已小写的串）——把这条契约也钉住
+  assert.match(app, /\.value \? \$?\('?pluginSearch'?\)?\.value : ''\)\.trim\(\)\.toLowerCase\(\)|const query = \([\s\S]{0,80}?\.toLowerCase\(\);/,
+    '搜索词应在调用方统一小写后再交给 pluginMatches')
+})
+
+test('一键更新：目标只取「可更新」的卡片（与卡片同一份判定），不可更新的不碰', () => {
+  const start = main.indexOf('function outdatedManagedPluginTargets() {')
+  assert.ok(start > 0, '找不到 outdatedManagedPluginTargets')
+  const src = main.slice(start, main.indexOf('\n}\n', start) + 3)
+  const calls = []
+  const ctx = {
+    MANAGED_NPM_PLUGINS: [
+      { id: 'rewind', name: '对话回退', npm: 'dsh-rewind-plugin' },
+      { id: 'context', name: '上下文洞察', npm: 'dsh-context' },
+      { id: 'chat-import', name: '会话导入', npm: 'dsh-chat-import' },
+    ],
+    // 真卡片目录的形状：市场那一张永远是 outdated:false，它有自己的「重新安装」
+    buildPluginCatalog: () => [
+      { id: 'dshmarket', outdated: false },
+      { id: 'bridge-next', outdated: true },
+      { id: 'rewind', outdated: true },
+      { id: 'context', outdated: true },
+      { id: 'chat-import', outdated: false },
+    ],
+    market: { getState: () => ({}), PROFILE_NAME: 'web' },
+    bridge: { getState: () => ({}) },
+    Config: { pluginNotes: {} },
+    runNpmPluginAction: (d, action, opts) => { calls.push({ id: d.id, action, defer: !!(opts && opts.defer) }); return Promise.resolve({ ok: true }) },
+    reinstallRemoteConnectManaged: (opts) => { calls.push({ id: 'bridge-next', action: 'update', defer: !!(opts && opts.defer) }); return Promise.resolve({ ok: true }) },
+  }
+  const names = Object.keys(ctx)
+  const fn = new Function(...names, src + '\nreturn outdatedManagedPluginTargets')(...names.map((k) => ctx[k]))
+  const targets = fn()
+  assert.deepEqual(targets.map((t) => t.key), ['bridge-next', 'rewind', 'context'], '只取可更新的，按卡片顺序')
+  assert.deepEqual(targets.map((t) => t.label), ['手机连接', '对话回退', '上下文洞察'], '目标要带人类可读的名字（进度要显示）')
+  return Promise.all(targets.map((t) => t.run())).then(() => {
+    assert.deepEqual(calls.map((c) => c.id), ['bridge-next', 'rewind', 'context'], '每个目标都真的被执行')
+    assert.ok(calls.every((c) => c.defer), '更新必须带 defer：否则会更新一个重启一次')
+    assert.deepEqual(calls.filter((c) => c.id !== 'bridge-next').map((c) => c.action), ['update', 'update'], 'npm 插件走 update 动作')
+  })
+})
+
+test('一键更新：只停一次服务、全程 defer、全部更新完只重启一次（注入桩执行真实流程）', async () => {
+  const start = main.indexOf('async function updateAllManagedPlugins() {')
+  assert.ok(start > 0, '找不到 updateAllManagedPlugins')
+  const end = main.indexOf('\n}\n', main.indexOf('return { ok: restarted, updated, restarted', start)) + 3
+  const src = main.slice(start, end)
+
+  let targets = []
+  let releaseProfileOp = () => {}
+  let stopped = 0
+  let restarts = 0
+  const notifies = []
+  const ctx = {
+    pluginInstallAllRunning: false,
+    pluginBatchKind: '',
+    pluginInstallAllTarget: 0,
+    pluginInstallAllDone: 0,
+    pluginInstallAllCurrent: '',
+    pluginInstallAllError: '',
+    broadcastState() {},
+    log() {},
+    notify(_title, msg) { notifies.push(msg) },
+    tryBeginProfileOp: () => releaseProfileOp,
+    profileBusyError: () => ({ ok: false, error: '另一个插件操作正在进行', busy: true }),
+    stopServiceForPluginChange: async () => { stopped++; return { ok: true } },
+    checkManagedPluginUpdates: async () => {},
+    outdatedManagedPluginTargets: () => targets,
+    market: { classifyEnvFailure: () => null },
+    clearPluginEnvFailure() {},
+    notePluginEnvFailure() {},
+    notePluginReleaseAgeRetry() {},
+    applyPendingPluginChanges: async () => { restarts++; return { ok: true } },
+  }
+  const names = Object.keys(ctx)
+  const fn = new Function(...names, src + '\nreturn updateAllManagedPlugins')(...names.map((k) => ctx[k]))
+
+  // ① 两个可更新：停一次、更新两个、重启一次
+  const ran = []
+  targets = [
+    { key: 'rewind', label: '对话回退', run: async () => { ran.push('rewind'); return { ok: true } } },
+    { key: 'context', label: '上下文洞察', run: async () => { ran.push('context'); return { ok: true } } },
+  ]
+  const r = await fn()
+  assert.deepEqual(ran, ['rewind', 'context'], '两个可更新的都要更新到')
+  assert.equal(stopped, 1, '整个批量流程只应停一次服务')
+  assert.equal(restarts, 1, '全部更新完只重启一次 —— 这是这个按钮的核心语义')
+  assert.equal(r.ok, true)
+  assert.equal(r.updated, 2)
+  assert.equal(r.restarted, true)
+  assert.equal(ctx.pluginInstallAllRunning, false, '跑完必须释放批量锁')
+  assert.equal(ctx.pluginBatchKind, '', '跑完必须清掉批次标记')
+  assert.match(notifies.join('|'), /已更新 2 个插件/, '结果要说一声')
+
+  // ② 没有可更新的：不停服、不重启（点了没反应是最难解释的失败，所以要有明确回执）
+  targets = []
+  stopped = 0; restarts = 0; notifies.length = 0
+  const idle = await fn()
+  assert.equal(idle.ok, true)
+  assert.equal(idle.updated, 0)
+  assert.equal(idle.message, '所有插件都已是最新')
+  assert.equal(stopped, 0, '没有可更新的就不该停服务')
+  assert.equal(restarts, 0, '没有可更新的就不该重启')
+
+  // ③ 一个成功一个失败：成功的也要生效 → 仍然重启一次，并把失败项报出来
+  targets = [
+    { key: 'rewind', label: '对话回退', run: async () => ({ ok: true }) },
+    { key: 'context', label: '上下文洞察', run: async () => { throw new Error('npm 源限流') } },
+  ]
+  stopped = 0; restarts = 0
+  const partial = await fn()
+  assert.equal(restarts, 1, '有成功项就必须重启（否则成功的那次更新也不生效）')
+  assert.equal(partial.ok, false)
+  assert.equal(partial.updated, 1)
+  assert.equal(partial.failed, 1)
+  assert.match(partial.error, /上下文洞察：npm 源限流/, '失败原因要带插件名')
+
+  // ④ 拿不到 profile 写锁：一个都不许动
+  releaseProfileOp = null
+  targets = [{ key: 'rewind', label: '对话回退', run: async () => { ran.push('never'); return { ok: true } } }]
+  stopped = 0; restarts = 0
+  const blocked = await fn()
+  assert.equal(blocked.ok, false)
+  assert.equal(stopped, 0, '拿不到锁不得停服务')
+  assert.equal(restarts, 0, '拿不到锁不得重启')
+  assert.ok(!ran.includes('never'), '拿不到锁时不得改任何插件的 profile')
+
+  // ⑤ 接线：按钮 → 命令 → 流程，且确认框要说清「全部更新完自动重启一次」
+  assert.match(main, /case 'pluginsUpdateAll': \{/, '应有 pluginsUpdateAll 命令')
+  assert.match(main, /void updateAllManagedPlugins\(\)/, '命令要真的启动更新流程')
+  assert.match(app, /\$\('btnPluginsUpdate'\)\.addEventListener\('click'/, '按钮要接点击')
+  assert.match(app, /cmd\('pluginsUpdateAll'\)/, '点击要发 pluginsUpdateAll')
+  assert.match(app, /全部更新完自动重启一次 DSH 生效/, '确认框要写明最后会重启一次')
+  assert.match(app, /kind === 'update'/, '进度要按批次类型显示在正确的按钮上')
+  assert.match(app, /desc\.title = p\.description/, '说明被截断时要有悬停全文')
+})
+
 test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
   assert.doesNotMatch(html, /id="pluginMarketState"/, '设置页不应再保留插件市场行')
   assert.doesNotMatch(html, /id="btnRemoteConnect"/, '设置页不应再保留远程连接行')
   assert.doesNotMatch(html, /id="btnRecoveryMarket"/, '恢复页不应再保留插件修复行')
 })
-test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装，界面类保持手动；会话归档与 MCP Lens 已摘出注册表', () => {
+test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装，界面类与上下文洞察保持手动；会话归档与 MCP Lens 已摘出注册表', () => {
   assert.match(main, /pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: \{\}/, '配置应有自动安装与退役清理记账字段')
   assert.match(main, /function pluginAutoDeclined\(id\)/, '应有「用户卸载过」记忆查询')
   assert.match(main, /function notePluginAutoDeclined\(id, declined\)/, '应有「用户卸载过」记账写入')
@@ -502,6 +771,7 @@ test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器�
   assert.doesNotMatch(main, /npm: 'dsh-mcp-lens',\n    name: 'MCP Lens',\n    autoInstall: true,/, 'MCP Lens 改为手动安装（上游 npm 只有预发布版，稳定版校验会拒绝）')
   assert.doesNotMatch(main, /npm: 'dsh-chat-import',\n    name: '会话导入',\n    autoInstall: true,/, '会话导入保持手动安装')
   assert.doesNotMatch(main, /npm: '@michengai\/dsh-codex-ui',\n    name: 'Codex 风格界面',\n    autoInstall: true,/, 'Codex 风格界面默认不安装（只进插件页）')
+  assert.doesNotMatch(main, /npm: 'dsh-context',\n    name: '上下文洞察',\n    autoInstall: true,/, '上下文洞察保持手动安装')
 
   const triggers = main.match(/void maybeAutoInstallRecommendedPlugins\(\)/g) || []
   assert.ok(triggers.length >= 3, '应在启动 / 环境装好 / 服务就绪等触发点补装（实际 ' + triggers.length + ' 处）')
@@ -509,8 +779,8 @@ test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器�
 
   assert.match(main, /notePluginAutoDeclined\(descriptor\.id, false\)/, '手动装回应清除「不再自动安装」')
   assert.match(main, /notePluginAutoDeclined\(descriptor\.id, true\)/, '手动卸载应记下「不再自动安装」')
-  assert.match(main, /autoInstall: !!\(d\.autoInstall && !pluginAutoDeclined\(d\.id\)\)/, '卡片状态应反映自动安装语义')
-  assert.match(app, /p\.autoInstallLabel/, '插件卡片应显示自动安装来源')
+  assert.match(main, /const autoOn = !!\(d\.autoInstall && !pluginAutoDeclined\(d\.id\)\)/, '卡片状态应反映自动安装语义')
+  assert.match(app, /p\.tags/, '插件卡片应渲染归属标签')
 })
 
 test('默认代装：只装缺失且未被卸载的，一次装完全部只重启一次（注入桩执行真实流程）', async () => {
