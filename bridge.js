@@ -67,6 +67,36 @@ const state = {
   busy: '', // '' | 'installing' | 'uninstalling'
   error: '',
   lastChange: '',
+  lastChangeAt: 0, // 回执时刻：它必须有保质期（清理见 clearLastChanges / expireLastChanges）
+}
+
+/** 记一条动作回执（卡片上那行 ✓）：只有成功才写，并带上时刻。 */
+function noteLastChange(text) {
+  state.lastChange = String(text || '')
+  state.lastChangeAt = Date.now()
+}
+
+/** 清掉动作回执（**生效即过期**）：变更真正生效后由主进程调用。@returns {number} 清掉的条数 */
+function clearLastChanges() {
+  if (!state.lastChange) return 0
+  state.lastChange = ''
+  state.lastChangeAt = 0
+  return 1
+}
+
+/**
+ * 清掉超过 maxAgeMs 的动作回执（**超时兜底**）：给"改完一直没重启"的机器收尾。
+ * 没写时刻的老回执不动它。@returns {number} 清掉的条数
+ */
+function expireLastChanges(maxAgeMs) {
+  const ttl = Number(maxAgeMs)
+  if (!Number.isFinite(ttl) || ttl <= 0) return 0
+  if (!state.lastChange) return 0
+  const at = Number(state.lastChangeAt)
+  if (!Number.isFinite(at) || at <= 0 || Date.now() - at < ttl) return 0
+  state.lastChange = ''
+  state.lastChangeAt = 0
+  return 1
 }
 
 function initBridge(opts = {}) {
@@ -527,6 +557,7 @@ function getState() {
     busy: state.busy,
     error: state.error,
     lastChange: state.lastChange,
+    lastChangeAt: state.lastChangeAt,
     plugin: PLUGIN_NAME,
     profile: PROFILE_NAME,
     payloadVersion: payloadVersion(),
@@ -1036,7 +1067,7 @@ async function install(opts = {}) {
     if (!readMaterializedPackageState().patchReady) {
       throw new Error('安装后插件缺少 dsh.bundle.patch 文件')
     }
-    state.lastChange = `已安装远程连接插件 v${payload.version}`
+    noteLastChange(`已安装远程连接插件 v${payload.version}`)
     log('installed ' + payload.version)
     state.busy = ''
     return { ok: true, version: payload.version }
@@ -1062,7 +1093,7 @@ async function uninstall() {
     await runCli(['remove', PLUGIN_NAME, '-w'])
     const after = installed()
     if (after.installed || after.bundle) throw new Error('卸载后 profile 仍记录该插件')
-    state.lastChange = '已卸载远程连接插件'
+    noteLastChange('已卸载远程连接插件')
     log('uninstalled')
     state.busy = ''
     return { ok: true }
@@ -1082,6 +1113,10 @@ module.exports = {
   uninstall,
   verifyPayload,
   payloadVersion,
+  // 动作回执的生命周期（生效即清 / 超时兜底，策略在 main.js）
+  noteLastChange,
+  clearLastChanges,
+  expireLastChanges,
   // 纯函数（测试用）
   pluginStateOf,
   needsInstall,

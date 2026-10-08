@@ -38,9 +38,14 @@ test('pluginStateOf：空/畸形 manifest 不抛错', () => {
   assert.deepEqual(market.pluginStateOf({ dependencies: null, dsh: { profile: { bundles: 'x' } } }), { installed: false, version: '', bundle: false })
 })
 
-test('verifyNpmManifestShape：合法 manifest 返回精确版本', () => {
+test('verifyNpmManifestShape：合法 manifest 返回精确版本 + 它的 peer 声明（门禁预判要用同一份）', () => {
   const r = market.verifyNpmManifestShape({ name: NAME, version: '1.45.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }, NAME)
-  assert.deepEqual(r, { name: NAME, version: '1.45.0' })
+  assert.deepEqual(r, { name: NAME, version: '1.45.0', peerDependencies: {} })
+  const withPeers = market.verifyNpmManifestShape({
+    name: NAME, version: '1.45.0', dsh: { bundle: { patch: './cordis.patch.yml' } },
+    peerDependencies: { '@deepseek-ai/dsh-tools': '^0.2.0', react: '^18.2.0' },
+  }, NAME)
+  assert.deepEqual(withPeers.peerDependencies, { '@deepseek-ai/dsh-tools': '^0.2.0', react: '^18.2.0' })
 })
 
 test('verifyNpmManifestShape：精确的预发布版本也接受（上游只发预览版的插件要能用）', () => {
@@ -48,7 +53,7 @@ test('verifyNpmManifestShape：精确的预发布版本也接受（上游只发�
   // 真实案例：dsh-mcp-lens 在 npm 上只有 0.1.0-rc.9，latest 也指向它
   assert.deepEqual(
     market.verifyNpmManifestShape({ name: NAME, version: '0.1.0-rc.9', ...bundle }, NAME),
-    { name: NAME, version: '0.1.0-rc.9' },
+    { name: NAME, version: '0.1.0-rc.9', peerDependencies: {} },
   )
   for (const v of ['1.4.5-alpha.1', '2.0.0-beta', '1.0.0-0', '1.0.0+build.5', '1.0.0-rc.1+build.5']) {
     assert.equal(market.verifyNpmManifestShape({ name: NAME, version: v, ...bundle }, NAME).version, v, v + ' 是精确版本，应接受')

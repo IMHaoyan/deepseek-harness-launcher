@@ -230,6 +230,9 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
     ],
     market: { getState: () => ({ installed: false }) },
     bridge: { getState: () => ({ installed: false }) },
+    // 门禁预判：这个用例只关心"每个插件都带 defer、全程不重启"，判定本身另有专门用例
+    npmVersionCache: new Map(),
+    pluginGateVerdict: () => ({ state: 'ok', dshVersion: '', peers: [], reason: 'test' }),
     runNpmPluginAction: async (d, action, opts) => { deferCalls.push({ id: d.id, action, defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
     installManagedMarket: async (opts) => { deferCalls.push({ id: "dshmarket", action: "install", defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
     setRemoteConnectManaged: async (enabled, opts) => { deferCalls.push({ id: "bridge-next", action: "install", defer: !!(opts && opts.defer) }); return { ok: true } },
@@ -280,6 +283,8 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
     MANAGED_NPM_PLUGINS: [{ id: 'a', name: '插件A', npm: 'pkg-a' }],
     market: { getState: () => ({ installed: false }) },
     bridge: { getState: () => ({ installed: false }) },
+    npmVersionCache: new Map(),
+    pluginGateVerdict: () => ({ state: 'ok', dshVersion: '', peers: [], reason: 'test' }),
     runNpmPluginAction: async () => { deferCalls.push('a'); return { ok: true } },
     installManagedMarket: async () => { deferCalls.push('m'); return { ok: true } },
     setRemoteConnectManaged: async () => { deferCalls.push('b'); return { ok: true } },
@@ -359,6 +364,9 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     sliceFn('function cleanInstalledVersion(spec) {', '\n}\n'),
     sliceFn('function pluginBusyLabel(action) {', '\n}\n'),
     sliceFn('function pluginCardActions(opts) {', '\n}\n'),
+    sliceFn('function pluginGateReason(name, targetVersion, gate) {', '\n}\n'),
+    sliceFn('function pluginGateConfirmBody(name, targetVersion, gate) {', '\n}\n'),
+    sliceFn('function pluginReceiptText(raw) {', '\n}\n'),
     sliceFn('function pluginRepoOf(id) {', '\n}\n'),
     sliceFn('function pluginTagsOf(opts) {', '\n}\n'),
     sliceFn('function buildPluginCatalog(marketState, bridgeState, notes) {', '\n}\n'),
@@ -368,8 +376,12 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     MANAGED_NPM_PLUGINS: registry,
     PLUGIN_MARKET_REPO: marketRepo,
     pluginRepo,
+    LAST_CHANGE_TTL_MS: 60 * 1000,
     Config: { pluginMarketDeclined: false, pluginNotes: {}, remoteConnect: { enabled: true, declined: false } },
     pluginActionBusy: new Map(),
+    // 门禁预判：这里只关心卡片渲染（状态/按钮/顺序），判定本身在 tests/plugin-version-gate.test.js 里钉死。
+    // 默认 unknown = 界面按"未能确认"处理，不改变按钮语义。
+    pluginGateVerdict: () => ({ state: 'unknown', dshVersion: '', peers: [], reason: 'test' }),
     market: {
       PLUGIN_NAME: 'dshmarket',
       getState: (npm) => ({
@@ -792,9 +804,12 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
   assert.ok(end > driver, '找不到函数结尾')
   const fnSrc = main.slice(start, end)
 
-  const calls = { installs: [], stops: 0, applied: [], notified: 0 }
+  const calls = { installs: [], stops: 0, applied: [], notified: 0, resolved: [], envFailures: [], consoleOpen: true }
   const installed = new Set(['dsh-chat-import']) // 会话导入已装（且非默认代装）
   const Config = { pluginAutoInstallTriedVersion: '', pluginAutoDeclined: { 'usage-billing': true } }
+  // 门禁预判的注入点：默认全部放行，④ 里再单独把某个插件标成"会被门禁拒绝"
+  const gatePlan = {}
+  const npmVersionCache = new Map()
   const ctx = {
     SELF_TEST: false,
     Config,
@@ -811,7 +826,12 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
       PROFILE_NAME: 'web',
       getState: (npm) => ({ installed: installed.has(npm) }),
       installByName: async (npm) => { calls.installs.push(npm); installed.add(npm); return { ok: true, version: '9.9.9' } },
+      versionGateFailure: require('../market').versionGateFailure, // 真文案：与安装期失败同源
     },
+    // 预判输入：目标版本先查一遍 npm（真实现里也是同一份 manifest）
+    npmVersionCache,
+    resolveNpmVersion: async (npm) => { calls.resolved.push(npm); npmVersionCache.set(npm, { version: '9.9.9', peerDependencies: {}, at: Date.now() }); return '9.9.9' },
+    pluginGateVerdict: (npm) => gatePlan[npm] || { state: 'ok', dshVersion: '', peers: [], reason: 'test' },
     envReady: () => true,
     envReport: { pnpm: { status: 'ok' } },
     server: { running: () => true },
@@ -823,12 +843,14 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
     notify: () => { calls.notified++ },
     log: () => {},
     saveConfig: () => {},
-    notePluginEnvFailure: () => {},
+    notePluginEnvFailure: (id, action, info) => { calls.envFailures.push({ id, action, kind: info && info.kind, version: info && info.gate && info.gate.version }) },
     notePluginReleaseAgeRetry: () => {},
     broadcastState: () => {},
+    // 控制台开着时由弹窗提醒（不另发系统通知）；关着时退回系统通知指路
+    consoleIsOpen: () => calls.consoleOpen,
   }
   const names = Object.keys(ctx)
-  const factory = new Function(...names, fnSrc + '\nreturn { maybeAutoInstallRecommendedPlugins, pendingAutoInstallPlugins, notePluginAutoDeclined }')
+  const factory = new Function(...names, fnSrc + '\nreturn { maybeAutoInstallRecommendedPlugins, pendingAutoInstallPlugins, notePluginAutoDeclined, setPluginGateNotice, ackPluginGateNotice }')
   const api = factory(...names.map((k) => ctx[k]))
 
   await api.maybeAutoInstallRecommendedPlugins()
@@ -850,6 +872,46 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
   installed.delete('dsh-better-sidebar')
   await api.maybeAutoInstallRecommendedPlugins()
   assert.deepEqual(calls.installs, ['dsh-better-sidebar', 'dsh-better-sidebar'], '手动装回后应恢复自动维护')
+
+  // ④ 目标版本会被 DSH 版本门禁拒绝的：不进这次代装、也**不代用户授权**，
+  //    只把事实记到提示条上（界面据此给「授权并重试」），并如实记账免得每个 tick 重来
+  Config.pluginAutoInstallTriedVersion = ''
+  installed.delete('dsh-better-sidebar')
+  calls.installs.length = 0; calls.stops = 0; calls.applied.length = 0; calls.envFailures.length = 0; calls.resolved.length = 0
+  gatePlan['dsh-better-sidebar'] = {
+    state: 'gated',
+    dshVersion: '0.2.1-alpha.1',
+    peers: [{ name: '@deepseek-ai/dsh-tools', range: '0.2.0-rc.2' }],
+    reason: 'incompatible',
+  }
+  await api.maybeAutoInstallRecommendedPlugins()
+  assert.deepEqual(calls.installs, [], '会被门禁拒绝的插件不该硬装一次（白停服务、白跑 pnpm）')
+  assert.equal(calls.stops, 0, '全被门禁挡住时一次都不该停服务')
+  assert.equal(calls.applied.length, 0, '什么都没装就不该重启')
+  assert.ok(calls.resolved.includes('dsh-better-sidebar'), '预判前要先拿目标版本的 manifest')
+  assert.deepEqual(calls.envFailures.map((x) => [x.id, x.action, x.kind, x.version]), [
+    ['better-sidebar', 'install', 'version-gate', '9.9.9'],
+  ], '要在提示条上留一条「需先授权」的事实（文案与安装期失败同源）')
+  assert.equal(Config.pluginAutoInstallTriedVersion, '1.2.1-rc.15', '跳过也要记账：同一启动器版本内不再每个 tick 重来')
+  // 光留提示条不够：首次安装的用户可能压根不会打开「预装插件」页 —— 要有一条待确认的弹窗清单
+  assert.deepEqual(Config.pluginGateNotice.items, [
+    { id: 'better-sidebar', name: '增强侧边栏', npm: 'dsh-better-sidebar', version: '9.9.9', dshVersion: '0.2.1-alpha.1' },
+  ], '没装上的那几个要带上 包名/版本/dsh 版本（弹窗据此说清"为什么"与"装哪个"）')
+  assert.equal(calls.notified, 0, '控制台开着时由弹窗提醒，不再另发系统通知')
+
+  // ⑤ 控制台关着（用户在 DSH 页面里）：弹窗看不见 → 退回系统通知指路
+  Config.pluginAutoInstallTriedVersion = ''
+  Config.pluginGateNotice = null
+  calls.consoleOpen = false
+  calls.notified = 0
+  await api.maybeAutoInstallRecommendedPlugins()
+  assert.equal(calls.notified, 1, '控制台没开时要发一条系统通知，别让提醒静默丢掉')
+  assert.ok(Config.pluginGateNotice, '弹窗清单仍然要留着：下次打开控制台还会弹')
+
+  // ⑥ 用户看过了（去安装 / 稍后再说）→ 清掉，不反复打扰
+  assert.deepEqual(api.ackPluginGateNotice(), { ok: true, acked: true })
+  assert.equal(Config.pluginGateNotice, null)
+  assert.deepEqual(api.ackPluginGateNotice(), { ok: true, already: true }, '重复 ack 不报错')
 })
 test('挂起变更统一走重启：任何插件变更都只提供「立即重启生效」', async () => {
   const start = main.indexOf('function deferPluginChange(')

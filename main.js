@@ -116,7 +116,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -2269,6 +2269,7 @@ async function applyPluginChange(verb, version, spec = {}) {
   const ok = await handleStart()
   if (ok) {
     clearPendingPluginRestart() // 已经重启，挂起的变更随之生效
+    clearPluginReceipts() // 生效即过期：✓ 回执退场，真实状态由版本号 + 状态胶囊表达
     refreshWebUiOnReady(true)
     notify('DeepSeek Harness', verb === 'install' ? `${spec.label}已安装（${name}），服务已重启生效` : `${spec.label}已卸载，服务已重启生效`, undefined, 'recovery')
   } else {
@@ -2276,6 +2277,45 @@ async function applyPluginChange(verb, version, spec = {}) {
   }
   broadcastState()
   return ok
+}
+
+/**
+ * 动作回执（卡片上那行 ✓）的保质期。
+ * 为什么需要：回执是"刚刚发生了什么"，不是状态 —— 它写在进程内存里、没有清零点时长驻到启动器退出
+ * （实测：装完 v1.1.13 后卡片一直挂着「✓ 已安装 …」，让人以为还有事没办完）。
+ * 两条清理路径：① 变更真正生效（applyPluginChange 成功）→ 立刻清；② 超过这个时限 → tick 兜底清。
+ * 一分钟足够看清"刚装了什么"，又短到不会变成僵尸文案；批量挂起期间真正的"待生效"由顶部提示条表达。
+ */
+const LAST_CHANGE_TTL_MS = 60 * 1000
+
+/** 卡片上那行 ✓ 的文案：过期（或已清）就给空串 —— 界面不该显示一条已经不算"刚刚"的回执。 */
+function pluginReceiptText(raw) {
+  const text = String((raw && raw.lastChange) || '')
+  if (!text) return ''
+  const at = Number(raw && raw.lastChangeAt)
+  // 没有时刻的老回执照旧显示（宁可多留一会儿，也不误删一条来源不明的文案）
+  if (!Number.isFinite(at) || at <= 0) return text
+  return Date.now() - at < LAST_CHANGE_TTL_MS ? text : ''
+}
+
+/** 清掉所有插件的动作回执（生效即过期）。 */
+function clearPluginReceipts() {
+  let n = 0
+  try { n += market.clearLastChanges() } catch { /* noop */ }
+  try { n += bridge.clearLastChanges() } catch { /* noop */ }
+  return n
+}
+
+/** 超时兜底：清掉过期的回执并推一次状态，让那行自己消失（不然它只会一直挂到启动器退出）。 */
+function expirePluginReceipts() {
+  let n = 0
+  try { n += market.expireLastChanges(LAST_CHANGE_TTL_MS) } catch { /* noop */ }
+  try { n += bridge.expireLastChanges(LAST_CHANGE_TTL_MS) } catch { /* noop */ }
+  if (n > 0) {
+    log('[plugins] ' + n + ' 条动作回执超过 ' + Math.round(LAST_CHANGE_TTL_MS / 1000) + 's 未生效，已退场')
+    broadcastState()
+  }
+  return n
 }
 
 /**
@@ -2730,7 +2770,7 @@ function pluginTagsOf(opts) {
 }
 
 // npm 侧最新版本缓存：只影响卡片上「可更新」提示，不阻塞渲染；进插件页/点刷新时补一次。
-const npmVersionCache = new Map() // npm 包名 -> { version, at }
+const npmVersionCache = new Map() // npm 包名 -> { version, peerDependencies, at }
 // 版本查询失败的去重账本：包名 -> 上一次记过的原因（同原因不重复刷日志；查成功即清除）
 const npmVersionErrors = new Map()
 const NPM_VERSION_TTL_MS = 10 * 60 * 1000
@@ -2768,12 +2808,30 @@ function notePluginEnvFailure(id, action, info) {
   const same = !!pluginEnvIssue && pluginEnvIssue.kind === info.kind
   const names = same ? pluginEnvIssue.names.slice() : []
   const retry = same ? pluginEnvIssue.retry.slice() : []
+  const grants = same ? (pluginEnvIssue.grants || []).slice() : []
   if (label && !names.includes(label)) names.push(label)
   // 不可重试的原因（如 pnpm 未就绪）不给「重试」按钮：按钮必须对应真实可用的动作。
   if (info.recoverable !== false && id && !retry.some((x) => x.id === id)) {
     retry.push({ id: String(id), action: String(action || ''), label })
   }
-  pluginEnvIssue = Object.assign({}, info, { names, retry, at: Date.now() })
+  // 版本门禁失败给的是「授权并重试」：授权记录按 包@版本 一条一条走（dsh 的账本就是这个粒度），
+  // 所以这里也按这个粒度去重 —— 同一个插件失败两次不该长成两个授权项。
+  const gate = info.gate
+  if (gate && gate.packageName && gate.version) {
+    const key = gate.packageName + '@' + gate.version
+    if (!grants.some((x) => x.key === key)) {
+      grants.push({
+        key,
+        id: String(id || ''),
+        action: String(action || ''),
+        label,
+        packageName: gate.packageName,
+        version: gate.version,
+        dshVersion: gate.dshVersion || '',
+      })
+    }
+  }
+  pluginEnvIssue = Object.assign({}, info, { names, retry, grants, at: Date.now() })
   pluginEnvNote = ''
   return true
 }
@@ -2784,6 +2842,7 @@ function clearPluginEnvFailure(id) {
   const label = pluginDisplayName(id)
   pluginEnvIssue.names = pluginEnvIssue.names.filter((n) => n !== label)
   pluginEnvIssue.retry = pluginEnvIssue.retry.filter((x) => x.id !== id)
+  pluginEnvIssue.grants = (pluginEnvIssue.grants || []).filter((x) => x.id !== id)
   if (pluginEnvIssue.names.length) return false
   pluginEnvIssue = null
   return true
@@ -2820,13 +2879,37 @@ async function retryPluginEnvFailures() {
   return { ok: true, retried: items.length }
 }
 
+/**
+ * 「授权并重试」：把提示条里那批被版本门禁拒绝的插件逐个走一遍「授权 → 安装」。
+ * 授权粒度是 包@版本（dsh 的账本是这么记的），所以是逐个来，不是一次放行一片；
+ * 授权动作本身交给 dsh 的 allow-version（见 grantVersionExemptionFor），DSHL 不碰 compatibility.json。
+ * 与「重试失败的插件」同款：全程 defer，装完由用户点顶部「立即重启生效」。
+ */
+async function grantAndRetryPluginEnvFailures() {
+  const items = (pluginEnvIssue && pluginEnvIssue.grants) || []
+  if (!items.length) return { ok: false, error: '没有可授权的失败项' }
+  const failed = []
+  for (const item of items) {
+    let r
+    try {
+      r = await runManagedPluginAction(item.id, item.action, { defer: true, grantExemption: true })
+    } catch (e) { r = { ok: false, error: (e && e.message) || String(e) } }
+    if (!r || !r.ok) failed.push(item.label + '：' + ((r && r.error) || '未知原因'))
+  }
+  broadcastState()
+  if (failed.length) return { ok: false, error: failed.join('；'), failed: failed.length }
+  return { ok: true, granted: items.length }
+}
+
 /** 拉取 npm 官方源上的最新版本号；失败返回空串（卡片退化为「已安装」，不显示误导性状态）。 */
 async function resolveNpmVersion(name) {
   const hit = npmVersionCache.get(name)
   if (hit && Date.now() - hit.at < NPM_VERSION_TTL_MS) return hit.version
   try {
     const v = await market.verifyNpmPackage(name)
-    npmVersionCache.set(name, { version: v.version, at: Date.now() })
+    // peerDependencies 与 version 一起缓存：卡片上的门禁预判必须判"即将装的那一版"，
+    // 另起一次 npm 查询会留出"查的和装的不一致"的窗口。
+    npmVersionCache.set(name, { version: v.version, peerDependencies: v.peerDependencies || {}, at: Date.now() })
     npmVersionErrors.delete(name) // 恢复了：下次再失败要重新留证
     return v.version
   } catch (e) {
@@ -2884,14 +2967,21 @@ async function installAllManagedPlugins() {
   const failed = []
   let installed = 0
   let skipped = 0
+  const gatedNames = []
   let stopFailed = null
   try {
     const targets = []
     for (const d of MANAGED_NPM_PLUGINS) {
-      if (!market.getState(d.npm).installed) targets.push({ key: d.id, label: d.name, run: () => runNpmPluginAction(d, 'install', { defer: true }) })
+      if (market.getState(d.npm).installed) continue
+      // 目标版本会被门禁拒绝的，不在这里装、也不代授权：一键安装只做"点一下就能成功"的那批，
+      // 需要授权的那张卡片自己带「授权并安装」按钮（风险接受必须由用户单独拍板一次）。
+      const latest = (npmVersionCache.get(d.npm) || {}).version || ''
+      if (pluginGateVerdict(d.npm, latest).state === 'gated') { gatedNames.push(d.name); continue }
+      targets.push({ key: d.id, label: d.name, run: () => runNpmPluginAction(d, 'install', { defer: true }) })
     }
     if (!market.getState().installed) targets.push({ key: 'dshmarket', label: '插件市场', run: () => installManagedMarket({ defer: true }) })
     if (!bridge.getState().installed) targets.push({ key: 'bridge-next', label: '手机连接', run: () => setRemoteConnectManaged(true, { defer: true }) })
+    if (gatedNames.length) log('[plugins] 一键安装跳过 ' + gatedNames.length + ' 个需先授权的插件：' + gatedNames.join('、'))
     pluginInstallAllTarget = targets.length
     if (targets.length) {
       // 只在最开始停一次服务；之后的安装都在服务停止状态下进行
@@ -2929,13 +3019,18 @@ async function installAllManagedPlugins() {
     releaseProfileOp()
     broadcastState()
   }
-  if (stopFailed) return { ok: false, error: stopFailed, installed, skipped }
+  const blocked = gatedNames.length
+    ? gatedNames.length + ' 个插件需先授权才能安装（在卡片上点「授权并安装」）：' + gatedNames.join('、')
+    : ''
+  if (stopFailed) return { ok: false, error: stopFailed, installed, skipped, skippedGated: gatedNames.length }
   if (installed > 0) {
-    notify('DeepSeek Harness', '已安装 ' + installed + ' 个插件，点控制台顶部的「立即重启生效」后启用', undefined, 'recovery')
+    notify('DeepSeek Harness', '已安装 ' + installed + ' 个插件，点控制台顶部的「立即重启生效」后启用'
+      + (blocked ? '；' + blocked : ''), undefined, 'recovery')
   }
-  if (failed.length) return { ok: false, error: failed.join('；'), installed, skipped, failed: failed.length }
+  if (failed.length) return { ok: false, error: [failed.join('；'), blocked].filter(Boolean).join('；'), installed, skipped, failed: failed.length, skippedGated: gatedNames.length }
+  if (blocked) return { ok: installed > 0, error: blocked, installed, skipped, pendingRestart: installed > 0, skippedGated: gatedNames.length }
   if (!installed && !skipped) return { ok: true, installed: 0, skipped: 0, message: '所有插件都已安装' }
-  return { ok: true, installed, skipped, pendingRestart: installed > 0 }
+  return { ok: true, installed, skipped, pendingRestart: installed > 0, skippedGated: 0 }
 }
 
 /** 本页所有「可更新」的插件。目标与卡片同源：都来自 buildPluginCatalog 的 outdated。 */
@@ -2943,9 +3038,12 @@ function outdatedManagedPluginTargets() {
   const targets = []
   for (const card of buildPluginCatalog(market.getState(), bridge.getState(), Config.pluginNotes)) {
     if (!card.outdated) continue
+    // gated = 目标版本会被 DSH 的版本门禁拒绝（卡片上写着「需授权后更新到 vX」的那批）。
+    // 一键更新必须跳过它们，并且**不**代用户授权：授权是风险接受，只能在卡片上单独拍板一次。
+    const gated = !!(card.gate && card.gate.state === 'gated')
     const def = MANAGED_NPM_PLUGINS.find((d) => d.id === card.id)
-    if (def) targets.push({ key: def.id, label: def.name, run: () => runNpmPluginAction(def, 'update', { defer: true }) })
-    else if (card.id === 'bridge-next') targets.push({ key: 'bridge-next', label: '手机连接', run: () => reinstallRemoteConnectManaged({ defer: true }) })
+    if (def) targets.push({ key: def.id, label: def.name, gated, run: () => runNpmPluginAction(def, 'update', { defer: true }) })
+    else if (card.id === 'bridge-next') targets.push({ key: 'bridge-next', label: '手机连接', gated: false, run: () => reinstallRemoteConnectManaged({ defer: true }) })
   }
   return targets
 }
@@ -2971,11 +3069,18 @@ async function updateAllManagedPlugins() {
   const failed = []
   let updated = 0
   let stopFailed = null
+  let skippedNames = []
   try {
     // 先把 npm 侧最新版补齐再挑目标：缓存过期或从没查过时，「可更新」判定会漏掉插件，
     // 点一下按钮却什么都没发生是最难解释的那种失败。
     await checkManagedPluginUpdates()
-    const targets = outdatedManagedPluginTargets()
+    const all = outdatedManagedPluginTargets()
+    // 被门禁挡住的**不在一键更新里授权**：授权是风险接受，只能在卡片上单独拍板一次。
+    // 批量的职责是"别去撞一堵已经知道的墙"，并把这件事如实说出来（既不静默授权，也不假装成功）。
+    const gated = all.filter((t) => t.gated)
+    const targets = all.filter((t) => !t.gated)
+    skippedNames = gated.map((t) => t.label)
+    if (skippedNames.length) log('[plugins] 一键更新跳过 ' + skippedNames.length + ' 个需先授权的插件：' + skippedNames.join('、'))
     pluginInstallAllTarget = targets.length
     if (targets.length) {
       // 只在最开始停一次服务；之后的更新都在服务停止状态下进行
@@ -3013,19 +3118,26 @@ async function updateAllManagedPlugins() {
   }
   if (stopFailed) return { ok: false, error: stopFailed, updated }
   if (!updated) {
-    // 一个都没更新成：没有可更新的（正常收尾）或全失败了（报错），两种情况都不重启
-    if (failed.length) return { ok: false, error: failed.join('；'), updated: 0, failed: failed.length }
+    // 一个都没更新成：没有可更新的（正常收尾）、全失败了、或全被门禁挡着（要用户先授权）
+    const blocked = skippedNames.length
+      ? skippedNames.length + ' 个插件需先授权才能更新（在卡片上点「授权并更新到 vX」）：' + skippedNames.join('、')
+      : ''
+    if (failed.length) return { ok: false, error: [failed.join('；'), blocked].filter(Boolean).join('；'), updated: 0, failed: failed.length, skipped: skippedNames.length }
+    if (blocked) return { ok: false, error: blocked, updated: 0, skipped: skippedNames.length }
     return { ok: true, updated: 0, message: '所有插件都已是最新' }
   }
   // 全部更新完 → 只在这里重启一次，这就是「更新完所有的一起重启」的落点
   const applied = await applyPendingPluginChanges()
   broadcastState()
   const restarted = !!(applied && applied.ok)
+  const skippedNote = skippedNames.length
+    ? '；' + skippedNames.length + ' 个需先授权，未更新（在卡片上点「授权并更新」）'
+    : ''
   notify('DeepSeek Harness', restarted
-    ? ('已更新 ' + updated + ' 个插件，服务已重启生效')
-    : ('已更新 ' + updated + ' 个插件，但重启失败，请到控制台重试'), undefined, 'recovery')
-  if (failed.length) return { ok: false, error: failed.join('；'), updated, restarted, failed: failed.length }
-  return { ok: restarted, updated, restarted, error: restarted ? '' : '重启失败' }
+    ? ('已更新 ' + updated + ' 个插件，服务已重启生效' + skippedNote)
+    : ('已更新 ' + updated + ' 个插件，但重启失败，请到控制台重试' + skippedNote), undefined, 'recovery')
+  if (failed.length) return { ok: false, error: failed.join('；'), updated, restarted, failed: failed.length, skipped: skippedNames.length }
+  return { ok: restarted, updated, restarted, skipped: skippedNames.length, error: restarted ? '' : '重启失败' }
 }
 
 // ---------- 推荐插件（npm 分发）：默认自动安装 ----------
@@ -3063,6 +3175,39 @@ function pendingAutoInstallPlugins() {
   return out
 }
 
+// ---------- 默认代装被版本门禁挡住时的「未装上清单」提醒 ----------
+// 为什么需要：默认代装**不替用户授权**（不兼容风险只能由本人拍板），于是"缺了几个插件"这件事
+// 只留在插件页那条提示条里 —— 而首次安装的用户很可能根本不会打开那一页，装完就以为万事俱备。
+// 所以把它变成一条**要人确认的弹窗**：说清哪几个没装上、为什么、去哪手动装。
+// 持久化到配置：用户还没看到就重启也不丢（下次打开控制台还会弹）；点过「去安装 / 稍后再说」才清。
+
+/** 记下"这几个预装插件因为版本门禁没装上"（覆盖式：以最近一次代装的结果为准）。 */
+function setPluginGateNotice(items) {
+  const list = (Array.isArray(items) ? items : []).filter((x) => x && x.npm)
+  if (!list.length) return false
+  Config.pluginGateNotice = {
+    at: Date.now(),
+    items: list.map((x) => ({
+      id: String(x.id || ''),
+      name: String(x.name || x.npm),
+      npm: String(x.npm),
+      version: String(x.version || ''),
+      dshVersion: String(x.dshVersion || ''),
+    })),
+  }
+  try { saveConfig() } catch { /* noop */ }
+  return true
+}
+
+/** 用户已经看过这条提醒（点了「去预装插件页安装」或「稍后再说」）：清掉，别反复打扰。 */
+function ackPluginGateNotice() {
+  if (!Config.pluginGateNotice) return { ok: true, already: true }
+  Config.pluginGateNotice = null
+  try { saveConfig() } catch { /* noop */ }
+  broadcastState()
+  return { ok: true, acked: true }
+}
+
 /**
  * 推荐插件默认自动安装（幂等，可多处调用）：
  *   - 首次运行 / 升级到本版本后，把 autoInstall 的插件里「缺的」补齐；
@@ -3088,13 +3233,58 @@ async function maybeAutoInstallRecommendedPlugins() {
     log('plugins: pnpm 未就绪，暂不自动安装推荐插件（' + detail + '）')
     return
   }
+  // 目标版本的 manifest 先补齐（就是 installByName 稍后要拉的那一份）：门禁预判要用它，
+  // 顺带把 npm 侧版本喂给卡片 —— 代装跳过时卡片能直接写「需授权后安装 vX」。
+  await Promise.all(targets.map((d) => resolveNpmVersion(d.npm)))
+  const gated = []
+  const todo = []
+  for (const d of targets) {
+    const version = (npmVersionCache.get(d.npm) || {}).version || ''
+    const gate = pluginGateVerdict(d.npm, version)
+    if (gate.state === 'gated') gated.push({ id: d.id, npm: d.npm, name: d.name, version, gate })
+    else todo.push(d)
+  }
+  // 与「一键安装」同口径：**不替用户授权**（风险接受只能由本人拍板），只把事实摆到提示条上。
+  // 为什么要预判而不是硬装一次：装下去必然被门禁整条拒绝，白停一次服务、白跑一次 pnpm。
+  if (gated.length) {
+    log('plugins: 默认代装跳过 ' + gated.length + ' 个需先授权的插件：' + gated.map((x) => x.name).join('、'))
+    for (const x of gated) {
+      notePluginEnvFailure(x.id, 'install', market.versionGateFailure({
+        packageName: x.npm,
+        version: x.version,
+        dshVersion: x.gate.dshVersion,
+      }))
+    }
+    // 光有插件页的提示条不够：首次安装的用户可能根本不会打开那一页。
+    // 记一条待确认的弹窗提醒，把人引导到「预装插件」页手动点「授权并安装」。
+    setPluginGateNotice(gated.map((x) => ({
+      id: x.id,
+      name: x.name,
+      npm: x.npm,
+      version: x.version,
+      dshVersion: x.gate.dshVersion,
+    })))
+    // 控制台没开着就只能靠系统通知指路（不主动抢焦点/弹窗口）；开着的话弹窗会直接出现
+    if (!consoleIsOpen()) {
+      notify('DeepSeek Harness Launcher',
+        gated.length + ' 个预装插件需要你手动安装：打开启动器控制台「预装插件」页，点对应卡片的「授权并安装」',
+        undefined, 'recovery')
+    }
+  }
+  if (!todo.length) {
+    // 全是需授权的：一个都不装 → 不停服务、不重启，提示条与卡片已经写明下一步（授权并安装）
+    Config.pluginAutoInstallTriedVersion = ver
+    try { saveConfig() } catch { /* noop */ }
+    broadcastState()
+    return
+  }
   recommendedAutoInstalling = true
   const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装推荐插件')
   if (!releaseProfileOp) { recommendedAutoInstalling = false; return }
   try {
     Config.pluginAutoInstallTriedVersion = ver
     try { saveConfig() } catch { /* noop */ }
-    log('plugins: 自动安装推荐插件（' + targets.map((d) => d.name).join('、') + '）…')
+    log('plugins: 自动安装推荐插件（' + todo.map((d) => d.name).join('、') + '）…')
     // 安装要停服务（pnpm 改写 profile 依赖树时不能有 dsh 进程在跑）：先等服务起来再动，最多等 3 分钟
     const deadline = Date.now() + 180 * 1000
     while (Date.now() < deadline && !server.running()) await sleep(1000)
@@ -3105,7 +3295,7 @@ async function maybeAutoInstallRecommendedPlugins() {
     }
     const installed = []
     const failed = []
-    for (const d of targets) {
+    for (const d of todo) {
       const r = await market.installByName(d.npm)
       if (r && r.ok) {
         installed.push(d.name + (r.version ? '@' + r.version : ''))
@@ -3238,6 +3428,38 @@ async function maybeRemoveRetiredPlugins() {
 }
 
 /**
+ * 为某个插件**当前的目标版本**授予精确版本豁免（交给 dsh 自己的 allow-version 落盘）。
+ *
+ * 为什么由 dsh 写而不是 DSHL 写：compatibility.json 是 DSH 的授权账本，它的命令会自己校验
+ * 参数形状、校验 --dsh-version 必须等于运行中的 dsh、自己加文件锁原子写。DSHL 自己改那个文件
+ * 就等于绕过了这套校验口径 —— 这里只负责"把用户拍板的风险接受交给它执行"。
+ *
+ * fail-closed：命令失败、或命令报成功但 compatibility.json 里读不到这一对精确版本 →
+ * 一律返回失败，**绝不继续安装**（否则这次失败会被归到"安装失败"，把责任推给插件）。
+ */
+async function grantVersionExemptionFor(npmName) {
+  const name = String(npmName || '')
+  const target = (npmVersionCache.get(name) || {}).version || ''
+  const dshVersion = runningDshVersion()
+  if (!target) return { ok: false, error: '还没查到 ' + name + ' 的目标版本，先点「检查更新」再来授权' }
+  if (!dshVersion) return { ok: false, error: '还没探测到运行中的 dsh 版本，等环境就绪后再授权' }
+  const r = await market.allowVersionExemption(name, target, dshVersion)
+  if (!r.ok) return { ok: false, error: '授权失败：' + r.error }
+  // 二次校验：只信盘上的结果，不信命令自己的回执
+  const granted = pluginCompat.isExempted(pluginCompat.readProfileExemptions(DSH_PROFILE_DIR), name + '@' + target, dshVersion)
+  invalidateProfileExemptions()
+  if (!granted) {
+    return {
+      ok: false,
+      error: '授权命令已返回成功，但 compatibility.json 里读不到 ' + name + '@' + target
+        + ' / dsh ' + dshVersion + '（视为未生效，已中止安装）',
+    }
+  }
+  log('[plugins] 已授权精确版本豁免：' + name + '@' + target + ' on dsh ' + dshVersion)
+  return { ok: true, version: target, dshVersion }
+}
+
+/**
  * 安装/卸载/更新推荐插件（调用方负责先停服务）。
  * opts.defer=true 时只改 profile、不重启，交给批量流程攒着等用户点「立即重启生效」。
  */
@@ -3248,6 +3470,12 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
   if (action === 'install' || action === 'update' || action === 'reinstall') {
     const cur = market.getState(descriptor.npm)
     if (action === 'install' && cur.installed) return { ok: true, already: true }
+    // 「授权并安装/更新」：先落盘豁免再装。授权失败就到此为止 —— 装下去必然被门禁再拒一次，
+    // 那次的失败会被归到"安装失败"，让用户以为是插件的问题。
+    if (opts.grantExemption) {
+      const granted = await grantVersionExemptionFor(descriptor.npm)
+      if (!granted.ok) return granted
+    }
     const r = await market.installByName(descriptor.npm, { force: true })
     if (!r.ok) return r
     const afterRows = pluginSwitch.rowIdsForPackage(descriptor.npm)
@@ -3309,7 +3537,14 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
       // pnpm 改写 profile 依赖树时不能有 dsh 进程占用；重启由 applyPluginChange 统一负责。
       const stop = await stopServiceForPluginChange()
       if (!stop.ok) return stop
-      return runNpmPluginAction(npmDef, act, { defer })
+      return runNpmPluginAction(npmDef, act, { defer, grantExemption: !!opts.grantExemption })
+    }
+    // 「授权并安装 / 授权并更新」：动作本身还是 install/update，只是先落一次精确版本豁免。
+    // 授权必须由用户在卡片上显式点（带风险确认），批量流程绝不静默授权。
+    if (act === 'grant-install' || act === 'grant-update') {
+      const stop = await stopServiceForPluginChange()
+      if (!stop.ok) return stop
+      return runNpmPluginAction(npmDef, act === 'grant-install' ? 'install' : 'update', { defer, grantExemption: true })
     }
     if (act === 'enable' || act === 'disable') return runNpmPluginAction(npmDef, act, { defer })
     return { ok: false, error: '未知操作：' + pid + '/' + act }
@@ -3346,29 +3581,128 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
  */
 const pluginActionBusy = new Map()
 
-/** 动作 → 状态胶囊文案（与 market/bridge 的 installing/uninstalling 口径保持一致）。 */
+/**
+ * 动作 → 状态胶囊文案（与 market/bridge 的 installing/uninstalling 口径保持一致）。
+ */
 function pluginBusyLabel(action) {
   const a = String(action || '')
-  if (a === 'install') return '安装中…'
+  if (a === 'install' || a === 'grant-install') return '安装中…'
   if (a === 'uninstall') return '卸载中…'
   if (a === 'reinstall') return '重新安装中…'
   if (a === 'update') return '更新中…'
+  if (a === 'grant-update') return '授权并更新中…'
   return '处理中…'
+}
+
+// ---------- 插件更新的「版本门禁」预判（只读，不写任何状态） ----------
+// 为什么需要它：DSH 在**安装前**就按插件声明的 `@deepseek-ai/dsh*` peer 做精确版本门禁，
+// 「不满足 **且** 未豁免」直接整条拒绝（exit 1 / nothing was installed）。而 DSHL 的卡片此前只比
+// npm 上的版本号，于是界面先承诺「可更新到 vX」，点下去必然失败 —— 文案与真实动作不符。
+// 判据与 DSH 完全一致，直接复用 dsh-plugin-compat 的纯函数：只看 @deepseek-ai/dsh*，
+// `semver.satisfies(目标, range, { includePrerelease: true })`，且 compatibility.json 里
+// 已授权的**精确版本**豁免算数（否则刚授权过还会一直报"需授权"）。
+//
+// fail-closed：dsh 版本探测不到、或还没查到这一版的 npm manifest → state='unknown'。界面按
+// "未能确认"处理：既不承诺兼容，也不改按钮语义（保持原来的「更新到 vX」），失败时由归类文案兜底。
+// 绝不把拿不准当成兼容，也绝不因为拿不准就挡住一个真实可用的动作。
+
+/** 运行中的 dsh 版本（门禁比较的基准，去掉可能存在的 v 前缀）；探测不到给空串。 */
+function runningDshVersion() {
+  const v = (envReport && envReport.dsh && envReport.dsh.version) || ''
+  return String(v).replace(/^v/u, '')
+}
+
+/** profile 的精确版本豁免（带 mtime + TTL 缓存：状态推送很频繁，不能每次都读盘）。 */
+const PROFILE_EXEMPTIONS_TTL_MS = 60 * 1000
+let profileExemptionsCache = { key: '', at: 0, value: {} }
+function profileVersionExemptions() {
+  let mtime = 0
+  try { mtime = fs.statSync(path.join(DSH_PROFILE_DIR, 'compatibility.json')).mtimeMs } catch { mtime = 0 }
+  const key = String(mtime)
+  if (profileExemptionsCache.key === key && Date.now() - profileExemptionsCache.at < PROFILE_EXEMPTIONS_TTL_MS) {
+    return profileExemptionsCache.value
+  }
+  const value = pluginCompat.readProfileExemptions(DSH_PROFILE_DIR)
+  profileExemptionsCache = { key, at: Date.now(), value }
+  return value
+}
+
+/** 授权刚落盘时清一次缓存：卡片上的"需授权"必须立刻跟着变，不能等 TTL。 */
+function invalidateProfileExemptions() {
+  profileExemptionsCache = { key: '', at: 0, value: {} }
+}
+
+/**
+ * 某个 npm 插件的目标版本在运行中的 dsh 下的门禁处境（纯查询）。
+ * @param {string} npmName 包名
+ * @param {string} targetVersion 即将安装/更新的精确版本
+ * @returns {{state:'ok'|'exempt'|'gated'|'unknown', dshVersion:string, peers:Array<{name:string,range:string}>, reason:string}}
+ */
+function pluginGateVerdict(npmName, targetVersion) {
+  const name = String(npmName || '')
+  const target = String(targetVersion || '')
+  const dshVersion = runningDshVersion()
+  const cached = npmVersionCache.get(name) || {}
+  const unknown = (reason) => ({ state: 'unknown', dshVersion, peers: [], reason })
+  if (!dshVersion || !semver.valid(dshVersion)) return unknown('no-dsh-version')
+  if (!target || cached.version !== target || !cached.peerDependencies) return unknown('no-manifest')
+  if (pluginCompat.isExempted(profileVersionExemptions(), name + '@' + target, dshVersion)) {
+    return { state: 'exempt', dshVersion, peers: [], reason: 'exempted' }
+  }
+  const verdict = pluginCompat.evaluateManifestPeers({ peerDependencies: cached.peerDependencies }, dshVersion)
+  if (verdict.compatible) return { state: 'ok', dshVersion, peers: [], reason: 'compatible' }
+  return { state: 'gated', dshVersion, peers: verdict.peers, reason: 'incompatible' }
+}
+
+/**
+ * 门禁拒绝的原因（单行版 + 不满足的声明）：给卡片 tooltip 用，长尾不抢版面。
+ */
+function pluginGateReason(name, targetVersion, gate) {
+  const g = gate || {}
+  const peers = (g.peers || []).map((p) => '· ' + p.name + ' 声明 ' + p.range).join('\n')
+  return [
+    'DSH 在安装前按插件声明的 dsh peer 做精确版本门禁：' + name + '@' + targetVersion
+      + ' 声明的范围里没有当前 dsh ' + (g.dshVersion || '') + '，所以直接拒绝安装。',
+    peers ? '不满足的声明：\n' + peers : '',
+  ].filter(Boolean).join('\n')
+}
+
+/**
+ * 授权前的确认正文：说清"为什么被拒 / 授权的作用范围 / 接受的是什么风险"。
+ * 授权是用户拍板的风险接受，不是安装细节 —— 所以这段文案必须出现在动手之前。
+ */
+function pluginGateConfirmBody(name, targetVersion, gate) {
+  return [
+    pluginGateReason(name, targetVersion, gate),
+    '继续会先调用 dsh 自己的 allow-version，为「这一对精确版本」写入门禁豁免，再安装。',
+    '授权等于接受作者标注的不兼容风险（可能崩溃或损坏数据），而且只对这一对版本生效：'
+      + 'dsh 升级、或插件再发新版，都需要重新授权。',
+  ].filter(Boolean).join('\n')
 }
 
 /**
  * 插件卡片的按钮形态（唯一来源，三类插件共用）：
  *   未安装 → 1 个按钮：安装
  *   已安装 → 2 个按钮：重新安装（有新版则「更新到 vX」）+ 卸载
+ * 被版本门禁挡住时，按钮换成「授权并安装 / 授权并更新到 vX」：这时"先授权"是动作的一部分，
+ * 按钮文案必须写出来 —— 否则界面上就只剩一个点了必然失败的按钮。
  * 需要真实启停语义的插件（手机连接）另有「启用」态，但已安装时的按钮数保持一致。
  */
 function pluginCardActions(opts) {
   const o = opts || {}
   if (o.busy) return []
-  if (!o.installed) return [{ action: 'install', label: '安装', tone: 'primary' }]
+  const gated = o.gateState === 'gated'
+  if (!o.installed) {
+    return [gated
+      ? { action: 'grant-install', label: '授权并安装', tone: 'primary', confirmTitle: '先授权再安装？', confirmBody: o.grantBody || '' }
+      : { action: 'install', label: '安装', tone: 'primary' }]
+  }
   const out = []
-  if (o.outdated && o.latestVersion) out.push({ action: 'update', label: '更新到 v' + o.latestVersion, tone: 'primary' })
-  else out.push({ action: 'reinstall', label: '重新安装', tone: 'default' })
+  if (o.outdated && o.latestVersion) {
+    out.push(gated
+      ? { action: 'grant-update', label: '授权并更新到 v' + o.latestVersion, tone: 'primary', confirmTitle: '先授权再更新？', confirmBody: o.grantBody || '' }
+      : { action: 'update', label: '更新到 v' + o.latestVersion, tone: 'primary' })
+  } else out.push({ action: 'reinstall', label: '重新安装', tone: 'default' })
   out.push({ action: o.uninstallAction || 'uninstall', label: '卸载', tone: 'danger', confirmTitle: o.uninstallTitle || ('卸载「' + (o.name || '') + '」？'), confirmBody: o.uninstallBody || '会重启 DSH 服务，正在运行的会话会中断；之后可在插件页重新安装。' })
   return out
 }
@@ -3464,6 +3798,10 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
         : installedVersion !== latest)
     const disabled = !!raw.installed && pluginSwitch.isDisabled(d.npm)
     const toggle = !!raw.installed && pluginSwitch.canToggle(d.npm)
+    // 门禁预判：判的是"即将装的那一版"（latest）在运行中的 dsh 下会不会被拒。
+    // 判不了（unknown）就照旧给「更新到 vX」——不能用"拿不准"挡住真实可用的动作。
+    const gate = pluginGateVerdict(d.npm, latest)
+    const gated = gate.state === 'gated'
     const status = unresolvedStatus(d.npm, busy
       ? { label: busyText, tone: 'busy' }
       : (raw.error
@@ -3471,7 +3809,17 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
         : (raw.installed
           ? (disabled ? { label: '已关闭', tone: 'muted' } : (outdated ? { label: '可更新', tone: 'warn' } : { label: toggle ? '已启用' : '已安装', tone: 'ok' }))
           : { label: '未安装', tone: 'muted' })))
-    const actions = pluginCardActions({ busy, installed: !!raw.installed, outdated, latestVersion: latest, name: d.name })
+    // 状态胶囊说状态，被门禁挡住这件事退到 tooltip（版面留给下面那行"需授权…"）
+    if (gated && status && !status.title) status.title = pluginGateReason(d.name, latest, gate)
+    const actions = pluginCardActions({
+      busy,
+      installed: !!raw.installed,
+      outdated,
+      latestVersion: latest,
+      name: d.name,
+      gateState: gate.state,
+      grantBody: gated ? pluginGateConfirmBody(d.name, latest, gate) : '',
+    })
     // 自动安装是否仍然生效（用户手动卸载过就不再自动装回）：卡片字段与标签文案共用这一份判断
     const autoOn = !!(d.autoInstall && !pluginAutoDeclined(d.id))
     return {
@@ -3493,11 +3841,19 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       version: installedVersion, // 展示真实版本，不展示 ^1.2.6 这种依赖范围
       latestVersion: latest,
       outdated,
+      // 门禁预判结果（只读）：state='gated' 时界面必须写"需授权…"，不能承诺点一下就更新好。
+      // peers 只带不满足的那几条，用于 tooltip 与确认正文。
+      gate: {
+        state: gate.state,
+        dshVersion: gate.dshVersion,
+        targetVersion: latest,
+        peers: gate.peers,
+      },
       payloadReady: true,
       busy: busy || '',
       error: raw.error || '',
       activation: activationText(d.npm),
-      lastChange: raw.lastChange || '',
+      lastChange: pluginReceiptText(raw),
       autoInstall: autoOn,
       tags: pluginTagsOf({ preset: !!d.autoInstall, official: !!d.official, autoInstall: autoOn }),
       toggleAction: toggle ? 'toggle' : '', // 装/卸走下方按钮；开关走 user patch layer 的真实启停
@@ -3528,7 +3884,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       busy: m.busy || '',
       error: m.error || '',
       activation: activationText(market.PLUGIN_NAME),
-      lastChange: m.lastChange || '',
+      lastChange: pluginReceiptText(m),
       autoInstall: !Config.pluginMarketDeclined,
       tags: pluginTagsOf({
         preset: true, // 随启动器代装
@@ -3561,7 +3917,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       busy: b.busy || '',
       error: b.error || (bridgeEnabled && !bridgePayloadReady ? (b.payloadError || '插件 payload 不可用') : ''),
       activation: activationText(bridge.PLUGIN_NAME),
-      lastChange: b.lastChange || '',
+      lastChange: pluginReceiptText(b),
       autoInstall: bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
       tags: pluginTagsOf({
         preset: true, // 随启动器分发
@@ -5272,10 +5628,19 @@ function stateJson() {
         recoversAt: pluginEnvIssue.recoversAt,
         names: pluginEnvIssue.names,
         retryCount: (pluginEnvIssue.retry || []).length,
+        // 版本门禁失败：给「授权并重试」用的精确 包@版本 清单（含 dsh 版本，界面据此说清作用范围）
+        grants: (pluginEnvIssue.grants || []).map((g) => ({
+          packageName: g.packageName,
+          version: g.version,
+          dshVersion: g.dshVersion,
+          label: g.label,
+        })),
         at: pluginEnvIssue.at,
       }
       : null,
     pluginEnvNote: pluginEnvNote || '',
+    // 默认代装因版本门禁没装上的那批（待用户确认的弹窗）：控制台据此弹一次并把用户引导到预装插件页
+    pluginGateNotice: Config.pluginGateNotice || null,
     diagnosticsDir: DIAG_DIR,
   })
 }
@@ -5383,6 +5748,7 @@ async function watchTrackedService() {
 function onTick() {
   // 环境未就绪时周期性重测（缓存 30s 节流），用户在外部装好 Node/DSH 后自动就绪
   if (!envReady()) void refreshEnv(false)
+  expirePluginReceipts() // 动作回执超时兜底：不重启的机器上也要自己退场
   maybeStartDeferred() // 安装完成/启动请求时环境未就绪 → 就绪后自动补启动
   if (envReady()) void maybeRepairPnpm() // pnpm 缺失/版本不匹配时后台对齐一次
   if (envReady() && server.running()) void maybeAutoInstallBridge() // 服务就绪且开关开启时补装远程连接插件
@@ -5987,6 +6353,8 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           }
         }
         case 'pluginsRetryEnvFailed': return JSON.stringify(await withProfileOp('重试失败的插件', () => retryPluginEnvFailures()))
+        case 'pluginsAckGateNotice': return JSON.stringify(ackPluginGateNotice())
+        case 'pluginsGrantEnvFailed': return JSON.stringify(await withProfileOp('授权并重试失败的插件', () => grantAndRetryPluginEnvFailures()))
         // ---------- 远程连接（DSH Bridge Next 插件安装/卸载） ----------
         case 'remoteConnectGetState': return JSON.stringify({ enabled: Config.remoteConnect.enabled, declined: Config.remoteConnect.declined, autoEnabledFor: Config.remoteConnect.autoEnabledFor, plugin: bridge.getState() })
         case 'remoteConnectSet': return JSON.stringify(await withProfileOp('手机连接开关', () => setRemoteConnectManaged(!!(value && value.enabled))))
@@ -6159,7 +6527,7 @@ async function runSelfTest() {
     if (!consoleWc) { selftestPrint('FAILED: console view not created'); app.exit(2); return }
     const title = await consoleWc.executeJavaScript('document.title')
     const consoleOk = await consoleWc.executeJavaScript(
-      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('consoleNav') !== null && document.getElementById('consoleContent') !== null && document.getElementById('navGeneral') !== null && document.getElementById('navPlugins') !== null && document.getElementById('pagePlugins') !== null && document.getElementById('pluginCards') !== null && document.getElementById('navLog') !== null && document.getElementById('btnEnvBack') !== null && document.getElementById('btnOpenEnv') !== null && document.getElementById('btnRecoveryStart') !== null && document.getElementById('btnRecoveryRestart') !== null && document.getElementById('btnRecoveryStop') !== null && document.getElementById('btnRecoveryDiag') !== null && document.getElementById('btnRecoveryDiagDir') !== null && document.getElementById('btnOpenLogsDir') !== null && document.getElementById('recoverySlots') !== null && document.getElementById('logFull') !== null && document.getElementById('logSources') !== null && document.getElementById('logCause') !== null && document.getElementById('logCauseText') !== null && document.getElementById('btnLogCauseJump') !== null && document.getElementById('btnGithub') !== null && document.getElementById('btnChangelog') !== null && document.getElementById('pendingRestartBar') !== null && document.getElementById('btnApplyRestart') !== null && document.getElementById('btnConsoleReturn') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.querySelector('#btnZoom .zoom-slider') !== null && document.querySelector('#btnZoom .zoom-value') !== null && document.querySelector('#btnZoom .zoom-reset') !== null && document.querySelector('#btnWebZoom .zoom-slider') !== null && document.querySelector('#btnWebZoom .zoom-value') !== null && document.querySelector('#btnWebZoom .zoom-reset') !== null && document.getElementById('btnReset') !== null ? 'console-ok' : 'console-missing'",
+      "typeof window.dshBridge !== 'undefined' && window._lastZoom !== undefined && typeof window._running === 'boolean' && document.getElementById('consoleNav') !== null && document.getElementById('consoleContent') !== null && document.getElementById('navGeneral') !== null && document.getElementById('navPlugins') !== null && document.getElementById('pagePlugins') !== null && document.getElementById('pluginCards') !== null && document.getElementById('btnPluginEnvGrant') !== null && document.getElementById('navLog') !== null && document.getElementById('btnEnvBack') !== null && document.getElementById('btnOpenEnv') !== null && document.getElementById('btnRecoveryStart') !== null && document.getElementById('btnRecoveryRestart') !== null && document.getElementById('btnRecoveryStop') !== null && document.getElementById('btnRecoveryDiag') !== null && document.getElementById('btnRecoveryDiagDir') !== null && document.getElementById('btnOpenLogsDir') !== null && document.getElementById('recoverySlots') !== null && document.getElementById('logFull') !== null && document.getElementById('logSources') !== null && document.getElementById('logCause') !== null && document.getElementById('logCauseText') !== null && document.getElementById('btnLogCauseJump') !== null && document.getElementById('btnGithub') !== null && document.getElementById('btnChangelog') !== null && document.getElementById('pendingRestartBar') !== null && document.getElementById('btnApplyRestart') !== null && document.getElementById('btnConsoleReturn') !== null && document.getElementById('btnPort') !== null && document.getElementById('feedbackContact') !== null && document.getElementById('btnFeedback') !== null && document.getElementById('btnUpdateNow') !== null && document.getElementById('btnWizardStart') !== null && document.getElementById('wizardPercent') !== null && document.getElementById('btnWizardRetry') !== null && document.getElementById('btnDshUpdateNow') !== null && document.getElementById('launcherVersion') !== null && document.getElementById('dshVersion') !== null && document.getElementById('dshChannelChips') !== null && document.querySelector('#btnZoom .zoom-slider') !== null && document.querySelector('#btnZoom .zoom-value') !== null && document.querySelector('#btnZoom .zoom-reset') !== null && document.querySelector('#btnWebZoom .zoom-slider') !== null && document.querySelector('#btnWebZoom .zoom-value') !== null && document.querySelector('#btnWebZoom .zoom-reset') !== null && document.getElementById('btnReset') !== null ? 'console-ok' : 'console-missing'",
     )
     selftestPrint(`CONSOLE OK: ${title} | ${consoleOk}`)
     if (consoleOk !== 'console-ok') { selftestPrint('FAILED: console DOM incomplete'); app.exit(2); return }

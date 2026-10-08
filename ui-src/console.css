@@ -933,6 +933,8 @@ button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offs
 }
 
 .plugin-latest { color: var(--text-tertiary); font-size: 11.5px; white-space: nowrap; }
+/* 「需授权后更新到 vX」：不是报错，但也不是常规信息 —— 与状态胶囊 warn 同一支色，让它在那列里跳出来 */
+.plugin-latest.gate { color: #B45309; }
 
 /* 卡片操作按钮统一外观：描边胶囊（默认中性 / 主操作品牌色 / 危险项红色）
    与 DSH「设置 → 插件」的卸载按钮一致，overlap 掉基础 .btn 的透明无边框样式 */

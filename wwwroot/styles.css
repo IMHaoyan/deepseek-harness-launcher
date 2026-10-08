@@ -1088,4 +1088,7 @@ input[type="checkbox"], input[type="radio"], input[type="range"] {
   color: var(--text-secondary);
   user-select: text;
   -webkit-user-select: text;
+  /* 正文由调用方给纯文本：授权确认这类有多行结构（风险说明 + 不满足的 peer 声明清单），
+     没有 pre-line 的话换行会被 HTML 折成空格，清单挤成一整段。单行正文不受影响。 */
+  white-space: pre-line;
 }

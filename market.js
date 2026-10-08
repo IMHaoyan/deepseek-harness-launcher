@@ -22,6 +22,8 @@ const PLUGIN_NAME = 'dshmarket'
 const PROFILE_NAME = 'web'
 const NPM_REGISTRY_ORIGIN = 'https://registry.npmjs.org'
 const NPM_PACKAGE_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u
+/** 精确版本（只接受完整 semver，含预发布/构建后缀）——版本号会被原样拼进 `pkg@版本`。 */
+const EXACT_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u
 const PROFILE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CLI_TIMEOUT_MS = 15 * 60 * 1000 // 首次安装要拉完整依赖树，给足时间
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024
@@ -36,10 +38,59 @@ const states = new Map()
 function stateOf(name = PLUGIN_NAME) {
   let s = states.get(name)
   if (!s) {
-    s = { installed: false, version: '', bundle: false, busy: '', error: '', lastChange: '' }
+    s = { installed: false, version: '', bundle: false, busy: '', error: '', lastChange: '', lastChangeAt: 0 }
     states.set(name, s)
   }
   return s
+}
+
+/**
+ * 记一条「动作回执」（卡片上那行 ✓）：只有成功才写，并且**必须带上时刻**。
+ * 为什么带时刻：回执是"刚刚发生了什么"，不是状态 —— 生效之后、或超过保质期之后它就该退场
+ * （清理见 clearLastChanges / expireLastChanges；保质期策略在 main.js 的 LAST_CHANGE_TTL_MS）。
+ */
+function noteLastChange(name, text) {
+  const s = stateOf(name)
+  s.lastChange = String(text || '')
+  s.lastChangeAt = Date.now()
+}
+
+/**
+ * 清掉所有插件的动作回执（**生效即过期**）：变更真正生效（服务重启成功）后调用 ——
+ * 那一刻起版本号与状态胶囊已经表达了真实状态，回执再留着就是僵尸文案。
+ * @returns {number} 清掉的条数
+ */
+function clearLastChanges() {
+  let n = 0
+  for (const s of states.values()) {
+    if (!s.lastChange) continue
+    s.lastChange = ''
+    s.lastChangeAt = 0
+    n++
+  }
+  return n
+}
+
+/**
+ * 清掉超过 maxAgeMs 的动作回执（**超时兜底**）：给"改完一直没重启"的机器收尾。
+ * 没写时刻的老回执不动它：宁可多显示一会儿，也不误删一条来源不明的文案。
+ * @returns {number} 清掉的条数
+ */
+function expireLastChanges(maxAgeMs) {
+  const ttl = Number(maxAgeMs)
+  if (!Number.isFinite(ttl) || ttl <= 0) return 0
+  const now = Date.now()
+  let n = 0
+  for (const s of states.values()) {
+    if (!s.lastChange) continue
+    const at = Number(s.lastChangeAt)
+    if (Number.isFinite(at) && at > 0 && now - at >= ttl) {
+      s.lastChange = ''
+      s.lastChangeAt = 0
+      n++
+    }
+  }
+  return n
 }
 
 function initMarket(opts = {}) {
@@ -117,6 +168,7 @@ function getState(name = PLUGIN_NAME) {
     busy: s.busy,
     error: s.error,
     lastChange: s.lastChange,
+    lastChangeAt: s.lastChangeAt,
     plugin: name,
   }
 }
@@ -167,10 +219,16 @@ function verifyNpmManifestShape(manifest, expectedName) {
   }
   if (manifest.name !== expectedName) throw new Error('npm 包身份不一致')
   const version = manifest.version
-  const exact = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u
-  if (typeof version !== 'string' || !exact.test(version)) {
+  if (typeof version !== 'string' || !EXACT_VERSION_PATTERN.test(version)) {
     throw new Error('npm 未提供精确的版本号')
   }
+  // 顺手把这份 manifest 的 peer 声明带出去：DSH 的安装门禁就是按它判的，卡片上的
+  // 「会不会被门禁拒绝」预判要用同一份数据 —— 另起一次 npm 查询会引入"查的和装的不一致"的窗口。
+  // 只做形状收敛（对象 + 字符串值），是不是 DSH 命名空间由判定方（dsh-plugin-compat）说了算。
+  const rawPeers = manifest.peerDependencies
+  const peerDependencies = (rawPeers && typeof rawPeers === 'object' && !Array.isArray(rawPeers))
+    ? Object.fromEntries(Object.entries(rawPeers).filter(([, range]) => typeof range === 'string'))
+    : {}
   const dsh = manifest.dsh && typeof manifest.dsh === 'object' ? manifest.dsh : {}
   const bundle = dsh.bundle && typeof dsh.bundle === 'object' ? dsh.bundle : {}
   const patch = bundle.patch
@@ -182,7 +240,7 @@ function verifyNpmManifestShape(manifest, expectedName) {
     || p.split('/').some((s) => s.length === 0 || s === '.' || s === '..' || s.includes(':'))) {
     throw new Error('npm 包未声明合法的 DSH bundle')
   }
-  return { name: expectedName, version }
+  return { name: expectedName, version, peerDependencies }
 }
 
 async function verifyNpmPackage(name) {
@@ -278,12 +336,86 @@ function releaseAgeRecoversAt(entries) {
 }
 
 /**
+ * DSH 的「版本门禁」拒绝：`Plugin <包>@<版本> is incompatible with dsh <版本>: peerDependencies {…}`。
+ *
+ * 安装前（`dsh plugin add`）与启动时（bundle 被跳过）都会打印这句，措辞一致；区别只在前面那截
+ * （`dsh: installation rejected: …` / `dsh: skipping profile bundle "…": …`）。所以这里只认中间那句，
+ * 两种来源都能抠出同一对「包@版本 + dsh 版本」——授权按钮要用它拼出 dsh 自己的 allow-version 命令。
+ *
+ * 抠不出包名/版本时返回 packageName:''：提示条仍能说出"被门禁拒绝"，但不会给出假的授权动作。
+ * 完全不是门禁（例如 pnpm 的 24h 观察期、EPERM）一律返回 null，交给别的分类。
+ * @returns {{packageName:string, version:string, dshVersion:string, exemptionActive:boolean}|null}
+ */
+function parseVersionGate(output) {
+  const text = String(output == null ? '' : output)
+  const m = /Plugin\s+(\S+)\s+is incompatible with dsh\s+([^\s:]+)/u.exec(text)
+  const exemption = /Exact-version exemption:\s*(not active|active)/u.exec(text)
+  if (!m && !exemption) return null
+  let packageName = ''
+  let version = ''
+  if (m) {
+    // 包名可能带 scope（@scope/name@1.2.3）：按**最后一个** @ 切，不要把 scope 的 @ 当成版本分隔符
+    const at = m[1].lastIndexOf('@')
+    if (at > 0 && at < m[1].length - 1) {
+      packageName = m[1].slice(0, at)
+      version = m[1].slice(at + 1)
+    }
+  }
+  return {
+    packageName,
+    version,
+    dshVersion: m ? m[2] : '',
+    exemptionActive: exemption ? exemption[1] === 'active' : false,
+  }
+}
+
+/**
+ * 版本门禁失败的归类：**结构化事实 → 一类解释**。
+ *
+ * 为什么要单独一个函数：这条失败有两个来源 —— ① 安装真的被 DSH 拒了（classifyEnvFailure 解析 stderr）；
+ * ② 装之前就预判出会被拒（默认代装/批量安装的预判，拿的是 npm manifest 的 peer）。
+ * 两条路必须给出**同一份文案**（否则同一个原因在提示条上会有两种说法），所以文案只在这里定义一处。
+ * recoverable:false 是刻意的：普通重试不会变好，必须先授权 —— 界面据此给「授权并重试」而不是「重试」。
+ * @param {{packageName?:string, version?:string, dshVersion?:string, exemptionActive?:boolean}} gate
+ */
+function versionGateFailure(gate) {
+  const g = gate || {}
+  const packageName = String(g.packageName || '')
+  const version = String(g.version || '')
+  const pair = packageName && version ? packageName + '@' + version : ''
+  const runtime = g.dshVersion || '当前版本'
+  return {
+    kind: 'version-gate',
+    title: '插件声明的 dsh 版本范围不含当前 dsh',
+    reason: pair
+      ? 'DSH 在安装前按插件声明的 peer 做精确版本门禁：' + pair + ' 声明支持的 dsh 版本里没有 ' + runtime
+        + '，所以整条拒绝（没装任何东西）。这是作者声明的兼容边界，不是安装坏了；'
+        + '要装就得为「这一对精确版本」授权（接受崩溃/数据损坏风险），只有你能拍板。'
+      : 'DSH 拒绝了这次安装：插件声明的 dsh peer 不含当前 dsh（' + runtime + '）。',
+    entries: [],
+    recoversAt: '',
+    recoverable: false,
+    gate: {
+      packageName,
+      version,
+      dshVersion: String(g.dshVersion || ''),
+      exemptionActive: !!g.exemptionActive,
+    },
+  }
+}
+
+/**
  * 环境级失败分类：这些原因与「装哪个插件」无关，同一批安装会一起中。
  * 面板据此把 N 条一模一样的「操作失败」收敛成一条解释 —— 文案只在这里定义一处。
  */
 function classifyEnvFailure(output) {
   const text = String(output == null ? '' : output)
   const empty = { kind: '', title: '', reason: '', entries: [], recoversAt: '', recoverable: false }
+  // 版本门禁放在最前：它的输出最长、最容易被后面的宽松标记误判，而且它是唯一一类
+  // 「重试不会变好、必须先授权」的失败 —— recoverable:false 是刻意的，不能让提示条给出
+  // 一个点了还会同样失败的「重试」按钮。
+  const gate = parseVersionGate(text)
+  if (gate) return versionGateFailure(gate)
   if (releaseAgeViolation(text)) {
     const entries = parseReleaseAgeEntries(text)
     return {
@@ -407,6 +539,35 @@ async function runCli(args) {
   }
 }
 
+// ---------- 精确版本豁免（把门禁放行交给 dsh 自己做） ----------
+
+/**
+ * 为「一个精确的 包@版本 + 一个精确的 dsh 版本」授予门禁豁免。
+ *
+ * 为什么由 dsh 自己写：放行记录是 profile 目录下的 `compatibility.json`，那是 DSH 的授权账本 ——
+ * `dsh plugin allow-version` 会自己校验参数形状、自己校验 `--dsh-version` 必须等于**运行中**的 dsh、
+ * 自己加文件锁做原子写。DSHL 自己改那个文件就等于绕过了这套校验，所以这里只做"把这个动作交给它"。
+ *
+ * 参数一律先做形状收敛（fail-closed）：包名/版本不合法就不发命令 —— 版本号是要被原样拼进
+ * `包@版本` 的，范围或 dist-tag 混进来会让"授权了哪一版"变得不可预测。
+ * 授权只覆盖这一对精确版本：dsh 升级、或插件再发新版，都要重新授权（DSH 的模型如此，不是这里的选择）。
+ * @returns {Promise<{ok:true, output:string}|{ok:false, error:string, output?:string}>}
+ */
+async function allowVersionExemption(packageName, version, dshVersion) {
+  const pkg = String(packageName == null ? '' : packageName)
+  const ver = String(version == null ? '' : version)
+  const runtime = String(dshVersion == null ? '' : dshVersion)
+  if (!NPM_PACKAGE_PATTERN.test(pkg)) return { ok: false, error: 'npm 包名格式不合法：' + pkg }
+  if (!EXACT_VERSION_PATTERN.test(ver)) return { ok: false, error: '插件版本必须是精确版本：' + ver }
+  if (!EXACT_VERSION_PATTERN.test(runtime)) return { ok: false, error: 'dsh 版本必须是精确版本：' + runtime }
+  try {
+    const r = await runCliOnce(['allow-version', pkg + '@' + ver, '--dsh-version', runtime, '--accept-risk'])
+    return { ok: true, output: (r && r.output) || '' }
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e), output: (e && e.output) || '' }
+  }
+}
+
 // ---------- 安装 / 卸载 ----------
 
 /**
@@ -437,7 +598,7 @@ async function installByName(name, opts = {}) {
     if (!after.installed || !after.bundle) {
       throw new Error('安装后 profile 未正确记录该插件（dependencies/bundles 缺一）')
     }
-    s.lastChange = '已安装 ' + pkg + '@' + after.version
+    noteLastChange(pkg, '已安装 ' + pkg + '@' + after.version)
     log('installed ' + pkg + '@' + after.version)
     s.busy = ''
     return { ok: true, version: after.version, releaseAge: (cli && cli.releaseAge) || null }
@@ -469,7 +630,7 @@ async function uninstallByName(name) {
     if (after.installed || after.bundle) {
       throw new Error('卸载后 profile 仍记录该插件')
     }
-    s.lastChange = '已卸载 ' + pkg
+    noteLastChange(pkg, '已卸载 ' + pkg)
     log('uninstalled ' + pkg)
     s.busy = ''
     return { ok: true }
@@ -498,11 +659,19 @@ module.exports = {
   // 任意 npm 插件（控制台「插件」页的推荐插件用）
   installByName,
   uninstallByName,
+  allowVersionExemption,
+  // 动作回执的生命周期（生效即清 / 超时兜底，策略在 main.js）
+  noteLastChange,
+  clearLastChanges,
+  expireLastChanges,
+  stateOf, // 测试用：进程内瞬时状态（含 lastChange/lastChangeAt）
   installedPackageVersion,
   verifyNpmPackage,
   // 纯函数（测试用）
   pluginStateOf,
   verifyNpmManifestShape,
+  parseVersionGate,
+  versionGateFailure,
   pnpmReady,
   withReleaseAgeOverride,
   releaseAgeViolation,

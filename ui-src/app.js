@@ -458,6 +458,7 @@ function render(state) {
   renderInstallAll(state.pluginInstallAll, state.plugins);
   renderPendingRestart(state.pluginPendingRestart);
   renderPluginEnvIssue(state.pluginEnvIssue, state.pluginEnvNote);
+  void renderPluginGateNotice(state.pluginGateNotice);
 
   // 通知分类开关（设置页）+ 恢复页（检查点/回退记录/服务操作）
   renderNotifyCategories(state.notifyCategories);
@@ -953,6 +954,7 @@ function confirmDialog(opts) {
     $('confirmTitle').textContent = o.title || '确认';
     $('confirmBody').textContent = o.body || '';
     okBtn.textContent = o.confirmText || '确定';
+    cancelBtn.textContent = o.cancelText || '取消';
     okBtn.className = 'btn ' + (o.danger ? 'danger' : 'primary');
     let done = false;
     const finish = (v) => {
@@ -1535,6 +1537,20 @@ function pluginMatches(p, filter, query) {
   return [p.name, p.subtitle, p.description, p.id, p.category].some((v) => String(v || '').toLowerCase().includes(query));
 }
 
+/**
+ * 「需授权」那行提示的 tooltip：为什么会被拒 + 按钮接下来会做什么（长尾留 tooltip，单行不抢版面）。
+ * 数据全部来自主进程的门禁预判（p.gate），壳不自己判兼容性。
+ */
+function pluginGateHint(p) {
+  const g = (p && p.gate) || {};
+  const peers = (g.peers || []).map((x) => '· ' + x.name + ' 声明 ' + x.range).join('\n');
+  return 'DSH 的版本门禁：' + ((p && p.name) || '') + '@' + (g.targetVersion || (p && p.latestVersion) || '')
+    + ' 声明的 dsh 范围里没有当前 dsh ' + (g.dshVersion || '') + '，直接安装/更新会被拒。\n'
+    + '点按钮会先调用 dsh 自己的 allow-version，为「这一对精确版本」授权后再装；'
+    + '授权只对这一对版本生效，dsh 升级或插件再发新版都要重新授权。'
+    + (peers ? '\n不满足的声明：\n' + peers : '');
+}
+
 function pluginCardEl(p) {
   const card = document.createElement('article');
   card.className = 'plugin-card' + (p.busy ? ' busy' : '');
@@ -1611,9 +1627,21 @@ function pluginCardEl(p) {
   const actions = document.createElement('div'); actions.className = 'plugin-actions';
   // 版本提示：只有拿到 npm 侧最新版时才显示，避免「已是最新」是伪结论
   const latestKnown = !!(p.latestVersion && p.version && p.latestVersion === p.version);
+  // 版本门禁预判（主进程给）：目标版本会被 DSH 拒绝时，这里不能写「可更新到 vX」——
+  // 那是在承诺一个点下去必然失败的动作；改成"需授权"，按钮也由主进程换成「授权并更新」。
+  const gated = !!(p.gate && p.gate.state === 'gated');
   if (p.outdated && p.latestVersion) {
-    const latest = document.createElement('span'); latest.className = 'plugin-latest';
-    latest.textContent = '可更新到 v' + p.latestVersion;
+    const latest = document.createElement('span');
+    latest.className = 'plugin-latest' + (gated ? ' gate' : '');
+    latest.textContent = gated ? '需授权后更新到 v' + p.latestVersion : '可更新到 v' + p.latestVersion;
+    if (gated) latest.title = pluginGateHint(p);
+    actions.appendChild(latest);
+  } else if (gated && !p.installed && p.latestVersion) {
+    // 还没装、但 npm 上最新那版会被门禁拒绝：安装同样得先授权，先说清楚
+    const latest = document.createElement('span');
+    latest.className = 'plugin-latest gate';
+    latest.textContent = '需授权后安装 v' + p.latestVersion;
+    latest.title = pluginGateHint(p);
     actions.appendChild(latest);
   } else if (latestKnown) {
     const latest = document.createElement('span'); latest.className = 'plugin-latest'; latest.textContent = '已是最新';
@@ -1748,6 +1776,10 @@ function renderInstallAll(info, list) {
   const updateBtn = $('btnPluginsUpdate');
   if (updateBtn) {
     const outdated = (Array.isArray(list) ? list : []).filter((p) => p && p.outdated);
+    // 被版本门禁挡住的那些不归「一键更新」管（授权必须由用户在卡片上单独拍板一次），
+    // 所以可用态只数真正能更新的：否则会出现"点了却一个都没更新"。
+    const updatable = outdated.filter((p) => !(p.gate && p.gate.state === 'gated'));
+    const gated = outdated.filter((p) => p.gate && p.gate.state === 'gated');
     updateBtn.textContent = '一键更新';
     if (running && kind === 'update') {
       updateBtn.textContent = '更新中 (' + done + '/' + total + ')' + current + '…';
@@ -1757,10 +1789,13 @@ function renderInstallAll(info, list) {
       updateBtn.disabled = true;
       updateBtn.title = '另一个插件批量操作正在进行中';
     } else {
-      updateBtn.disabled = !outdated.length;
-      updateBtn.title = outdated.length
-        ? '更新 ' + outdated.length + ' 个可更新的插件（' + outdated.map((p) => p.name).join('、') + '）；全部完成后自动重启一次 DSH 生效'
-        : '当前没有可更新的插件';
+      updateBtn.disabled = !updatable.length;
+      updateBtn.title = updatable.length
+        ? '更新 ' + updatable.length + ' 个可更新的插件（' + updatable.map((p) => p.name).join('、') + '）；全部完成后自动重启一次 DSH 生效'
+          + (gated.length ? '。另有 ' + gated.length + ' 个需先授权（' + gated.map((p) => p.name).join('、') + '），请在卡片上单独点「授权并更新」' : '')
+        : (gated.length
+          ? gated.length + ' 个可更新的插件都需先授权（' + gated.map((p) => p.name).join('、') + '）：在卡片上点「授权并更新到 vX」'
+          : '当前没有可更新的插件');
     }
   }
 }
@@ -1803,7 +1838,86 @@ function renderPluginEnvIssue(info, note) {
     retry.classList.toggle('hidden', n === 0);
     retry.textContent = n > 1 ? '重试这 ' + n + ' 个插件' : '重试失败的插件';
   }
+  // 版本门禁失败：普通"重试"不会变好（DSH 还会照样拒），所以给的是「授权并重试」——
+  // 按钮只在真有可授权的 包@版本 时出现，tooltip 里写明会授权哪几对。
+  const grant = $('btnPluginEnvGrant');
+  if (grant) {
+    const items = Array.isArray(issue.grants) ? issue.grants : [];
+    grant.classList.toggle('hidden', items.length === 0);
+    grant.textContent = items.length > 1 ? '授权这 ' + items.length + ' 个并重试' : '授权并重试';
+    grant.title = items.length
+      ? '会为这些「插件版本 + dsh 版本」逐个授予精确版本豁免（等价于 dsh plugin allow-version），然后重新安装：\n'
+        + items.map((g) => '· ' + (g.label || g.packageName) + '：' + g.packageName + '@' + g.version + ' on dsh ' + g.dshVersion).join('\n')
+      : '';
+  }
 }
+
+/**
+ * 默认代装因版本门禁没装上的那批：弹一次窗，把"哪几个、为什么、去哪装"讲清楚。
+ *
+ * 为什么要弹窗而不是只留提示条：提示条在「预装插件」页里，而首次安装的用户很可能压根不会打开那一页 ——
+ * 装完向导就以为万事俱备，最后缺插件这件事谁也没告诉他。默认代装又**不会替他授权**
+ * （不兼容风险只能本人拍板），所以这里只做提醒 + 指路，动作仍由用户在卡片上点「授权并安装」。
+ * 只弹一次：点过任何一个按钮都会 ack（主进程把这条记在配置里），重开控制台也不会再弹。
+ */
+async function renderPluginGateNotice(notice) {
+  const info = (notice && Array.isArray(notice.items) && notice.items.length) ? notice : null;
+  if (!info) { window._gateNoticeAt = 0; return; }
+  if (window._gateNoticeAt === info.at || window._gateNoticeBusy) return; // 同一条只弹一次
+  window._gateNoticeAt = info.at;
+  window._gateNoticeBusy = true;
+  try {
+    const list = info.items.map((x) => '· ' + x.name + '（' + x.npm + (x.version ? '@' + x.version : '') + '）');
+    const dsh = (info.items[0] && info.items[0].dshVersion) || '';
+    const ok = await confirmDialog({
+      title: info.items.length + ' 个预装插件需要你手动安装',
+      body: '默认代装不会替你接受插件的兼容风险，所以下面这几个没有自动安装：\n' + list.join('\n')
+        + '\n\n原因：它们声明的 dsh 版本范围里没有当前 dsh' + (dsh ? ' ' + dsh : '') + '，直接安装会被 DSH 拒绝。'
+        + '\n\n要装的话，去「预装插件」页点对应卡片的「授权并安装」—— 那一步会把风险和生效范围讲清楚，由你自己确认。',
+      confirmText: '去预装插件页安装',
+      cancelText: '稍后再说',
+    });
+    await cmd('pluginsAckGateNotice'); // 看过了就不再弹（去装 / 稍后都算看过）
+    if (ok) {
+      showPage('plugins');
+      // 顺手把第一张「需授权」的卡片滚进视野：用户点完就知道该点哪儿
+      const chip = document.querySelector('.plugin-card .plugin-latest.gate');
+      const card = chip && chip.closest('.plugin-card');
+      if (card && card.scrollIntoView) card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  } finally {
+    window._gateNoticeBusy = false;
+  }
+}
+
+// 授权并重试：逐个把「这一对精确版本」交给 dsh 的 allow-version 授权，然后重装 ——
+// 风险接受必须显式确认一次（按钮不是"再试一下"，而是"接受不兼容风险并继续"），文案里写清作用范围。
+$('btnPluginEnvGrant').addEventListener('click', async () => {
+  const btn = $('btnPluginEnvGrant');
+  const issue = window._pluginEnvIssue || {};
+  const items = Array.isArray(issue.grants) ? issue.grants : [];
+  if (!items.length) return;
+  const ok = await confirmDialog({
+    title: '授权并重试这些插件？',
+    body: '会为下面这些「插件版本 + dsh 版本」逐个授予精确版本豁免（等价于 dsh 的 allow-version），然后重新安装：\n'
+      + items.map((g) => '· ' + (g.label || g.packageName) + '：' + g.packageName + '@' + g.version + ' on dsh ' + g.dshVersion).join('\n')
+      + '\n\n授权等于接受作者标注的不兼容风险（可能崩溃或损坏数据）。授权只对这一对精确版本生效：'
+      + 'dsh 升级、或插件再发新版，都需要重新授权。',
+    confirmText: '授权并重试',
+  });
+  if (!ok) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '授权中…';
+  const r = await cmd('pluginsGrantEnvFailed');
+  const fresh = await cmd('pluginsGetState');
+  if (fresh) renderPlugins(fresh, true);
+  btn.disabled = false;
+  btn.textContent = old;
+  showConsoleToast(r && r.ok
+    ? '已授权并重新安装，点顶部「立即重启生效」后启用'
+    : ('授权或重试仍有失败：' + ((r && r.error) || '未知原因')));
+});
 
 // 重试失败项：只跑这批失败的插件，装完仍由顶部「立即重启生效」统一生效
 $('btnPluginEnvRetry').addEventListener('click', async () => {
@@ -1975,12 +2089,24 @@ $('btnPluginsInstallAll').addEventListener('click', async () => {
 // 一键更新：把所有「可更新」的插件更新一遍 —— 中途不重启，全部更新完自动重启一次 DSH 生效
 $('btnPluginsUpdate').addEventListener('click', async () => {
   const btn = $('btnPluginsUpdate');
-  const targets = (window._plugins || []).filter((p) => p && p.outdated);
-  if (!targets.length) return;
+  const outdated = (window._plugins || []).filter((p) => p && p.outdated);
+  // 需先授权的那些不进这批：批量里静默替用户接受不兼容风险是错的，它们由卡片上的按钮单独拍板
+  const gated = outdated.filter((p) => p.gate && p.gate.state === 'gated');
+  const targets = outdated.filter((p) => !(p.gate && p.gate.state === 'gated'));
+  if (!targets.length) {
+    showConsoleToast(gated.length
+      ? '这些插件需先授权：请在卡片上点「授权并更新到 vX」'
+      : '没有可更新的插件');
+    return;
+  }
   const ok = await confirmDialog({
     title: '更新所有可更新的插件？',
     body: '会依次更新本页 ' + targets.length + ' 个可更新的插件（' + targets.map((p) => p.name).join('、') + '）。'
-      + '开始前会先停止 DSH 服务，进行中的会话会中断；中途不重启，全部更新完自动重启一次 DSH 生效。',
+      + '开始前会先停止 DSH 服务，进行中的会话会中断；中途不重启，全部更新完自动重启一次 DSH 生效。'
+      + (gated.length
+        ? '\n\n另有 ' + gated.length + ' 个需先授权（' + gated.map((p) => p.name).join('、') + '），不在这批里：'
+          + '请在卡片上单独点「授权并更新到 vX」（授权是风险接受，只对这一对精确版本生效）。'
+        : ''),
     confirmText: '开始更新',
   });
   if (!ok) return;

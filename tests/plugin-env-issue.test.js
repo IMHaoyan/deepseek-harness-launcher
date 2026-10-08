@@ -19,16 +19,26 @@ const AGE_OUTPUT = '[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries 
   + '  dsh-chat-import@0.17.0 was published at 2026-09-15T15:39:20.245Z, within the minimumReleaseAge cutoff (x)\n'
   + 'The lockfile contains entries that the active policies reject. This can mean the lockfile is stale, or that someone committed a lockfile that bypassed the policy locally.'
 
+// DSH 版本门禁的真实输出（2026-10-08 实测：运行 dsh 0.2.1-alpha.1，插件声明只到 0.2.0-rc.2）
+const GATE_OUTPUT = 'dsh: installation rejected: Plugin @michengai/dsh-skills-manager@1.1.13 is incompatible with '
+  + 'dsh 0.2.1-alpha.1: peerDependencies {"@deepseek-ai/dsh-skill":"0.1.2-rc.1 || 0.2.0-rc.2"}. Running it may cause '
+  + 'crashes or data loss. Update the plugin or install a plugin version compatible with this dsh runtime. To accept '
+  + 'this risk explicitly, grant the exact-version exemption for @michengai/dsh-skills-manager@1.1.13 on dsh '
+  + '0.2.1-alpha.1 with `dsh plugin allow-version` or the plugin manager, then retry the installation or restart dsh. '
+  + 'Exact-version exemption: not active.\n'
+  + 'dsh: nothing was installed.'
+
 /** 取真实的聚合实现（含 module 内的 pluginEnvIssue/pluginEnvNote），注入最小上下文跑真流程。 */
 function loadAggregator(overrides = {}) {
   const start = main.indexOf('let pluginEnvIssue = null')
   const retryAt = main.indexOf('async function retryPluginEnvFailures() {')
   assert.ok(start > 0 && retryAt > start, '找不到插件环境级故障聚合实现')
-  const end = main.indexOf('\n}\n', retryAt) + 3
+  const end = main.indexOf('\n}\n', main.indexOf('async function grantAndRetryPluginEnvFailures() {')) + 3
   const ctx = {
     MANAGED_NPM_PLUGINS: [
       { id: 'usage-billing', name: '用量与计费', npm: '@kenz1117/dsh-ui-usage-billing' },
       { id: 'rename-me', name: '另一个插件', npm: 'other-pkg' },
+      { id: 'skills-manager', name: '技能管理', npm: '@michengai/dsh-skills-manager' },
     ],
     market,
     runManagedPluginAction: async () => ({ ok: true }),
@@ -37,7 +47,7 @@ function loadAggregator(overrides = {}) {
   }
   const names = Object.keys(ctx)
   const body = main.slice(start, end)
-    + '\nreturn { pluginDisplayName, notePluginEnvFailure, clearPluginEnvFailure, notePluginReleaseAgeRetry, retryPluginEnvFailures, issue: () => pluginEnvIssue, note: () => pluginEnvNote }'
+    + '\nreturn { pluginDisplayName, notePluginEnvFailure, clearPluginEnvFailure, notePluginReleaseAgeRetry, retryPluginEnvFailures, grantAndRetryPluginEnvFailures, issue: () => pluginEnvIssue, note: () => pluginEnvNote }'
   return new Function(...names, body)(...names.map((k) => ctx[k]))
 }
 
@@ -125,6 +135,49 @@ test('重试失败项：只跑这批、攒着等一次重启、失败原样回�
   ], '重试必须沿用原动作，并走 defer（不逐项重启服务）')
 })
 
+test('版本门禁失败：给「授权并重试」的精确清单，不给点了还会失败的重试按钮', () => {
+  const agg = loadAggregator()
+  const info = market.classifyEnvFailure(GATE_OUTPUT)
+  agg.notePluginEnvFailure('skills-manager', 'update', info)
+  agg.notePluginEnvFailure('skills-manager', 'update', info) // 同一对 包@版本 只记一次
+  const issue = agg.issue()
+  assert.equal(issue.kind, 'version-gate')
+  assert.deepEqual(issue.retry, [], '普通重试不会变好：不给「重试失败的插件」')
+  assert.deepEqual(issue.grants.map((g) => [g.packageName, g.version, g.dshVersion]), [
+    ['@michengai/dsh-skills-manager', '1.1.13', '0.2.1-alpha.1'],
+  ], '授权项必须是精确的 包@版本 + dsh 版本（dsh 的账本就是按这对记的）')
+  assert.deepEqual(issue.names, ['技能管理'])
+})
+
+test('授权并重试：沿用原动作 + grantExemption + defer，失败原样回报', async () => {
+  const calls = []
+  const agg = loadAggregator({
+    runManagedPluginAction: async (id, action, opts) => {
+      calls.push({ id, action, defer: !!(opts && opts.defer), grant: !!(opts && opts.grantExemption) })
+      return id === 'skills-manager' ? { ok: true } : { ok: false, error: '授权被拒' }
+    },
+  })
+  assert.deepEqual(await agg.grantAndRetryPluginEnvFailures(), { ok: false, error: '没有可授权的失败项' })
+  const info = market.classifyEnvFailure(GATE_OUTPUT)
+  agg.notePluginEnvFailure('skills-manager', 'update', info)
+  const r = await agg.grantAndRetryPluginEnvFailures()
+  assert.deepEqual(r, { ok: true, granted: 1 })
+  assert.deepEqual(calls, [{ id: 'skills-manager', action: 'update', defer: true, grant: true }],
+    '授权重试必须带 grantExemption，并走 defer（不逐项重启服务）')
+})
+
+test('归类换挡：门禁与 24h 观察期不混成一条；成功一次就把授权项摘掉', () => {
+  const agg = loadAggregator()
+  agg.notePluginEnvFailure('skills-manager', 'update', market.classifyEnvFailure(GATE_OUTPUT))
+  agg.notePluginEnvFailure('usage-billing', 'install', market.classifyEnvFailure(AGE_OUTPUT))
+  assert.equal(agg.issue().kind, 'release-age', '换一类原因就重新开始')
+  assert.deepEqual(agg.issue().grants, [], '旧原因下的授权项不跟着新提示走')
+  agg.notePluginEnvFailure('skills-manager', 'update', market.classifyEnvFailure(GATE_OUTPUT))
+  assert.equal(agg.issue().kind, 'version-gate')
+  agg.clearPluginEnvFailure('skills-manager')
+  assert.equal(agg.issue(), null, '摘空了整条提示就消失')
+})
+
 test('主进程接线：状态下发、动作记账、IPC 命令齐全', () => {
   assert.match(main, /pluginEnvIssue: pluginEnvIssue/, 'stateJson 应下发聚合状态')
   assert.match(main, /pluginEnvNote: pluginEnvNote \|\| ''/, 'stateJson 应下发放行完成的低噪提示')
@@ -134,6 +187,8 @@ test('主进程接线：状态下发、动作记账、IPC 命令齐全', () => {
   assert.match(main, /notePluginEnvFailure\(d\.id, 'install'/, '默认代装的失败项也要记账')
   // 命令必须存在；插件操作统一走 profile 写锁（withProfileOp），所以匹配的是包了一层的形态
   assert.match(main, /case 'pluginsRetryEnvFailed': return JSON\.stringify\(await withProfileOp\([^)]*\(\) => retryPluginEnvFailures\(\)\)\)/, '应有重试失败项的命令')
+  assert.match(main, /case 'pluginsGrantEnvFailed': return JSON\.stringify\(await withProfileOp\([^)]*\(\) => grantAndRetryPluginEnvFailures\(\)\)\)/, '应有「授权并重试」的命令')
+  assert.match(main, /grants: \(pluginEnvIssue\.grants \|\| \[\]\)\.map\(/, 'stateJson 要下发可授权的 包@版本 清单')
   assert.match(main, /pluginDisplayName\(id\)/, '提示条里的插件名应走统一取名')
 })
 
@@ -145,10 +200,13 @@ test('控制台接线：提示条结构、渲染、重试与「知道了」都�
   assert.match(html, /id="pluginEnvTitle"/, '提示条应有标题位')
   assert.match(html, /id="pluginEnvDetail"/, '提示条应有解释位')
   assert.match(html, /id="btnPluginEnvRetry"/, '提示条应有「重试失败的插件」')
+  assert.match(html, /id="btnPluginEnvGrant"/, '提示条应有「授权并重试」（版本门禁唯一真实的下一步）')
   assert.match(html, /id="btnPluginEnvDismiss"/, '提示条应能收起')
   assert.match(app, /function renderPluginEnvIssue\(info, note\)/, '应有提示条渲染器')
   assert.match(app, /renderPluginEnvIssue\(state\.pluginEnvIssue, state\.pluginEnvNote\)/, '状态推送应驱动提示条')
   assert.match(app, /cmd\('pluginsRetryEnvFailed'\)/, '重试按钮应走真实命令')
+  assert.match(app, /cmd\('pluginsGrantEnvFailed'\)/, '授权按钮应走真实命令')
+  assert.match(app, /confirmDialog\(\{\n\s+title: '授权并重试这些插件？'/, '授权前必须显式确认一次（风险接受不能静默）')
   assert.match(app, /window\._pluginEnvDismissedAt === issue\.at/, '「知道了」按这条故障记，不吞掉下一次失败')
   assert.match(app, /envNote\.split\('；'\)\[0\]/, '环境提示只占概览行后缀，全文退到 tooltip')
   assert.match(css, /\.plugin-env-bar \{/, '提示条应有样式')
