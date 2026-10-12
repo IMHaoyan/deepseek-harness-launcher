@@ -7874,6 +7874,11 @@ function init() {
     if (!envReady()) {
       showConsolePage(firstRun ? 'wizard' : 'env')
       log('environment not ready, console opened for one-click install')
+      // ★ 说明页也要切到实际状态。这条路径以前直接 return，而 startForConsole 在 envReady 那关就
+      //   早退了（永远到不了它自己的 refreshWebUiPhase）—— 于是背后的说明页一直停在
+      //   openWebUi({loadingReason:'start'}) 那一页，显示「正在启动…（已等待 N 秒）」**永远等下去**，
+      //   而实际上什么都没在启动。这正是"界面文案与实际动作不符"：用户点掉控制台就看到它在撒谎。
+      if (!SELF_TEST) void refreshWebUiPhase()
       return
     }
     void maybeAutoInstallPluginMarket() // 插件市场默认安装（每个版本只自动尝试一次）

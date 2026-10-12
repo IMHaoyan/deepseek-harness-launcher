@@ -477,6 +477,29 @@ test('控制台主页把「未生效」收敛成一行（不发系统通知：�
   assert.ok(alertAt > crashAt && alertAt < at + 600, 'alert 样式只看 severity，不受未生效影响')
 })
 
+// ---------- ⑭ 环境不就绪：说明页也必须切到实际状态 ----------
+test('环境不就绪的启动路径要刷新说明页（否则背后那页永远显示"正在启动"）', () => {
+  // 真机实测（DSHL_FRESH_TEST=1 让环境真的不就绪）：
+  //   改前 → LOADURL-DIAG reason=start      （而且 startForConsole 在 envReady 那关就早退，
+  //                                          永远到不了它自己的 refreshWebUiPhase → 一直等下去）
+  //   改后 → LOADURL-DIAG reason=envMissing
+  // 这一页说的是"正在启动…（已等待 N 秒）"，而实际什么都没在启动 —— 正是"文案与实际动作不符"。
+  const at = main.indexOf('environment not ready, console opened for one-click install')
+  assert.ok(at > 0, '找得到那条日志')
+  // 日志行在 if (!envReady()) 之后，所以往前多取一点才能把那个 if 包进来
+  const block = main.slice(Math.max(0, at - 300), at + 700)
+  assert.match(block, /if \(!envReady\(\)\) \{[\s\S]*?refreshWebUiPhase\(\)[\s\S]*?return/,
+    '环境不就绪时也要把说明页切到实际状态，再返回')
+  // 成因：这条路径上**没有任何别的地方**会刷新说明页。
+  // startForConsole（修复动作走的那条）在 envReady 那关直接 return，它自己不带刷新 ——
+  // 所以启动路径必须自己补，不能指望下游。
+  assert.match(main, /async function startForConsole\(\) \{[\s\S]{0,300}?env-not-ready[\s\S]{0,200}?\n\}/,
+    'startForConsole 早退时不刷新 —— 这就是启动路径必须自己刷的原因')
+  // 而 start 不在 PLAN_REASONS 里：plan 即使算出了 envMissing 也不能在 start 页上生效
+  assert.match(loading, /PLAN_REASONS = new Set\(\['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'\]\)/,
+    'start 必须不在白名单里，否则启动中就会显示失败页')
+})
+
 test('构建产物与源同步：wwwroot/app.js 要带上这一行', () => {
   const builtApp = read('wwwroot/app.js')
   assert.match(builtApp, /个插件未生效（重启不会改变）/, 'wwwroot/app.js 未同步：请执行 npm run build:assets')
