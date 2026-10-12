@@ -204,6 +204,15 @@ test('runCli：默认跑一次；命中判定才放行重试一次；其它错�
       + '  dshmarket@1.47.0 was published at 2026-09-15T04:59:30.465Z, within the minimumReleaseAge cutoff (2026-09-15T03:00:00.000Z)'
     return e
   }
+  // ★ 2026-10-12 真机上失败的那一种表现（不是"整份 lockfile 被拒"，而是"精确版本无匹配"）。
+  //   报错串是从 ~/.dsh/dshl-logs/dshl.log 原样抄的 —— 旧标记表不认它，兜底因此从未触发。
+  const preciseViolation = () => {
+    const e = new Error('dsh plugin 退出码 1：TCHING_VERSION] 1 version does not meet the minimumReleaseAge constraint')
+    e.output = '[ERR_PNPM_NO_MATCHING_VERSION] 1 version does not meet the minimumReleaseAge constraint: '
+      + '@michengai/dsh-skills-manager@1.1.16 was published at 2026-10-12T05:30:14.858Z, '
+      + 'within the minimumReleaseAge cutoff (2026-10-11T06:26:52.060Z)'
+    return e
+  }
 
   // 1) 干净 lockfile：一次成功，且**不带**放行参数（pnpm 自己会写 exclude，lockfile 保持合规）
   const ok = mk(() => ({ code: 0, output: 'Done' }))
@@ -217,6 +226,19 @@ test('runCli：默认跑一次；命中判定才放行重试一次；其它错�
   assert.deepEqual(retried.calls, [['add', 'pkg@1.0.0', '-w'], ['add', '--config.minimumReleaseAge=0', 'pkg@1.0.0', '-w']])
   assert.equal(r2.releaseAge.retried, true)
   assert.equal(r2.releaseAge.entries.length, 1)
+
+  // 2b) ★ 真机 2026-10-12 那一次：精确版本被观察期挡掉。这条必须和上面一样走通 ——
+  //     不走通就是"用户点了更新、拿到一行看不懂的报错、没有任何出路"，正是这次要修的。
+  const precise = mk((args, n) => (n === 1 ? preciseViolation() : { code: 0, output: 'Done' }))
+  const r2b = await precise.run(['add', '@michengai/dsh-skills-manager@1.1.16', '-w'])
+  assert.deepEqual(precise.calls, [
+    ['add', '@michengai/dsh-skills-manager@1.1.16', '-w'],
+    ['add', '--config.minimumReleaseAge=0', '@michengai/dsh-skills-manager@1.1.16', '-w'],
+  ], '真机那种表现也必须触发一次性放行并重试')
+  assert.equal(r2b.releaseAge.retried, true)
+  assert.equal(r2b.code, 0, '放行后应当装成功 —— 插件/技能要真的生效')
+  assert.equal(r2b.releaseAge.entries.length, 1)
+  assert.equal(r2b.releaseAge.entries[0].name, '@michengai/dsh-skills-manager@1.1.16')
 
   // 3) 其它错误（占用/网络）：不重试，原样抛出
   const other = mk(() => { const e = new Error('ERR_PNPM_EPERM: operation not permitted'); e.output = 'ERR_PNPM_EPERM: operation not permitted'; return e })
