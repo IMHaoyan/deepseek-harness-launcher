@@ -500,6 +500,42 @@ test('环境不就绪的启动路径要刷新说明页（否则背后那页永�
     'start 必须不在白名单里，否则启动中就会显示失败页')
 })
 
+// ---------- ⑮ 观察点：真实使用代替合成复现 ----------
+test('四类失败页的 reason 只有一份定义，页面侧与主进程侧不许漂移', () => {
+  // 主进程从 recovery-plan.PAGE_REASONS 取，页面侧是独立一份（浏览器页面 require 不到模块），
+  // 所以这条断言就是防漂移的那道闸。
+  const mainSide = planSrc.match(/const PAGE_REASONS = Object\.freeze\(\[([^\]]*)\]\)/)
+  assert.ok(mainSide, 'recovery-plan.js 要有 PAGE_REASONS')
+  const names = mainSide[1].split(',').map((s) => s.trim().replace(/^'|'$/gu, '')).filter(Boolean)
+  assert.deepEqual(names, ['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'])
+  for (const n of names) {
+    assert.ok(loading.includes(`'${n}'`), `页面侧缺 ${n}`)
+    assert.ok(new RegExp(`PLAN_REASONS = new Set\\(\\[[^\\]]*'${n}'`).test(loading)
+      || loading.includes(`'${n}'`), `页面白名单缺 ${n}`)
+  }
+  const pageSet = loading.match(/PLAN_REASONS = new Set\(\[([^\]]*)\]\)/)
+  assert.ok(pageSet, '页面侧要有 PLAN_REASONS')
+  const pageNames = pageSet[1].split(',').map((s) => s.trim().replace(/^'|'$/gu, '')).filter(Boolean)
+  assert.deepEqual(pageNames, names, '两侧必须一模一样：多了会显示不该显示的页，少了会漏掉该显示的')
+  // start 绝不能进白名单：否则启动过程中就会显示失败页
+  assert.ok(!names.includes('start'), 'start 不是失败页')
+})
+
+test('四类失败页第一次真出现时要留下证据（合成场景造不出来，就靠这行日志）', () => {
+  const n = body('noteRecoveryPageShown')
+  assert.match(n, /recoveryPlan\.PAGE_REASONS\.includes\(reason\)/, '只记这四类，常态页记了是噪音')
+  assert.match(n, /sig === lastRecoveryPageLogged\) return/, '同一种失败反复刷新不该刷屏')
+  assert.match(n, /recovery: page reason=/, '日志要能直接看出是哪一页')
+  for (const key of ['kind', 'target', 'targets', 'streak']) {
+    assert.ok(n.includes(key + '='), `日志要带 ${key}（判断"野外的失败形状"就靠这几个字段）`)
+  }
+  // 必须在 refreshWebUiPhase 里被调用，且用同一个 reason（两处各算一次就会不一致）
+  const r = body('refreshWebUiPhase')
+  assert.match(r, /const reason = reasonForPhase\(servicePhase\(\)\)/, 'reason 只算一次')
+  assert.match(r, /noteRecoveryPageShown\(reason\)/, '要真的调用')
+  assert.match(r, /loadingUrl\(reason, t\.id, loadingParams\(\)\)/, '刷新用的是同一个 reason')
+})
+
 test('构建产物与源同步：wwwroot/app.js 要带上这一行', () => {
   const builtApp = read('wwwroot/app.js')
   assert.match(builtApp, /个插件未生效（重启不会改变）/, 'wwwroot/app.js 未同步：请执行 npm run build:assets')

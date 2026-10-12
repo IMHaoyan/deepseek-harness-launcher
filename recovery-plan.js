@@ -8,6 +8,31 @@
 // 本模块只做判定，不做任何 IO，也不执行动作：
 //   planRecovery({ failure, capabilities }) → { scenario, reason, title, sub, detail, primary, secondary, blocked }
 //
+// ── 验证等级（诚实标注，别把"单测全绿"读成"真机验过"）──────────────────────────────────────
+// 这份表是 2026-10 逐个分支核过之后写的。五条分支的代码长得一样，但真机验证程度差得远。
+//
+//   分支             真机  怎么验的 / 为什么没验
+//   ───────────────  ────  ──────────────────────────────────────────────────────────
+//   bootUnknown      ✅    真机：把沙箱 profile 的 package.json 写成非法 JSON →
+//                          `SyntaxError: Unexpected token '}'` 真的让服务起不来。
+//                          这次真机跑还抓出一个单测抓不到的文案 bug（见下面 ⑤ 的注释）。
+//   envMissing       ✅    真机：DSHL_FRESH_TEST=1（env-detect 自带的"全新机模拟"）让环境
+//                          真的不就绪（ready=false node=missing）。**并因此发现说明页在这条
+//                          路径上根本不刷新**，一直停在「正在启动」——已修（main.js 启动路径
+//                          里补 refreshWebUiPhase）。
+//   pluginFailed     ⚠️    只有 harness 渲染 + 行为测试。当前 dsh（0.2.1-alpha.2）对第三方
+//                          插件失败**只写 warning、退出码 0、服务照常运行**，所以这个失败页
+//                          在野外还没被观察到过。要合成它得找旧版 dsh 或 patch dsh 安装的
+//                          required 条目 —— 代价不成比例，且证明不了真正想知道的事（可达性）。
+//   settingsInvalid  ⚠️    同上。另外这条规则本身取自旧日志：实测把 <DSH_HOME>/settings.yaml
+//                          写坏，DSH 启动期**根本不读它**，所以当前版本能否产出这条错误也不确定。
+//   bind             —     刻意不在这里处理：端口类失败有单一来源 server.blockedReason 与既有
+//                          链路（reasonForPhase 把 blocked 判在最前面），在这里再判一次就是两处口径。
+//
+// 可达性怎么补：**不靠合成复现，靠真实使用**。main.js 的 refreshWebUiPhase 给这四类 reason
+// 留了一行观察日志（reason/kind/targets），第一次真出现时日志里就有证据。
+// 这比再钻两小时沙箱有用得多 —— 未知的是"野外的失败形状"，不是"这页会不会画"。
+//
 // ── 借鉴自 dsh-desktop 的三条 ──────────────────────────────────────────────────────────────
 // 出处：anywhere-labs/dsh-desktop 的 `dsh-plugin-desktop/src/recovery-copy.ts`（一张 100+ 字段的
 // 中英文案表）与 `src/startup-failure-routing.ts`（21 行路由）。三条里第 2 条最容易被做反。
@@ -58,6 +83,24 @@ const ACTION_IDS = Object.freeze([
   'uninstall-plugin',
   'restore-checkpoint',
   'retry',
+])
+
+/**
+ * 由本模块判定出来的四个 reason —— 也就是说明页上"带动作/带解释"的那四类失败页。
+ *
+ * 为什么要单列：说明页（ui-src/loading.js）用它当白名单，决定"plan 参数能不能在这页生效"；
+ * 主进程用它当观察点的过滤条件。两处各写一份必然漂移，所以主进程侧从这里取，
+ * 并有测试钉住它与页面侧那份一致。
+ *
+ * 注意 start / offline / failed / blocked 等**不在这里**：那些是常态页，plan 不该在它们上面生效
+ * （否则启动过程中就会显示失败页）。
+ * @type {readonly string[]}
+ */
+const PAGE_REASONS = Object.freeze([
+  'pluginFailed',
+  'settingsInvalid',
+  'envMissing',
+  'bootUnknown',
 ])
 
 /**
@@ -394,6 +437,7 @@ module.exports = {
   pluginTargetsOf,
   pluginFacts,
   ACTION_IDS,
+  PAGE_REASONS,
   CONSOLE_PAGES,
   PLUGIN_KINDS,
   PACKAGE_NAME_RE,

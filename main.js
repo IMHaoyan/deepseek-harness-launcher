@@ -6063,13 +6063,34 @@ function webLoadTabs(reason) {
 }
 
 // 启动失败/阶段变化后：把还在显示"启动中"的说明页刷新为当前实际状态（未启动/重启中/卡住）
+// 观察点（2026-10 加）：新加的四类失败页（recovery-plan.js 派生的）在野外到底会不会出现？
+// 合成场景很难造 —— 当前 dsh 对第三方插件失败只写 warning、不阻断启动，所以 pluginFailed /
+// settingsInvalid 至今没被真实观察到。与其再钻沙箱，不如留一行日志让**真实使用**回答"可达性"：
+// 第一次真出现时日志里就有 reason/kind/targets。只在四类里记（常态页每次状态变化都刷新，记了是噪音），
+// 且按签名去重（同一种失败反复刷新不该刷屏）。
+let lastRecoveryPageLogged = ''
+function noteRecoveryPageShown(reason) {
+  if (!recoveryPlan.PAGE_REASONS.includes(reason)) return
+  try {
+    const f = bootFailureState() || {}
+    const targets = Array.isArray(f.targets) ? f.targets : []
+    const sig = reason + '|' + (f.kind || '') + '|' + targets.join(',')
+    if (sig === lastRecoveryPageLogged) return // 同一种失败只记一次
+    lastRecoveryPageLogged = sig
+    log(`recovery: page reason=${reason} kind=${f.kind || '-'} target=${f.target || '-'}`
+      + ` targets=${targets.length ? targets.join('、') : '-'} streak=${f.count || 0}`)
+  } catch (e) { log('recovery: page note failed: ' + ((e && e.message) || String(e))) }
+}
+
 async function refreshWebUiPhase() {
   if (SELF_TEST) return
+  const reason = reasonForPhase(servicePhase())
+  noteRecoveryPageShown(reason)
   for (const t of webTabs) {
     const wc = t.view.webContents
     if (wc.isDestroyed()) continue
     if ((wc.getURL() || '').includes('loading.html')) {
-      try { wc.loadURL(loadingUrl(reasonForPhase(servicePhase()), t.id, loadingParams())) } catch { /* noop */ }
+      try { wc.loadURL(loadingUrl(reason, t.id, loadingParams())) } catch { /* noop */ }
     }
   }
 }
