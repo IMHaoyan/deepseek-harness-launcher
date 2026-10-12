@@ -394,6 +394,9 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
       }),
     },
     pluginSwitch: { isDisabled: () => false, canToggle: () => true },
+    // 「Profile 里的其他插件」分组：本用例只关心注册表卡片，显式桩成空表
+    // （该分组自己的用例在 tests/plugin-inventory.test.js）。
+    pluginInventoryCards: () => [],
     npmVersionCache: new Map(),
     semver: { valid: () => true, lt: () => false },
     pluginAutoDeclined: () => false,
@@ -832,6 +835,9 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
     npmVersionCache,
     resolveNpmVersion: async (npm) => { calls.resolved.push(npm); npmVersionCache.set(npm, { version: '9.9.9', peerDependencies: {}, at: Date.now() }); return '9.9.9' },
     pluginGateVerdict: (npm) => gatePlan[npm] || { state: 'ok', dshVersion: '', peers: [], reason: 'test' },
+    // 这个用例只关心"注册表 → 卡片目录"这一段；「Profile 里的其他插件」分组由
+    // plugin-inventory.js 自己的用例覆盖，这里显式桩成空表（不是漏掉）。
+    pluginInventoryCards: () => [],
     envReady: () => true,
     envReport: { pnpm: { status: 'ok' } },
     server: { running: () => true },

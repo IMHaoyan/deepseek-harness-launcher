@@ -188,3 +188,44 @@ test('端到端：端口类失败连续 3 次也不触发确定性判定', () =>
   }
   assert.equal(deterministic, false)
 })
+
+// —— 多插件失败：一次失败里有几个插件坏了 ——
+// DSH 把多插件激活失败聚合成 AggregateError 并**逐条打印**（dsh-app-boot/lib/index.js:4260）。
+// classifyBootFailure 只返回一个 target 是刻意的（挑最具体的那条），但界面需要知道"还有谁"，
+// 否则用户禁用掉第一个、重启、又被第二个拦住，看起来像"修了没用"的循环。
+const MULTI_PLUGIN = [
+  'Error: dsh: plugin tree failed to load',
+  'PluginActivationError: failed to import loader entry sidebar (dsh-ui-kit)',
+  'PluginActivationError: failed to import loader entry charts (dsh-charts)',
+  'PluginActivationError: failed to import loader entry theme (dsh-theme-pack)',
+].join('\n')
+
+test('pluginTargets：收集所有被点名的包，去重保序，不受分类优先级影响', () => {
+  assert.deepEqual(bf.pluginTargets(MULTI_PLUGIN), ['dsh-ui-kit', 'dsh-charts', 'dsh-theme-pack'])
+  // 同一个包出现两次只算一个
+  assert.deepEqual(bf.pluginTargets(MULTI_PLUGIN + '\n' + MULTI_PLUGIN), ['dsh-ui-kit', 'dsh-charts', 'dsh-theme-pack'])
+  // 其他两类规则里的包名同样算"被点名"
+  assert.deepEqual(bf.pluginTargets('cannot resolve profile bundle "dsh-x"'), ['dsh-x'])
+  assert.deepEqual(bf.pluginTargets("Cannot find package 'left-pad'"), ['left-pad'])
+})
+
+test('pluginTargets：识别不出就是空数组，且有长度上限（不许把 stderr 抄进界面）', () => {
+  assert.deepEqual(bf.pluginTargets('Error: 谁也没见过的新故障'), [])
+  assert.deepEqual(bf.pluginTargets(''), [])
+  assert.deepEqual(bf.pluginTargets(null), [])
+  assert.deepEqual(bf.pluginTargets(undefined), [])
+  const many = Array.from({ length: 30 }, (_, i) => `failed to import loader entry e${i} (pkg-${i})`).join('\n')
+  assert.equal(bf.pluginTargets(many).length, bf.MAX_TARGETS)
+})
+
+test('classifyBootFailure 带上 targets，但 target 仍是那一个（判定口径不变）', () => {
+  const c = bf.classifyBootFailure(MULTI_PLUGIN)
+  assert.equal(c.kind, 'plugin-tree')
+  assert.equal(c.target, 'dsh-ui-kit', 'target 仍是"最具体的那一条"，不许被 targets 影响')
+  assert.deepEqual(c.targets, ['dsh-ui-kit', 'dsh-charts', 'dsh-theme-pack'])
+  // 单插件失败时 targets 恰好就是那一个，界面据此判断"不用提还有别的"
+  assert.deepEqual(bf.classifyBootFailure(PLUGIN_TREE).targets, ['dsh-better-sidebar'])
+  // 非插件类失败也带上（可能为空），字段始终存在，消费方不必判 undefined
+  assert.deepEqual(bf.classifyBootFailure(EACCES).targets, [])
+  assert.ok(Array.isArray(bf.classifyBootFailure('Error: 未知').targets))
+})

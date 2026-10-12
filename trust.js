@@ -11,9 +11,30 @@
 //   none  —— 不是我们的任何视图：一律拒绝
 'use strict'
 
-// 说明页自己会用的命令（ui-src/loading.js）：重载此页 / 换端口并启动 / 重启服务以恢复访问。
-// 信任边界必须收在这三条上——DSH 页面（或用户在其中跳转到的站点）拿不到这份信任。
-const LOADING_PAGE_COMMANDS = new Set(['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart'])
+// 说明页自己会用的命令（ui-src/loading.js）：重载此页 / 换端口并启动 / 重启服务以恢复访问 /
+// 执行一个恢复动作 / 跳转到控制台的某个页面。
+// 信任边界必须收在这几条上——DSH 页面（或用户在其中跳转到的站点）拿不到这份信任。
+//
+// 为什么新增的 `browser:repairBoot` 是安全的（加在这里之前先确认这三件事仍然成立）：
+//   ① 它的载荷只有一个 action id，且必须在 recovery-plan.ACTION_IDS 内；真正的目标（哪个插件、
+//      哪个槽位）由主进程从账本现算，页面既无法指定也无法伪造；
+//   ② 每个**写**动作还要过一次原生确认框，默认焦点在「取消」（回车不写）；
+//   ③ 它不接受任何路径/包名参数，因此不存在"借说明页改任意文件"的面。
+//
+// `browser:openConsole` 的来历要说清楚，因为**这颗按钮以前被删过一次**（2026-09，用户要求）：
+// 当时那颗按钮写的是「打开 DSHL 控制台（更换端口）」，点下去跑的却是 fixPane（重载本页），
+// 属于"说了不做"—— 删的是那个谎，不是"说明页不许有导航"这条规矩。
+// 2026-10 用户明确要求恢复一个「管理插件」入口，所以按下面的约束加回来：
+//   ① 载荷只有一个页面 key，且必须在 recovery-plan.CONSOLE_PAGES 内（页面无法指定 URL/路径）；
+//   ② 它**不改任何状态**，只是把控制台显示到那一页；
+//   ③ 触发它的理由是可验证的：插件类失败时，失败页只能处理一个包，而清单能一次看完。
+const LOADING_PAGE_COMMANDS = new Set([
+  'browser:fixPane',
+  'browser:blockSwitch',
+  'browser:authRestart',
+  'browser:repairBoot',
+  'browser:openConsole',
+])
 
 /**
  * URL 是否就是说明页本身。允许带 query/hash（loadingUrl() 生成的就是 `…loading.html?reason=…`），

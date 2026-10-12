@@ -22,7 +22,7 @@ test('自己人页面（控制台/窗口壳）任何命令都放行', () => {
 })
 
 test('说明页的白名单命令放行（含带 query 的真实地址）', () => {
-  for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart']) {
+  for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart', 'browser:repairBoot', 'browser:openConsole']) {
     assert.equal(trust.decideCommand(tab(AUTH_PAGE), LOADING_URL, name), 'allow', `说明页应放行 ${name}`)
   }
   // loadingUrl() 生成的一律是 `…loading.html?reason=…`；裸地址与 hash 也算说明页
@@ -32,7 +32,7 @@ test('说明页的白名单命令放行（含带 query 的真实地址）', () =
 
 test('DSH 页面拿不到 browser:* 的信任（这是本文件存在的理由）', () => {
   for (const url of [DSH_PAGE, OTHER_SITE, 'http://127.0.0.1:3080/?token=abc']) {
-    for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart']) {
+    for (const name of ['browser:fixPane', 'browser:blockSwitch', 'browser:authRestart', 'browser:repairBoot', 'browser:openConsole']) {
       assert.equal(trust.decideCommand(tab(url), LOADING_URL, name), 'deny', `${url} 不得放行 ${name}`)
     }
   }
@@ -63,9 +63,12 @@ test('非我们视图的发送方（含取不到发送方）一律拒绝', () =>
   }
 })
 
-// 说明页上没有“打开控制台”按钮了（用户要求删掉）→ 白名单也不该再留这条：界面不动用的权限就不该给
-test('判定表本身：说明页白名单恰好三条，不多不少', () => {
-  assert.deepEqual([...trust.LOADING_PAGE_COMMANDS].sort(), ['browser:authRestart', 'browser:blockSwitch', 'browser:fixPane'])
+// 说明页的导航能力被删过一次（2026-09，那颗按钮"说了不做"），2026-10 按用户要求以「管理插件」
+// 的形式加回来 —— 它只发一个页面 key（白名单在 recovery-plan.CONSOLE_PAGES），不改任何状态。
+// 每次往这里加东西都要过一遍：载荷能不能被页面用来指定目标？它会不会改状态？
+test('判定表本身：说明页白名单恰好五条，不多不少', () => {
+  assert.deepEqual([...trust.LOADING_PAGE_COMMANDS].sort(),
+    ['browser:authRestart', 'browser:blockSwitch', 'browser:fixPane', 'browser:openConsole', 'browser:repairBoot'])
 })
 
 test('isLoadingPageUrl：参数非法/空值不抛错且判否', () => {

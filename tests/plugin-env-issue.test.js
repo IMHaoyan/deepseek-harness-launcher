@@ -41,6 +41,9 @@ function loadAggregator(overrides = {}) {
       { id: 'skills-manager', name: '技能管理', npm: '@michengai/dsh-skills-manager' },
     ],
     market,
+    // pluginDisplayName 现在也要认「Profile 里的其他插件」那类 id（profile:<npm>），
+    // 前缀与显示名规则在 plugin-inventory.js 里，注入真模块而不是在这里抄一份常量。
+    pluginInventory: require('../plugin-inventory'),
     runManagedPluginAction: async () => ({ ok: true }),
     broadcastState: () => {},
     ...overrides,

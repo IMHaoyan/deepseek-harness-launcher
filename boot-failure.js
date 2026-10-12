@@ -105,6 +105,46 @@ const RULES = [
 // 参与确定性判定的种类：这些失败的根因是磁盘上的持久状态，重试不会改变结果
 const DETERMINISTIC_KINDS = new Set(['bundle-missing', 'plugin-tree', 'settings-invalid', 'module-missing'])
 
+// —— 多插件失败：一次失败里到底有几个插件坏了 ——
+// DSH 侧多插件激活失败是一个 AggregateError，成员**逐条打印**：
+//   dsh-app-boot/lib/index.js:4260
+//   `deepest instanceof AggregateError ? ... deepest.errors.map(formatActivationError).join("\n") : ...`
+// 所以"还有谁坏了"在 stderr 里是查得到的。分类只返回一个 target（挑最具体的那条），
+// 若就此打住，用户会以为修完这一个就好了；重启后又被下一个拦住，看起来像循环。
+const TARGET_RES = [
+  /failed to import loader entry [^\s(]+\s*\(([^)]+)\)/gu,
+  /cannot resolve profile bundle "([^"]+)"/gu,
+  /Cannot find package '([^']+)'/gu,
+]
+const MAX_TARGETS = 8
+
+/**
+ * 收集本次失败里**所有**被点名的包，去重保序。
+ * 这是给界面用的"还有几个"，不参与任何判定（判定仍走 RULES + target）。
+ * @param {string} text 子进程 stderr（尾部若干行）
+ * @returns {string[]} 最多 MAX_TARGETS 个；识别不出则空数组
+ */
+function pluginTargets(text) {
+  const raw = String(text === undefined || text === null ? '' : text)
+  const out = []
+  for (const line of raw.split(/\r?\n/u).slice(-TAIL_SCAN_LINES)) {
+    for (const re of TARGET_RES) {
+      re.lastIndex = 0 // 模块级全局正则：每次用前必须复位，否则 lastIndex 会跨行残留
+      let m = re.exec(line)
+      while (m !== null) {
+        const name = cleanLine(m[1])
+        if (name && !out.includes(name)) {
+          out.push(name)
+          if (out.length >= MAX_TARGETS) return out
+        }
+        if (m.index === re.lastIndex) re.lastIndex += 1 // 空匹配保护
+        m = re.exec(line)
+      }
+    }
+  }
+  return out
+}
+
 /** 判定「这行看起来是不是根因」。用于 firstErrorLine 的候选筛选。 */
 function looksLikeError(line) {
   return /(^|\s)(Error|TypeError|RangeError|ReferenceError|SyntaxError)\b/u.test(line) ||
@@ -165,6 +205,8 @@ function focusLine(hit) {
 function classifyBootFailure(text) {
   const raw = String(text === undefined || text === null ? '' : text)
   const lines = raw.split(/\r?\n/u).slice(-TAIL_SCAN_LINES)
+  // 一次失败里所有被点名的包：给界面回答"是不是还有别的插件也坏了"
+  const targets = pluginTargets(raw)
   for (const rule of RULES) {
     for (const line of lines) {
       const m = rule.re.exec(line)
@@ -173,6 +215,7 @@ function classifyBootFailure(text) {
       return {
         kind: rule.kind,
         target,
+        targets,
         signature: signatureOf(line),
         eligible: DETERMINISTIC_KINDS.has(rule.kind),
         line: cleanLine(line).slice(0, LINE_MAX),
@@ -184,6 +227,7 @@ function classifyBootFailure(text) {
   return {
     kind: 'unknown',
     target: '',
+    targets,
     signature: line ? signatureOf(line) : '',
     eligible: false,
     line,
@@ -222,9 +266,11 @@ module.exports = {
   DETERMINISTIC_STREAK,
   DETERMINISTIC_KINDS,
   LINE_MAX,
+  MAX_TARGETS,
   cleanLine,
   signatureOf,
   firstErrorLine,
+  pluginTargets,
   classifyBootFailure,
   nextFailureStreak,
   isDeterministic,

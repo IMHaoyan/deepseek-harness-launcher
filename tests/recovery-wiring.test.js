@@ -1,0 +1,330 @@
+// tests/recovery-wiring.test.js — 启动失败恢复界面的接线护栏（node --test）
+//
+// 对应的是一次真实缺口：boot-failure.js 早就在分类失败（kind/target），但那份结果只喂了通知里
+// 的一句 reason 与"要不要提前停重试"的判定 —— 用户面对的状态页永远只有一个「启动服务」按钮，
+// 对一个插件树挂掉的服务，点下去必然还是同样的失败。
+//
+// 这些断言防的是**改回去**，逐条对应一个会导致"说的和做的不一样"的退化：
+//   ① 分类结果不进 state → 控制台永远看不到是哪个包坏了；
+//   ② 新 reason 没接进 reasonForPhase → 新文案表成了死代码；
+//   ③ plan 没随 URL 下发 → 页面拿不到动作，退回写死的「启动服务」；
+//   ④ 按钮不走 repairBoot → 文案承诺"禁用 X"，实际做的却是重载本页（本仓库踩过这个坑）；
+//   ⑤ 确认框默认焦点不在「取消」→ 回车就把用户的 profile 改了；
+//   ⑥ 凭据不是一次性 / 不绑定失败签名 → 陈旧页面可以对已经变化的目标动手；
+//   ⑦ 写后不回读 → 命令退出码 0 但状态没变，界面照样报成功；
+//   ⑧ recovery-plan.js 没进打包清单 → 打包后 require 失败（只有装机版才会暴露）。
+'use strict'
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+
+const root = path.resolve(__dirname, '..')
+const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n?/gu, '\n')
+const main = read('main.js')
+const trust = read('trust.js')
+const loading = read('ui-src/loading.js')
+const builtLoading = read('wwwroot/loading.js')
+const app = read('ui-src/app.js')
+const planSrc = read('recovery-plan.js')
+const inventory = read('plugin-inventory.js')
+const pkg = JSON.parse(read('package.json'))
+
+/** 取 main.js 里一个函数的函数体（到下一个行首 `}` 为止，够用且不依赖解析器）。 */
+function body(fnName) {
+  const at = main.indexOf(`function ${fnName}(`)
+  assert.ok(at >= 0, `main.js 里找不到 function ${fnName}(`)
+  const rest = main.slice(at)
+  const end = rest.indexOf('\n}')
+  return rest.slice(0, end)
+}
+
+// ---------- ① 分类结果必须到得了界面 ----------
+test('stateJson 下发完整分类（kind/target/reason/count），而不只是 kind', () => {
+  assert.match(main, /function bootFailureState\(\)/, '必须有取分类结果的单一入口')
+  const state = body('stateJson')
+  assert.match(state, /bootFailure: bootFailureState\(\)/, 'state 必须带 bootFailure')
+  const bf = body('bootFailureState')
+  for (const key of ['kind', 'target', 'reason', 'line', 'count']) {
+    assert.ok(bf.includes(key + ':'), `bootFailure 缺字段 ${key}（target 是"该修哪个插件"的唯一依据）`)
+  }
+  // 多插件失败：targets 是"还有谁坏了"的唯一来源，界面靠它说明"别以为修完这一个就好了"
+  assert.match(bf, /targets: Array\.isArray\(info\.targets\) \? info\.targets\.slice\(0, 8\)\.map\(String\) : \[\]/,
+    'targets 必须透传且有上限（兜底分类对象没有这个字段，必须容错）')
+  // stateJson 会被 broadcastState 高频调用 → 这里不能做 IO
+  assert.ok(!/recoveryCapabilities\(\)/.test(state), 'stateJson 里不许现算能力面（那是文件 IO，会拖垮状态推送）')
+  // 控制台恢复页要消费它（否则又是"下发了没人用"的死数据）
+  assert.match(app, /state\.bootFailure/, '控制台恢复页应消费 bootFailure')
+})
+
+// ---------- ② 新 reason 必须真的被用上 ----------
+test('reasonForPhase 按恢复判定返回新 reason，且判在通用 failed/offline 之前', () => {
+  const r = body('reasonForPhase')
+  for (const [scenario, reason] of [['plugin', 'pluginFailed'], ['settings', 'settingsInvalid'], ['env', 'envMissing'], ['unknown', 'bootUnknown']]) {
+    assert.match(r, new RegExp(`scenario === '${scenario}'\\) return '${reason}'`), `${scenario} → ${reason} 的映射不见了`)
+  }
+  // 顺序：分类判定必须在 failed/offline 之前，否则永远走不到
+  assert.ok(r.indexOf("return 'pluginFailed'") < r.indexOf("return 'failed'"), '分类必须判在通用 failed 之前')
+  assert.ok(r.indexOf("return 'pluginFailed'") < r.indexOf("return 'offline'"), '分类必须判在通用 offline 之前')
+  // 端口/凭据两类仍享有最高优先级（单一来源，不许被分类抢走）
+  assert.ok(r.indexOf("return 'blocked'") < r.indexOf("return 'pluginFailed'"))
+  assert.ok(r.indexOf("return 'auth'") < r.indexOf("return 'pluginFailed'"))
+})
+
+test('说明页文案表覆盖新 reason（否则 fallback 成"正在启动…"，与真实动作不符）', () => {
+  const bodySrc = loading.slice(loading.indexOf('const TEXTS = {'), loading.indexOf('const triedAuth'))
+  const keys = new Set([...bodySrc.matchAll(/^  ([A-Za-z][A-Za-z0-9]*): \{$/gm)].map((m) => m[1]))
+  for (const r of ['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown']) {
+    assert.ok(keys.has(r), `说明页缺少 ${r} 的文案`)
+  }
+  // 需要用户介入的状态必须立刻给按钮，不能等 15 秒
+  const busy = loading.slice(loading.indexOf('const BUSY_REVEAL_MS'), loading.indexOf('const revealMs'))
+  for (const r of ['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown']) {
+    assert.ok(!busy.includes(r + ':'), `${r} 需要用户介入，不该进 BUSY_REVEAL_MS`)
+  }
+})
+
+// ---------- ③ plan 必须随 URL 一起下发 ----------
+test('plan 随说明页 URL 下发，且长度有上限（detail 里可能是整行插件树报错）', () => {
+  assert.match(main, /function loadingParams\(\)[\s\S]{0,400}?recoveryPlanNow\(\)/, 'loadingParams 必须把判定结果带上')
+  assert.match(main, /if \(extra && extra\.plan && extra\.plan\.reason\) q \+= '&plan='/, 'loadingUrl 必须序列化 plan')
+  assert.match(main, /JSON\.stringify\(extra\.plan\)\.slice\(0, 1500\)/, 'plan 必须有长度上限')
+})
+
+// ---------- ④ 按钮文案 = 真实动作 ----------
+test('有判定结果时，说明页主按钮发的是 repairBoot + 那个动作本身，不回落到 fixPane', () => {
+  const at = loading.indexOf("document.getElementById('btnReload').addEventListener")
+  assert.ok(at >= 0, '找不到主按钮的监听')
+  const handler = loading.slice(at, loading.indexOf('btnAlt.addEventListener'))
+  assert.match(handler, /if \(planAction\)/, '必须先判有没有主进程给的判定')
+  assert.match(handler, /send\('repairBoot', \{ action: planAction \}\)/, '按钮必须发它承诺的那个动作')
+  // 关键顺序：planAction 分支必须 return，不许掉进下面的 fixPane 兜底
+  const planBranch = handler.slice(handler.indexOf('if (planAction)'), handler.indexOf("if (reason === 'blocked'"))
+  assert.match(planBranch, /return/, 'planAction 分支必须提前返回，否则会同时发两个命令')
+  assert.ok(handler.indexOf('if (planAction)') < handler.indexOf("send('fixPane'"), 'repairBoot 必须判在 fixPane 之前')
+  // 文案来自主进程的同一个对象，页面不自己编
+  assert.match(loading, /btnEl\.textContent = planLabel \|\| t\.btn/, '按钮文案必须优先用 plan 给的 label')
+})
+
+test('构建产物与源同步（wwwroot 是打包真正读的那份）', () => {
+  assert.match(builtLoading, /send\('repairBoot'/, 'wwwroot/loading.js 未同步：请执行 npm run build:assets')
+  assert.match(builtLoading, /pluginFailed:/, 'wwwroot/loading.js 未同步：请执行 npm run build:assets')
+})
+
+test('只有"确实是恢复界面"的那几个 reason 才采纳 plan（进行中的页面不能被上一次失败顶掉文案）', () => {
+  // 主进程的 loadingParams() 对 plugin / recovery / update 这些"进行中"的页面也会附带 plan
+  // （lastBootFailureInfo 还留着上一次的失败）。不加这道闸，"正在应用插件变更…"会被渲染成
+  // 上一次失败的标题——正是"文案与真实动作不符"。
+  assert.match(loading, /const PLAN_REASONS = new Set\(\['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'\]\)/,
+    '必须显式列出采纳 plan 的 reason')
+  assert.match(loading, /if \(PLAN_REASONS\.has\(reason\)\) \{[\s\S]{0,200}?JSON\.parse\(raw\)/,
+    'plan 的解析必须在 reason 闸之内')
+  const at = loading.indexOf('if (PLAN_REASONS.has(reason))')
+  const guard = loading.slice(at, loading.indexOf('const planAction'))
+  assert.match(guard, /plan = JSON\.parse\(raw\)/, 'plan 只能在闸内赋值')
+  // 集合本身恰好是这四个：多一个就是把"进行中"的页面也交出去了
+  const setLine = loading.slice(loading.indexOf('const PLAN_REASONS'), loading.indexOf('\n', loading.indexOf('const PLAN_REASONS')))
+  const listed = [...setLine.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]).sort()
+  assert.deepEqual(listed, ['bootUnknown', 'envMissing', 'pluginFailed', 'settingsInvalid'])
+})
+
+// ---------- ⑤ 确认框 fail-closed ----------
+test('恢复动作的原生确认框：默认焦点与 Esc 都落在「取消」，回车不执行任何写操作', () => {
+  const c = body('confirmBootRepair')
+  assert.match(c, /defaultId: 1/, '默认按钮必须是「取消」（index 1）')
+  assert.match(c, /cancelId: 1/, 'Esc 必须等价于「取消」')
+  assert.match(c, /noLink: true/, '不许出现"不再询问"这类勾选')
+  assert.match(c, /catch[\s\S]{0,200}?return false/, '弹不出确认框就不得执行（fail-closed）')
+  // 语气跟着可逆性走：只有不可逆的卸载用 warning
+  const spec = body('repairConfirmSpec')
+  assert.match(spec, /action === 'uninstall-plugin'[\s\S]{0,300}?type: 'warning'/, '卸载是不可逆动作，语气应为 warning')
+  assert.match(spec, /action === 'disable-plugin'[\s\S]{0,300}?type: 'question'/, '禁用是可逆动作，语气应为 question 而不是警告')
+})
+
+// ---------- ⑥ 凭据一次性 + 绑定世界状态 ----------
+test('凭据先核销再校验，且绑定世界状态指纹（陈旧页面不能对已变化的目标动手）', () => {
+  const e = body('executeRepair')
+  const del = e.indexOf('repairPreviews.delete(previewId)')
+  const get = e.indexOf('repairPreviews.get(previewId)')
+  assert.ok(get >= 0 && del > get, '必须先取再删')
+  const afterDelete = e.slice(del)
+  assert.match(afterDelete, /if \(!preview\)/, '删掉之后才判空 —— 顺序反了就不是一次性')
+  assert.match(e, /preview\.expiresAt <= Date\.now\(\)/, '必须校验 TTL')
+  assert.match(e, /preview\.binding !== bindingFor\(preview\.action, preview\.slotId\)/,
+    '必须用**现算**的绑定值比对（且两侧走同一个函数，否则口径会漂）')
+  const p = body('previewBootRepair')
+  assert.match(p, /if \(!plan\.primary \|\| plan\.primary\.id !== actionId\)/, '签发凭据前必须确认这个动作此刻仍然成立')
+  assert.match(p, /stale: true/, '状态已变化要明确告诉界面刷新，而不是静默失败')
+  assert.match(main, /REPAIR_PREVIEW_TTL_MS = 5 \* 60 \* 1000/, '凭据要有明确 TTL')
+})
+
+test('回退类凭据绑槽的 snapshotId（槽被重新捕获过就作废），插件类绑失败签名', () => {
+  const b = body('restoreBinding')
+  assert.match(b, /health\.listSlots\(\)\.find\(\(s\) => s\.slotId === slotId && s\.valid\)/,
+    '绑定必须**绕过缓存**直接读 health.listSlots()：用 5 秒缓存会让两次比较落在同一份陈旧快照上')
+  assert.ok(!/recoveryCheckpoints\(\)/.test(b), '绑定不许走带缓存的列表（那样等于没校验）')
+  assert.match(b, /slot\.slotId \+ ':' \+ \(\(slot\.meta && slot\.meta\.snapshotId\) \|\| ''\)/, '绑定值必须含 snapshotId')
+  assert.match(b, /if \(!slot\) return ''/, '槽没了要返回空串 → 与存档值必不等 → 判 stale')
+  assert.match(b, /catch \(e\) \{\s*\n\s*log\(/, '读失败要降级成空串并记日志，不能抛给调用方')
+  // snapshotId 必须真的从 health 的 meta 里取出来，否则绑的是一个不存在的字段
+  assert.match(main, /snapshotId: s\.meta \? String\(s\.meta\.snapshotId \|\| ''\) : ''/, 'recoveryCheckpoints 必须透出 snapshotId')
+  const f = body('bindingFor')
+  assert.match(f, /actionId === 'restore-checkpoint'[\s\S]{0,80}?'restore:' \+ restoreBinding\(slotId\)/, '回退走 snapshot 绑定')
+  assert.match(f, /'failure:' \+ failureBinding\(\)/, '其余走失败签名绑定')
+})
+
+// ---------- ⑥b 两条入口共用一条执行路径 ----------
+test('控制台的回退也走两阶段：previewHealthRestore 签发，healthRestore 只认凭据', () => {
+  assert.match(main, /case 'previewHealthRestore': return JSON\.stringify\(previewConsoleRestore\(/, '缺少签发命令')
+  assert.match(main, /case 'healthRestore': return JSON\.stringify\(await executeRepair\(String\(\(value && value\.previewId\) \|\| ''\)\)\)/,
+    'healthRestore 必须只接受 previewId —— 还认 slotId 就等于两阶段白做')
+  const pc = body('previewConsoleRestore')
+  assert.match(pc, /if \(!slot\.valid\)/, '签发前必须自己确认槽可用，不靠页面传')
+  assert.match(pc, /mintRepairPreview\('restore-checkpoint', '', want\)/, '控制台路径也要走同一个签发函数')
+  // 确认文案的事实来自签发瞬间的权威记录
+  assert.match(pc, /capturedAt: slot\.capturedAt/, '要把捕获时间交给页面（否则确认框只能写一句空话）')
+  assert.match(pc, /dshVersion: slot\.dshVersion/, '要把 DSH 版本交给页面')
+  // 页面侧：先签发再确认再核销，且确认文案用的是签发返回的事实
+  assert.match(app, /cmd\('previewHealthRestore', \{ slotId: s\.slotId \}\)/, '控制台必须先签发凭据')
+  assert.match(app, /cmd\('healthRestore', \{ previewId: p\.previewId \}\)/, '确认后才用凭据核销')
+  assert.ok(app.indexOf("cmd('previewHealthRestore'") < app.indexOf("cmd('healthRestore'"), '顺序不能反')
+  assert.match(app, /p\.capturedAt/, '确认文案要用签发返回的捕获时间')
+})
+
+test('回退结果原样透传（备份文件名是唯一可复核的线索，不能压成一句话）', () => {
+  const e = body('executeRepair')
+  assert.match(e, /Object\.assign\(\{\}, r, \{ message: '已回退到检查点 '/, 'restoreCheckpoint 的结果要透传')
+  assert.match(app, /r\.backupFile/, '控制台回执要显示备份文件名')
+})
+
+test('"在不在"与"变没变"分开判：绑定放行不等于槽还在', () => {
+  // 反例：槽在签发时就已经没了 → 两次现算绑定都是 ''，相等 → 绑定那一关反而放行。
+  const e = body('executeRepair')
+  const restoreAt = e.indexOf("preview.action === 'restore-checkpoint'")
+  const branch = e.slice(restoreAt, restoreAt + 500)
+  assert.match(branch, /const stillThere = restoreBinding\(preview\.slotId\) !== ''/, '执行前必须显式确认槽还在')
+  assert.match(branch, /if \(!stillThere\) return \{ ok: false, error: '该检查点已不可用[^']*', stale: true \}/, '槽不在要判 stale')
+  assert.ok(branch.indexOf('stillThere') < branch.indexOf('restoreCheckpoint(preview.slotId)'), '存在性检查必须在真正写入之前')
+})
+
+// ---------- ⑦ 写后回读 ----------
+test('插件写操作成功后必须回读账本确认后置条件', () => {
+  const e = body('executeRepair')
+  assert.match(e, /setEnabled\(preview\.target, false\)[\s\S]{0,400}?if \(!pluginSwitch\.isDisabled\(preview\.target\)\)/,
+    '禁用后必须回读 isDisabled：写入成功不等于状态变了')
+  assert.match(e, /market\.uninstallByName\(preview\.target\)/, '卸载必须走官方 dsh plugin 命令（不自己改 profile）')
+  assert.match(e, /restarted[\s\S]{0,200}?服务仍未起来/, '重启失败必须如实说，不能报"已完成"')
+})
+
+// ---------- ⑧ 能力面 fsil-closed ----------
+test('能力面只从权威账本取证，且 fail-closed（查不到就不给按钮）', () => {
+  const c = body('recoveryCapabilities')
+  assert.match(c, /pluginSwitch\.canToggle\(target\)/, '可禁用性必须问 plugin-switch 的补丁层账本')
+  assert.match(c, /market\.getState\(target\)[\s\S]{0,40}?installed/, '可卸载性必须问 profile 清单')
+  assert.match(c, /recoveryCheckpoints\(\)\.find\(\(s\) => s\.valid\)/, '检查点只认 valid 槽位')
+  assert.match(c, /PACKAGE_NAME_RE\.test\(target\)/, 'target 可能是 loader entry 而非包名，必须挡住')
+  // 取证失败不能抛出（否则整个状态页起不来）
+  assert.match(c, /catch \(e\) \{ log\(/, '取证失败只能记日志并降级')
+})
+
+// ---------- ⑨ 信任边界与打包清单 ----------
+test('新增命令只扩到说明页，且必须是被信任的发送方', () => {
+  assert.match(main, /case 'browser:repairBoot':/, '主进程必须实现 browser:repairBoot')
+  assert.match(trust, /'browser:repairBoot'/)
+  // 说明页只能发 id，不许出现能指定路径/包名的参数面
+  const handler = main.slice(main.indexOf("case 'browser:repairBoot':"))
+  assert.match(handler.slice(0, 400), /runBootRepair\(String\(\(value && value\.action\) \|\| ''\)\)/,
+    '只接受一个 action id，目标由主进程现算')
+})
+
+// ---------- ⑪「管理插件」导航入口 ----------
+test('导航入口只认白名单页面 key，主进程自己映射成控制台页面', () => {
+  assert.match(trust, /'browser:openConsole'/, '说明页白名单要有这条')
+  const at = main.indexOf("case 'browser:openConsole':")
+  assert.ok(at > 0, '主进程必须实现 browser:openConsole')
+  const branch = main.slice(at, at + 500)
+  assert.match(branch, /if \(!recoveryPlan\.CONSOLE_PAGES\.includes\(page\)\) return JSON\.stringify\(\{ ok: false/,
+    '页面 key 必须过白名单：说明页不许指定任意页面')
+  assert.match(branch, /showConsolePage\(page\)/, '映射到控制台页面')
+  assert.ok(!/showConsolePage\((value|String\(value)/.test(branch), '不许把页面传来的原值直接当页面名用')
+  assert.match(planSrc, /const CONSOLE_PAGES = Object\.freeze\(\['plugins'\]\)/, '白名单本身在 recovery-plan.js')
+})
+
+test('说明页把入口画在次按钮上，且页面自己不知道控制台有哪些页', () => {
+  assert.match(loading, /if \(planEntry\) \{[\s\S]{0,200}?btnAlt\.textContent = planEntry\.label/,
+    '按钮文案必须来自 plan（页面不自己编）')
+  assert.match(loading, /send\('openConsole', \{ page: planEntry\.page \}\)/, '点下去发的是 plan 给的 page')
+  // ★ 页面里不许出现具体页面名：否则"白名单"就成了摆设
+  assert.ok(!/'plugins'/.test(loading), "loading.js 里不该硬编码 'plugins'（页面不该知道控制台有哪些页）")
+  assert.ok(!/showPage|showConsolePage/.test(loading), '页面不该自己决定控制台显示哪一页')
+  // 入口优先于「重新检测」：两者共用一个按钮位，状态页只留两个按钮
+  const altAt = loading.indexOf('if (planEntry) {')
+  const sendAt = loading.indexOf("send('openConsole'")
+  assert.ok(altAt > 0 && sendAt > altAt, '入口的渲染与点击分发都要有')
+  assert.match(builtLoading, /send\('openConsole'/, 'wwwroot/loading.js 未同步：请执行 npm run build:assets')
+})
+
+test('recovery-plan.js 进了打包清单（否则只有装机版会 require 失败）', () => {
+  assert.ok(pkg.build.files.includes('recovery-plan.js'), 'package.json build.files 缺少 recovery-plan.js')
+})
+
+// ---------- ⑩ 插件页必须覆盖 Profile 的真实内容，而不只是注册表 ----------
+// 缺口：能导致启动失败的是 Profile 里**任何**一个包，而卡片来自 MANAGED_NPM_PLUGINS 注册表。
+// 手动装的第三方插件以前在界面上不存在 —— 用户看得到失败原因，却找不到能关掉它的地方。
+test('插件页把 Profile 里不在注册表里的插件也补成卡片', () => {
+  assert.match(main, /const pluginInventory = require\('\.\/plugin-inventory'\)/, '必须引入清单模块')
+  const catalog = main.slice(main.indexOf('function buildPluginCatalog('), main.indexOf('function buildPluginCatalog(') + 20000)
+  assert.match(catalog, /\.\.\.pluginInventoryCards\(\)/, 'catalog 必须带上清单分组')
+  assert.match(main, /targets = pluginCompat\.readProfileTargets\(DSH_PROFILE_DIR\)/,
+    '清单来源必须是 readProfileTargets（与升级预判同一份判据，不新造一个）')
+})
+
+test('清单卡片有缓存，且失效判据是 profile 文件的 mtime（stateJson 每次推送都要跑它）', () => {
+  const fn = body('pluginInventoryCards')
+  assert.match(fn, /inventoryCardsCache\.key === key/, '必须有缓存命中分支')
+  assert.match(fn, /stamp\(DSH_PROFILE_PACKAGE\)/, '失效判据要看 profile package.json 的 mtime')
+  assert.match(fn, /stamp\(DSH_PROFILE_PATCH\)/, '失效判据要看 cordis.patch.yml 的 mtime')
+  assert.match(fn, /const stamp = \(file\) => \{ try \{ return fs\.statSync\(file\)\.mtimeMs \} catch \{ return 0 \} \}/,
+    '取 mtime 失败要按 0 处理（与升级预判同一套写法）')
+  // 真正改了 profile 的路径要显式作废，不能只靠 mtime 的秒级分辨率
+  assert.match(main, /invalidatePluginInventory\(\)/, 'applyPluginChange 之后要显式作废缓存')
+})
+
+test('清单插件的动作分发：走官方 CLI 卸载，且停用/启用要回读校验', () => {
+  const d = body('dispatchManagedPluginAction')
+  assert.match(d, /pid\.startsWith\(pluginInventory\.INVENTORY_ID_PREFIX\)/, '分发必须先认前缀')
+  assert.match(d, /if \(act === 'enable' \|\| act === 'disable'\)/, '要有启停分支')
+  assert.match(d, /market\.uninstallByName\(npm\)/, '卸载必须走官方 dsh plugin 命令')
+  assert.match(d, /if \(pluginSwitch\.isDisabled\(npm\) === want\) return \{ ok: false/, '写后必须回读校验')
+  assert.match(d, /只支持停用\/启用\/卸载/, '安装/更新要明确拒绝并说明，不能默默返回未知操作')
+  const fs = require('node:fs')
+  assert.ok(!/'profile:'/.test(main), 'main.js 里不该硬编码 profile: 前缀（改用模块常量）')
+})
+
+// ---------- ⑫「未生效」必须有出口 ----------
+test('「未生效」证据接到清单卡片上，且与注册表卡片同源', () => {
+  const fn = body('pluginInventoryCards')
+  assert.match(fn, /activationOf: \(npm\) => \{[\s\S]{0,160}?activationIssueOf\(npm\)/,
+    '清单卡片也要走 activationIssueOf（同一个判据，不另造一份）')
+  assert.match(fn, /pluginActivation\.describeActivationIssue\(issue\)/, '文案同源')
+  assert.match(inventory, /activation: String\(activationOf\(npm\) \|\| ''\)/, '纯函数侧要真的用上这个探针')
+})
+
+test('控制台主页把「未生效」收敛成一行（不发系统通知：按需降噪）', () => {
+  // 服务起来了 ≠ 插件起来了，而这条既不是启动失败、也没有任何主动提示 —— 必须有个出口。
+  const at = app.indexOf("const notActive = (state.plugins || []).filter")
+  assert.ok(at > 0, '控制台主页要有这一行')
+  const block = app.slice(at, at + 600)
+  assert.match(block, /个插件未生效（重启不会改变）/, '文案要说清"重启不会改变"')
+  assert.match(block, /可在「预装插件」页查看/, '要给出下一步去哪儿')
+  assert.match(block, /notes\.push/, '走既有的提示卡，不新开模块')
+  // 与"启动失败/崩溃"分开：它不属于 alert 那一档，不能染红
+  const crashAt = app.indexOf('function renderCrashNote')
+  const alertAt = app.indexOf("crashEl.classList.toggle('env-warning', alert)")
+  assert.ok(alertAt > crashAt && alertAt < at + 600, 'alert 样式只看 severity，不受未生效影响')
+})
+
+test('构建产物与源同步：wwwroot/app.js 要带上这一行', () => {
+  const builtApp = read('wwwroot/app.js')
+  assert.match(builtApp, /个插件未生效（重启不会改变）/, 'wwwroot/app.js 未同步：请执行 npm run build:assets')
+})

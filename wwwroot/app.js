@@ -396,6 +396,15 @@ function render(state) {
     if (state.autoRestartStopped) {
       notes.push('自动恢复已停止，服务保持停止状态');
     }
+    // 服务起来了 ≠ 插件起来了：DSH 对「bundle 被跳过 / 行没激活」只写 stderr、退出码 0，
+    // 所以它既不是启动失败、也不会有任何主动提示 —— 插件就那么静默地没工作。
+    // 这里只占一行（非红卡），详情在插件页每张卡片的「未生效」态上；不另发系统通知（按需降噪）。
+    const notActive = (state.plugins || []).filter((p) => p && p.activation);
+    if (notActive.length) {
+      const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
+      notes.push(`${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
+        + `${notActive.length > 3 ? ' 等' : ''} → 可在「预装插件」页查看`);
+    }
     crashEl.classList.toggle('env-warning', alert); // 非 alert 用普通卡片样式，不再红色告警
     crashEl.classList.toggle('hidden', notes.length === 0);
     if (notes.length) {
@@ -1077,17 +1086,28 @@ function recoverySlotEl(s) {
   return el;
 }
 async function doRestoreSlot(s) {
+  // 两阶段：先签发一次性凭据，确认文案里的每个事实（槽位、捕获时间、DSH 版本）都由主进程
+  // 在签发这一刻从权威记录里取，而不是用列表里那份可能已经过期的显示值。
+  const p = await cmd('previewHealthRestore', { slotId: s.slotId });
+  if (!p || !p.ok) {
+    setRecoverySlotStatus('✕ ' + ((p && p.error) || '该检查点当前不可用'), 'error');
+    return;
+  }
+  const when = fmtLocalTime(p.capturedAt);
   const ok = await confirmDialog({
-    title: '回退到 ' + s.slotId + '？',
-    body: '会中断正在运行的会话；当前配置会先备份为 .broken-* 文件（日志目录可查），不会丢东西。回退后启动器会自动重启服务。',
+    title: '回退到 ' + p.slotId + '？',
+    body: '将用' + (when ? when + ' ' : '') + '捕获的这份配置覆盖当前配置'
+      + (p.dshVersion ? '（DSH ' + p.dshVersion + '）' : '')
+      + '。会中断正在运行的会话；当前配置会先备份（日志目录可查），不会丢东西。回退后启动器会自动重启服务。'
+      + '若这期间配置或检查点已经变化，本次回退会被拒绝，需要重新点一次。',
     confirmText: '回退并重启',
     danger: true,
   });
   if (!ok) return;
   setRecoverySlotStatus('正在回退并重启服务…', '');
-  const r = await cmd('healthRestore', { slotId: s.slotId });
+  const r = await cmd('healthRestore', { previewId: p.previewId });
   if (r && r.ok) {
-    setRecoverySlotStatus('✓ 已回退到 ' + s.slotId + (r.backupFile ? '，原配置备份为 ' + r.backupFile : '') + '，服务已重新启动', 'ok');
+    setRecoverySlotStatus('✓ 已回退到 ' + (r.slotId || p.slotId) + (r.backupFile ? '，原配置备份为 ' + r.backupFile : '') + '，服务已重新启动', 'ok');
   } else {
     setRecoverySlotStatus('✕ ' + ((r && r.error) || '回退失败，请查看日志'), 'error');
   }
@@ -1108,6 +1128,13 @@ function renderRecovery(state) {
   }
   if (r.autoRestartStopped) {
     notes.push('自动恢复已停止：服务连续启动失败，请查看日志后手动处理');
+  }
+  // 本次启动失败的分类（主进程 boot-failure.js 判定 → recovery-plan.js 派生动作为止）。
+  // 以前这里只说"已停止"，不说"为什么"；target（哪个包/哪个文件）此前连界面都拿不到。
+  const bf = state && state.bootFailure;
+  if (bf && bf.kind && !(state && state.running)) {
+    const detail = bf.target ? '（' + bf.target + '）' : '';
+    notes.push('本次启动失败：' + (bf.reason || '原因未识别') + detail);
   }
   const noteRow = $('recoveryStatusRow');
   if (noteRow) noteRow.classList.toggle('warn', notes.length > 0);

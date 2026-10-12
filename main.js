@@ -4,7 +4,7 @@
 //                          DshServer.cs（服务生命周期） TcpPid.cs（端口→PID） Bridge.cs（命令桥）
 'use strict'
 
-const { app, BrowserWindow, WebContentsView, Tray, Menu, Notification, shell, ipcMain, nativeImage, nativeTheme, clipboard, screen } = require('electron')
+const { app, BrowserWindow, WebContentsView, Tray, Menu, Notification, shell, ipcMain, nativeImage, nativeTheme, clipboard, screen, dialog } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
@@ -23,8 +23,10 @@ const runGuard = require('./run-guard')
 const lifecycle = require('./lifecycle')
 const health = require('./health')
 const diagnostics = require('./diagnostics')
+const recoveryPlan = require('./recovery-plan')
 const market = require('./market')
 const pluginSwitch = require('./plugin-switch')
+const pluginInventory = require('./plugin-inventory')
 const pluginRepo = require('./plugin-repo')
 const pluginCompat = require('./dsh-plugin-compat')
 const stopGuard = require('./service-stop-guard')
@@ -1827,6 +1829,370 @@ function deterministicFailure() {
   return Object.assign({}, lastBootFailureInfo, { count: lastBootFailure.count })
 }
 
+// ---------- 恢复界面：失败分类 → 一个状态一个动作（借鉴 dsh-desktop 的 recovery 窗口） ----------
+//
+// 为什么需要：boot-failure.js 早就在分类失败（kind/target），但那份结果此前只喂了通知里的一句
+// reason 和"要不要提前停重试"的判定；用户面对的状态页永远只有一个「启动服务」按钮 —— 对一个
+// 插件树挂掉的服务，点下去必然还是同样的失败。这一节把分类接到**可执行的动作**上。
+//
+// 三条来自 dsh-desktop 的设计约束（详见 recovery-plan.js 顶部注释）：
+//   ① 一个状态一个动作；② "能不能修"问权威账本（下面的 recoveryCapabilities），不问错误文本；
+//   ③ 证明不了能做就不给按钮（fail-closed），而不是给一个灰按钮。
+//
+// 分工：**判定**在 recovery-plan.js（纯函数、可单测）；**取证**（哪些能力真的可用）在这里；
+// **执行**在 runBootRepair()。三者分开是为了让"给不给按钮"这件事能被机器断言。
+
+/**
+ * 本次启动失败的分类结果（下发给界面；target 此前从不进 state，只在日志行里）。
+ * @returns {{kind:string,target:string,reason:string,line:string,count:number}|null}
+ */
+function bootFailureState() {
+  const info = lastBootFailureInfo
+  if (!info) return null
+  return {
+    kind: String(info.kind || ''),
+    target: String(info.target || ''),
+    // 一次失败里所有被点名的包（DSH 多插件失败时逐条打印，见 boot-failure.js 的 pluginTargets）。
+    // 界面据此说明"还有别的插件也坏了"，避免用户误以为修完这一个就没事了。
+    targets: Array.isArray(info.targets) ? info.targets.slice(0, 8).map(String) : [],
+    reason: String(info.reason || ''),
+    line: String(info.line || ''),
+    count: lastBootFailure ? Math.max(0, Math.floor(Number(lastBootFailure.count) || 0)) : 0,
+  }
+}
+
+/**
+ * 恢复界面的能力面 —— 每一项都从**权威账本**现算，算不出来一律 false（fail-closed）。
+ * 为什么不缓存：插件补丁层 / 检查点 / 环境报告都可能在两次绘制之间变化，而这里每一个 true
+ * 都直接等于"界面上会出现一个能改用户状态的按钮"。
+ * @returns {object}
+ */
+function recoveryCapabilities() {
+  const failure = bootFailureState()
+  const target = failure ? failure.target : ''
+  const cap = {
+    envReady: false,
+    autoRestartStopped: !!autoRestartStopped,
+    recoveredAt: lastRecoveryAt || '',
+    backupFile: lastRestoreBackup || '',
+    checkpoint: null,
+    plugin: null,
+  }
+  // 环境：envReady() 依赖可能尚未建立的 envReport，读失败按"未就绪"处理（与启动路径同一口径）
+  try { cap.envReady = !!envReady() } catch { cap.envReady = false }
+  // 检查点：只认 valid 的最新槽位（与恢复页列表同源，避免两处口径）
+  try {
+    const slot = recoveryCheckpoints().find((s) => s.valid)
+    if (slot) cap.checkpoint = { slotId: slot.slotId, capturedAt: slot.capturedAt || '' }
+  } catch (e) { log('recovery: checkpoints unavailable: ' + ((e && e.message) || String(e))) }
+  // 插件：target 必须在包名判据内、且确实是当前 profile 里能识别加载项的那个包。
+  //   toggleable —— plugin-switch 能找到它的补丁行（= 禁用是可逆且安全的）
+  //   installed  —— profile 清单里确实记着它（= 卸载有对象）
+  //   两者都查不到 → 界面不给插件按钮，退到"回退检查点"或"看日志"。
+  try {
+    if (target && recoveryPlan.PACKAGE_NAME_RE.test(target)) {
+      const toggleable = pluginSwitch.canToggle(target)
+      const installed = !!(market.getState(target) || {}).installed
+      if (toggleable || installed) {
+        cap.plugin = {
+          name: target,
+          toggleable,
+          disabled: toggleable ? pluginSwitch.isDisabled(target) : false,
+          installed,
+        }
+      }
+    }
+  } catch (e) { log('recovery: plugin inventory unavailable: ' + ((e && e.message) || String(e))) }
+  return cap
+}
+
+/** 恢复界面的当前判定结果。任何一步取证失败都退化成"没有动作"，绝不抛给调用方。 */
+function recoveryPlanNow() {
+  try {
+    return recoveryPlan.planRecovery({ failure: bootFailureState(), capabilities: recoveryCapabilities() })
+  } catch (e) {
+    log('recovery: plan failed: ' + ((e && e.message) || String(e)))
+    return { scenario: 'none', reason: '', title: '', sub: '', detail: '', primary: null, blocked: '' }
+  }
+}
+
+// ---------- 恢复动作：preview → confirm → execute ----------
+// 为什么要两阶段（借鉴 dsh-desktop 的 startup-recovery-controller）：
+//   说明页只知道"用户点了哪个动作"，它**不知道目标此刻还在不在**。从点击到执行之间有确认框这一
+//   段时间，profile 可能已被控制台改过。所以先签发一张一次性凭据（preview），执行时**先核销再校验**，
+//   校验不过就当过期处理。凭据只在主进程里流转，说明页永远拿不到（它没有 Node、没有 IPC 能力）。
+//
+// 确认框走**原生 dialog** 而不是页内 modal（同 dsh-desktop）：页内 modal 的文案由页面渲染，
+//   而"这个按钮到底会改什么"必须由持有账本的一侧来说。默认焦点固定在「取消」——回车不执行任何写操作。
+const REPAIR_PREVIEW_TTL_MS = 5 * 60 * 1000
+const REPAIR_PREVIEW_MAX = 16
+const repairPreviews = new Map()
+
+/** 失败签名：两次失败的原因不同，就不再允许对旧目标动手。 */
+function failureBinding() {
+  return (lastBootFailure && lastBootFailure.signature) || ''
+}
+
+/**
+ * 回退类动作的绑定：**槽的 identity**（slotId + snapshotId）。
+ * 为什么不用"当前配置的哈希"：那只能发现"用户改了启动器设置"，发现不了真正要紧的事 ——
+ * 槽在这段时间被重新捕获过（轮转 / 另一次成功启动），此时用户看到的 capturedAt 与将要写入的
+ * 内容已经不是同一份。snapshotId 每次捕获都重新生成（health.js:329），正好是这份 identity。
+ *
+ * ★ 这里刻意**绕过 recoveryCheckpoints() 的 5 秒缓存**直接读 health.listSlots()：
+ *   绑定值必须反映"此刻磁盘上是什么"，而缓存值只适合用来画列表。用缓存会让
+ *   "签发 → 核销"两次比较落在同一份陈旧快照上，等于没有校验。
+ * 槽消失或损坏 → 返回 ''，与存档值必然不等 → 判 stale。
+ */
+function restoreBinding(slotId) {
+  let slot
+  try {
+    slot = health.listSlots().find((s) => s.slotId === slotId && s.valid)
+  } catch (e) {
+    log('recovery: fresh slot read failed: ' + ((e && e.message) || String(e)))
+    return ''
+  }
+  if (!slot) return ''
+  return slot.slotId + ':' + ((slot.meta && slot.meta.snapshotId) || '')
+}
+
+/**
+ * 一张凭据绑定的"世界状态指纹"——签发与核销两侧都调它，所以必须**只依赖权威账本**，
+ * 绝不接受调用方传进来的值。
+ * @param {string} actionId
+ * @param {string} slotId
+ */
+function bindingFor(actionId, slotId) {
+  return actionId === 'restore-checkpoint'
+    ? 'restore:' + restoreBinding(slotId)
+    : 'failure:' + failureBinding()
+}
+
+function pruneRepairPreviews() {
+  const now = Date.now()
+  for (const [id, p] of repairPreviews) if (p.expiresAt <= now) repairPreviews.delete(id)
+  while (repairPreviews.size > REPAIR_PREVIEW_MAX) {
+    const oldest = repairPreviews.keys().next().value
+    if (oldest === undefined) break
+    repairPreviews.delete(oldest)
+  }
+}
+
+/** 签发一张一次性凭据。调用方**必须**先自行取证，这里只负责登记与绑定。 */
+function mintRepairPreview(action, target, slotId) {
+  pruneRepairPreviews()
+  const id = require('crypto').randomBytes(16).toString('hex')
+  const preview = {
+    id,
+    action,
+    target: target || '',
+    slotId: slotId || '',
+    binding: bindingFor(action, slotId || ''),
+    expiresAt: Date.now() + REPAIR_PREVIEW_TTL_MS,
+  }
+  repairPreviews.set(id, preview)
+  return preview
+}
+
+/**
+ * 为说明页上的一个动作签发凭据。**目标此刻必须真的可做**，否则连确认框都不弹。
+ * @param {string} actionId
+ * @returns {{ok:true, preview:object}|{ok:false, error:string}}
+ */
+function previewBootRepair(actionId) {
+  if (!recoveryPlan.ACTION_IDS.includes(actionId)) return { ok: false, error: '未知的恢复动作' }
+  const plan = recoveryPlanNow()
+  // 说明页按钮上写的动作，必须仍然是此刻的判定结果 —— 否则就是"说的和做的不是一回事"。
+  if (!plan.primary || plan.primary.id !== actionId) {
+    return { ok: false, error: '当前状态已变化，请按刷新后的提示重试', stale: true }
+  }
+  const target = (bootFailureState() || {}).target || ''
+  // 下面的复核是**第二次取证**（第一次在 recoveryCapabilities），因为签发凭据到执行之间还有确认框
+  if (actionId === 'disable-plugin') {
+    if (!target || !pluginSwitch.canToggle(target)) return { ok: false, error: '已无法识别该插件的加载项' }
+    if (pluginSwitch.isDisabled(target)) return { ok: false, error: '该插件已经被禁用', stale: true }
+  }
+  if (actionId === 'uninstall-plugin') {
+    if (!target || !((market.getState(target) || {}).installed)) return { ok: false, error: '该插件已不在当前 Profile 中', stale: true }
+  }
+  let slotId = ''
+  if (actionId === 'restore-checkpoint') {
+    const slot = recoveryCheckpoints().find((s) => s.valid)
+    if (!slot) return { ok: false, error: '没有可用的健康检查点', stale: true }
+    slotId = slot.slotId
+  }
+  return { ok: true, preview: mintRepairPreview(actionId, target, slotId) }
+}
+
+/**
+ * 控制台的「回退并重启」：先签发凭据并把**权威记录里的事实**交给页面，
+ * 由页面据此渲染确认文案，确认后再用凭据核销执行。
+ * 为什么确认框仍在页面里（而说明页走原生 dialog）：控制台是 dshl 自己的可信页面，
+ * 全站都用同一套页内确认；这里要补的不是"确认框放哪"，而是**一次性 + 状态绑定**。
+ * @param {string} slotId
+ */
+function previewConsoleRestore(slotId) {
+  const want = String(slotId || '')
+  const slot = recoveryCheckpoints().find((s) => s.slotId === want)
+  if (!slot) return { ok: false, error: '找不到该检查点' }
+  if (!slot.valid) return { ok: false, error: '该检查点不可用（为空或已损坏）' }
+  const preview = mintRepairPreview('restore-checkpoint', '', want)
+  return {
+    ok: true,
+    previewId: preview.id,
+    expiresAt: new Date(preview.expiresAt).toISOString(),
+    // 以下三项给页面渲染确认文案：文案里的每个事实都来自这次签发时的权威记录，
+    // 而不是页面上那份可能已经过期的列表。
+    slotId: slot.slotId,
+    capturedAt: slot.capturedAt || '',
+    dshVersion: slot.dshVersion || '',
+  }
+}
+
+/** 确认框的语气跟着动作的可逆性走；默认焦点永远在「取消」。 */
+function repairConfirmSpec(preview) {
+  if (preview.action === 'disable-plugin') {
+    return {
+      type: 'question',
+      title: '禁用这个插件？',
+      message: '禁用 ' + preview.target + ' 并重启服务？',
+      detail: '不会删除任何内容：插件本身、版本声明和配置都完整保留在当前 Profile 中，只是下次启动时不再加载'
+        + '（可随时在控制台「插件」页重新启用）。',
+      confirmLabel: '禁用并重启',
+    }
+  }
+  if (preview.action === 'uninstall-plugin') {
+    return {
+      type: 'warning',
+      title: '卸载这个插件？',
+      message: '从当前 Profile 卸载 ' + preview.target + '？',
+      detail: '这会真的移除这个包（走官方 dsh plugin 命令），之后需要重新安装才能使用，也因此无法一键撤销。',
+      confirmLabel: '卸载并重启',
+    }
+  }
+  if (preview.action === 'restore-checkpoint') {
+    return {
+      type: 'question',
+      title: '回退到健康检查点？',
+      message: '用检查点 ' + preview.slotId + ' 覆盖当前配置并重启服务？',
+      detail: '当前配置会先备份到日志目录，回退后可查、可人工还原。',
+      confirmLabel: '回退并重启',
+    }
+  }
+  return { type: 'question', title: '重新启动服务？', message: '重新启动 DeepSeek Harness 服务？', detail: '', confirmLabel: '重新启动' }
+}
+
+/** 弹原生确认框。browserWin 可能已销毁/未创建 → 退化成无父窗口的对话框（仍然可用）。 */
+async function confirmBootRepair(preview) {
+  const spec = repairConfirmSpec(preview)
+  const opts = {
+    type: spec.type,
+    buttons: [spec.confirmLabel, '取消'],
+    defaultId: 1, // ★ 默认落在「取消」：回车不执行任何写操作
+    cancelId: 1,
+    noLink: true,
+    title: spec.title,
+    message: spec.message,
+  }
+  if (spec.detail) opts.detail = spec.detail
+  try {
+    const parent = webWin && !webWin.isDestroyed() ? webWin : undefined
+    const r = parent ? await dialog.showMessageBox(parent, opts) : await dialog.showMessageBox(opts)
+    return r && r.response === 0
+  } catch (e) {
+    log('recovery: confirm dialog failed: ' + ((e && e.message) || String(e)))
+    return false // 弹不出来就不执行（fail-closed）
+  }
+}
+
+/**
+ * 消费一张凭据并执行。**先核销再校验**：凭据天然一次性，重复提交 / 重放都不可能成功。
+ * 每一步失败都带 `stale` 或明确原因，界面据此刷新而不是静默。
+ * 说明页与控制台共用这一条执行路径 —— 两条入口的差别只在"确认框放哪"，不该有两套执行语义。
+ */
+async function executeRepair(previewId) {
+  const preview = repairPreviews.get(previewId)
+  repairPreviews.delete(previewId) // ★ 先删：一次性由这里保证，不靠调用方自觉
+  if (!preview) return { ok: false, error: '恢复凭据已失效，请重试', stale: true }
+  if (preview.expiresAt <= Date.now()) return { ok: false, error: '恢复凭据已过期，请重试', stale: true }
+  // 绑定值必须**现算**再比：签发到核销之间世界可能已经变了（槽被重新捕获 / 失败原因变了）
+  if (preview.binding !== bindingFor(preview.action, preview.slotId)) {
+    return { ok: false, error: '状态已变化，请刷新后重试', stale: true }
+  }
+
+  try {
+    if (preview.action === 'disable-plugin') {
+      if (!pluginSwitch.canToggle(preview.target)) return { ok: false, error: '已无法识别该插件的加载项', stale: true }
+      const r = pluginSwitch.setEnabled(preview.target, false)
+      if (!r.ok) return { ok: false, error: (r && r.error) || '禁用失败' }
+      // 写后回读（借鉴 dsh-desktop 的 "写后必须重读清单确认后置条件"）：命令成功不等于状态变了
+      if (!pluginSwitch.isDisabled(preview.target)) return { ok: false, error: '已写入补丁层，但插件仍显示为启用；请查看日志' }
+      lifecycle.emit('recovery.repair', { action: 'disable-plugin', target: preview.target })
+      const restarted = await applyPluginChange('toggle', '', { name: preview.target, profile: market.PROFILE_NAME, logTag: 'recovery', label: preview.target })
+      return {
+        ok: true,
+        restarted: !!restarted,
+        message: restarted
+          ? '已禁用 ' + preview.target + '，服务已重启'
+          : '已禁用 ' + preview.target + '，但服务仍未起来；下面是新的诊断结果。',
+      }
+    }
+    if (preview.action === 'uninstall-plugin') {
+      if (!((market.getState(preview.target) || {}).installed)) return { ok: false, error: '该插件已不在当前 Profile 中', stale: true }
+      const beforeRows = pluginSwitch.rowIdsForPackage(preview.target)
+      const beforeCarriers = pluginSwitch.carrierDisableIds(preview.target)
+      const r = await market.uninstallByName(preview.target)
+      if (!r || !r.ok) return { ok: false, error: (r && r.error) || '卸载失败' }
+      pluginSwitch.removeRows(preview.target, beforeRows, beforeCarriers)
+      lifecycle.emit('recovery.repair', { action: 'uninstall-plugin', target: preview.target })
+      const restarted = await applyPluginChange('uninstall', '', { name: preview.target, profile: market.PROFILE_NAME, logTag: 'recovery', label: preview.target })
+      return {
+        ok: true,
+        restarted: !!restarted,
+        message: restarted
+          ? '已卸载 ' + preview.target + '，服务已重启'
+          : '已卸载 ' + preview.target + '，但服务仍未起来；下面是新的诊断结果。',
+      }
+    }
+    if (preview.action === 'restore-checkpoint') {
+      // 显式再确认一次槽还可用。为什么不能只靠上面的绑定比对：当槽在**签发时就已经没了**，
+      // 两次现算的绑定都是 ''，相等 → 绑定这一关反而放行。绑定管的是"变没变"，
+      // "在不在"必须单独判 —— 两个问题，两条判据。
+      const stillThere = restoreBinding(preview.slotId) !== ''
+      if (!stillThere) return { ok: false, error: '该检查点已不可用，请刷新后重试', stale: true }
+      const r = await restoreCheckpoint(preview.slotId)
+      // 原样透传 restoreCheckpoint 的结果（slotId/backupFile/extras）：控制台的回退回执要用它们，
+      // 压成一句 message 会把"备份到哪了"这条唯一可复核的线索丢掉。
+      return r && r.ok
+        ? Object.assign({}, r, { message: '已回退到检查点 ' + preview.slotId })
+        : Object.assign({}, r || {}, { ok: false, error: (r && r.error) || '回退失败' })
+    }
+    if (preview.action === 'retry') {
+      const ok = await startForConsole()
+      return ok ? { ok: true, message: '已重新启动服务' } : { ok: false, error: '重新启动失败，请查看日志' }
+    }
+    return { ok: false, error: '未知的恢复动作' }
+  } catch (e) {
+    const msg = (e && e.message) || String(e)
+    log('recovery: repair failed (' + preview.action + '): ' + msg)
+    return { ok: false, error: msg }
+  }
+}
+
+/**
+ * 说明页唯一的写入口。说明页只发 action id —— 目标、槽位、是否可做全部由主进程现算。
+ * @param {string} actionId
+ * @returns {Promise<object>}
+ */
+async function runBootRepair(actionId) {
+  const p = previewBootRepair(actionId)
+  if (!p.ok) return p
+  if (!(await confirmBootRepair(p.preview))) return { ok: false, cancelled: true } // 取消：不改状态，也不刷新页面
+  const r = await executeRepair(p.preview.id)
+  broadcastState()
+  return r
+}
+
 async function maybeAutoRestart() {
   if (!Config.autoRestart || reallyExit) return
   if (autoRestartStopped) return // 已显式停止：等待用户人工处理（启动成功后重新武装）
@@ -1981,6 +2347,10 @@ function recoveryCheckpoints() {
       exists: !!s.exists,
       valid: !!s.valid,
       capturedAt: s.meta ? String(s.meta.capturedAt || '') : '',
+      // 每次捕获都会重新生成的 identity（health.js:329）。回退类凭据绑它：
+      // 槽中途被重新捕获过（轮转 / 另一次成功启动）→ 用户看到的 capturedAt 与将要写入的内容
+      // 已经不是同一份，必须判 stale。
+      snapshotId: s.meta ? String(s.meta.snapshotId || '') : '',
       dshVersion: s.meta ? String(s.meta.dshVersion || '') : '',
       port: s.meta && Number.isInteger(s.meta.port) ? s.meta.port : 0,
       reason: s.meta ? String(s.meta.reason || '') : '',
@@ -2270,6 +2640,7 @@ async function applyPluginChange(verb, version, spec = {}) {
   if (ok) {
     clearPendingPluginRestart() // 已经重启，挂起的变更随之生效
     clearPluginReceipts() // 生效即过期：✓ 回执退场，真实状态由版本号 + 状态胶囊表达
+    invalidatePluginInventory() // profile 刚被改写：插件页的"其余插件"分组要立刻反映出来
     refreshWebUiOnReady(true)
     notify('DeepSeek Harness', verb === 'install' ? `${spec.label}已安装（${name}），服务已重启生效` : `${spec.label}已卸载，服务已重启生效`, undefined, 'recovery')
   } else {
@@ -2793,10 +3164,77 @@ let pluginInstallAllError = ''
 let pluginEnvIssue = null // { kind, title, reason, entries, recoversAt, recoverable, names, retry, at }
 let pluginEnvNote = '' // 安装靠「一次性放行」完成时的低噪提示（插件页概览行后缀）
 
+/**
+ * Profile 里**实际存在**、但不在 DSHL 注册表里的插件，补成同构的卡片。
+ *
+ * 为什么需要它：插件页的卡片来自 MANAGED_NPM_PLUGINS 这份**注册表**，而能导致启动失败的是
+ * Profile 里真实存在的**任何**包 —— 手动 `dsh plugin add` 装的、在 DSH 自己的市场里装的、
+ * 或者从某版起被 DSHL 从注册表移除的。这些包以前在界面上根本不存在：用户在启动失败页看到
+ * "插件 X 加载失败"，却在整个控制台里找不到能关掉 X 的地方。
+ *
+ * 判定（哪些能停用/卸载）全在 plugin-inventory.js 这个纯函数里（可单测）；这里只负责取证：
+ * 清单来源用 dsh-plugin-compat.readProfileTargets —— 读 dependencies + dsh.profile.bundles +
+ * cordis.patch.yml 的 insert 行三者并集，与升级前兼容预判用的是同一份判据（不是为这个功能新造的）。
+ * 读不到 profile 就返回空数组：宁可少一个分组，也不编一份可能不对的清单。
+ *
+ * ★ 必须缓存：buildPluginCatalog 会被 stateJson 调用，而 stateJson 每次 broadcastState 都跑。
+ *   不缓存的话每次状态推送都要读两遍 profile 文件 + 解析 JSON。失效判据用 profile 两个文件的
+ *   mtime（与升级预判 main.js 的 stamp() 同一套），比 TTL 准，而且只花两次 stat。
+ */
+let inventoryCardsCache = { key: '', cards: [] }
+function pluginInventoryCards() {
+  const stamp = (file) => { try { return fs.statSync(file).mtimeMs } catch { return 0 } }
+  // ★ 缓存的失效判据必须**同时也看"未生效"证据到没到**：那两个证据是启动过程中才陆续解析出来的，
+  //   而 profile 的 mtime 在服务跑起来之后不会再变。只看 mtime 的话，第一次算出来的卡片会被
+  //   一直复用，"未生效"永远显示不出来（实测：withActivation=0 且再也不重算）。
+  const issues = (server.activationIssues || []).length
+  const key = stamp(DSH_PROFILE_PACKAGE) + '|' + stamp(DSH_PROFILE_PATCH) + '|act' + issues
+  if (inventoryCardsCache.key === key) return inventoryCardsCache.cards
+  let targets = []
+  try {
+    targets = pluginCompat.readProfileTargets(DSH_PROFILE_DIR) || []
+  } catch (e) {
+    log('plugins: profile inventory unavailable: ' + ((e && e.message) || String(e)))
+    inventoryCardsCache = { key, cards: [] }
+    return []
+  }
+  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm).concat([market.PLUGIN_NAME, bridge.PLUGIN_NAME]))
+  let cards = []
+  try {
+    cards = pluginInventory.inventoryCards({
+      targets,
+      known,
+      stateOf: (npm) => market.getState(npm) || {},
+      isDisabled: (npm) => pluginSwitch.isDisabled(npm),
+      canToggle: (npm) => pluginSwitch.canToggle(npm),
+      busyOf: (id) => String(pluginActionBusy.get(id) || ''),
+      busyLabel: pluginBusyLabel,
+      // 「未生效」的证据：与注册表卡片同源（同一个 activationIssueOf），不另造一份判据
+      activationOf: (npm) => {
+        const issue = activationIssueOf(npm)
+        return issue ? pluginActivation.describeActivationIssue(issue) : ''
+      },
+    })
+  } catch (e) {
+    log('plugins: inventory projection failed: ' + ((e && e.message) || String(e)))
+    cards = []
+  }
+  inventoryCardsCache = { key, cards }
+  return cards
+}
+
+/** profile 变了就让清单缓存立刻失效（安装/卸载/启停后调用；也挂了 5s 兜底 TTL） */
+function invalidatePluginInventory() {
+  inventoryCardsCache = { key: '', cards: [] }
+}
+
 /** 插件卡片 / 提示条用的人类可读名字。 */
 function pluginDisplayName(id) {
   if (id === 'dshmarket') return '插件市场'
   if (id === 'bridge-next') return '手机连接'
+  if (String(id || '').startsWith(pluginInventory.INVENTORY_ID_PREFIX)) {
+    return pluginInventory.shortName(String(id).slice(pluginInventory.INVENTORY_ID_PREFIX.length))
+  }
   const def = MANAGED_NPM_PLUGINS.find((d) => d.id === id)
   return def ? def.name : String(id || '')
 }
@@ -3531,6 +3969,44 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
   const defer = !!opts.defer
   const pid = String(id || '')
   const act = String(action || '')
+  // Profile 里"其余"的插件（不在注册表里）：只认能"让服务先起来"的三个动作，判据全部现查账本。
+  // 安装/更新**故意不给**：它当初从哪装的我们不知道，编一个来源就是文案与真实动作不符。
+  if (pid.startsWith(pluginInventory.INVENTORY_ID_PREFIX)) {
+    const npm = pid.slice(pluginInventory.INVENTORY_ID_PREFIX.length)
+    if (!recoveryPlan.PACKAGE_NAME_RE.test(npm)) return { ok: false, error: '插件名不合法' }
+    const label = pluginDisplayName(pid)
+    if (act === 'enable' || act === 'disable') {
+      if (!pluginSwitch.canToggle(npm)) return { ok: false, error: '找不到它在 profile 补丁层里的加载项，无法安全地停用/启用' }
+      const want = act === 'enable'
+      if (pluginSwitch.isDisabled(npm) === !want) return { ok: true, already: true }
+      const r = pluginSwitch.setEnabled(npm, want)
+      if (!r.ok) return r
+      // 写后回读：命令成功不等于状态变了（与恢复页同一条判据）
+      if (pluginSwitch.isDisabled(npm) === want) return { ok: false, error: '已写入补丁层，但插件状态没有变化；请查看日志' }
+      if (defer) deferPluginChange('toggle', npm, label)
+      else await applyPluginChange('toggle', '', { name: npm, profile: market.PROFILE_NAME, logTag: 'plugins', label })
+      return { ok: true }
+    }
+    if (act === 'uninstall') {
+      // 兜底闸（第二道）：只允许卸载**真的装在 profile 里**的包。
+      // 第一道在 plugin-inventory.js（只收 sources 含 dep 的条目）；这里再查一次实时账本，
+      // 因为"能不能卸"是破坏性动作，宁可多一层。DSH 安装自带的核心 bundle（dsh-base 等）
+      // 不在 dependencies 里 —— 对它们执行 dsh plugin remove 会动 profile 的 bundle 声明。
+      const cur = market.getState(npm)
+      if (!cur || !cur.installed) return { ok: false, error: '它不在当前 Profile 的依赖里，DSHL 不会卸载它' }
+      const beforeRows = pluginSwitch.rowIdsForPackage(npm)
+      const beforeCarriers = pluginSwitch.carrierDisableIds(npm)
+      const stop = await stopServiceForPluginChange()
+      if (!stop.ok) return stop
+      const r = await market.uninstallByName(npm)
+      if (!r || !r.ok) return r || { ok: false, error: '卸载失败' }
+      pluginSwitch.removeRows(npm, beforeRows, beforeCarriers)
+      if (defer) deferPluginChange('uninstall', npm, label)
+      else await applyPluginChange('uninstall', '', { name: npm, profile: market.PROFILE_NAME, logTag: 'plugins', label })
+      return { ok: true }
+    }
+    return { ok: false, error: '这类插件只支持停用/启用/卸载：' + pid + '/' + act }
+  }
   const npmDef = MANAGED_NPM_PLUGINS.find((d) => d.id === pid)
   if (npmDef) {
     if (act === 'install' || act === 'uninstall' || act === 'update' || act === 'reinstall') {
@@ -3929,6 +4405,9 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       actions: bridgeActions,
     },
     ...npmEntries,
+    // Profile 里真实存在、但不在上面的注册表里的插件（见 pluginInventoryCards）。
+    // 放在最后：它们是"其余"，但**必须在页面上**——能导致启动失败的正是 profile 里的任意一个包。
+    ...pluginInventoryCards(),
     // 排序契约：**已安装的一律排前面**（主键，与右上角「N 个已安装」同一个口径：都按 installed 字段算），
     // 其次才是预装集合（插件市场、手机连接 + 注册表声明 autoInstall 的那批）排在手动安装的前面，
     // 同组内按注册表的 order。未安装的卡片一律沉到底部，不会插在已安装的中间。
@@ -4917,6 +5396,9 @@ function loadingUrl(reason, tabId, extra) {
   if (extra && extra.detail) q += '&detail=' + encodeURIComponent(String(extra.detail).slice(0, 500))
   if (extra && extra.suggest) q += '&suggest=' + encodeURIComponent(String(extra.suggest))
   if (extra && extra.tried) q += '&tried=1'
+  // 恢复界面：标题/副文案/主次动作整包交给说明页，避免"文案在主进程、按钮在页面"两处各写一半。
+  // 长度上限是**失败**时也必须有界：detail 里可能是一整行插件树报错。
+  if (extra && extra.plan && extra.plan.reason) q += '&plan=' + encodeURIComponent(JSON.stringify(extra.plan).slice(0, 1500))
   return `${pathToFileURL(path.join(WWWROOT, 'loading.html')).href}?${q}`
 }
 function reasonForPhase(phase) {
@@ -4924,13 +5406,24 @@ function reasonForPhase(phase) {
   if (server.authPending && server.running()) return 'auth' // 自重启后继在服务，但拿不到它的访问凭据
   if (phase === 'starting') return 'start'
   if (phase === 'restarting') return 'restart'
+  // 启动失败已分类 → 换成"带一个动作"的状态页（文案与动作都由 recovery-plan.js 派生）。
+  // 判在 failed/offline 之前：这两个通用页对插件类失败只能给出"再启动一次"，而那必然再失败一次。
+  const scenario = recoveryPlanNow().scenario
+  if (scenario === 'plugin') return 'pluginFailed'
+  if (scenario === 'settings') return 'settingsInvalid'
+  if (scenario === 'env') return 'envMissing'
+  if (scenario === 'unknown') return 'bootUnknown'
   if (phase === 'ready') return 'failed'
   return 'offline'
 }
 
-// 端口冲突时说明页的附加参数（冲突详情 + 建议端口）
+// 端口冲突时说明页的附加参数（冲突详情 + 建议端口）；其余失败按 recovery-plan 的判定结果附带。
 function loadingParams() {
-  return server.blockedReason ? { detail: server.blockedReason, suggest: server.suggestedPort || '' } : {}
+  if (server.blockedReason) return { detail: server.blockedReason, suggest: server.suggestedPort || '' }
+  // 每次都现算，不做缓存：这里面每一个 true 都直接等于"界面上会出现一个能改用户状态的按钮"，
+  // 而 profile / 补丁层 / 检查点都可能在两次绘制之间被改掉。
+  const plan = recoveryPlanNow()
+  return plan.reason ? { plan } : {}
 }
 
 // 新建标签页：视图先在后台创建并加载，激活时才挂载（切换无白屏）
@@ -5565,6 +6058,10 @@ function stateJson() {
     // 只在确实有未处理的失败时非空（成功就绪会清掉），所以不会长期占版面。
     serviceError: lastServiceError || '',
     serviceErrorKind: (lastBootFailureInfo && lastBootFailureInfo.kind) || '',
+    // 本次启动失败的完整分类（kind/target/reason/count）。此前只下发 kind 且界面零引用，
+    // target（到底哪个包）连界面都拿不到 —— 恢复页据此显示"是什么坏了 + 该点哪个动作"。
+    // 只做纯计算、不做 IO：stateJson 会被 broadcastState 高频调用。
+    bootFailure: bootFailureState(),
     version: app.getVersion(),
     firstRun: firstRun,
     autostart: autostartEnabled(),
@@ -5591,7 +6088,8 @@ function stateJson() {
     recoveredAt: lastRecoveryAt || '',
     autoRestartStopped: autoRestartStopped,
     notifyCategories: Config.notifyCategories,
-    // 恢复页数据：健康检查点 + 最近回退 + 崩溃提示（控制台只读；回退动作走 healthRestore 命令）
+    // 恢复页数据：健康检查点 + 最近回退 + 崩溃提示（控制台只读）
+    // 回退动作走两阶段：previewHealthRestore 签发一次性凭据 → healthRestore 核销执行
     recovery: {
       lastExit: runGuardHandle ? (runGuardHandle.previousRun ? 'crashed' : 'clean') : 'unknown',
       lastCrashAt: (runGuardHandle && runGuardHandle.previousRun && runGuardHandle.previousRun.startedAt) || '',
@@ -5995,6 +6493,21 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         }
         case 'browser:authRestart': await restartForAuth(); return '{}'
         case 'browser:blockSwitch': await switchToSuggestedPort((value && value.port) || server.suggestedPort); return '{}'
+        // 恢复界面唯一写入口：说明页只发 action id，目标/槽位/是否可做全部由主进程现算（见 runBootRepair）。
+        case 'browser:repairBoot': {
+          const r = await runBootRepair(String((value && value.action) || ''))
+          // 取消不动状态，也就不该刷掉用户正看着的那一屏
+          if (!r.cancelled) void refreshWebUiPhase()
+          return JSON.stringify(r)
+        }
+        // 恢复界面唯一的**导航**入口（palette: 「管理插件」）：只认白名单里的页面 key，
+        // 不接受 URL / 路径 / 任意页码，主进程自己映射成控制台页面。不改任何状态。
+        case 'browser:openConsole': {
+          const page = String((value && value.page) || '')
+          if (!recoveryPlan.CONSOLE_PAGES.includes(page)) return JSON.stringify({ ok: false, error: '未知的控制台页面' })
+          if (!SELF_TEST) showConsolePage(page)
+          return JSON.stringify({ ok: true, page })
+        }
         case 'browser:winMin': if (webWin && !webWin.isDestroyed()) { try { webWin.minimize() } catch { /* noop */ } } return '{}'
         case 'browser:winMax': {
           if (webWin && !webWin.isDestroyed()) {
@@ -6035,7 +6548,11 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'openLogs': try { shell.openPath(LOG_DIR) } catch { /* noop */ } return '{}'
         // 日志与反馈页的来源切换：launcher=启动器自己的日志；server-* = DSH 子进程的 stdout/stderr
         case 'logRead': return JSON.stringify(readLogSource(value && value.source, value && value.lines))
-        case 'healthRestore': return JSON.stringify(await restoreCheckpoint(String((value && value.slotId) || '')))
+        // 回退配置的两阶段（控制台）：先签发凭据 + 把权威事实交给页面渲染确认文案，
+        // 确认后凭 healthRestore 核销执行。凭据是**一次性**的，且绑定到槽的 snapshotId —— 
+        // 槽在这中间被重新捕获过就判 stale，宁可让用户重来一次。
+        case 'previewHealthRestore': return JSON.stringify(previewConsoleRestore(String((value && value.slotId) || '')))
+        case 'healthRestore': return JSON.stringify(await executeRepair(String((value && value.previewId) || '')))
         case 'openHealthSnapshot': {
           const slotId = String((value && value.slotId) || '')
           if (!/^slot-[123]$/.test(slotId)) return JSON.stringify({ ok: false, error: '未知的检查点' })

@@ -4,6 +4,28 @@ const q = new URLSearchParams(location.search)
 const reason = q.get('reason') || 'start'
 const pane = q.get('pane') || ''
 
+// 恢复界面：主进程按失败分类给出的「一个状态一个动作」（判定在 recovery-plan.js，取证在 main.js）。
+// 参数不存在时保持本页原有行为，一个字都不变 —— 这条是回归安全的底线。
+//
+// ★ 只在**本页确实是恢复界面**时才采纳 plan。主进程的 loadingParams() 对"进行中"的页面
+//   （plugin / recovery / update …）也会照常附带 plan（那里还留着上一次失败的分类），
+//   若不加这道闸，"正在应用插件变更…"那一屏会被渲染成上一次失败的标题 —— 正是本仓库
+//   反复强调的"文案与真实动作不符"。
+const PLAN_REASONS = new Set(['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'])
+let plan = null
+if (PLAN_REASONS.has(reason)) {
+  try {
+    const raw = q.get('plan')
+    if (raw) plan = JSON.parse(raw)
+  } catch (e) { plan = null }
+  if (!plan || typeof plan !== 'object') plan = null
+}
+const planAction = (plan && plan.primary && typeof plan.primary.id === 'string') ? plan.primary.id : ''
+const planLabel = (plan && plan.primary && typeof plan.primary.label === 'string') ? plan.primary.label : ''
+// 导航入口（不是动作）：不改状态，只把人送到控制台里能一次看完的那一页（目前只有插件清单）。
+const planEntry = (plan && plan.entry && typeof plan.entry.page === 'string' && typeof plan.entry.label === 'string')
+  ? plan.entry : null
+
 const TEXTS = {
   start: {
     title: '正在启动 DeepSeek Harness 服务…',
@@ -65,22 +87,60 @@ const TEXTS = {
     btn: '重启服务以恢复访问',
     alt: '再刷新一次',
   },
+  // ---- 启动失败分类页（reason 由 main.js 的 reasonForPhase 按 recovery-plan 的判定给出）----
+  // 这里的文案是**兜底**：plan 参数在时以主进程的判定为准（title 取 plan.title、按钮取
+  // plan.primary.label、副文案取 plan.sub），三者都缺才用到下面这份。
+  // 兜底也必须诚实 —— 主进程判定拿不到时，本页唯一真能做的事就是「重新检测」（fixPane）。
+  pluginFailed: {
+    title: '服务因插件启动失败',
+    sub: '当前 Profile 里有插件加载失败，服务因此起不来。',
+    btn: '重新检测',
+  },
+  settingsInvalid: {
+    title: 'DSH 设置文件解析失败',
+    sub: '设置文件无法解析，服务因此起不来。',
+    btn: '重新检测',
+  },
+  envMissing: {
+    title: '运行环境未就绪',
+    sub: '启动器还没有可用的 dsh 运行环境，服务无法启动。',
+    btn: '重新检测',
+  },
+  bootUnknown: {
+    title: '服务启动失败',
+    sub: '服务没有输出可识别的错误。',
+    btn: '重新检测',
+  },
 }
 const triedAuth = reason === 'auth' && q.get('tried') === '1'
 const t = (triedAuth ? TEXTS.authRestart : TEXTS[reason]) || TEXTS.start
 const subEl = document.getElementById('sub')
 const sub2El = document.getElementById('sub2')
 const btnEl = document.getElementById('btnReload')
-document.getElementById('title').textContent = t.title
+document.getElementById('title').textContent = (plan && plan.title) || t.title
 subEl.textContent = t.sub
-btnEl.textContent = t.btn
+btnEl.textContent = planLabel || t.btn
 
 const btnAlt = document.getElementById('btnSecondary')
 if (triedAuth && t.alt) {
   btnAlt.textContent = t.alt
   btnAlt.classList.remove('hidden')
 }
-if (reason === 'failed' || reason === 'offline' || reason === 'auth') document.body.classList.add('failed')
+// 有恢复动作时同时给出「重新检测」：修完（或不想动插件）之后，用户总得有一条不依赖任何判定的退路。
+// 它走的是既有的 fixPane，不需要新权限。
+if (planAction) {
+  btnAlt.textContent = '重新检测'
+  btnAlt.classList.remove('hidden')
+}
+// 导航入口抢次按钮位：插件类失败时"去清单里一次看完"比"再检测一次"有用得多
+//（失败页只能处理一个包，而清单是整份 Profile）。两者共用同一个按钮位 —— 状态页只留两个按钮，
+// 免得异常页变成一排操作。清单页自己有重启入口，所以不冲突。
+if (planEntry) {
+  btnAlt.textContent = planEntry.label
+  btnAlt.classList.remove('hidden')
+  btnAlt.title = '打开控制台，查看当前 Profile 里的全部插件并逐个停用/启用/卸载'
+}
+if (reason === 'failed' || reason === 'offline' || reason === 'auth' || plan) document.body.classList.add('failed')
 
 // 端口冲突页：detail 展示冲突原因；suggest 有值 → 一键换端口启动；
 // 无值（附近端口全被占）→ 就地重新探测端口并重试启动。
@@ -98,7 +158,7 @@ if (reason === 'blocked') {
 // 没数据 / reason 不匹配（未启动、端口冲突、页面失败、凭据页）→ 不显示步骤行。
 const stepEl = document.getElementById('step')
 const phaseEl = document.getElementById('phase')
-const baseSub = t.sub
+const baseSub = (plan && plan.sub) ? plan.sub : t.sub
 const baseSub2 = t.sub2 || '' // 可选的第二行（见 TEXTS.restartManual）
 let progressData = null
 let tickTimer = null
@@ -160,6 +220,21 @@ function renderProgress(p) {
 const BUSY_REVEAL_MS = { start: 15000, restart: 15000, restartManual: 15000, plugin: 15000, recovery: 15000, update: 90000 }
 const revealMs = BUSY_REVEAL_MS[reason] || 0
 const hintEl = document.getElementById('hint')
+
+// 恢复界面：把"为什么没有动作"（blocked）或原始报错摆出来。
+// 按需降噪 —— 有 blocked 时只讲 blocked（它才是可行动的）；原文单独一行只在 plan **主动给了**
+// detail 时才出现（plugin 场景在有动作时会给空串，所以那里不会多出这一行）。
+// ★ 别把 detail 只在"没有动作"时才显示：实测 kind=unknown 时页面上写着"没有输出错误"，
+//   而原文 `SyntaxError: Unexpected token '}'` 就在手边 —— 那正是最需要摆出来的一行。
+if (plan) {
+  if (plan.detail) subEl.title = String(plan.detail)
+  const note = plan.blocked || (plan.detail ? '原始报错：' + plan.detail : '')
+  if (note && hintEl) {
+    hintEl.textContent = note
+    hintEl.classList.remove('hidden')
+  }
+}
+
 if (revealMs > 0) {
   btnEl.classList.add('hidden')
   setTimeout(() => {
@@ -170,7 +245,26 @@ if (revealMs > 0) {
     }
   }, revealMs)
 }
-document.getElementById('btnReload').addEventListener('click', () => {
+document.getElementById('btnReload').addEventListener('click', async () => {
+  // 有主进程判定时，按钮发的就是它承诺的那个动作本身（文案来自同一个 plan.primary.label）。
+  // 目标（哪个插件 / 哪个槽位）不在页面里，由主进程从账本现算，页面只传 id。
+  if (planAction) {
+    btnEl.disabled = true
+    try {
+      const r = JSON.parse(await window.browserBridge.send('repairBoot', { action: planAction }) || '{}')
+      // 取消（用户在原生确认框里点了「取消」）不改任何东西，也不刷新本页 —— 保持原位即可。
+      if (!r.ok && !r.cancelled) {
+        if (hintEl) {
+          hintEl.textContent = '没能完成：' + (r.error || '未知原因')
+          hintEl.classList.remove('hidden')
+        }
+        btnEl.disabled = false
+      }
+    } catch (e) {
+      btnEl.disabled = false
+    }
+    return
+  }
   try {
     // blocked 且没有建议端口时走 fixPane：主进程会重新探测端口 → 重试启动 → 按最新状态刷新本页
     if (reason === 'blocked' && suggest) window.browserBridge.send('blockSwitch', { port: Number(suggest) })
@@ -179,6 +273,11 @@ document.getElementById('btnReload').addEventListener('click', () => {
   } catch (e) { /* 桥未就绪忽略 */ }
 })
 btnAlt.addEventListener('click', () => {
+  // 导航入口优先：它就是按钮上写的那件事（把控制台切到那一页），不改任何状态。
+  if (planEntry) {
+    try { window.browserBridge.send('openConsole', { page: planEntry.page }) } catch (e) { /* 桥未就绪忽略 */ }
+    return
+  }
   try { window.browserBridge.send('fixPane', { id: pane }) } catch (e) { /* 桥未就绪忽略 */ }
 })
 
