@@ -577,8 +577,13 @@ test('改 profile 前落一个检查点：强制安装弄坏了 DSH 也有得退
   assert.match(c, /invalidateRecoverySlots\(\)/, '落了新点要让恢复页缓存失效，否则列表还是旧的')
   // 只在"当前真的有一个健康状态可保护"时才落：服务没起来时快照的是坏状态，
   // 拿它当回退点等于把用户送回坑里。
-  assert.match(c, /if \(!server\.running\(\) \|\| !server\.managed\(\)\) return false/,
-    '服务没起来 / 不是我们管的实例 → 不落点')
+  assert.match(c, /if \(!server\.running\(\) \|\| !server\.managed\(\)\) \{[\s\S]{0,200}?log\(/,
+    '服务没起来 / 不是我们管的实例 → 不落点，但**必须记日志**')
+  assert.match(c, /未落点/, '跳过要说清"这次没有新增回退点"')
+  // 静默跳过就是白加这行日志：实测（自动代装在服务就绪之前跑）日志里一片空白，
+  // 看起来像这个功能没生效，实际是"那时确实没有健康状态可保护"。两者必须可区分。
+  assert.ok(!/if \(!server\.running\(\) \|\| !server\.managed\(\)\) return false/u.test(c),
+    '跳过不许静默 —— 否则分不清"没调用"和"被守卫挡了"')
   // 检查点是安全网，不是前置条件：落点失败不许阻断写操作，但必须留痕
   assert.match(c, /catch \(e\) \{[\s\S]{0,160}?log\(/, '落点失败只能记日志')
   assert.ok(!/\bthrow\b/u.test(c), '落点失败绝不能抛给调用方（那会让插件操作直接失败）')

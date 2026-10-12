@@ -2382,7 +2382,13 @@ function maybeCaptureHealthy(reason) {
  */
 function capturePreWriteSnapshot(label) {
   if (SELF_TEST) return false
-  if (!server.running() || !server.managed()) return false
+  // 跳过也要留痕。为什么：这行日志存在的意义就是"让用户知道有没有得退"——
+  // 静默跳过等于白加（实测：自动代装在服务就绪之前跑，落点被守卫挡掉，日志里一片空白，
+  // 看起来像这个功能没生效，实际是"那时确实没有健康状态可保护"）。
+  if (!server.running() || !server.managed()) {
+    log(`health: 改 profile 前未落点（服务未运行或非本工具管辖，${label}）—— 这次没有新增回退点`)
+    return false
+  }
   try {
     const r = health.captureHealthy({
       dshlVersion: app.getVersion(),
