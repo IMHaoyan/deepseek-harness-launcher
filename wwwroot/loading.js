@@ -108,7 +108,11 @@ const TEXTS = {
   },
   bootUnknown: {
     title: '服务启动失败',
-    sub: '服务没有输出可识别的错误。',
+    // ★ 这句兜底必须对**两种事实**同时成立：服务有输出但 DSHL 认不出、和服务压根没输出。
+    //   旧文案写死「服务没有输出可识别的错误。」—— 真机实测里日志明明白白有
+    //   `SyntaxError: Unexpected token '}'`，用户拿着日志一对照就发现界面在撒谎。
+    //   到底属于哪一种，由下面的 detail 行回答（有原文就摆出来，没有就是不吭声退的）。
+    sub: 'DSHL 认不出这次启动失败的原因。',
     btn: '重新检测',
   },
 }
@@ -226,11 +230,19 @@ const hintEl = document.getElementById('hint')
 // detail 时才出现（plugin 场景在有动作时会给空串，所以那里不会多出这一行）。
 // ★ 别把 detail 只在"没有动作"时才显示：实测 kind=unknown 时页面上写着"没有输出错误"，
 //   而原文 `SyntaxError: Unexpected token '}'` 就在手边 —— 那正是最需要摆出来的一行。
+// ★ 兜底路径（主进程没下发 plan）同样要摆原文。这条路径以前一个字都不显示，
+//   只留一句被写死的"认不出/没输出"，是全页最误导的组合；detail 本来就单独传了（上面 148 行）。
 if (plan) {
   if (plan.detail) subEl.title = String(plan.detail)
   const note = plan.blocked || (plan.detail ? '原始报错：' + plan.detail : '')
   if (note && hintEl) {
     hintEl.textContent = note
+    hintEl.classList.remove('hidden')
+  }
+} else if (detail && reason !== 'blocked') {
+  subEl.title = detail // blocked 已把它当副文案显示了，不重复
+  if (hintEl) {
+    hintEl.textContent = '原始报错：' + detail
     hintEl.classList.remove('hidden')
   }
 }

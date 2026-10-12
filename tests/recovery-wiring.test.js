@@ -328,3 +328,27 @@ test('构建产物与源同步：wwwroot/app.js 要带上这一行', () => {
   const builtApp = read('wwwroot/app.js')
   assert.match(builtApp, /个插件未生效（重启不会改变）/, 'wwwroot/app.js 未同步：请执行 npm run build:assets')
 })
+
+// ---------- ⑬ 兜底文案不许再说谎 ----------
+test('说明页的兜底文案对"有输出但认不出"和"压根没输出"两种事实都成立', () => {
+  // 旧文案写死「服务没有输出可识别的错误。」—— 真机实测里日志明明白白有 SyntaxError，
+  // 用户拿着日志一对照就发现界面在撒谎。兜底拿不到分类结果，所以它只能承诺"DSHL 认不出"。
+  const loading = read('ui-src/loading.js')
+  const t = loading.slice(loading.indexOf('bootUnknown: {'), loading.indexOf('bootUnknown: {') + 420)
+  // 只看 sub 的**值**：注释里为了说明缘由引用了那句旧文案，不能被自己的注释绊倒
+  const m = t.match(/sub: '([^']*)'/)
+  assert.ok(m, '要能取到 bootUnknown 的 sub')
+  assert.ok(!/没有输出/.test(m[1]), '兜底里还留着"没有输出"这种断言：' + m[1])
+  assert.match(m[1], /DSHL 认不出这次启动失败的原因/, '兜底要只说"认不出"这一件它能确定的事')
+})
+
+test('兜底路径（主进程没下发 plan）也要把原文摆出来', () => {
+  // 这条路径以前一个字都不显示，只留一句被写死的断言 —— 全页最误导的组合。
+  const loading = read('ui-src/loading.js')
+  const at = loading.indexOf("} else if (detail && reason !== 'blocked') {")
+  assert.ok(at > 0, '要有"无 plan 但有 detail"的分支')
+  const block = loading.slice(at, at + 300)
+  assert.match(block, /'原始报错：' \+ detail/, '原文要真的渲染出来')
+  assert.match(block, /hintEl\.classList\.remove\('hidden'\)/, '渲染了还要显示')
+  assert.match(block, /reason !== 'blocked'/, 'blocked 已经把它当副文案了，别重复一遍')
+})
