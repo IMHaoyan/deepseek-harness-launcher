@@ -150,7 +150,7 @@ test('凭据先核销再校验，且绑定世界状态指纹（陈旧页面不�
   const afterDelete = e.slice(del)
   assert.match(afterDelete, /if \(!preview\)/, '删掉之后才判空 —— 顺序反了就不是一次性')
   assert.match(e, /preview\.expiresAt <= Date\.now\(\)/, '必须校验 TTL')
-  assert.match(e, /preview\.binding !== bindingFor\(preview\.action, preview\.slotId\)/,
+  assert.match(e, /preview\.binding !== bindingFor\(preview\.action, preview\.slotId, preview\.targets\)/,
     '必须用**现算**的绑定值比对（且两侧走同一个函数，否则口径会漂）')
   const p = body('previewBootRepair')
   assert.match(p, /if \(!plan\.primary \|\| plan\.primary\.id !== actionId\)/, '签发凭据前必须确认这个动作此刻仍然成立')
@@ -171,6 +171,10 @@ test('回退类凭据绑槽的 snapshotId（槽被重新捕获过就作废），
   const f = body('bindingFor')
   assert.match(f, /actionId === 'restore-checkpoint'[\s\S]{0,80}?'restore:' \+ restoreBinding\(slotId\)/, '回退走 snapshot 绑定')
   assert.match(f, /'failure:' \+ failureBinding\(\)/, '其余走失败签名绑定')
+  // 插件动作还要把**整批包名**绑进去：按钮上写着"禁用这 3 个"，预览到执行之间清单变了就得作废。
+  // 只绑失败签名不够 —— 同一种失败换个批次规模，签名可以不变而作用域已经不同。
+  assert.match(f, /Array\.isArray\(targets\)[\s\S]{0,80}?\.sort\(\)\.join\(','\)/, '批次要排序后进绑定（顺序不该影响指纹）')
+  assert.match(f, /'\|batch:' \+ batch/, '绑定值里要带批次')
 })
 
 // ---------- ⑥b 两条入口共用一条执行路径 ----------
@@ -180,7 +184,7 @@ test('控制台的回退也走两阶段：previewHealthRestore 签发，healthRe
     'healthRestore 必须只接受 previewId —— 还认 slotId 就等于两阶段白做')
   const pc = body('previewConsoleRestore')
   assert.match(pc, /if \(!slot\.valid\)/, '签发前必须自己确认槽可用，不靠页面传')
-  assert.match(pc, /mintRepairPreview\('restore-checkpoint', '', want\)/, '控制台路径也要走同一个签发函数')
+  assert.match(pc, /mintRepairPreview\('restore-checkpoint', \[\], want\)/, '控制台路径也要走同一个签发函数')
   // 确认文案的事实来自签发瞬间的权威记录
   assert.match(pc, /capturedAt: slot\.capturedAt/, '要把捕获时间交给页面（否则确认框只能写一句空话）')
   assert.match(pc, /dshVersion: slot\.dshVersion/, '要把 DSH 版本交给页面')
@@ -207,22 +211,171 @@ test('"在不在"与"变没变"分开判：绑定放行不等于槽还在', () =
   assert.ok(branch.indexOf('stillThere') < branch.indexOf('restoreCheckpoint(preview.slotId)'), '存在性检查必须在真正写入之前')
 })
 
-// ---------- ⑦ 写后回读 ----------
-test('插件写操作成功后必须回读账本确认后置条件', () => {
+// ---------- ⑦ 写后回读（行为，不只是源码字面量） ----------
+/**
+ * 把 main.js 里 executeRepair 的**真实源码**装进一个带桩的作用域里跑。
+ * 为什么值得这么干：整批执行的行为（几个都写了、重启几次、部分失败怎么报）断言源码字面量证明不了 ——
+ * 源码写得再漂亮，循环写错一行照样只处理一个。这里让它真的跑一遍。
+ */
+function reproWorld(targets, opts) {
+  const o = opts || {}
+  const disabled = new Set()
+  const calls = { restarts: 0, writes: [], uninstalls: [] }
+  const preview = {
+    id: 'p1',
+    action: o.action || 'disable-plugin',
+    target: targets[0] || '',
+    targets,
+    slotId: '',
+    binding: 'B',
+    expiresAt: Date.now() + 60000,
+  }
+  const names = ['repairPreviews', 'bindingFor', 'pluginSwitch', 'market', 'lifecycle',
+    'applyPluginChange', 'restoreBinding', 'restoreCheckpoint', 'startForConsole', 'log']
+  const values = [
+    { get: () => preview, delete: () => {} },
+    () => 'B',
+    {
+      canToggle: (n) => (o.notToggleable || []).indexOf(n) < 0,
+      setEnabled: (n) => { calls.writes.push(n); disabled.add(n); return { ok: true } },
+      // readBackFails 里的包"写进去了但回读说没生效" —— 用来测部分失败怎么报
+      isDisabled: (n) => (o.readBackFails || []).indexOf(n) < 0 && disabled.has(n),
+      // 卸载路径要先记录这个包占用了哪些补丁行，卸载成功后按记录清理
+      rowIdsForPackage: () => [],
+      carrierDisableIds: () => [],
+      removeRows: () => {},
+    },
+    {
+      getState: () => ({ installed: true }),
+      PROFILE_NAME: 'web',
+      uninstallByName: async (n) => { calls.uninstalls.push(n); return o.uninstallFails && o.uninstallFails.indexOf(n) >= 0 ? { ok: false, error: 'x' } : { ok: true } },
+    },
+    { emit: () => {} },
+    async () => { calls.restarts += 1; return true },
+    () => '',
+    async () => ({ ok: true }),
+    async () => true,
+    () => {},
+  ]
+  // ★ body() 从 `function` 开始切，会把前面的 `async ` 丢掉 —— 这里要真跑，必须补回来
+  const src = 'async ' + body('executeRepair')
+  // eslint-disable-next-line no-new-func
+  const fn = new Function(...names, src + '\n}\nreturn executeRepair;')(...values)
+  return { run: () => fn('p1'), calls, disabled, preview }
+}
+
+test('整批真的全写了，而且只重启一次（N 次重启正是被修掉的东西）', async () => {
+  const w = reproWorld(['a-plugin', 'b-plugin', 'c-plugin'])
+  const r = await w.run()
+  assert.equal(r.ok, true, r.error)
+  assert.deepEqual(w.calls.writes, ['a-plugin', 'b-plugin', 'c-plugin'], '三个都要写')
+  assert.deepEqual([...w.disabled].sort(), ['a-plugin', 'b-plugin', 'c-plugin'])
+  assert.equal(w.calls.restarts, 1, '整批只重启一次')
+  assert.ok(!r.partial, '全部成功不该标 partial')
+  assert.match(r.message, /已禁用 3 个插件（a-plugin、b-plugin、c-plugin）/, r.message)
+  assert.match(r.message, /服务已重启/, r.message)
+})
+
+test('回读失败的包不算成功：报 partial 并点名，绝不报"已完成"', async () => {
+  const w = reproWorld(['a-plugin', 'b-plugin', 'c-plugin'], { readBackFails: ['b-plugin'] })
+  const r = await w.run()
+  assert.equal(r.ok, true, '有成功的就仍然算执行成功')
+  assert.equal(r.partial, true, '部分成功必须显式标记')
+  assert.match(r.message, /b-plugin/, '没成功的要点名：' + r.message)
+  assert.match(r.message, /没能禁用/, r.message)
+  assert.equal(w.calls.restarts, 1, '部分失败也仍然只重启一次')
+})
+
+test('一个都没写成 → 不重启、不报成功', async () => {
+  const w = reproWorld(['a-plugin'], { readBackFails: ['a-plugin'] })
+  const r = await w.run()
+  assert.equal(r.ok, false)
+  assert.match(r.error, /都没能禁用成功/, r.error)
+  assert.equal(w.calls.restarts, 0, '什么都没改就不该重启服务')
+})
+
+test('不可停用的包被跳过并算失败，不是静默丢弃', async () => {
+  const w = reproWorld(['a-plugin', 'b-plugin'], { notToggleable: ['b-plugin'] })
+  const r = await w.run()
+  assert.deepEqual(w.calls.writes, ['a-plugin'], '禁不了的不能硬写')
+  assert.equal(r.partial, true)
+  assert.match(r.message, /b-plugin/, r.message)
+})
+
+test('卸载整批同理：逐个走官方命令，最后只重启一次', async () => {
+  const w = reproWorld(['x-plugin', 'y-plugin'], { action: 'uninstall-plugin' })
+  const r = await w.run()
+  assert.deepEqual(w.calls.uninstalls, ['x-plugin', 'y-plugin'])
+  assert.equal(w.calls.restarts, 1)
+  assert.match(r.message, /已卸载 2 个插件/, r.message)
+})
+
+test('批次变了凭据就作废：绑定值现算，和签发时不一致直接 stale', async () => {
+  // 按钮上写着"这 3 个"，预览到执行之间失败清单变成 2 个 —— 这条必须拦住。
+  const w = reproWorld(['a-plugin'])
+  w.preview.binding = 'B|batch:a-plugin,b-plugin,c-plugin'
+  const r = await w.run()
+  assert.equal(r.ok, false)
+  assert.equal(r.stale, true, '要判 stale 让界面刷新，而不是照着旧批次动手')
+  assert.equal(w.calls.writes.length, 0, 'stale 时一个字节都不许写')
+})
+
+test('插件写操作整批执行、逐个回读账本，且最后只重启一次', () => {
   const e = body('executeRepair')
-  assert.match(e, /setEnabled\(preview\.target, false\)[\s\S]{0,400}?if \(!pluginSwitch\.isDisabled\(preview\.target\)\)/,
-    '禁用后必须回读 isDisabled：写入成功不等于状态变了')
-  assert.match(e, /market\.uninstallByName\(preview\.target\)/, '卸载必须走官方 dsh plugin 命令（不自己改 profile）')
+  const at = e.indexOf("preview.action === 'disable-plugin'")
+  const branch = e.slice(at, e.indexOf("preview.action === 'uninstall-plugin'"))
+  assert.match(branch, /const batch = \(preview\.targets \|\| \[\]\)\.filter\(Boolean\)/, '作用域来自凭据里的整批')
+  assert.match(branch, /for \(const name of batch\)/, '要逐个处理')
+  assert.match(branch, /setEnabled\(name, false\)[\s\S]{0,200}?isDisabled\(name\)/,
+    '每个都要回读 isDisabled：写入成功不等于状态变了')
+  assert.match(branch, /failed\.push\(name\)/, '没落实的要落进 failed，不能静默跳过')
+  assert.match(branch, /partial: failed\.length > 0/, '部分成功要显式标记，绝不报成整体成功')
+  assert.match(branch, /没能禁用，请在控制台「插件」页手动处理/, '要如实说清哪几个没成功')
+  const afterLoop = branch.slice(branch.indexOf('if (!done.length)'))
+  assert.match(afterLoop, /applyPluginChange\('toggle'/, '重启要在整批写完之后')
+  assert.equal((branch.match(/applyPluginChange\(/g) || []).length, 1, '整批只重启一次 —— N 次重启正是被修掉的东西')
+  const uat = e.indexOf("preview.action === 'uninstall-plugin'")
+  const ubranch = e.slice(uat, e.indexOf("preview.action === 'restore-checkpoint'"))
+  assert.match(ubranch, /market\.uninstallByName\(name\)/, '卸载必须走官方 dsh plugin 命令（不自己改 profile）')
+  assert.equal((ubranch.match(/applyPluginChange\(/g) || []).length, 1, '卸载整批也只重启一次')
+  assert.match(e, /restarted[\s\S]{0,200}?服务仍未起来/, '重启失败必须如实说，不能报"已完成"')
+})
+// ★ 2026-10：作用域从"一个包"扩成"整批"（用户问"为什么不一次禁用全部失败的"）。
+//   回读这条不变量不变，但现在必须**逐个**校验：整批里任何一个没落实都要算失败，
+//   而且最后**只重启一次** —— 那正是这次改动的全部意义。
+test('插件写操作整批执行、逐个回读账本，且最后只重启一次', () => {
+  const e = body('executeRepair')
+  const at = e.indexOf("preview.action === 'disable-plugin'")
+  const branch = e.slice(at, e.indexOf("preview.action === 'uninstall-plugin'"))
+  assert.match(branch, /const batch = \(preview\.targets \|\| \[\]\)\.filter\(Boolean\)/, '作用域来自凭据里的整批')
+  assert.match(branch, /for \(const name of batch\)/, '要逐个处理')
+  assert.match(branch, /setEnabled\(name, false\)[\s\S]{0,200}?isDisabled\(name\)/,
+    '每个都要回读 isDisabled：写入成功不等于状态变了')
+  assert.match(branch, /failed\.push\(name\)/, '没落实的要落进 failed，不能静默跳过')
+  assert.match(branch, /partial: failed\.length > 0/, '部分成功要显式标记，绝不报成整体成功')
+  assert.match(branch, /没能禁用，请在控制台「插件」页手动处理/, '要如实说清哪几个没成功')
+  // 一次重启：applyPluginChange 在整批循环**之外**，且分支里只出现一次
+  const afterLoop = branch.slice(branch.indexOf('if (!done.length)'))
+  assert.match(afterLoop, /applyPluginChange\('toggle'/, '重启要在整批写完之后')
+  assert.equal((branch.match(/applyPluginChange\(/g) || []).length, 1, '整批只重启一次 —— N 次重启正是被修掉的东西')
+  // 卸载同理
+  const uat = e.indexOf("preview.action === 'uninstall-plugin'")
+  const ubranch = e.slice(uat, e.indexOf("preview.action === 'restore-checkpoint'"))
+  assert.match(ubranch, /market\.uninstallByName\(name\)/, '卸载必须走官方 dsh plugin 命令（不自己改 profile）')
+  assert.equal((ubranch.match(/applyPluginChange\(/g) || []).length, 1, '卸载整批也只重启一次')
   assert.match(e, /restarted[\s\S]{0,200}?服务仍未起来/, '重启失败必须如实说，不能报"已完成"')
 })
 
-// ---------- ⑧ 能力面 fsil-closed ----------
+// ---------- ⑧ 能力面 fail-closed ----------
 test('能力面只从权威账本取证，且 fail-closed（查不到就不给按钮）', () => {
   const c = body('recoveryCapabilities')
-  assert.match(c, /pluginSwitch\.canToggle\(target\)/, '可禁用性必须问 plugin-switch 的补丁层账本')
-  assert.match(c, /market\.getState\(target\)[\s\S]{0,40}?installed/, '可卸载性必须问 profile 清单')
+  assert.match(c, /pluginSwitch\.canToggle\(name\)/, '可禁用性必须问 plugin-switch 的补丁层账本')
+  assert.match(c, /market\.getState\(name\)[\s\S]{0,40}?installed/, '可卸载性必须问 profile 清单')
+  assert.match(c, /for \(const name of probes\)/, '每个被点名的包都要单独取证（作用域是整批）')
+  assert.match(c, /pluginTargetsOf\(failure, target\)/, '批次来自权威分类结果，不是页面传进来的')
+  assert.match(c, /cap\.pluginListCapped = probes\.length >= bootFailure\.MAX_TARGETS/,
+    '打到解析上限要如实标记（界面据此打"可能还有下一批"的预防针）')
   assert.match(c, /recoveryCheckpoints\(\)\.find\(\(s\) => s\.valid\)/, '检查点只认 valid 槽位')
-  assert.match(c, /PACKAGE_NAME_RE\.test\(target\)/, 'target 可能是 loader entry 而非包名，必须挡住')
   // 取证失败不能抛出（否则整个状态页起不来）
   assert.match(c, /catch \(e\) \{ log\(/, '取证失败只能记日志并降级')
 })

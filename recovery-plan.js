@@ -129,37 +129,84 @@ function withRunFacts(base, failure, capabilities) {
 }
 
 /**
- * 本次失败里**还有哪些**包也坏了。
- * 为什么要说：DSH 把多插件激活失败聚合成一个 AggregateError 并逐条打印，但分类只返回一个
- * target。不说的话，用户禁用掉这一个、重启、又被下一个拦住 —— 看起来像"修了没用"的循环。
- * 只是把事实摆出来，**不新增动作**（一个状态一个动作不变）。
- * @returns {string} 需要时返回一句可拼接的话；只有一个目标时返回 ''
+ * 把 capabilities 里的插件事实规整成一个数组。
+ * 兼容旧的单数 `plugin` 字段（老调用方）与新的复数 `plugins`（一次失败可能点名多个包）。
+ * @returns {Array<{name:string, toggleable?:boolean, disabled?:boolean, installed?:boolean}>}
  */
-function otherPluginsNote(failure, target, primaryId) {
-  const all = failure && Array.isArray(failure.targets) ? failure.targets : []
-  const others = all.filter((n) => typeof n === 'string' && n && n !== target)
-  if (!others.length) return ''
-  const shown = others.slice(0, 3).join('、') + (others.length > 3 ? ' 等' : '')
-  const head = others.length === 1 ? '另外还有 1 个插件也加载失败（' : '另外还有 ' + others.length + ' 个插件也加载失败（'
-  // 只有"定点处理一个包"的动作才需要交代先后顺序；退到回退检查点时不存在"下一个"的问题。
-  const tail = (primaryId === 'disable-plugin' || primaryId === 'uninstall-plugin')
-    ? '）；本次先处理 ' + target + '，处理完若还有别的插件失败，这里会给出下一个。'
-    : '）。'
-  return head + shown + tail
+function pluginFacts(capabilities) {
+  const list = Array.isArray(capabilities && capabilities.plugins) ? capabilities.plugins : []
+  const out = list.filter((p) => p && isPackageName(p.name)).slice()
+  const one = capabilities && capabilities.plugin
+  if (one && isPackageName(one.name) && !out.some((p) => p.name === one.name)) out.push(one)
+  return out
+}
+
+/**
+ * 本次失败点名了哪些包（去重保序）。分类只给一个 target，而 DSH 会把多插件失败逐条打印，
+ * 所以以 targets 为准、再把 target 并进来（两者不一致时都不漏）。
+ * @returns {string[]}
+ */
+function pluginTargetsOf(failure, target) {
+  const listed = Array.isArray(failure && failure.targets) ? failure.targets : []
+  const out = []
+  for (const n of listed.concat(isPackageName(target) ? [target] : [])) {
+    if (isPackageName(n) && !out.includes(n)) out.push(n)
+  }
+  return out
+}
+
+/** 多包时按钮上要说清作用到几个；单个时保持原来的直呼其名。 */
+function batchLabel(verb, names) {
+  return names.length === 1
+    ? verb + ' ' + names[0] + ' 并重启服务'
+    : verb + '这 ' + names.length + ' 个插件并重启服务'
+}
+
+/** 把最多 3 个名字列出来，多的用"等"收尾。 */
+function listNames(names, max) {
+  const lim = max || 3
+  return names.slice(0, lim).join('、') + (names.length > lim ? ' 等' : '')
+}
+
+/**
+ * 说明这次动作**没覆盖到**谁、以及为什么。按需降噪：没有例外就不产生任何字。
+ *
+ * 历史（2026-10）：这里以前写的是"本次先处理 X，处理完若还有别的插件失败，这里会给出下一个"——
+ * 那等于把"禁用→重启→又被下一个拦住"的循环写成设计，还配了 3 次重启。现在动作本身覆盖整批，
+ * 所以这段只负责交代**例外**。
+ * @returns {string}
+ */
+function scopeNote(capabilities, unsupported, alreadyOff) {
+  const parts = []
+  if (unsupported.length) {
+    parts.push(listNames(unsupported) + ' 不在当前 Profile 的补丁层里，这次没能一起停用'
+      + '，可在「管理插件」页卸载或先装回来')
+  }
+  if (alreadyOff.length) {
+    parts.push(listNames(alreadyOff) + ' 已经是关闭状态却仍然报错，请查看日志确认是否还有别的插件')
+  }
+  // 解析上限是 8 个：打到上限就意味着**可能还有没被点名的**。先打预防针，
+  // 否则第二轮看起来又像"修了没用"。不说具体数字，因为这个数由别的模块管，说死会漂。
+  if (flag(capabilities, 'pluginListCapped')) {
+    parts.push('DSH 点名的插件已达单次解析上限，可能还有下一批；重启后若仍失败，这里会给出新的目标')
+  }
+  return parts.length ? '（' + parts.join('；') + '）' : ''
 }
 
 /**
  * 判定一次启动失败在恢复界面上该怎么呈现。
  *
  * @param {{
- *   failure?: {kind?: string, target?: string, reason?: string, line?: string, count?: number}|null,
+ *   failure?: {kind?: string, target?: string, targets?: string[], reason?: string, line?: string, count?: number}|null,
  *   capabilities?: {
  *     envReady?: boolean,
  *     autoRestartStopped?: boolean,
  *     recoveredAt?: string,
  *     backupFile?: string,
  *     checkpoint?: {slotId: string, capturedAt?: string}|null,
- *     plugin?: {name?: string, toggleable?: boolean, disabled?: boolean, installed?: boolean}|null
+ *     plugin?: {name?: string, toggleable?: boolean, disabled?: boolean, installed?: boolean}|null,
+ *     plugins?: Array<{name: string, toggleable?: boolean, disabled?: boolean, installed?: boolean}>,
+ *     pluginListCapped?: boolean
  *   }
  * }} input
  * @returns {{
@@ -207,52 +254,91 @@ function planRecovery(input) {
 
   // ② 插件类失败：这是唯一能"定点修"的一类。
   if (PLUGIN_KINDS.has(kind)) {
-    const plugin = capabilities.plugin || {}
-    const named = isPackageName(target) && plugin.name === target
-    const what = {
-      'plugin-tree': {
-        title: '服务因插件启动失败',
-        sub: named ? '插件 ' + target + ' 加载失败，多半与当前 DSH 版本不兼容。' : '当前 Profile 里有插件加载失败，多半与当前 DSH 版本不兼容。',
-      },
-      'module-missing': {
-        title: '插件依赖缺失',
-        sub: named ? '插件 ' + target + ' 依赖的包没有安装，服务因此起不来。' : '某个插件依赖的包没有安装，服务因此起不来。',
-      },
-      'bundle-missing': {
-        title: 'Profile 声明的插件未安装',
-        sub: named ? '当前 Profile 声明了 ' + target + '，但它不在 node_modules 里。' : '当前 Profile 声明了尚未安装的插件。',
-      },
-    }[kind]
+    const facts = pluginFacts(capabilities)
+    const byName = new Map(facts.map((p) => [p.name, p]))
+    const names = pluginTargetsOf(failure, target)
+    // 点名了但探不到事实的包：按"证明不了"处理，绝不猜（它既不会进 scope，也不会被说成可处理）
+    const known = names.filter((n) => byName.has(n)).map((n) => byName.get(n))
+
+    // ★ 一次把**本次确认加载失败、且当前确实可停用**的全部包处理掉。
+    //   历史（2026-10）：这里原来只处理 target 一个，然后在文案里写"本次先处理 X，处理完若还有
+    //   别的插件失败，这里会给出下一个"—— 等于把"禁用→重启→又被下一个拦住"的循环写进了设计，
+    //   3 个坏插件就是 3 次确认框 + 3 次重启。用户 2026-10 直接问了"为什么不一次禁用全部"。
+    //   判定口径没变，只是作用域从"一个包"扩成"这一批"：能禁用的优先（可逆），
+    //   其次才是卸载（不可逆，仅限确实装在 profile 里的 —— 含"已经禁用过、禁了也没用"的那种，
+    //   那时禁用在语义上不成立，卸载才是唯一还能做的事）。
+    const disableable = (p) => flag(p, 'toggleable') && !flag(p, 'disabled')
+    const canDisable = known.filter(disableable)
+    const canUninstall = known.filter((p) => flag(p, 'installed') && !disableable(p))
+    const alreadyOff = known.filter((p) => flag(p, 'disabled'))
 
     let primary = null
     let blocked = ''
+    let scope = []
+    let unsupported = []
     if (kind === 'bundle-missing') {
       // 声明与安装不一致：没有可禁用的加载项（包根本不在），能安全修的是"回到一份声明与安装一致的配置"。
       primary = checkpointAction
+      scope = names.slice()
       if (!primary) blocked = '没有可用的健康检查点，无法自动对账这条失效声明。'
-    } else if (named && flag(plugin, 'toggleable') && !flag(plugin, 'disabled')) {
+    } else if (canDisable.length) {
       // 可逆优先：禁用保留安装内容，用户随时能在控制台装回来。
-      primary = action('disable-plugin', '禁用 ' + target + ' 并重启服务')
-    } else if (named && flag(plugin, 'installed')) {
-      primary = action('uninstall-plugin', '卸载 ' + target + ' 并重启服务')
-    } else if (named && flag(plugin, 'disabled')) {
-      blocked = target + ' 已经被禁用，但服务仍然起不来；请查看日志确认是否还有别的插件。'
+      scope = canDisable.map((p) => p.name)
+      unsupported = canUninstall.map((p) => p.name)
+      primary = action('disable-plugin', batchLabel('禁用', scope))
+    } else if (canUninstall.length) {
+      scope = canUninstall.map((p) => p.name)
+      primary = action('uninstall-plugin', batchLabel('卸载', scope))
+    } else if (alreadyOff.length) {
+      unsupported = alreadyOff.map((p) => p.name)
+      blocked = listNames(unsupported) + ' 已经被禁用，但服务仍然起不来；请查看日志确认是否还有别的插件。'
     } else if (checkpointAction) {
       // 认不出是哪个包时退到"回到上一个能起来的配置"——这是一条不需要先知道根因的路。
       primary = checkpointAction
+      scope = names.slice()
     } else {
       blocked = '没能确认出问题的插件在当前 Profile 里的加载项，无法自动处理。'
     }
+
+    // 副文案按"这次真的要动几个"来说，而不是按分类给出的那一个 —— 界面说的必须等于按钮做的。
+    const n = scope.length
+    const plural = n > 1
+    const what = {
+      'plugin-tree': {
+        title: '服务因插件启动失败',
+        sub: plural ? '当前 Profile 里有 ' + n + ' 个插件加载失败，多半与当前 DSH 版本不兼容。'
+          : (n === 1 ? '插件 ' + scope[0] + ' 加载失败，多半与当前 DSH 版本不兼容。'
+            : '当前 Profile 里有插件加载失败，多半与当前 DSH 版本不兼容。'),
+      },
+      'module-missing': {
+        title: '插件依赖缺失',
+        sub: plural ? '这 ' + n + ' 个插件依赖的包没有安装，服务因此起不来。'
+          : (n === 1 ? '插件 ' + scope[0] + ' 依赖的包没有安装，服务因此起不来。'
+            : '某个插件依赖的包没有安装，服务因此起不来。'),
+      },
+      'bundle-missing': {
+        title: 'Profile 声明的插件未安装',
+        sub: plural ? '当前 Profile 声明了 ' + n + ' 个尚未安装的插件。'
+          : (n === 1 ? '当前 Profile 声明了 ' + scope[0] + '，但它不在 node_modules 里。'
+            : '当前 Profile 声明了尚未安装的插件。'),
+      },
+    }[kind]
+
+    // 动作覆盖不到全部点名目标时才解释例外；全覆盖就一个字都不加（按需降噪）。
+    // pluginListCapped 也算"覆盖不到全部"：没被点名的那些根本没进 names，不能因为
+    // scope==known 就当作处理完了。
+    const covered = scope.length >= known.length && !unsupported.length && !flag(capabilities, 'pluginListCapped')
+    const note = covered ? '' : scopeNote(capabilities, unsupported, alreadyOff)
 
     return {
       scenario: 'plugin',
       reason: 'pluginFailed',
       title: what.title,
-      sub: withRunFacts(what.sub + otherPluginsNote(failure, target, primary ? primary.id : ''), failure, capabilities),
+      sub: withRunFacts(what.sub + note, failure, capabilities),
       detail: primary ? '' : (detail || reasonText),
       primary,
-      // 插件类失败一律给「管理插件」入口：这里的动作只能处理**一个**包，而清单能一次看完。
-      // 特别是"还有 N 个插件也加载失败"时，逐个重启去处理本来就是错的路。
+      // 插件类失败一律给「管理插件」入口：动作的作用域是"本次失败点名的这批"，
+      // 而清单是**整份 Profile** —— 想自己挨个挑、或想装回来时都得有条路。
       entry: { page: 'plugins', label: '管理插件' },
       blocked,
     }
@@ -305,6 +391,8 @@ function planRecovery(input) {
 
 module.exports = {
   planRecovery,
+  pluginTargetsOf,
+  pluginFacts,
   ACTION_IDS,
   CONSOLE_PAGES,
   PLUGIN_KINDS,

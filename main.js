@@ -1885,23 +1885,27 @@ function recoveryCapabilities() {
     const slot = recoveryCheckpoints().find((s) => s.valid)
     if (slot) cap.checkpoint = { slotId: slot.slotId, capturedAt: slot.capturedAt || '' }
   } catch (e) { log('recovery: checkpoints unavailable: ' + ((e && e.message) || String(e))) }
-  // 插件：target 必须在包名判据内、且确实是当前 profile 里能识别加载项的那个包。
+  // 插件：每一个被点名的包都单独取证。targets 是 DSH 逐条打印出来的失败清单（多插件失败会被
+  //   聚合成一个 AggregateError），分类只给一个 target —— 两处并起来才是"这次到底有几个坏的"。
   //   toggleable —— plugin-switch 能找到它的补丁行（= 禁用是可逆且安全的）
   //   installed  —— profile 清单里确实记着它（= 卸载有对象）
-  //   两者都查不到 → 界面不给插件按钮，退到"回退检查点"或"看日志"。
+  //   两者都查不到 → 这个包既不进禁用批次也不进卸载批次（界面会点名说明没动它）。
   try {
-    if (target && recoveryPlan.PACKAGE_NAME_RE.test(target)) {
-      const toggleable = pluginSwitch.canToggle(target)
-      const installed = !!(market.getState(target) || {}).installed
+    const probes = recoveryPlan.pluginTargetsOf(failure, target)
+    const plugins = []
+    for (const name of probes) {
+      const toggleable = pluginSwitch.canToggle(name)
+      const installed = !!(market.getState(name) || {}).installed
       if (toggleable || installed) {
-        cap.plugin = {
-          name: target,
-          toggleable,
-          disabled: toggleable ? pluginSwitch.isDisabled(target) : false,
-          installed,
-        }
+        plugins.push({ name, toggleable, disabled: toggleable ? pluginSwitch.isDisabled(name) : false, installed })
       }
     }
+    if (plugins.length) {
+      cap.plugins = plugins
+      cap.plugin = plugins[0] // 旧字段继续给（插件页与既有测试都按单数读）
+    }
+    // 打到解析上限 = 可能还有没被点名的插件。这个事实决定界面要不要打"可能还有下一批"的预防针。
+    cap.pluginListCapped = probes.length >= bootFailure.MAX_TARGETS
   } catch (e) { log('recovery: plugin inventory unavailable: ' + ((e && e.message) || String(e))) }
   return cap
 }
@@ -1959,13 +1963,18 @@ function restoreBinding(slotId) {
 /**
  * 一张凭据绑定的"世界状态指纹"——签发与核销两侧都调它，所以必须**只依赖权威账本**，
  * 绝不接受调用方传进来的值。
+ *
+ * 插件动作的绑定里**带上整批包名**：按钮上写着"禁用这 3 个"，如果预览到执行之间失败清单变了
+ * （比如又冒出一个坏插件、或某个包被别的路径停用了），指纹就不一样，凭据当场作废、重新走流程。
+ * 只绑"失败签名"是不够的 —— 同一种失败换个批次规模，签名可以不变而作用域已经不同。
  * @param {string} actionId
  * @param {string} slotId
+ * @param {string[]} targets
  */
-function bindingFor(actionId, slotId) {
-  return actionId === 'restore-checkpoint'
-    ? 'restore:' + restoreBinding(slotId)
-    : 'failure:' + failureBinding()
+function bindingFor(actionId, slotId, targets) {
+  if (actionId === 'restore-checkpoint') return 'restore:' + restoreBinding(slotId)
+  const batch = Array.isArray(targets) ? targets.slice().sort().join(',') : ''
+  return 'failure:' + failureBinding() + (batch ? '|batch:' + batch : '')
 }
 
 function pruneRepairPreviews() {
@@ -1978,16 +1987,24 @@ function pruneRepairPreviews() {
   }
 }
 
-/** 签发一张一次性凭据。调用方**必须**先自行取证，这里只负责登记与绑定。 */
-function mintRepairPreview(action, target, slotId) {
+/**
+ * 签发一张一次性凭据。调用方**必须**先自行取证，这里只负责登记与绑定。
+ * @param {string} action
+ * @param {string[]} targets 插件动作的作用域（整批；其它动作为空数组）
+ * @param {string} slotId
+ */
+function mintRepairPreview(action, targets, slotId) {
   pruneRepairPreviews()
   const id = require('crypto').randomBytes(16).toString('hex')
+  const batch = Array.isArray(targets) ? targets.filter(Boolean) : []
   const preview = {
     id,
     action,
-    target: target || '',
+    // 保留单数字段：restore 之类的老读法与确认框文案都还用它
+    target: batch.length === 1 ? batch[0] : (batch[0] || ''),
+    targets: batch,
     slotId: slotId || '',
-    binding: bindingFor(action, slotId || ''),
+    binding: bindingFor(action, slotId || '', batch),
     expiresAt: Date.now() + REPAIR_PREVIEW_TTL_MS,
   }
   repairPreviews.set(id, preview)
@@ -2006,14 +2023,20 @@ function previewBootRepair(actionId) {
   if (!plan.primary || plan.primary.id !== actionId) {
     return { ok: false, error: '当前状态已变化，请按刷新后的提示重试', stale: true }
   }
-  const target = (bootFailureState() || {}).target || ''
-  // 下面的复核是**第二次取证**（第一次在 recoveryCapabilities），因为签发凭据到执行之间还有确认框
-  if (actionId === 'disable-plugin') {
-    if (!target || !pluginSwitch.canToggle(target)) return { ok: false, error: '已无法识别该插件的加载项' }
-    if (pluginSwitch.isDisabled(target)) return { ok: false, error: '该插件已经被禁用', stale: true }
-  }
-  if (actionId === 'uninstall-plugin') {
-    if (!target || !((market.getState(target) || {}).installed)) return { ok: false, error: '该插件已不在当前 Profile 中', stale: true }
+  // 下面的复核是**第二次取证**（第一次在 recoveryCapabilities），因为签发凭据到执行之间还有确认框。
+  // 插件动作：作用域是"本次失败点名的这一批"。**每个都要在签发凭据的这一刻重新取证** ——
+  // 按钮上写着"这 3 个"，执行时就只能是这 3 个，中间任何一个变得不可停用都得当场拒绝。
+  let targets = []
+  if (actionId === 'disable-plugin' || actionId === 'uninstall-plugin') {
+    const cap = recoveryCapabilities()
+    const batch = (cap.plugins || []).filter((p) => (actionId === 'disable-plugin'
+      ? p.toggleable && !p.disabled
+      : !p.toggleable && p.installed && !p.disabled))
+    if (!batch.length) {
+      const why = actionId === 'disable-plugin' ? '已无法识别这些插件的加载项' : '这些插件已不在当前 Profile 中'
+      return { ok: false, error: why, stale: true }
+    }
+    targets = batch.map((p) => p.name)
   }
   let slotId = ''
   if (actionId === 'restore-checkpoint') {
@@ -2021,7 +2044,7 @@ function previewBootRepair(actionId) {
     if (!slot) return { ok: false, error: '没有可用的健康检查点', stale: true }
     slotId = slot.slotId
   }
-  return { ok: true, preview: mintRepairPreview(actionId, target, slotId) }
+  return { ok: true, preview: mintRepairPreview(actionId, targets, slotId) }
 }
 
 /**
@@ -2036,7 +2059,7 @@ function previewConsoleRestore(slotId) {
   const slot = recoveryCheckpoints().find((s) => s.slotId === want)
   if (!slot) return { ok: false, error: '找不到该检查点' }
   if (!slot.valid) return { ok: false, error: '该检查点不可用（为空或已损坏）' }
-  const preview = mintRepairPreview('restore-checkpoint', '', want)
+  const preview = mintRepairPreview('restore-checkpoint', [], want)
   return {
     ok: true,
     previewId: preview.id,
@@ -2051,23 +2074,29 @@ function previewConsoleRestore(slotId) {
 
 /** 确认框的语气跟着动作的可逆性走；默认焦点永远在「取消」。 */
 function repairConfirmSpec(preview) {
+  const batch = Array.isArray(preview.targets) ? preview.targets.filter(Boolean) : []
+  const many = batch.length > 1
+  const names = many ? batch.join('、') : (batch[0] || preview.target)
   if (preview.action === 'disable-plugin') {
     return {
       type: 'question',
-      title: '禁用这个插件？',
-      message: '禁用 ' + preview.target + ' 并重启服务？',
+      title: many ? '禁用这 ' + batch.length + ' 个插件？' : '禁用这个插件？',
+      // 确认框必须写清**作用到几个**：批量动作的影响面和单个不一样，不能还写一句含糊的"禁用插件"。
+      message: many ? '禁用以下 ' + batch.length + ' 个插件并重启服务？\n\n' + names
+        : '禁用 ' + names + ' 并重启服务？',
       detail: '不会删除任何内容：插件本身、版本声明和配置都完整保留在当前 Profile 中，只是下次启动时不再加载'
         + '（可随时在控制台「插件」页重新启用）。',
-      confirmLabel: '禁用并重启',
+      confirmLabel: many ? '禁用这 ' + batch.length + ' 个并重启' : '禁用并重启',
     }
   }
   if (preview.action === 'uninstall-plugin') {
     return {
       type: 'warning',
-      title: '卸载这个插件？',
-      message: '从当前 Profile 卸载 ' + preview.target + '？',
-      detail: '这会真的移除这个包（走官方 dsh plugin 命令），之后需要重新安装才能使用，也因此无法一键撤销。',
-      confirmLabel: '卸载并重启',
+      title: many ? '卸载这 ' + batch.length + ' 个插件？' : '卸载这个插件？',
+      message: many ? '从当前 Profile 卸载以下 ' + batch.length + ' 个插件？\n\n' + names
+        : '从当前 Profile 卸载 ' + names + '？',
+      detail: '这会真的移除这些包（走官方 dsh plugin 命令），之后需要重新安装才能使用，也因此无法一键撤销。',
+      confirmLabel: many ? '卸载这 ' + batch.length + ' 个并重启' : '卸载并重启',
     }
   }
   if (preview.action === 'restore-checkpoint') {
@@ -2115,43 +2144,73 @@ async function executeRepair(previewId) {
   repairPreviews.delete(previewId) // ★ 先删：一次性由这里保证，不靠调用方自觉
   if (!preview) return { ok: false, error: '恢复凭据已失效，请重试', stale: true }
   if (preview.expiresAt <= Date.now()) return { ok: false, error: '恢复凭据已过期，请重试', stale: true }
-  // 绑定值必须**现算**再比：签发到核销之间世界可能已经变了（槽被重新捕获 / 失败原因变了）
-  if (preview.binding !== bindingFor(preview.action, preview.slotId)) {
+  // 绑定值必须**现算**再比：签发到核销之间世界可能已经变了（槽被重新捕获 / 失败原因变了 / 批次变了）
+  if (preview.binding !== bindingFor(preview.action, preview.slotId, preview.targets)) {
     return { ok: false, error: '状态已变化，请刷新后重试', stale: true }
   }
 
   try {
     if (preview.action === 'disable-plugin') {
-      if (!pluginSwitch.canToggle(preview.target)) return { ok: false, error: '已无法识别该插件的加载项', stale: true }
-      const r = pluginSwitch.setEnabled(preview.target, false)
-      if (!r.ok) return { ok: false, error: (r && r.error) || '禁用失败' }
-      // 写后回读（借鉴 dsh-desktop 的 "写后必须重读清单确认后置条件"）：命令成功不等于状态变了
-      if (!pluginSwitch.isDisabled(preview.target)) return { ok: false, error: '已写入补丁层，但插件仍显示为启用；请查看日志' }
-      lifecycle.emit('recovery.repair', { action: 'disable-plugin', target: preview.target })
-      const restarted = await applyPluginChange('toggle', '', { name: preview.target, profile: market.PROFILE_NAME, logTag: 'recovery', label: preview.target })
+      // ★ 整批一起写，最后**只重启一次**。历史（2026-10）：这里原来只处理一个包，
+      //   3 个坏插件就是 3 次确认框 + 3 次重启（每次 10~30s），用户问过"为什么不一次禁用全部"。
+      //   逐个回读校验，任何一个没落实就如实报"N 个里成功了 M 个"，绝不报成功。
+      const batch = (preview.targets || []).filter(Boolean)
+      if (!batch.length) return { ok: false, error: '恢复凭据里没有目标插件，请刷新后重试', stale: true }
+      const done = []
+      const failed = []
+      for (const name of batch) {
+        if (!pluginSwitch.canToggle(name)) { failed.push(name); continue }
+        const r = pluginSwitch.setEnabled(name, false)
+        // 写后回读（借鉴 dsh-desktop 的 "写后必须重读清单确认后置条件"）：命令成功不等于状态变了
+        if (!r || !r.ok || !pluginSwitch.isDisabled(name)) { failed.push(name); continue }
+        done.push(name)
+      }
+      if (!done.length) return { ok: false, error: '这些插件都没能禁用成功；请查看日志' }
+      lifecycle.emit('recovery.repair', { action: 'disable-plugin', targets: done, failed })
+      const restarted = await applyPluginChange('toggle', '', {
+        name: done.length === 1 ? done[0] : '', profile: market.PROFILE_NAME, logTag: 'recovery',
+        label: done.length === 1 ? done[0] : done.length + ' 个插件',
+      })
+      const head = '已禁用 ' + (done.length === 1 ? done[0] : done.length + ' 个插件（' + done.join('、') + '）')
+      const tailFailed = failed.length
+        ? '；另有 ' + failed.length + ' 个（' + failed.join('、') + '）没能禁用，请在控制台「插件」页手动处理'
+        : ''
       return {
         ok: true,
+        partial: failed.length > 0,
         restarted: !!restarted,
-        message: restarted
-          ? '已禁用 ' + preview.target + '，服务已重启'
-          : '已禁用 ' + preview.target + '，但服务仍未起来；下面是新的诊断结果。',
+        message: head + (restarted ? '，服务已重启' : '，但服务仍未起来；下面是新的诊断结果。') + tailFailed,
       }
     }
     if (preview.action === 'uninstall-plugin') {
-      if (!((market.getState(preview.target) || {}).installed)) return { ok: false, error: '该插件已不在当前 Profile 中', stale: true }
-      const beforeRows = pluginSwitch.rowIdsForPackage(preview.target)
-      const beforeCarriers = pluginSwitch.carrierDisableIds(preview.target)
-      const r = await market.uninstallByName(preview.target)
-      if (!r || !r.ok) return { ok: false, error: (r && r.error) || '卸载失败' }
-      pluginSwitch.removeRows(preview.target, beforeRows, beforeCarriers)
-      lifecycle.emit('recovery.repair', { action: 'uninstall-plugin', target: preview.target })
-      const restarted = await applyPluginChange('uninstall', '', { name: preview.target, profile: market.PROFILE_NAME, logTag: 'recovery', label: preview.target })
+      const batch = (preview.targets || []).filter(Boolean)
+      if (!batch.length) return { ok: false, error: '恢复凭据里没有目标插件，请刷新后重试', stale: true }
+      const done = []
+      const failed = []
+      for (const name of batch) {
+        if (!((market.getState(name) || {}).installed)) { failed.push(name); continue }
+        const beforeRows = pluginSwitch.rowIdsForPackage(name)
+        const beforeCarriers = pluginSwitch.carrierDisableIds(name)
+        const r = await market.uninstallByName(name)
+        if (!r || !r.ok) { failed.push(name); continue }
+        pluginSwitch.removeRows(name, beforeRows, beforeCarriers)
+        done.push(name)
+      }
+      if (!done.length) return { ok: false, error: '这些插件都没能卸载成功；请查看日志' }
+      lifecycle.emit('recovery.repair', { action: 'uninstall-plugin', targets: done, failed })
+      const restarted = await applyPluginChange('uninstall', '', {
+        name: done.length === 1 ? done[0] : '', profile: market.PROFILE_NAME, logTag: 'recovery',
+        label: done.length === 1 ? done[0] : done.length + ' 个插件',
+      })
+      const head = '已卸载 ' + (done.length === 1 ? done[0] : done.length + ' 个插件（' + done.join('、') + '）')
+      const tailFailed = failed.length
+        ? '；另有 ' + failed.length + ' 个（' + failed.join('、') + '）没能卸载，请在控制台「插件」页手动处理'
+        : ''
       return {
         ok: true,
+        partial: failed.length > 0,
         restarted: !!restarted,
-        message: restarted
-          ? '已卸载 ' + preview.target + '，服务已重启'
-          : '已卸载 ' + preview.target + '，但服务仍未起来；下面是新的诊断结果。',
+        message: head + (restarted ? '，服务已重启' : '，但服务仍未起来；下面是新的诊断结果。') + tailFailed,
       }
     }
     if (preview.action === 'restore-checkpoint') {

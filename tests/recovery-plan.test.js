@@ -192,8 +192,11 @@ test('单次失败不提升级（噪音），连续 >=2 次才说；自动回退
   assert.match(many.sub, /bak-20261011/, '要告诉用户原配置备份在哪，否则"已回退"不可复核')
 })
 
-// ---------- 多插件失败：必须告诉用户"还有别的"，否则看起来像修了没用 ----------
-test('多插件失败时点名其余的包，并交代先后顺序（不新增动作）', () => {
+// ---------- 多插件失败：一次处理整批，而不是"修一个、重启、又被下一个拦住" ----------
+// 2026-10 用户问："多个插件同时失败，为什么不一次禁用全部失败的" —— 问得对。
+// 旧实现只处理 target 一个，然后在文案里写"本次先处理 X……这里会给出下一个"，
+// 3 个坏插件 = 3 次确认框 + 3 次重启。动作现在的作用域就是"本次失败点名的这一批"。
+test('多插件失败 → 一个动作覆盖整批，按钮上写清有几个', () => {
   const p = plan.planRecovery({
     failure: {
       kind: 'plugin-tree',
@@ -202,14 +205,48 @@ test('多插件失败时点名其余的包，并交代先后顺序（不新增�
       line: 'x',
       count: 1,
     },
-    capabilities: pluginCap({ plugin: { name: 'dsh-ui-kit', toggleable: true, disabled: false, installed: true } }),
+    capabilities: pluginCap({
+      plugins: [
+        { name: 'dsh-ui-kit', toggleable: true, installed: true },
+        { name: 'dsh-charts', toggleable: true, installed: true },
+        { name: 'dsh-theme-pack', toggleable: true, installed: true },
+      ],
+    }),
   })
   assert.equal(p.primary.id, 'disable-plugin', '仍然只有一个动作')
-  assert.match(p.sub, /另外还有 2 个插件也加载失败/, '要点名"还有别的"：' + p.sub)
-  assert.match(p.sub, /dsh-charts、dsh-theme-pack/, '要列出是哪些：' + p.sub)
-  assert.match(p.sub, /本次先处理 dsh-ui-kit/, '要交代这次处理的是哪个')
-  assert.match(p.sub, /这里会给出下一个/, '要交代后面还会再来一次，否则用户以为是循环')
-  assert.ok(!/dsh-ui-kit、/.test(p.sub.replace('本次先处理 dsh-ui-kit', '')), '列"其余的"时不该把当前这个再列一遍')
+  assert.equal(p.primary.label, '禁用这 3 个插件并重启服务', '按钮必须写清作用到几个：' + p.primary.label)
+  assert.match(p.sub, /有 3 个插件加载失败/, '正文也要按实际作用域说：' + p.sub)
+  assert.ok(!/给出下一个|本次先处理/.test(p.sub), '不许再提"下一个"——那正是被修掉的循环：' + p.sub)
+})
+
+test('批次里混着不可禁用的 → 只禁能禁的，并逐个点名说明没动谁', () => {
+  const p = plan.planRecovery({
+    failure: { kind: 'plugin-tree', target: 'a-plugin', targets: ['a-plugin', 'b-plugin', 'c-plugin'], count: 1 },
+    capabilities: pluginCap({
+      plugins: [
+        { name: 'a-plugin', toggleable: true, installed: true },
+        { name: 'b-plugin', toggleable: true, installed: true },
+        { name: 'c-plugin', toggleable: false, installed: true },
+      ],
+    }),
+  })
+  assert.equal(p.primary.label, '禁用这 2 个插件并重启服务')
+  assert.match(p.sub, /c-plugin 不在当前 Profile 的补丁层里/, '没动的那个必须点名：' + p.sub)
+  assert.ok(!/a-plugin|b-plugin/.test(p.sub.replace(/禁用这 2 个插件/, '')), '已经会处理的不用再列一遍')
+})
+
+test('打到解析上限 → 先打"可能还有下一批"的预防针', () => {
+  const p = plan.planRecovery({
+    failure: { kind: 'plugin-tree', target: 'a-plugin', targets: ['a-plugin', 'b-plugin'], count: 1 },
+    capabilities: pluginCap({
+      pluginListCapped: true,
+      plugins: [
+        { name: 'a-plugin', toggleable: true, installed: true },
+        { name: 'b-plugin', toggleable: true, installed: true },
+      ],
+    }),
+  })
+  assert.match(p.sub, /可能还有下一批/, '打到上限时必须交代，否则第二轮又像"修了没用"：' + p.sub)
 })
 
 test('只有一个插件失败时不提"还有别的"（避免无中生有的噪音）', () => {
@@ -217,23 +254,27 @@ test('只有一个插件失败时不提"还有别的"（避免无中生有的噪
     failure: { kind: 'plugin-tree', target: 'dsh-ui-kit', targets: ['dsh-ui-kit'], count: 1 },
     capabilities: pluginCap({ plugin: { name: 'dsh-ui-kit', toggleable: true, disabled: false, installed: true } }),
   })
-  assert.ok(!/另外还有/.test(p.sub), '只有一个目标时不该出现"还有别的"：' + p.sub)
+  assert.ok(!/另外还有|下一批/.test(p.sub), '只有一个目标时不该出现"还有别的"：' + p.sub)
+  assert.equal(p.primary.label, '禁用 dsh-ui-kit 并重启服务', '单个时保持直呼其名')
 })
 
-test('超过 3 个只列前 3 个并加"等"；退到回退检查点时不谈"下一个"', () => {
+test('超过 3 个也只在一处列名字，且退到回退检查点时不谈"下一个"', () => {
   const many = plan.planRecovery({
     failure: { kind: 'plugin-tree', target: 'p0', targets: ['p0', 'p1', 'p2', 'p3', 'p4'], count: 1 },
-    capabilities: pluginCap({ plugin: { name: 'p0', toggleable: true, disabled: false, installed: true } }),
+    capabilities: pluginCap({
+      plugins: ['p0', 'p1', 'p2', 'p3', 'p4'].map((n) => ({ name: n, toggleable: true, installed: true })),
+    }),
   })
-  assert.match(many.sub, /另外还有 4 个插件也加载失败（p1、p2、p3 等）/, many.sub)
+  assert.equal(many.primary.label, '禁用这 5 个插件并重启服务')
+  assert.match(many.sub, /有 5 个插件加载失败/, many.sub)
+  assert.ok(!/下一个/.test(many.sub), '整批处理之后不存在"下一个"')
 
   const fallback = plan.planRecovery({
     failure: { kind: 'plugin-tree', target: 'K2Node_X', targets: ['K2Node_X', 'dsh-charts'], count: 1 },
     capabilities: pluginCap({ checkpoint: checkpoint() }),
   })
   assert.equal(fallback.primary.id, 'restore-checkpoint')
-  assert.match(fallback.sub, /另外还有 1 个插件也加载失败（dsh-charts）/, fallback.sub)
-  assert.ok(!/这里会给出下一个/.test(fallback.sub), '回退检查点不是"逐个处理包"，不该承诺下一个')
+  assert.ok(!/下一个|先处理/.test(fallback.sub), '回退检查点不是"逐个处理包"，不该承诺下一个')
 })
 
 test('targets 缺字段 / 非数组 / 含垃圾值都不炸（main.js 的兜底路径会给不完整的对象）', () => {
