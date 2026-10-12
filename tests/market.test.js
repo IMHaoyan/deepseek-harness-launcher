@@ -113,7 +113,10 @@ test('pnpm 视图：默认不关策略，只有被 24h 观察期整体拒绝时�
   const fs = require('node:fs')
   const path = require('node:path')
   const src = fs.readFileSync(path.join(__dirname, '..', 'market.js'), 'utf8')
-  assert.match(src, /const RELEASE_AGE_OVERRIDE = '--config\.minimumReleaseAge=0'/, '放行参数应集中声明并说明原因')
+  // 放行参数与判定现在集中声明在 release-age.js（2026-10-12 之前 market.js 与 bridge.js
+  // 各有一份复制粘贴的副本，两份同时漏掉了 pnpm 11.8 的第三种表现 → 兜底从未触发）
+  assert.match(src, /const RELEASE_AGE_OVERRIDE = releaseAge\.RELEASE_AGE_OVERRIDE/, '放行参数从唯一来源取')
+  assert.match(src, /require\('\.\/release-age'\)/, '判定要走共享模块，不许再复制一份')
   assert.match(src, /withReleaseAgeOverride\(withReleaseAgeOverride\(list\)\)|withReleaseAgeOverride\(list\)/, '放行参数只用在重试路径上')
   assert.match(src, /async function runCliOnce\(args\)/, '必须有一个「不注入放行参数」的基础执行器')
   assert.match(src, /if \(!releaseAgeViolation\(e && e\.output\)\) throw e/, '只有命中 24h 观察期判定才重试，其它错误原样抛出')
@@ -122,7 +125,7 @@ test('pnpm 视图：默认不关策略，只有被 24h 观察期整体拒绝时�
   assert.deepEqual(market.withReleaseAgeOverride(['list']), ['list'])
 })
 
-test('releaseAgeViolation：认得 pnpm 的四种稳定标记（含错误码被尾部截断的情形）', () => {
+test('releaseAgeViolation：认得 pnpm 的全部稳定标记（三种表现）', () => {
   assert.equal(market.releaseAgeViolation('[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 1 lockfile entries failed verification:'), true)
   assert.equal(market.releaseAgeViolation('✗ Lockfile failed supply-chain policy check (275 entries in 3.4s)'), true)
   assert.equal(market.releaseAgeViolation('the lockfile is stale, or that someone committed a lockfile that bypassed the policy locally'), true)

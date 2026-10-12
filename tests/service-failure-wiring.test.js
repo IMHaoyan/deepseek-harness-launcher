@@ -179,14 +179,19 @@ test('锁是 fail-fast：后来者立刻拿到可读的拒绝，不排队', () =
   const end = main.indexOf('\n}\n', main.indexOf('function tryBeginBackgroundProfileOp')) + 3
   assert.ok(start > 0 && end > start, '找不到 profile 写锁实现')
   const cfg = {}
-  const factory = new Function('cfg', main.slice(start, end) + '\nreturn { tryBeginProfileOp, profileOpBusy, withProfileOp, tryBeginBackgroundProfileOp }')
-  const api = factory(cfg)
+  // 写锁入口现在还会先落一个健康检查点（capturePreWriteSnapshot），eval 作用域里要给它一个桩
+  const snapshots = []
+  const factory = new Function('cfg', 'capturePreWriteSnapshot',
+    main.slice(start, end) + '\nreturn { tryBeginProfileOp, profileOpBusy, withProfileOp, tryBeginBackgroundProfileOp }')
+  const api = factory(cfg, (label) => { snapshots.push(label); return true })
 
   assert.equal(api.profileOpBusy(), false, '初始应为空闲')
   const release = api.tryBeginProfileOp('第一个')
   assert.ok(typeof release === 'function')
+  assert.deepEqual(snapshots, ['第一个'], '拿到锁时要落一个回退点（写之前那个状态）')
   assert.equal(api.profileOpBusy(), true)
   assert.equal(api.tryBeginProfileOp('第二个'), null, '锁被占用时第二个调用者必须拿不到')
+  assert.deepEqual(snapshots, ['第一个'], '没拿到锁就不该落点（没锁就没打算写）')
   release()
   assert.equal(api.profileOpBusy(), false, 'release 后应恢复空闲')
   release() // 重复 release 幂等
@@ -196,8 +201,9 @@ test('锁是 fail-fast：后来者立刻拿到可读的拒绝，不排队', () =
 test('锁：withProfileOp 被占用时不执行 fn，并回可读错误', async () => {
   const start = main.indexOf('const PROFILE_BUSY_ERROR')
   const end = main.indexOf('\n}\n', main.indexOf('function tryBeginBackgroundProfileOp')) + 3
-  const factory = new Function('log', main.slice(start, end) + '\nreturn { tryBeginProfileOp, withProfileOp }')
-  const api = factory(() => {})
+  const factory = new Function('log', 'capturePreWriteSnapshot',
+    main.slice(start, end) + '\nreturn { tryBeginProfileOp, withProfileOp }')
+  const api = factory(() => {}, () => false)
 
   let ran = 0
   const release = api.tryBeginProfileOp('占用者')

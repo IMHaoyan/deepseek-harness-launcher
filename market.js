@@ -259,26 +259,19 @@ async function verifyNpmPackage(name) {
 
 // pnpm 11 起默认带 24h「新版本观察期」（minimumReleaseAge 默认 1440 分钟），而且它在每次
 // add/remove/install 前校验**整份** lockfile：只要里面有一个「发布不足 24h 且未被
-// minimumReleaseAgeExclude 放行」的条目，任何操作都会被整体拒绝
-// （ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。这条失败与「装哪个插件」无关，所以它的表现是
-// 「所有插件一起装失败」。处理方式对齐 dshmarket（它的 #39）：
+// minimumReleaseAgeExclude 放行」的条目，任何操作都会被整体拒绝。
+// 这条失败与「装哪个插件」无关，所以它的表现是「所有插件一起装失败」。处理方式对齐 dshmarket（它的 #39）：
 //   - 默认**不关策略**：pnpm 自己会把点名安装的新鲜版本写进 minimumReleaseAgeExclude
 //     （"Added 1 entry to minimumReleaseAgeExclude in pnpm-workspace.yaml"），lockfile 保持合规，
 //     别的工具（DSH 内置市场、终端里的 pnpm、IDE）不会被这次安装连坐；
 //   - 只有真的被整体拒绝时，才用一次性放行重试一次 —— 那次重试**不写**放行记录，所以它只能
 //     当兜底，不能当默认路径（否则 lockfile 会长期处于「绕过了策略」的状态）。
-const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
-// 判定「24h 观察期拒绝整份 lockfile」的标记：错误码可能被尾部截断，后两句是 pnpm 稳定打印的。
-const RELEASE_AGE_MARKERS = [
-  'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
-  'failed supply-chain policy check',
-  'bypassed the policy locally',
-  // pnpm 11.8 的 remove 路径没有 wire 观察期处理器：只要树里存在任何新鲜条目就直接硬失败，
-  // 连"违规的是谁"都不打印（2026-09-20 实测：同一棵树 add 会自愈写 minimumReleaseAgeExclude、
-  // remove 报这个码）。它同样属于「被 24h 观察期拒绝」，放行一次即可通过；
-  // 不认这个码的话，卸载路径的兜底重试永远不会触发，用户只会看到一句 pnpm 内部错误。
-  'ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED',
-]
+//
+// ★ 判定/抠条目/恢复时刻三件事统一在 release-age.js 里定义一次。
+//   历史上这里的标记表与 bridge.js 各有一份副本，2026-10-12 两份同时漏掉了 pnpm 11.8 的
+//   第三种表现（精确版本无匹配），兜底因此从未触发 —— 不再复制，改成 require。
+const releaseAge = require('./release-age')
+const RELEASE_AGE_OVERRIDE = releaseAge.RELEASE_AGE_OVERRIDE
 
 // ---------- 执行 dsh plugin（DSHL 保证 PATH 上的 pnpm 可用） ----------
 
@@ -296,17 +289,12 @@ function withToolchainPath(baseEnv, dirs) {
 
 /** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。只用于命中判定后的那一次重试。 */
 function withReleaseAgeOverride(args) {
-  const list = Array.isArray(args) ? args : []
-  const command = list[0]
-  if (command !== 'add' && command !== 'remove') return list
-  if (list.includes(RELEASE_AGE_OVERRIDE)) return list
-  return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
+  return releaseAge.withOverride(args)
 }
 
-/** 这次失败是不是「24h 观察期拒绝整份 lockfile」。 */
+/** 这次失败是不是「24h 观察期拒绝」。**必须传完整输出**（不是给用户看的那段截断文案）。 */
 function releaseAgeViolation(output) {
-  const text = String(output == null ? '' : output)
-  return RELEASE_AGE_MARKERS.some((marker) => text.includes(marker))
+  return releaseAge.isViolation(output)
 }
 
 /**
@@ -315,24 +303,12 @@ function releaseAgeViolation(output) {
  * 面板据此按本地时间告诉用户「什么时候自动恢复」，而不是笼统说一句「稍后再试」。
  */
 function parseReleaseAgeEntries(output) {
-  const text = String(output == null ? '' : output)
-  const out = []
-  const re = /^\s*(\S+) was published at ([^,\s]+), within the minimumReleaseAge cutoff/gmu
-  let m = re.exec(text)
-  while (m !== null) {
-    if (!out.some((e) => e.name === m[1])) out.push({ name: m[1], publishedAt: m[2] })
-    m = re.exec(text)
-  }
-  return out
+  return releaseAge.parseEntries(output)
 }
 
 /** 全部条目满 24h 后策略自动放行：取最晚的发布时间 + 24h（本地时间由界面负责展示）。 */
 function releaseAgeRecoversAt(entries) {
-  const times = (Array.isArray(entries) ? entries : [])
-    .map((e) => Date.parse(e && e.publishedAt))
-    .filter((t) => Number.isFinite(t))
-  if (!times.length) return ''
-  return new Date(Math.max(...times) + 24 * 60 * 60 * 1000).toISOString()
+  return releaseAge.recoversAt(entries)
 }
 
 /**
@@ -505,9 +481,11 @@ async function runCliOnce(args) {
       const output = chunks.join('').trimEnd()
       if (code === 0) resolve({ code, output })
       else {
-        const err = new Error('dsh plugin 退出码 ' + code + (output ? '：' + output.slice(-400) : ''))
+        // ★ 头部必须留着：错误码在最前面，只留尾部会切出 `TCHING_VERSION]` 这种残骸
+        //   （2026-10-12 真实截图）。省略策略见 release-age.js 的 quoteForError。
+        const err = new Error('dsh plugin 退出码 ' + code + (output ? '：' + releaseAge.quoteForError(output) : ''))
         err.exitCode = code
-        err.output = output // 完整输出：分类 / 抠条目都靠它（错误文案里只留尾部 400 字）
+        err.output = output // 完整输出：分类 / 抠条目都靠它（错误文案里只留头+尾）
         reject(err)
       }
     })

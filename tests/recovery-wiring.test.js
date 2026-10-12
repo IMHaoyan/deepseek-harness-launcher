@@ -564,3 +564,30 @@ test('兜底路径（主进程没下发 plan）也要把原文摆出来', () => 
   assert.match(block, /hintEl\.classList\.remove\('hidden'\)/, '渲染了还要显示')
   assert.match(block, /reason !== 'blocked'/, 'blocked 已经把它当副文案了，别重复一遍')
 })
+
+// ---------- ⑯ 改 profile 之前先落回退点 ----------
+test('改 profile 前落一个检查点：强制安装弄坏了 DSH 也有得退', () => {
+  // 用户 2026-10-12 的要求："如果绕过后打不开 dsh 了，应该能提供回退"。
+  // 回退链的其余部分（回退到检查点 / 禁用插件 / 自动回退）都已经有了，缺的只是"写之前那个点"：
+  // maybeCaptureHealthy 是服务健康起来**之后**才落、而且每次运行只落一次
+  // （healthCaptured 门槛），所以"改之前"这个状态压根不在槽里。
+  const c = body('capturePreWriteSnapshot')
+  assert.match(c, /health\.captureHealthy\(\{/, '要走既有捕获函数（不许自己写一套快照）')
+  assert.match(c, /reason: 'pre-write'/, '原因要可辨认：恢复页据此解释这个点是怎么来的')
+  assert.match(c, /invalidateRecoverySlots\(\)/, '落了新点要让恢复页缓存失效，否则列表还是旧的')
+  // 只在"当前真的有一个健康状态可保护"时才落：服务没起来时快照的是坏状态，
+  // 拿它当回退点等于把用户送回坑里。
+  assert.match(c, /if \(!server\.running\(\) \|\| !server\.managed\(\)\) return false/,
+    '服务没起来 / 不是我们管的实例 → 不落点')
+  // 检查点是安全网，不是前置条件：落点失败不许阻断写操作，但必须留痕
+  assert.match(c, /catch \(e\) \{[\s\S]{0,160}?log\(/, '落点失败只能记日志')
+  assert.ok(!/\bthrow\b/u.test(c), '落点失败绝不能抛给调用方（那会让插件操作直接失败）')
+  // 不许动 healthCaptured：那是"服务就绪后捕获"的门槛，置上会让重启后不再记录新状态
+  assert.ok(!/healthCaptured = true/u.test(c), '不许吃掉就绪后的那次捕获')
+
+  // 插在所有改 profile 的统一入口上 —— 一处覆盖全部，不用在每个写入口各补一次（那种补法必然漏）
+  const lock = body('tryBeginProfileOp')
+  assert.match(lock, /capturePreWriteSnapshot\(/, '写锁入口要落点')
+  assert.ok(lock.indexOf('capturePreWriteSnapshot(') < lock.indexOf('profileOp = token'),
+    '落点必须在真正占用写锁之后、动 profile 之前')
+})

@@ -32,18 +32,15 @@ const PLUGIN_NAME = '@agents-anywhere/dsh-bridge-next'
 const PROFILE_NAME = 'web'
 const BUNDLE_PATCH = './cordis.patch.yml'
 // pnpm 11 起默认带 24h「新版本观察期」：它在每次 add/remove/install 前校验整份 lockfile，
-// lockfile 里只要有一个刚发布不久且未放行的版本，任何操作都会在动手前被整体拒绝
-// （ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）。处理方式与 market.js 一致：
+// lockfile 里只要有一个刚发布不久且未放行的版本，任何操作都会在动手前被整体拒绝。
+// 处理方式与 market.js 一致：
 //   - 默认不关策略，让 pnpm 自己把新鲜版本写进 minimumReleaseAgeExclude（lockfile 保持合规）；
 //   - 只有真的被整体拒绝时，才用一次性放行重试一次（重试不写放行记录，只能当兜底）。
-const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
-const RELEASE_AGE_MARKERS = [
-  'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
-  'failed supply-chain policy check',
-  'bypassed the policy locally',
-  // 见 market.js 同名常量：pnpm 11.8 的 remove 路径缺观察期处理器，硬失败时打的就是这个码
-  'ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED',
-]
+// ★ 判定/注入两件事统一在 release-age.js 里定义一次 —— 这里原来是一份复制粘贴的副本，
+//   2026-10-12 与 market.js 同时漏掉 pnpm 11.8 的第三种表现（精确版本无匹配），
+//   两边的兜底一起失效。不再复制。
+const releaseAge = require('./release-age')
+const RELEASE_AGE_OVERRIDE = releaseAge.RELEASE_AGE_OVERRIDE
 const PROFILE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CLI_TIMEOUT_MS = 15 * 60 * 1000 // 首次安装要拉依赖树，给足时间
 const MAX_CLI_OUTPUT_BYTES = 64 * 1024
@@ -697,30 +694,17 @@ function withToolchainPath(baseEnv, dirs) {
 
 /** 只在 add/remove 时注入一次放行参数；其它子命令原样透传。只用于命中判定后的那一次重试。 */
 function withReleaseAgeOverride(args) {
-  const list = Array.isArray(args) ? args : []
-  const command = list[0]
-  if (command !== 'add' && command !== 'remove') return list
-  if (list.includes(RELEASE_AGE_OVERRIDE)) return list
-  return [command, RELEASE_AGE_OVERRIDE, ...list.slice(1)]
+  return releaseAge.withOverride(args)
 }
 
-/** 这次失败是不是「24h 观察期拒绝整份 lockfile」（判定口径与 market.js 一致）。 */
+/** 这次失败是不是「24h 观察期拒绝整份 lockfile」（判定口径见 release-age.js，两处共用一份）。 */
 function releaseAgeViolation(output) {
-  const text = String(output == null ? '' : output)
-  return RELEASE_AGE_MARKERS.some((marker) => text.includes(marker))
+  return releaseAge.isViolation(output)
 }
 
 /** 从 pnpm 的判定里抠出被拒条目（名字 + 发布时间），供控制台按本地时间解释「何时自动恢复」。 */
 function parseReleaseAgeEntries(output) {
-  const text = String(output == null ? '' : output)
-  const out = []
-  const re = /^\s*(\S+) was published at ([^,\s]+), within the minimumReleaseAge cutoff/gmu
-  let m = re.exec(text)
-  while (m !== null) {
-    if (!out.some((e) => e.name === m[1])) out.push({ name: m[1], publishedAt: m[2] })
-    m = re.exec(text)
-  }
-  return out
+  return releaseAge.parseEntries(output)
 }
 
 function captureProcess(child, label) {

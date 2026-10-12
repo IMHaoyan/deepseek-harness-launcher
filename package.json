@@ -45,6 +45,7 @@
       "lifecycle.js",
       "health.js",
       "boot-failure.js",
+      "release-age.js",
       "recovery-plan.js",
       "diagnostics.js",
       "notify-policy.js",

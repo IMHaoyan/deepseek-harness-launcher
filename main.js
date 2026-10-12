@@ -2366,6 +2366,47 @@ function maybeCaptureHealthy(reason) {
   }
 }
 
+/**
+ * 改 profile **之前**先落一个健康检查点 —— 这就是"装了个坏插件、DSH 再也起不来"时的回退点。
+ *
+ * 为什么不能只靠 maybeCaptureHealthy（上面那个）：它是「服务健康起来**之后**」才落的，而且有
+ * `healthCaptured` 门槛，每次运行只落一次。于是"改之前"这个状态压根不在槽里 —— 一旦强制安装
+ * （比如跳过 pnpm 的 24h 观察期）弄坏了 profile，用户手上可能**没有任何可以退回去的点**。
+ *
+ * 只在"当前真的有一个健康状态可保护"时才落：服务没起来时快照下来的是一份坏状态，
+ * 拿它当回退点等于把用户送回坑里。
+ *
+ * 落点失败**不阻断**写操作（检查点是安全网，不是前置条件），但一定记日志 ——
+ * 免得用户以为"有得退"而实际没有。
+ * @returns {boolean} 是否真的落了新点
+ */
+function capturePreWriteSnapshot(label) {
+  if (SELF_TEST) return false
+  if (!server.running() || !server.managed()) return false
+  try {
+    const r = health.captureHealthy({
+      dshlVersion: app.getVersion(),
+      dshKind: envReport && envReport.dsh ? envReport.dsh.kind : '',
+      dshVersion: envReport && envReport.plan ? (envReport.plan.dshVersion || '') : '',
+      nodeVersion: envReport && envReport.node ? (envReport.node.version || '') : '',
+      port: PORT,
+      reason: 'pre-write',
+    })
+    invalidateRecoverySlots()
+    if (r.status === 'captured') {
+      lifecycle.emit('health.capture', { slotId: r.slotId, reason: 'pre-write' })
+      log(`health: 改 profile 前落点 ${r.slotId}（${label}）—— 这次写入出问题可回退到这里`)
+      return true
+    }
+    // skipped = 刚回退过：槽里那份就是"改之前"的状态，不需要再落一个（也不该覆盖证据）
+    log(`health: 改 profile 前未落新点（${r.status}，${label}）`)
+    return false
+  } catch (e) {
+    log('health: 改 profile 前落点失败（不阻断写入）：' + ((e && e.message) || String(e)))
+    return false
+  }
+}
+
 // 服务就绪后安排延迟捕获（页面加载成功是快路径；120s 存活是慢速兜底）
 // 这里同时承担"稳定性证明"：只有连续存活满 RESTART_STABLE_MS 才清空崩溃计数窗口——
 // 页面加载成功不算证明（起来就崩的服务也能加载出页面，否则崩溃循环永远攒不到回退阈值）。
@@ -2635,6 +2676,10 @@ let profileOp = null // { label, at }；null = 空闲
 /** 尝试占用 profile 写锁。成功返回 release()，失败返回 null。 */
 function tryBeginProfileOp(label) {
   if (profileOp !== null) return null
+  // ★ 拿到写锁之后、动 profile **之前**先落一个回退点。放在这里是因为它是所有改 profile 的
+  //   统一入口（一键安装/一键更新/单个装卸启停都从这里进），一处插入覆盖全部 —— 不用在
+  //   每个写入口各补一次（那种补法必然会漏掉一个）。落点失败不阻断。
+  capturePreWriteSnapshot(String(label || '插件操作'))
   const token = { label: String(label || '插件操作'), at: Date.now() }
   profileOp = token
   let released = false
