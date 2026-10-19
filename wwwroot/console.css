@@ -719,6 +719,31 @@ body.console-surface {
   align-items: start;
 }
 
+/* 「Profile 中的其他插件」分组小标题：横跨整行 + 一条上分隔线，把它下面的卡片与 DSHL
+   代管的预装卡片隔开（否则同构卡片里混进几张没标签的，读起来像"预装清单被塞了野插件"）。 */
+.plugin-group-head {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 10px;
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.plugin-group-title {
+  font-size: 13.5px;
+  font-weight: 650;
+  line-height: 20px;
+}
+
+.plugin-group-note {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 18px;
+}
+
 .plugin-card {
   display: flex;
   flex-direction: column;
@@ -733,6 +758,13 @@ body.console-surface {
 }
 
 .plugin-card.busy { opacity: 0.8; }
+
+/* 「Profile 中的其他插件」的卡片：虚线边框 + 淡底。位置靠不住 —— 排序是「已安装优先」，
+   未安装的清单内卡片会排在这一组后面，所以归属要标在卡片自己身上。 */
+.plugin-card.plugin-card-other {
+  border: 1px dashed var(--border-soft);
+  background: var(--ghost-hover);
+}
 
 .plugin-card-head {
   display: flex;

@@ -25,14 +25,15 @@ test('左侧新增插件导航，插件页容器与搜索/筛选入口齐全', (
   assert.match(html, /id="btnPluginsUpdate"[^>]*>一键更新</, '一键更新按钮文案')
   assert.match(html, /id="btnPluginsRefresh"/, '工具栏应有刷新按钮')
   assert.match(html, /class="plugin-toolbar-actions"/, '应有操作按钮组')
-  assert.match(html, /id="navPlugins"[^>]*title="预装插件"/, '导航应叫「预装插件」')
-  assert.match(html, /<span>预装插件<\/span>/, '导航文字应为「预装插件」')
-  assert.match(html, /<span class="page-title">预装插件<\/span>/, '页面标题应为「预装插件」')
+  assert.match(html, /id="navPlugins"[^>]*title="插件管理"/, '导航应叫「插件管理」')
+  assert.match(html, /<span>插件管理<\/span>/, '导航文字应为「插件管理」')
+  assert.match(html, /<span class="page-title">插件管理<\/span>/, '页面标题应为「插件管理」')
 })
 
-test('预装插件页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方推荐」两枚标签', () => {
+test('插件管理页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方推荐」两枚标签', () => {
   assert.match(html, /class="plugin-page-intro"/, '页面应有定位说明条')
-  assert.match(html, /不是插件管理器/, '说明里要写清本页不是插件管理器')
+  assert.match(html, /Profile 中的其他插件/, '说明里要交代下半是 Profile 中的其他插件')
+  assert.match(html, /不在 DSHL 清单中/, '说明里要写清这些包不归 DSHL 管（所以只给停用/卸载）')
   assert.match(html, /DSH 窗口内的「插件市场」/, '说明里要指路 DSH 内置插件市场')
   assert.doesNotMatch(html, /btnOpenDshMarket/, '说明条不再放跳转按钮（已按用户要求去掉）')
   assert.doesNotMatch(main, /openDshPluginMarket/, '不应保留页面驱动的市场跳转实现')
@@ -55,6 +56,112 @@ test('预装插件页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方�
   assert.doesNotMatch(app, /plugin-note-toggle/, '渲染层不应再有备注入口')
   assert.doesNotMatch(app, /pluginSetNote/, '渲染层不应再调用备注保存命令')
   assert.doesNotMatch(css, /plugin-note/, '样式表不应残留备注样式')
+})
+
+// 用户实测反馈：清单外的卡片和预装卡片同构渲染，只差没挂归属标签 —— 平铺在一起会被读成
+// "预装清单里混进来一堆野插件"。B 方案：卡片位置不动，只加一枚分组小标题把它们隔开。
+test('Profile 中的其他插件：分组小标题隔开清单外卡片，判据用主进程发的 profile: 前缀', () => {
+  assert.match(app, /p\.id\.startsWith\('profile:'\)/, '分组判据要用主进程统一发的 profile: 前缀，不按有没有标签猜')
+  assert.doesNotMatch(app, /tags\.length === 0[\s\S]{0,80}plugin-group/, '不能按"没标签"认这一组：关掉自动安装的预装插件也没标签')
+  assert.match(app, /const others = visible\.filter\(isProfileInventoryCard\)\.length/,
+    '小标题里的数字要按当前筛选下可见的那批算，跟下面真正渲染的卡片同口径')
+  assert.match(app, /cards\.appendChild\(pluginGroupHeadEl\(others\)\)/, '第一张清单外卡片前要插一次分组小标题')
+  assert.match(app, /'Profile 中的其他插件（' \+ count \+ '）'/, '小标题文案要写明这是 Profile 中的其他插件')
+  assert.match(app, /不在 DSHL 清单中/, '小标题要一句话说清它们为什么在这儿')
+  assert.match(css, /\.plugin-group-head \{\n  grid-column: 1 \/ -1;/, '小标题要横跨整个卡片网格，不能挤成一格')
+  assert.match(css, /\.plugin-group-head \{[^}]*border-top: 1px solid var\(--border-soft\)/, '要有分隔线与预装卡片区分')
+  assert.match(css, /\.plugin-card\.plugin-card-other \{[^}]*border: 1px dashed/, '清单外卡片要自带虚线边框：排序会把它和清单内卡片打散，归属不能只靠位置')
+})
+
+// 上面那条只能钉住"代码里写了什么"。插了几次、插在谁前面、数字算的是哪一批，正则全挡不住 ——
+// 所以这里把渲染片段真的跑起来：抠出源码 + 一个最小 DOM 桩，直接看渲染出来的节点序列。
+function pluginRenderHarness(source) {
+  const start = source.indexOf('function pluginCardEl(')
+  const end = source.indexOf('function renderPendingRestart(')
+  assert.ok(start > 0 && end > start, '找不到插件页渲染片段（pluginCardEl / isProfileInventoryCard / renderPlugins）')
+  const makeEl = (tag) => {
+    const node = {
+      tag,
+      className: '',
+      title: '',
+      value: '',
+      children: [],
+      dataset: {},
+      classList: {
+        _set: new Set(),
+        toggle(name, on) { if (on) this._set.add(name); else this._set.delete(name) },
+        add(name) { this._set.add(name) },
+        remove(name) { this._set.delete(name) },
+        contains(name) { return this._set.has(name) },
+      },
+      appendChild(child) { this.children.push(child); return child },
+      setAttribute() {},
+    }
+    // 卡片渲染里有 `if (wrap.childNodes.length)` 这种判空：桩必须有 childNodes，否则真渲染跑不起来
+    Object.defineProperty(node, 'childNodes', { get: () => node.children })
+    // textContent 按真实 DOM 语义实现：写它 = 清空子节点。renderPlugins 每次用 `cards.textContent = ''`
+    // 清屏，桩要是只当普通属性存着，三次渲染的卡片会累加起来（第一版就是这么假失败的）。
+    let text = ''
+    Object.defineProperty(node, 'textContent', {
+      get: () => text,
+      set: (v) => { text = v == null ? '' : String(v); node.children.length = 0 },
+    })
+    return node
+  }
+  const nodes = new Map()
+  const el = (id) => {
+    if (!nodes.has(id)) nodes.set(id, makeEl('div'))
+    return nodes.get(id)
+  }
+  el('pluginCards'); el('pluginSummary'); el('pluginEmpty'); el('pluginSearch')
+  const win = {}
+  // 只实现本用例要用的两档筛选：'all' 与 'other'（其他档位与分组无关）
+  const pluginMatches = (p, filter) => !(filter === 'other' && (Array.isArray(p.tags) ? p.tags : []).length)
+  const factory = new Function('window', 'document', '$', 'pluginMatches', 'renderInstallAll',
+    source.slice(start, end) + '\nreturn { renderPlugins, pluginCardEl, isProfileInventoryCard, pluginGroupHeadEl };')
+  const api = factory(win, { createElement: makeEl }, (id) => nodes.get(id) || null, pluginMatches, () => {})
+  return { ...api, win, cards: el('pluginCards') }
+}
+
+test('Profile 中的其他插件：真跑渲染 —— 小标题只插一次、落在第一张清单外卡片之前、数字同口径', () => {
+  const h = pluginRenderHarness(app)
+  const kindsOf = () => h.cards.children.map((c) => (c.className === 'plugin-group-head' ? 'HEAD' : c.dataset.pluginId))
+  const marked = () => h.cards.children
+    .filter((c) => c.className !== 'plugin-group-head')
+    .every((c) => c.className.includes('plugin-card-other') === String(c.dataset.pluginId).startsWith('profile:'))
+
+  const list = [
+    { id: 'dshmarket', name: '插件市场', installed: true, enabled: true, tags: [{ key: 'preinstall', label: 'DSHL预装' }] },
+    // 关掉自动安装的预装插件：标签换了中性文案、但**没有被错划进这一组**
+    { id: 'rewind', name: '对话回退', installed: true, enabled: true, tags: [{ key: 'preinstall', label: '已关闭自动安装' }] },
+    { id: 'profile:dsh-image-gen', name: 'dsh-image-gen', installed: true, enabled: true, tags: [] },
+    { id: 'profile:dsh-mcp-panel', name: 'dsh-mcp-panel', installed: true, enabled: true, tags: [] },
+    { id: 'codex-ui', name: 'Codex 风格界面', installed: false, enabled: false, tags: [] },
+  ]
+  h.renderPlugins(list, true)
+  assert.deepEqual(kindsOf(),
+    ['dshmarket', 'rewind', 'HEAD', 'profile:dsh-image-gen', 'profile:dsh-mcp-panel', 'codex-ui'],
+    '小标题只能插一次，且必须在第一张清单外卡片之前（卡片顺序本身不动）')
+  const head = h.cards.children[2]
+  const headText = head.children.map((c) => c.textContent).join(' ')
+  assert.match(headText, /Profile 中的其他插件（2）/, '数字要按这一组里真正渲染出来的张数算')
+  assert.match(headText, /不在 DSHL 清单中/, '小标题要一句话说清它们为什么在这儿')
+  // 排序把未安装的清单内卡片（codex-ui）压在这一组**后面**：归属只能靠卡片自己的标记，不能靠位置
+  assert.ok(marked(), '清单外卡片要带 plugin-card-other，清单内卡片（含排在这一组后面的）不能带')
+
+  // 筛选到「其他」这一档：整页只剩清单外卡片，小标题照样要有（否则这一屏又变成"没有归属的野卡片"）
+  h.win._pluginFilter = 'other'
+  h.renderPlugins(list, true)
+  assert.deepEqual(kindsOf(), ['HEAD', 'profile:dsh-image-gen', 'profile:dsh-mcp-panel', 'codex-ui'],
+    '只剩清单外卡片时小标题仍在最前（清单内的未安装卡片按标签口径也落在这档，但它不属于这一组）')
+  assert.match(h.cards.children[0].children.map((c) => c.textContent).join(' '), /（2）/, '数字跟当前筛选下的可见张数一致')
+  assert.ok(marked(), '换筛选后归属标记不能丢')
+
+  // 没有清单外卡片时，一枚标题都不该出现
+  h.win._pluginFilter = 'all'
+  h.renderPlugins(list.filter((p) => !String(p.id).startsWith('profile:')), true)
+  assert.deepEqual(kindsOf(), ['dshmarket', 'rewind', 'codex-ui'], '没有清单外卡片时不该凭空多出一枚标题')
+  assert.ok(marked(), '此时没有任何卡片该带清单外标记')
 })
 
 test('插件卡片由 state.plugins 数据驱动', () => {

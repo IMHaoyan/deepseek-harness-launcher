@@ -131,7 +131,7 @@ test('端口无法监听（EACCES/EADDRINUSE）按冲突上报，并建议可 bi
   assert.match(mainJs, /if \(bindErr\) await reportBindBlocked\(bindErr\)/, '子进程启动阶段退出/就绪超时都要上报')
   assert.match(mainJs, /PORT < 15000 \? 15081 : PORT \+ 1/, '建议端口优先落在 15081 以上，避开 Windows 动态端口范围')
 })
-test('控制台导航收敛为「通用 / 预装插件 / 日志与反馈」，概览与设置已并页', () => {
+test('控制台导航收敛为「通用 / 插件管理 / 日志与反馈」，概览与设置已并页', () => {
   const consoleHtml = read('ui-src/index.html')
   const consoleJs = read('ui-src/app.js')
   const navIds = matchAll(consoleHtml, /id="(nav[A-Za-z]+)"/g)

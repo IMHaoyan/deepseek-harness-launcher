@@ -74,6 +74,9 @@ const HOST = args.host || '127.0.0.1'
 let PORT = args.port || (SELF_TEST ? 3999 : 3080)
 let WEB_URL = `http://${HOST}:${PORT}`
 const READY_TIMEOUT_SEC = 60
+// 启动器安装包的发布页：自动更新失败（尤其 GitHub 不可达）时，界面用「手动下载」打开它。
+// 主进程/更新窗口共用一处，避免两个渠道各写一个 URL 后悄悄分叉。
+const LAUNCHER_RELEASES_URL = 'https://github.com/IMHaoyan/deepseek-harness-launcher/releases'
 
 // 按当前配置重算运行端口（配置缺失/非法一律回退默认 3080）。
 // seed=true（仅启动时）：命令行 --port 优先，作为本次会话的种子；运行时（设置页/一键换端口）一律以 Config.port 为准，
@@ -3116,7 +3119,7 @@ function cleanInstalledVersion(spec) {
 // 会话导入、上下文洞察。
 // 从本版本起摘出注册表的两个（会话归档 / MCP Lens）只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
 // 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
-// tests/plugin-page-wiring.test.js 的默认代装断言与 README「预装插件」小节。
+// tests/plugin-page-wiring.test.js 的默认代装断言与 README「插件管理」小节。
 const MANAGED_NPM_PLUGINS = [
   {
     id: 'better-sidebar',
@@ -3314,7 +3317,13 @@ function pluginInventoryCards() {
     cards = pluginInventory.inventoryCards({
       targets,
       known,
-      stateOf: (npm) => market.getState(npm) || {},
+      // 版本必须是「装的是哪个版本」，不是 profile 里的依赖范围：清单外卡片的依赖常写成 `^0.9.0`，
+      // 直接把 spec 当版本渲染出来就是卡片标题上的 `v^0.9.0`（实测截图里那两张卡）。判据与注册表
+      // 卡片同一份（installedPackageVersion 优先，回退从 spec 里抠 semver），抠不到就**不显示版本**。
+      stateOf: (npm) => {
+        const raw = market.getState(npm) || {}
+        return Object.assign({}, raw, { version: raw.installedPackageVersion || cleanInstalledVersion(raw.version) })
+      },
       isDisabled: (npm) => pluginSwitch.isDisabled(npm),
       canToggle: (npm) => pluginSwitch.canToggle(npm),
       busyOf: (id) => String(pluginActionBusy.get(id) || ''),
@@ -3493,7 +3502,7 @@ function setManagedPluginNote(id, text) {
 }
 
 /**
- * 一键安装本页所有尚未安装的预装插件（「预装插件」页顶部按钮）。
+ * 一键安装本页所有尚未安装的预装插件（「插件管理」页顶部按钮）。
  *   - 覆盖页面上的全部预装项：插件市场、手机连接 + 注册表里的 npm 推荐插件；
  *   - 开始时停一次服务，之后连续安装（pnpm 改写 profile 不需要服务在跑）；
  *   - 只装未安装的，已装的不动（不做静默升级——更新仍由卡片上的按钮显式触发）；
@@ -3747,7 +3756,7 @@ function setPluginGateNotice(items) {
   return true
 }
 
-/** 用户已经看过这条提醒（点了「去预装插件页安装」或「稍后再说」）：清掉，别反复打扰。 */
+/** 用户已经看过这条提醒（点了「去插件管理页安装」或「稍后再说」）：清掉，别反复打扰。 */
 function ackPluginGateNotice() {
   if (!Config.pluginGateNotice) return { ok: true, already: true }
   Config.pluginGateNotice = null
@@ -3804,7 +3813,7 @@ async function maybeAutoInstallRecommendedPlugins() {
       }))
     }
     // 光有插件页的提示条不够：首次安装的用户可能根本不会打开那一页。
-    // 记一条待确认的弹窗提醒，把人引导到「预装插件」页手动点「授权并安装」。
+    // 记一条待确认的弹窗提醒，把人引导到「插件管理」页手动点「授权并安装」。
     setPluginGateNotice(gated.map((x) => ({
       id: x.id,
       name: x.name,
@@ -3815,7 +3824,7 @@ async function maybeAutoInstallRecommendedPlugins() {
     // 控制台没开着就只能靠系统通知指路（不主动抢焦点/弹窗口）；开着的话弹窗会直接出现
     if (!consoleIsOpen()) {
       notify('DeepSeek Harness Launcher',
-        gated.length + ' 个预装插件需要你手动安装：打开启动器控制台「预装插件」页，点对应卡片的「授权并安装」',
+        gated.length + ' 个预装插件需要你手动安装：打开启动器控制台「插件管理」页，点对应卡片的「授权并安装」',
         undefined, 'recovery')
     }
   }
@@ -4884,6 +4893,9 @@ function updateStateSnapshot() {
       status: launcher.status || 'idle',
       percent: launcher.percent || 0,
       error: launcher.error || '',
+      // 失败分类与「手动下载」指引：更新窗口据此把失败原因说清并给出可执行动作
+      errorKind: launcher.errorKind || '',
+      errorHint: launcher.errorHint || '',
     },
     dsh: {
       current: (envReport && envReport.dsh && envReport.dsh.version) || '',
@@ -6268,7 +6280,7 @@ function stateJson() {
       }
       : null,
     pluginEnvNote: pluginEnvNote || '',
-    // 默认代装因版本门禁没装上的那批（待用户确认的弹窗）：控制台据此弹一次并把用户引导到预装插件页
+    // 默认代装因版本门禁没装上的那批（待用户确认的弹窗）：控制台据此弹一次并把用户引导到插件管理页
     pluginGateNotice: Config.pluginGateNotice || null,
     diagnosticsDir: DIAG_DIR,
   })
@@ -6570,8 +6582,18 @@ function registerIpc() {
         case 'updaterGetState': return updater.getState()
         case 'updaterCheck': void updater.check(); return updater.getState()
         case 'updaterInstall': void updater.installNow(); return updater.getState()
-        case 'dshCheckNow': void dshUpdater.checkOnce('manual', true); return '{}'
+        case 'dshCheckNow': {
+          // 检查是异步的：这里立刻回执，结果由后端状态推送。必须接住 rejection ——
+          // 否则未处理的 Promise 拒绝只在主进程日志里留一行，界面永远等不到任何反馈。
+          void dshUpdater.checkOnce('manual', true).catch((err) => {
+            log('dsh-update: 手动检查异常：' + (err && err.message ? err.message : String(err)))
+          })
+          return '{}'
+        }
         case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
+        // 自动更新失败时的手动出路：打开固定发布页。不接受任何 URL 参数 ——
+        // 更新窗口/控制台只能"打开这一页"，没法借命令跳转到任意地址。
+        case 'openLauncherDownload': try { shell.openExternal(LAUNCHER_RELEASES_URL) } catch { /* noop */ } return '{}'
         default: return JSON.stringify({ ok: false, error: '未知命令：' + String(name) })
       }
     } catch (err) {
@@ -6703,7 +6725,9 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         }
         case 'openGithub': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher') } catch { /* noop */ } return '{}'
 
-        case 'openChangelog': try { shell.openExternal('https://github.com/IMHaoyan/deepseek-harness-launcher/releases') } catch { /* noop */ } return '{}'
+        case 'openChangelog': try { shell.openExternal(LAUNCHER_RELEASES_URL) } catch { /* noop */ } return '{}'
+        // 更新检查/下载失败时的「手动下载」：与控制台同一出口
+        case 'openLauncherDownload': try { shell.openExternal(LAUNCHER_RELEASES_URL) } catch { /* noop */ } return '{}'
         case 'openPluginRepo': {
           // 只收插件 id、不收 URL：跳转地址在主进程按注册表拼，渲染层无法借这条命令打开任意站点。
           const url = pluginRepo.releasesUrl(pluginRepoOf(value && value.id))
@@ -7037,7 +7061,14 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'updaterCheck': void updater.check(); return updater.getState()
         case 'updaterInstall': void updater.installNow(); return updater.getState()
         case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
-        case 'dshCheckNow': void dshUpdater.checkOnce('manual', true); return '{}'
+        case 'dshCheckNow': {
+          // 检查是异步的：这里立刻回执，结果由后端状态推送。必须接住 rejection ——
+          // 否则未处理的 Promise 拒绝只在主进程日志里留一行，界面永远等不到任何反馈。
+          void dshUpdater.checkOnce('manual', true).catch((err) => {
+            log('dsh-update: 手动检查异常：' + (err && err.message ? err.message : String(err)))
+          })
+          return '{}'
+        }
         case 'exit': void requestExit(); return '{}'
         default: log('bridge: unknown command ' + name); return '{}'
       }

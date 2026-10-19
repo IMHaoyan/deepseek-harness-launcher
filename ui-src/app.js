@@ -186,7 +186,7 @@ function applyTheme(mode) {
   document.documentElement.dataset.theme = mode; // system|light|dark（CSS 处理 system+系统暗色）
 }
 
-const CONSOLE_PAGE_LABELS = { general: '通用', plugins: '预装插件', env: '运行环境', logs: '日志与反馈', wizard: '首次设置' };
+const CONSOLE_PAGE_LABELS = { general: '通用', plugins: '插件管理', env: '运行环境', logs: '日志与反馈', wizard: '首次设置' };
 // env 是「通用 → 服务与更新」里的二级页：导航高亮仍落在通用上
 const CONSOLE_NAV_IDS = { general: 'navGeneral', plugins: 'navPlugins', env: 'navGeneral', logs: 'navLog' };
 // 旧名兼容：概览/设置已合并成「通用」（主进程很多入口还在推 main）；服务与诊断已合并进「日志与反馈」
@@ -403,7 +403,7 @@ function render(state) {
     if (notActive.length) {
       const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
       notes.push(`${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
-        + `${notActive.length > 3 ? ' 等' : ''} → 可在「预装插件」页查看`);
+        + `${notActive.length > 3 ? ' 等' : ''} → 可在「插件管理」页查看`);
     }
     crashEl.classList.toggle('env-warning', alert); // 非 alert 用普通卡片样式，不再红色告警
     crashEl.classList.toggle('hidden', notes.length === 0);
@@ -1385,17 +1385,39 @@ $('btnEnvRetry').addEventListener('click', () => {
 });
 $('btnEnvOpenInstallLog').addEventListener('click', () => void cmd('openInstallLog'));
 
-// 版本行内联检查结果提示：8 秒后自动消失（新状态到达会重置计时）
+// 版本行内联检查结果提示：终态（已是最新/发现新版本/失败）8 秒后自动消失（新状态到达会重置计时）。
+// opts.sticky：「检查中…」这类"还没结束"的提示不参与 8 秒清除 —— 一次检查最坏可能几十秒到几分钟，
+// 提示先消失会让界面看起来"点了没反应"（2026-10 反馈），而后续状态推送会自己把它换掉。
 const versionHintTimers = {};
-function flashVersionHint(el, text, title, key) {
+function flashVersionHint(el, text, title, key, opts) {
   if (!el) return;
   if (versionHintTimers[key]) { clearTimeout(versionHintTimers[key]); versionHintTimers[key] = null; }
   el.textContent = text;
   el.title = title || '';
-  if (text) versionHintTimers[key] = setTimeout(() => { el.textContent = ''; el.title = ''; versionHintTimers[key] = null; }, 8000);
+  if (text && !(opts && opts.sticky)) versionHintTimers[key] = setTimeout(() => { el.textContent = ''; el.title = ''; versionHintTimers[key] = null; }, 8000);
 }
 
 // ---------- 自动更新（electron-updater → GitHub Releases） ----------
+// 启动器更新失败：按主进程给的 errorKind 给一句短标签（行内只放得下几个字），
+// 完整原因 + 手动下载指引放 tooltip；失败态提示常驻，不再 8 秒消失（要让人来得及看和操作）。
+const UPDATER_FAIL_LABELS = {
+  network: '网络不可达',
+  blocked: 'GitHub 访问受限',
+  'not-found': '暂无发布信息',
+  checksum: '安装包校验失败',
+  install: '安装程序启动失败',
+  unknown: '检查更新失败',
+};
+function updaterFailureLabel(u) {
+  return UPDATER_FAIL_LABELS[(u && u.errorKind) || ''] || '检查更新失败';
+}
+function updaterFailureTitle(u) {
+  const lines = [];
+  if (u && u.error) lines.push(u.error);
+  if (u && u.errorHint) lines.push(u.errorHint);
+  return lines.join('\n');
+}
+
 function renderUpdater(u) {
   if (!u) return;
   window._updater = u;
@@ -1415,16 +1437,26 @@ function renderUpdater(u) {
     hoverCheck.disabled = u.status === 'checking';
     hoverCheck.textContent = u.status === 'checking' ? '检查中…' : '检查更新';
   }
-  // 版本行内联检查结果反馈（8 秒后自动消失，避免常驻）
+  // 版本行内联检查结果反馈（终态 8 秒后自动消失；"检查中"常驻到结果到达，避免慢检查看起来没反应）
   const rowHint = $('updRowHint');
   if (rowHint) {
     let text = '';
-    if (u.status === 'checking') text = '正在检查更新…';
+    let title = '';
+    let sticky = false;
+    if (u.status === 'checking') { text = '正在检查更新…'; sticky = true; }
     else if (u.status === 'downloading') text = `发现新版本 v${u.latest}，下载中…`;
     else if (u.status === 'downloaded') text = `新版本 v${u.latest} 已就绪`;
     else if (u.status === 'up-to-date') text = '已是最新版本';
-    else if (u.status === 'error') text = '检查更新失败';
-    flashVersionHint(rowHint, text, text === '检查更新失败' ? (u.error || '') : '', 'upd');
+    else if (u.status === 'error') { text = updaterFailureLabel(u); title = updaterFailureTitle(u); sticky = true; }
+    flashVersionHint(rowHint, text, title, 'upd', { sticky });
+  }
+  // 失败态给「手动下载」：自动更新走不通时（尤其没 VPN 连不上 GitHub），还能让能访问的同事
+  // 下载安装包后转交；成功/进行中不出现，不占常规版面。
+  const manualBtn = $('btnUpManual');
+  if (manualBtn) {
+    const failed = u.status === 'error';
+    manualBtn.classList.toggle('hidden', !failed);
+    manualBtn.title = failed ? (updaterFailureTitle(u) || '在浏览器打开发布页手动下载安装包') : '';
   }
 }
 
@@ -1439,6 +1471,8 @@ $('btnUpdateNow').addEventListener('click', () => {
 });
 // 主页面"启动器版本"行：悬停"检查更新"按钮
 $('btnUpCheckNow').addEventListener('click', () => void cmd('updaterCheck'));
+// 失败态「手动下载」：打开官方发布页（固定地址由主进程决定，界面不传 URL）
+$('btnUpManual').addEventListener('click', () => void cmd('openLauncherDownload'));
 
 // ---------- DSH 更新（检测全自动、更新全手动：点"立即更新"才执行） ----------
 // 主页最低端"DSH版本"行按钮：只有检测到更新（或更新中/失败重试）才显示；
@@ -1523,18 +1557,19 @@ function renderDshUpdate(u) {
     hoverCheck.disabled = status === 'checking';
     hoverCheck.textContent = status === 'checking' ? '检查中…' : '检查更新';
   }
-  // 版本行内联检查结果反馈（8 秒后自动消失，避免常驻）
+  // 版本行内联检查结果反馈（终态 8 秒后自动消失；"检查中"常驻到结果到达，避免慢检查看起来没反应）
   const rowHint = $('dshUpdRowHint');
   if (rowHint) {
     let text = '';
-    if (status === 'checking') text = '正在检查更新…';
+    let sticky = false;
+    if (status === 'checking') { text = '正在检查更新…'; sticky = true; }
     // 版本号（含 (next) 标记）由上面的常驻"目标版本"显示，这里不再重复一遍
     else if (status === 'available') text = '发现新版本';
     else if (status === 'updating') text = '更新中…';
     else if (status === 'updated') text = `已更新到 v${u.current}`;
     else if (status === 'up-to-date') text = '已是最新版本';
     else if (status === 'error') text = '检查/更新失败';
-    flashVersionHint(rowHint, text, text === '检查/更新失败' ? (u.error || '') : '', 'dsh');
+    flashVersionHint(rowHint, text, text === '检查/更新失败' ? (u.error || '') : '', 'dsh', { sticky });
   }
 
   // 设置页不再有"DSH版本与更新"行：版本、检查、更新入口都在主页面行内
@@ -1549,7 +1584,22 @@ $('btnDshUpdateNow').addEventListener('click', () => {
   else void cmd('dshCheckNow');
 });
 // 主页面"DSH版本"行：悬停"检查更新"按钮
-$('btnDshCheckHover').addEventListener('click', () => void cmd('dshCheckNow'));
+// 点击当刻就反馈，不等主进程状态推送：撞上在途检查（启动/定时检查或上一次点击）时，
+// 主进程会把这次点击并入并在结束后补查，状态推送可能几十秒后才到；这段空窗期界面必须已经显示"在检查"。
+$('btnDshCheckHover').addEventListener('click', () => {
+  const rowHint = $('dshUpdRowHint');
+  const hoverCheck = $('btnDshCheckHover');
+  flashVersionHint(rowHint, '正在检查更新…', '', 'dsh', { sticky: true });
+  if (hoverCheck) { hoverCheck.disabled = true; hoverCheck.textContent = '检查中…'; }
+  void cmd('dshCheckNow').then((r) => {
+    // 主进程侧异常（命令被拒/更新器未初始化）必须给出可读结果，不能静默；
+    // 这种失败不会带来任何状态推送，按钮得自己恢复成可点，否则会永远停在"检查中…"
+    if (r && r.ok === false) {
+      flashVersionHint(rowHint, '检查更新失败', r.error || '', 'dsh');
+      if (hoverCheck) { hoverCheck.disabled = false; hoverCheck.textContent = '检查更新'; }
+    }
+  });
+});
 
 // ---------- 插件页：state.plugins 数据驱动，新增插件无需改渲染逻辑 ----------
 function pluginMatches(p, filter, query) {
@@ -1580,7 +1630,10 @@ function pluginGateHint(p) {
 
 function pluginCardEl(p) {
   const card = document.createElement('article');
-  card.className = 'plugin-card' + (p.busy ? ' busy' : '');
+  // 清单外的卡片再挂一枚类：排序是「已安装优先」，所以**未安装的清单内卡片会排在这一组后面**
+  // （实测顺序：… 6 张清单外卡片 → Codex 风格界面 / 会话导入）。只插一枚分组小标题的话，
+  // 它们会被读成组里的人；把归属标在卡片自己身上，位置就改变不了语义（筛到「其他」那档同样成立）。
+  card.className = 'plugin-card' + (p.busy ? ' busy' : '') + (isProfileInventoryCard(p) ? ' plugin-card-other' : '');
   card.dataset.pluginId = p.id;
 
   // 标题行：名称 + 版本（参考「设置 → 插件」的排版）。
@@ -1707,6 +1760,34 @@ function pluginCardEl(p) {
   card.appendChild(footer); card.appendChild(feedback);
   return card;
 }
+
+/**
+ * 这一张是不是「Profile 中的其他插件」（主进程 plugin-inventory.js 补的那种卡片）。
+ * 判据只用 id 前缀 —— 那是主进程统一发的（INVENTORY_ID_PREFIX = 'profile:'），
+ * 渲染层不自己按"有没有标签"猜：预装插件的自动安装被关掉后标签会变成中性状态说明，
+ * 按标签猜会把它们错划进这一组。读不到 id 的卡片一律当预装侧（少插一个标题，不会有别的后果）。
+ */
+function isProfileInventoryCard(p) {
+  return !!p && typeof p.id === 'string' && p.id.startsWith('profile:');
+}
+
+/**
+ * 「Profile 中的其他插件」分组小标题：把这些卡片和 DSHL 代管的预装卡片在视觉上隔开。
+ * 数字是**当前筛选下可见**的条数，与它下面真正渲染出来的卡片同口径（筛选/搜索后不会对不上）。
+ */
+function pluginGroupHeadEl(count) {
+  const head = document.createElement('div');
+  head.className = 'plugin-group-head';
+  const title = document.createElement('span');
+  title.className = 'plugin-group-title';
+  title.textContent = 'Profile 中的其他插件（' + count + '）';
+  const note = document.createElement('span');
+  note.className = 'plugin-group-note';
+  note.textContent = '不在 DSHL 清单中：手动装的，或由 DSH 内的插件市场装的。服务被它们搞挂时，可以在这里停用或卸载。';
+  head.appendChild(title); head.appendChild(note);
+  return head;
+}
+
 function renderPlugins(plugins, force) {
   const list = Array.isArray(plugins) ? plugins : [];
   const cards = $('pluginCards');
@@ -1732,7 +1813,17 @@ function renderPlugins(plugins, force) {
     summary.title = envNote;
   }
   cards.textContent = '';
-  for (const p of visible) cards.appendChild(pluginCardEl(p));
+  // 「Profile 中的其他插件」小标题：这些卡片与预装卡片同构渲染，只差没挂归属标签 —— 不加标题
+  // 就会被读成"预装清单里混进来一堆野插件"（实测反馈）。只插一次，数字按**当前筛选下可见**的那批算。
+  const others = visible.filter(isProfileInventoryCard).length;
+  let groupHeadDone = false;
+  for (const p of visible) {
+    if (!groupHeadDone && isProfileInventoryCard(p)) {
+      groupHeadDone = true;
+      cards.appendChild(pluginGroupHeadEl(others));
+    }
+    cards.appendChild(pluginCardEl(p));
+  }
   const empty = $('pluginEmpty');
   if (empty) empty.classList.toggle('hidden', visible.length > 0);
   renderInstallAll(installAll, list);
@@ -1882,7 +1973,7 @@ function renderPluginEnvIssue(info, note) {
 /**
  * 默认代装因版本门禁没装上的那批：弹一次窗，把"哪几个、为什么、去哪装"讲清楚。
  *
- * 为什么要弹窗而不是只留提示条：提示条在「预装插件」页里，而首次安装的用户很可能压根不会打开那一页 ——
+ * 为什么要弹窗而不是只留提示条：提示条在「插件管理」页里，而首次安装的用户很可能压根不会打开那一页 ——
  * 装完向导就以为万事俱备，最后缺插件这件事谁也没告诉他。默认代装又**不会替他授权**
  * （不兼容风险只能本人拍板），所以这里只做提醒 + 指路，动作仍由用户在卡片上点「授权并安装」。
  * 只弹一次：点过任何一个按钮都会 ack（主进程把这条记在配置里），重开控制台也不会再弹。
@@ -1900,8 +1991,8 @@ async function renderPluginGateNotice(notice) {
       title: info.items.length + ' 个预装插件需要你手动安装',
       body: '默认代装不会替你接受插件的兼容风险，所以下面这几个没有自动安装：\n' + list.join('\n')
         + '\n\n原因：它们声明的 dsh 版本范围里没有当前 dsh' + (dsh ? ' ' + dsh : '') + '，直接安装会被 DSH 拒绝。'
-        + '\n\n要装的话，去「预装插件」页点对应卡片的「授权并安装」—— 那一步会把风险和生效范围讲清楚，由你自己确认。',
-      confirmText: '去预装插件页安装',
+        + '\n\n要装的话，去「插件管理」页点对应卡片的「授权并安装」—— 那一步会把风险和生效范围讲清楚，由你自己确认。',
+      confirmText: '去插件管理页安装',
       cancelText: '稍后再说',
     });
     await cmd('pluginsAckGateNotice'); // 看过了就不再弹（去装 / 稍后都算看过）

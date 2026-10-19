@@ -62,7 +62,7 @@ test('parseVersionGate：不是门禁就返回 null，别的失败照旧走各�
   assert.equal(market.parseVersionGate(null), null)
 })
 
-test('未装上清单的弹窗：主进程下发、控制台只弹一次、点完 ack、并把人引导到预装插件页', () => {
+test('未装上清单的弹窗：主进程下发、控制台只弹一次、点完 ack、并把人引导到插件管理页', () => {
   const app = read('ui-src/app.js')
   const html = read('ui-src/index.html')
   // 主进程：清单进 state、ack 有命令
@@ -73,10 +73,10 @@ test('未装上清单的弹窗：主进程下发、控制台只弹一次、点�
   // 控制台：弹窗 + 引导 + 一次性
   assert.match(app, /function renderPluginGateNotice\(notice\)/, '要有弹窗渲染器')
   assert.match(app, /void renderPluginGateNotice\(state\.pluginGateNotice\)/, '状态推送要驱动弹窗')
-  assert.match(app, /confirmText: '去预装插件页安装'/, '弹窗的主按钮要指向真实动作')
+  assert.match(app, /confirmText: '去插件管理页安装'/, '弹窗的主按钮要指向真实动作')
   assert.match(app, /cancelText: '稍后再说'/, '只提醒不强迫：取消文案要说清是"稍后"')
   assert.match(app, /await cmd\('pluginsAckGateNotice'\)/, '看过就要 ack（不然每次都弹）')
-  assert.match(app, /if \(ok\) \{\n\s+showPage\('plugins'\)/, '确认后要跳到「预装插件」页')
+  assert.match(app, /if \(ok\) \{\n\s+showPage\('plugins'\)/, '确认后要跳到「插件管理」页')
   assert.match(app, /plugin-latest\.gate[\s\S]{0,120}?scrollIntoView/, '顺手把第一张需授权的卡片滚进视野')
   assert.match(app, /window\._gateNoticeAt === info\.at/, '同一条只弹一次（状态每次都推）')
   assert.match(app, /cancelBtn\.textContent = o\.cancelText \|\| '取消'/, 'confirmDialog 要支持自定义取消文案')

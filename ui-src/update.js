@@ -143,6 +143,17 @@ function renderLauncher(state) {
   note.className = tone.trim()
   note.textContent = LAUNCHER_STATUS[status] || LAUNCHER_STATUS.idle
   box.appendChild(note)
+  if (status === 'error') {
+    // 失败原因与「手动下载」指引放 tooltip（这一行只放状态词，长文案会撑破布局）；
+    // 旁边补一颗按钮：自动更新失败时这是唯一能执行的出路。
+    note.title = [s.error, s.errorHint].filter(Boolean).join('\n')
+    const btn = document.createElement('button')
+    btn.className = 'upd-btn'
+    btn.textContent = '手动下载'
+    btn.title = '在浏览器打开发布页，手动下载安装包'
+    btn.addEventListener('click', () => { void cmd('openLauncherDownload') })
+    box.appendChild(btn)
+  }
 }
 
 function renderDsh(state) {

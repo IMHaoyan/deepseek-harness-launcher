@@ -31,6 +31,11 @@ const CHECK_MIN_GAP_MS = 30 * 60 * 1000
 const CHECK_TICK_MS = { latest: 6 * 60 * 60 * 1000, alpha: 60 * 60 * 1000 }
 const JOB_WAIT_TIMEOUT_MS = 20 * 60 * 1000 // 安装任务最长等待：20 分钟
 
+// 单次检查（环境探测 + 版本查询）的总时限。正常 2~3 秒；离线/挂死时最坏是两个 npm 源各 90 秒
+// 再加环境探测，取 5 分钟兜底。没有这道上限时，一个卡住的检查会让 checking 永久为 true，
+// 之后每一次手动点击都被 checkOnce 开头的 if (checking) 静默吞掉 —— "点了没反应"的根源之一。
+const CHECK_TIMEOUT_MS = 5 * 60 * 1000
+
 let Config = null
 let saveConfig = null
 let log = () => {}
@@ -64,6 +69,10 @@ const state = {
 }
 
 let checking = false
+let checkingSince = 0 // 当前这轮检查的开始时间（撞上在途检查时写进日志，能看出等了多久）
+let checkTimer = null // 单轮检查的超时看门狗
+let manualQueued = false // 在途检查期间点过"检查更新"：结束后若没有可见结果就补查一次
+let checkTimeoutMs = CHECK_TIMEOUT_MS // initDshUpdater 可覆盖（测试用短时限）
 let updating = false
 let warming = null // 当前预热任务（防重入）
 let staging = null // 已就绪的预装树：{ version, installDir, stagePkg, stagePrefix, stageRoot, binPath }
@@ -384,6 +393,7 @@ function initDshUpdater(o) {
   onState = o.onState || null
   lifecycleEmit = o.lifecycleEmit || null
   statePath = o.statePath || ''
+  checkTimeoutMs = Number(o.checkTimeoutMs) > 0 ? Number(o.checkTimeoutMs) : CHECK_TIMEOUT_MS
 }
 
 function getState() {
@@ -996,27 +1006,89 @@ function waitForJob() {
 
 // ---------- 检测（静默，只提示不更新） ----------
 
-// reason: 触发原因（'startup' / 'timer' / 'manual'）；force=true 跳过最小间隔地板（设置页手动"检查更新"）
+// 手动点击的"接单回执"：所有不真正开始检查的分支都要留痕 ——
+// 否则日志里"没点"和"点了被吞"长得一模一样，用户反馈"点了没反应"时只能靠猜。
+function isManualCheck(reason, force) {
+  return reason === 'manual' && force === true
+}
+
+function secondsSince(t0) {
+  const started = Number(t0) || 0
+  return started > 0 ? Math.max(0, Math.round((Date.now() - started) / 1000)) : 0
+}
+
+// 检查收尾：复位在途标记，并把"在途期间被吞掉的手动点击"补上。
+// 只有本轮静默收场（idle）时才补查：此时界面上没有任何结果，不补就等于这次点击永远没发生。
+function finishCheck() {
+  checking = false
+  checkingSince = 0
+  if (checkTimer) { clearTimeout(checkTimer); checkTimer = null }
+  if (!manualQueued) return
+  manualQueued = false
+  if (state.status !== 'idle') {
+    log(`dsh-update: 在途检查已给出结果（status=${state.status}），并入的手动点击不再补查`)
+    return
+  }
+  log('dsh-update: 在途检查静默收场（idle），补跑一次手动检查')
+  setImmediate(() => { void checkOnce('manual', true) })
+}
+
+// reason: 触发原因（'startup' / 'timer' / 'manual'）；force=true 跳过最小间隔地板（主页面手动"检查更新"）
+// 返回值给测试/诊断用（{ ok, joined?, skipped? }）：所有"没有真正开始检查"的分支都必须留日志，
+// 尤其手动点击撞上在途检查时 —— 老写法直接 return，界面上可能等不到任何反馈。
 async function checkOnce(reason, force) {
-  if (checking || updating) return
-  if (!Config || !envDetect || !envInstall) return
+  const manual = isManualCheck(reason, force)
+  if (checking) {
+    // 手动点击撞上在途检查：不静默丢弃。记排队标记，等这轮结束再决定：
+    //   · 它给出可见终态（已是最新/发现新版/失败）→ 这次点击算有结果，不重复查；
+    //   · 它静默收场（idle，例如环境未就绪/让路）→ 补跑一次 forced 检查，保证点击一定有结果。
+    if (manual) {
+      manualQueued = true
+      log(`dsh-update: 手动检查时已有检查在途（已进行 ${secondsSince(checkingSince)} 秒）：本次点击并入，结束后按结果决定是否补查`)
+    }
+    return { ok: false, joined: true }
+  }
+  if (updating) {
+    if (manual) log('dsh-update: 手动检查未执行：DSH 正在更新中')
+    return { ok: false, skipped: 'updating' }
+  }
+  if (!Config || !envDetect || !envInstall) {
+    if (manual) log('dsh-update: 手动检查未执行：更新器尚未初始化')
+    return { ok: false, skipped: 'uninitialized' }
+  }
   // 用户手动安装任务进行中时不打扰（手动检查除外）
   const snap = envInstall.getJob()
   if (!force && snap && snap.job && snap.job.status === 'running') {
     log('dsh-update: install job in progress, check skipped')
-    return
+    return { ok: false, skipped: 'install-job' }
   }
   const now = Date.now()
   const sinceLastCheck = now - (Number(Config.dshUpdateCheckedAt) || 0)
   if (!force && sinceLastCheck < CHECK_MIN_GAP_MS) {
     // 被地板挡掉的那次要留痕：否则日志里"没查"和"查了说没事"长得一模一样，检查频率只能靠猜
     log(`dsh-update: 距上次检查 ${Math.round(sinceLastCheck / 60000)} 分钟（地板 ${CHECK_MIN_GAP_MS / 60000} 分钟），本次 ${reason || 'startup'} 检查跳过`)
-    return
+    return { ok: false, skipped: 'floor' }
   }
+  if (manual) log(`dsh-update: 手动检查开始（渠道 ${channelOf()}）`)
   checking = true
+  checkingSince = now
   setState({ status: 'checking' })
+  // 看门狗：npm/网络挂死时不能让 checking 永久占着（否则之后所有点击都被开头的 if (checking) 吞掉）。
+  // 超时后主动收尾给可读错误；body 还挂在 await 上，用 timedOut 标记拦住它后续的 setState。
+  let timedOut = false
+  checkTimer = setTimeout(() => {
+    if (timedOut) return
+    timedOut = true
+    const seconds = Math.round(checkTimeoutMs / 1000)
+    log(`dsh-update: 检查超时（${seconds} 秒），本轮结束并复位检查状态`)
+    setState(force
+      ? { status: 'error', error: `检查超时：${seconds} 秒内没有取回结果（npm 或网络无响应）` }
+      : { status: 'idle' })
+    finishCheck()
+  }, checkTimeoutMs)
   try {
     const report = await envDetect.detectEnv(false)
+    if (timedOut) return
     if (!report || !report.plan) {
       log('dsh-update: environment not ready, check skipped')
       setState(force ? { status: 'error', error: '运行环境未就绪，无法检查 DSH 更新' } : { status: 'idle' })
@@ -1030,6 +1102,7 @@ async function checkOnce(reason, force) {
       return
     }
     const latest = await fetchLatest(plan.nodeCmd)
+    if (timedOut) return
     // 记的是"上次尝试"而不是"上次成功"：写在判空之前，取版本失败也落盘。
     // 这样离线时反复重启启动器不会每次都去等两个源各 90 秒；失败的重试机会落在地板到期后的下一次
     // 启动检查或下一个周期 tick 上（alpha 1 小时 / latest 6 小时；把这次写入挪到判空之后会拆掉地板的这层保护）。
@@ -1081,10 +1154,11 @@ async function checkOnce(reason, force) {
       if (!warming) cleanupStage(stageRootOf(installDir), '')
     }
   } catch (err) {
+    if (timedOut) return
     log('dsh-update: check failed: ' + (err && err.message ? err.message : String(err)))
     setState(force ? { status: 'error', error: err && err.message ? err.message : String(err) } : { status: 'idle' })
   } finally {
-    checking = false
+    if (!timedOut) finishCheck()
   }
 }
 

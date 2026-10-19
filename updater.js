@@ -39,6 +39,10 @@ const state = {
   latest: '',
   percent: 0,
   error: '',
+  // 失败的分类与行动指引（describeUpdateError 产出）：界面据此说清"是网络不可达还是
+  // GitHub 访问受限/校验失败"，并给出「手动下载」这条自动更新之外的出路。
+  errorKind: '', // network | blocked | not-found | checksum | install | unknown
+  errorHint: '',
   channel: 'latest',
   // 上一次"点更新→退出安装"的结果：{ target, applied, from }。用户报"点更新就闪退"时，
   // 这条就是唯一能事后说清"到底装上了没有"的证据（见 recordSelfUpdate/readSelfUpdateOutcome）。
@@ -135,6 +139,45 @@ function isNewerVersion(target, current) {
   } catch { return true }
 }
 
+// 「检查/下载/安装失败」共用的行动指引：自动更新这条路此时走不通，但用户还有手动下载这条出路。
+// 不写"请检查网络"这种没信息量的话：打不开发布页就说明当前网络到不了 GitHub，要把这一点说透。
+const FAILURE_GUIDE = '可点「手动下载」打开发布页获取安装包；打不开说明当前网络访问不了 GitHub，'
+  + '可让能访问的同事下载后传给你，运行安装包覆盖升级（设置不会丢）。'
+
+/**
+ * 把 electron-updater / Electron 的原始报错归类成「用户能看懂 + 能行动」的失败说明。
+ * 纯函数（无 IO，测试可直接求值）：同一句英文报错在不同网络环境下含义完全不同 ——
+ * "连不上"（没 VPN/代理）、"被拒"（代理拦截/限流）、"没有发布信息"（渠道未发）、
+ * "校验失败"（下载损坏）处理的姿势不一样，界面不能只丢一句 Error 原文。
+ * @param {string|Error} err 原始错误
+ * @returns {{kind:string, text:string, hint:string}} kind 供界面选短标签，text 给 tooltip/日志
+ */
+function describeUpdateError(err) {
+  const raw = String((err && err.message) || err || '').trim()
+  const probe = raw.toLowerCase()
+  const desc = (kind, text) => ({ kind, text, hint: FAILURE_GUIDE })
+  if (!raw) return desc('unknown', '检查更新失败（没有拿到具体原因）')
+  if (/(econnreset|econnrefused|econnaborted|enotfound|eai_again|etimedout|timed out|timeout|socket hang up|enetunreach|enetdown|err_internet|err_name_not_resolved|err_connection|err_timed_out|err_proxy|getaddrinfo|dns lookup)/.test(probe)) {
+    return desc('network', '网络不可达：连不上更新服务器（可能需要代理或 VPN 才能访问 GitHub）')
+  }
+  if (/(\b403\b|\b429\b|rate.?limit|forbidden|unauthorized|\b401\b|proxy|authentication)/.test(probe)) {
+    return desc('blocked', '更新服务器拒绝访问（GitHub 访问受限、代理拦截或触发限流）')
+  }
+  if (/(err_updater_invalid_update_info|cannot parse update info)/.test(probe)) {
+    return desc('not-found', '更新信息无效：发布源返回的内容不是更新文件（可能被代理或登录页拦截）')
+  }
+  if (/(\b404\b|err_updater_channel_file_not_found|cannot find channel|channel file.*not found)/.test(probe)) {
+    return desc('not-found', '发布源上没有当前渠道的更新信息（可能尚未发布该渠道）')
+  }
+  if (/(sha512|checksum|blockmap|integrity|signature|err_updater_old_file|size mismatch|corrupt)/.test(probe)) {
+    return desc('checksum', '更新包校验失败（下载不完整或被篡改），已丢弃下载内容')
+  }
+  if (/(cannot install|quitandinstall|spawn|installer|nsis|eperm|eacces|err_updater_install)/.test(probe)) {
+    return desc('install', '安装程序启动失败（可能被杀毒软件拦截或安装包损坏）')
+  }
+  return desc('unknown', '检查更新失败：' + raw)
+}
+
 function initUpdater(opts = {}) {
   if (initDone) return
   initDone = true
@@ -181,29 +224,29 @@ function initUpdater(opts = {}) {
   autoUpdater.autoInstallOnAppQuit = false
   applyChannel()
 
-  autoUpdater.on('checking-for-update', () => setStatus('checking'))
+  autoUpdater.on('checking-for-update', () => setStatus('checking', { error: '', errorKind: '', errorHint: '' }))
   autoUpdater.on('update-available', (info) => {
     // 兜底闸（与 applyChannel 那道一起）：更新源给的版本必须**真的比当前新**。
     // 不新就当作"已是最新"——界面文案与真实动作必须一致，降级绝不能披着"可更新到"的外衣。
     if (!isNewerVersion(info.version, state.current)) {
       log(`updater: 忽略不比当前新的版本 v${info.version}（当前 v${state.current}）`)
-      setStatus('up-to-date', { latest: '', error: '' })
+      setStatus('up-to-date', { latest: '', error: '', errorKind: '', errorHint: '' })
       return
     }
     log(`updater: new version available v${info.version} (current v${state.current})`)
-    setStatus('downloading', { latest: info.version, percent: 0, error: '' })
+    setStatus('downloading', { latest: info.version, percent: 0, error: '', errorKind: '', errorHint: '' })
   })
   autoUpdater.on('update-not-available', () => {
     log('updater: already up to date')
     // 必须清掉 latest：否则上一次"已下载"留下的版本号会一直在，界面就会拿它渲染「可更新到 vX」
-    setStatus('up-to-date', { latest: '', error: '' })
+    setStatus('up-to-date', { latest: '', error: '', errorKind: '', errorHint: '' })
   })
   autoUpdater.on('download-progress', (p) => {
     setStatus('downloading', { percent: Math.round(p.percent) })
   })
   autoUpdater.on('update-downloaded', (info) => {
     log(`updater: v${info.version} downloaded, will install on quit`)
-    setStatus('downloaded', { latest: info.version, percent: 100, error: '' })
+    setStatus('downloaded', { latest: info.version, percent: 100, error: '', errorKind: '', errorHint: '' })
     if (onEvent) { try { onEvent('update.launcher', { status: 'downloaded', latest: info.version }) } catch { /* noop */ } }
     if (onFlash) { try { onFlash() } catch { /* noop */ } }
     if (onNotify) {
@@ -214,11 +257,16 @@ function initUpdater(opts = {}) {
   autoUpdater.on('error', (err) => {
     if (installHandedOff) {
       installHandedOff = false
-      setStatus('downloaded', { error: '安装程序启动失败：' + (err && err.message || String(err)) })
+      setStatus('downloaded', { error: '安装程序启动失败：' + (err && err.message || String(err)), errorKind: 'install', errorHint: FAILURE_GUIDE })
     }
     log('updater error: ' + (err && err.message ? err.message : String(err)))
     // 已下载完成后的退出安装类错误不应覆盖"已就绪"状态
-    if (state.status !== 'downloaded') setStatus('error', { error: err && err.message ? err.message : String(err) })
+    if (state.status !== 'downloaded') {
+      // 原始英文报错只进日志；界面拿到的是"分类 + 可执行指引"（否则用户对着
+      // net::ERR_INTERNET_DISCONNECTED 既不知道是不是 VPN 问题，也不知道下一步做什么）
+      const desc = describeUpdateError(err)
+      setStatus('error', { error: desc.text, errorKind: desc.kind, errorHint: desc.hint })
+    }
     if (onEvent) { try { onEvent('update.launcher', { status: 'error', error: (err && err.message || String(err)).slice(0, 128) }) } catch { /* noop */ } }
   })
 }
@@ -240,7 +288,8 @@ async function check() {
     await autoUpdater.checkForUpdates()
   } catch (err) {
     log('updater check failed: ' + (err && err.message ? err.message : String(err)))
-    setStatus('error', { error: err && err.message ? err.message : String(err) })
+    const desc = describeUpdateError(err)
+    setStatus('error', { error: desc.text, errorKind: desc.kind, errorHint: desc.hint })
   }
 }
 
@@ -322,4 +371,4 @@ function installOnExit() {
   return installNow()
 }
 
-module.exports = { initUpdater, getState, check, autoCheck, installNow, installOnExit, isInstalling, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome }
+module.exports = { initUpdater, getState, check, autoCheck, installNow, installOnExit, isInstalling, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome, describeUpdateError, FAILURE_GUIDE }

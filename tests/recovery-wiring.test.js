@@ -432,6 +432,16 @@ test('插件页把 Profile 里不在注册表里的插件也补成卡片', () =>
     '清单来源必须是 readProfileTargets（与升级预判同一份判据，不新造一个）')
 })
 
+// 清单卡片的版本曾经直接抄 profile 的依赖 spec：`dsh-image-gen` 写的是 `^0.9.0`，卡片标题就
+// 渲染成「dsh-image-gen v^0.9.0」—— 依赖范围是范围，不是版本，这是界面在编一个没发生过的结论。
+test('清单卡片的版本走与注册表同一份判据：装的是哪版，不是依赖范围', () => {
+  const fn = body('pluginInventoryCards')
+  assert.match(fn, /raw\.installedPackageVersion \|\| cleanInstalledVersion\(raw\.version\)/,
+    '清单卡片要用 installedPackageVersion 优先 + 从 spec 抠 semver（与注册表卡片同一份判据）')
+  assert.doesNotMatch(fn, /stateOf: \(npm\) => market\.getState\(npm\) \|\| \{\}/,
+    '不能把 getState 的原始 spec 直接当版本交给渲染层')
+})
+
 test('清单卡片有缓存，且失效判据是 profile 文件的 mtime（stateJson 每次推送都要跑它）', () => {
   const fn = body('pluginInventoryCards')
   assert.match(fn, /inventoryCardsCache\.key === key/, '必须有缓存命中分支')
@@ -469,7 +479,7 @@ test('控制台主页把「未生效」收敛成一行（不发系统通知：�
   assert.ok(at > 0, '控制台主页要有这一行')
   const block = app.slice(at, at + 600)
   assert.match(block, /个插件未生效（重启不会改变）/, '文案要说清"重启不会改变"')
-  assert.match(block, /可在「预装插件」页查看/, '要给出下一步去哪儿')
+  assert.match(block, /可在「插件管理」页查看/, '要给出下一步去哪儿')
   assert.match(block, /notes\.push/, '走既有的提示卡，不新开模块')
   // 与"启动失败/崩溃"分开：它不属于 alert 那一档，不能染红
   const crashAt = app.indexOf('function renderCrashNote')

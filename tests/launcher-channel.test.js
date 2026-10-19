@@ -59,8 +59,8 @@ test('updater：显式关掉 electron-updater 的 allowDowngrade 副作用（降
 test('updater：更新源给了更旧/同版也不当更新（界面文案与真实动作一致）', () => {
   assert.match(updaterSrc, /if \(!isNewerVersion\(info\.version, state\.current\)\) \{/, 'update-available 必须过一遍版本大小闸')
   assert.match(updaterSrc, /updater: 忽略不比当前新的版本/, '拦下时要留日志（可解释）')
-  assert.match(updaterSrc, /setStatus\('up-to-date', \{ latest: '', error: '' \}\)/, '拦下后按"已是最新"呈现，且不带 latest')
-  assert.match(updaterSrc, /autoUpdater\.on\('update-not-available', \(\) => \{[\s\S]{0,220}?setStatus\('up-to-date', \{ latest: '', error: '' \}\)/, '检不到更新时必须清掉残留的 latest')
+  assert.match(updaterSrc, /setStatus\('up-to-date', \{ latest: '', error: ''/, '拦下后按"已是最新"呈现，且不带 latest')
+  assert.match(updaterSrc, /autoUpdater\.on\('update-not-available', \(\) => \{[\s\S]{0,220}?setStatus\('up-to-date', \{ latest: '', error: ''/, '检不到更新时必须清掉残留的 latest')
 })
 
 test('isNewerVersion：跑真实源码片段 —— 降级与同版都不算更新', () => {
