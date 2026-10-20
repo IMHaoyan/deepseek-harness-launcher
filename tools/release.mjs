@@ -182,6 +182,14 @@ if (!body && channel === 'latest') {
 }
 if (!body) { body = notesFromCommits(); notesSource = '提交列表兜底' }
 const notes = `${header()}\n\n${body}\n`
+// 公告不是 commit 明细：同一功能的多项细节必须合并（规范见 docs/release-notes-style.md）。
+// 正式版超过 10 条直接拒绝，避免把逐提交/逐细节的 changelog 当公告发出去。
+const announcementBullets = (body.match(/^- /gmu) || []).length
+if (channel === 'latest' && announcementBullets > 10) {
+  console.error(`发布说明有 ${announcementBullets} 条，超过公告上限 10 条。`)
+  console.error('请把同一功能的多项细节合并成一条（公告不是 commit 列表），再发布。')
+  process.exit(1)
+}
 console.log(`--- 发布说明（来源：${notesSource}）---\n` + notes + '----------------')
 if (channel === 'alpha') {
   console.log('注意：alpha 版本不发公告 —— 上面的内容只会写进本地留档，Release 正文仅留一句占位说明。')
