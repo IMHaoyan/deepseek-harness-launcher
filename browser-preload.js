@@ -12,32 +12,17 @@ contextBridge.exposeInMainWorld('browserBridge', {
   onLoadingProgress: (cb) => ipcRenderer.on('loading:progress', (_e, p) => { try { cb(p) } catch { /* noop */ } }),
 })
 
-// ---------- dshDesktop 标记：只对本机 DSH 页面暴露 ----------
+// ---------- 故意不暴露 dshDesktop 标记（2026-10-20 决策，替换 09-30 的旧做法） ----------
 //
-// 上游拿 `'dshDesktop' in globalThis` 当"当前跑在官方桌面壳里"的判据，而它管的远不止登录入口：
-//   - dsh-client-ui-settings-account  注册账号设置页 / 登录弹窗（我们要的）
-//   - dsh-client-ui-settings-models   关掉 API Key 自助引导与其设置入口
-//   - dsh-client-ui-chat              默认展示模式 detailed → standard
-//   - dsh-client-product-analytics    开启客户端埋点（在 web profile 下该插件行本身是 disabled）
-// 所以它必须只落在真 DSH 页面上：window.open 出去的外部网页、以及启动器自己的
-// file:// 说明页（location.origin 为 "file://"）都不得拿到它。
+// 上游用 `"dshDesktop" in globalThis` 当"跑在官方桌面壳里"的判据，而它会切换账号登录路径：
+//   - 有标记 → DSH 走 desktop 分支：只调用 Host 的 startSignIn，然后**等官方桌面壳**替它打开
+//     平台授权页（官方桌面 App 自己实现了这一步）。DSHL 不是官方壳，于是登录弹窗永远停在
+//     「没有自动打开新页面？复制登录链接」——用户只能手动粘贴。
+//   - 没标记 → DSH 走 web 分支：点击登录时先 window.open('about:blank') 预开标签页，拿到
+//     authorizeUrl 后再写进 popup.location。DSHL 的窗口策略（main.js webCreateTab）会把这个
+//     隐藏预开页的第一次真实导航交给系统默认浏览器；登录回调仍走 DSH Host 的 /oauth/callback，
+//     由 Host 轮询 attempt 状态完成闭环。
 //
-// 期望地址由主进程经 additionalArguments 传入：sandbox preload 只能 require
-// electron/events/timers/url，读不到 main.js 里的 WEB_URL。读不到 argv 就不暴露——宁少不误。
-const DSH_ORIGIN_FLAG = '--dshl-dsh-origin='
-function dshPageOrigin() {
-  try {
-    for (const arg of process.argv || []) {
-      const s = String(arg)
-      if (s.startsWith(DSH_ORIGIN_FLAG)) return s.slice(DSH_ORIGIN_FLAG.length)
-    }
-  } catch { /* argv 不可读：当作未知地址处理 */ }
-  return ''
-}
-const expectedOrigin = dshPageOrigin()
-if (expectedOrigin !== '' && location.origin === expectedOrigin) {
-  // 故意为空对象：上游只做 "dshDesktop" in globalThis 的存在性判断，其余读取点
-  // （deviceInfo / shortcuts / keyboard）都带 ?. 或只在 runtime==='desktop' 时才取值，
-  // 这里不提供它们，免得凭空多出没有实现支撑的能力。
-  contextBridge.exposeInMainWorld('dshDesktop', {})
-}
+// 当前 DSH（0.2.1-rc.2）的账号设置页与登录入口在 web 模式下同样注册（已用真实 DSH UI 实测：
+// 无标记时「账号菜单 → 登录」存在且会触发 window.open）。标记只额外影响 API Key 自助引导、
+// 会话展示默认模式、客户端埋点等非登录行为，那些差异对启动器可接受。

@@ -1,7 +1,24 @@
-/* DSHL 控制台宽屏布局：基础组件仍在 styles.css，这里只负责单窗口内的侧栏与响应式排布。 */
+/* DSHL 控制台宽屏布局：基础组件仍在 styles.css，这里只负责单窗口内的侧栏与响应式排布。
+   视觉方向对齐 DSH Web：左侧浅灰侧栏 + 右侧纯白画布；卡片用 1px 发丝线 + 大圆角，
+   选中态用中性近黑胶囊，品牌蓝只留给主操作与焦点环。 */
 :root {
-  --console-nav-w: 232px;
-  --console-content-max: 1240px;
+  --console-nav-w: 280px;
+  --console-content-max: 1120px;
+  --console-gutter: clamp(24px, 4vw, 48px);
+  --toast-bg: #353638;
+  --toast-fg: #FFFFFF;
+}
+
+[data-theme="dark"] {
+  --toast-bg: #43454A;
+  --toast-fg: #FFFFFF;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --toast-bg: #F5F6F8;
+    --toast-fg: #151517;
+  }
 }
 
 html, body { height: 100%; }
@@ -14,6 +31,7 @@ body.console-surface {
   min-height: 100%;
   padding: 0;
   overflow: hidden;
+  background: var(--surface);
 }
 
 /* ---------- 左侧导航 ---------- */
@@ -24,36 +42,45 @@ body.console-surface {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 18px 14px 14px;
-  background: color-mix(in srgb, var(--card) 82%, var(--bg));
-  border-right: 1px solid var(--border-soft);
+  padding: 6px 12px 12px;
+  background: var(--bg);
+  border-right: 1px solid var(--border-mid);
 }
 
 .console-brand {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 2px 8px 18px;
+  gap: 8px;
+  height: 60px;
+  padding: 0 8px;
 }
 
 .console-brand-mark {
   display: grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
+  width: 26px;
+  height: 26px;
   flex: none;
-  border-radius: 10px;
-  background: var(--ghost-hover);
-  font-size: 19px;
+  color: var(--text-primary);
 }
 
+.console-brand-mark svg { width: 24px; height: 24px; }
+
 .console-brand-copy { min-width: 0; }
-.console-brand-title { font-size: 15px; font-weight: 700; line-height: 20px; letter-spacing: .02em; }
+
+.console-brand-title {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  letter-spacing: 0;
+}
+
 .console-brand-sub {
   overflow: hidden;
   color: var(--text-tertiary);
   font-size: 10.5px;
-  line-height: 16px;
+  line-height: 14px;
+  letter-spacing: 0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -62,46 +89,54 @@ body.console-surface {
   display: flex;
   flex: 1;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   min-height: 0;
 }
 
 .console-nav-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  width: 100%;
-  min-height: 40px;
-  padding: 0 11px;
+  gap: 8px;
+  width: calc(100% - 4px);
+  min-height: 36px;
+  margin: 0 2px;
+  padding: 0 10px;
   border: none;
-  border-radius: 9px;
+  border-radius: 12px;
   background: transparent;
   color: var(--text-secondary);
   font-family: var(--font);
-  font-size: 13px;
+  font-size: 14px;
+  line-height: 20px;
   text-align: left;
   cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
 }
 
 .console-nav-item svg {
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
   flex: none;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.65;
+  stroke-width: 1.7;
 }
 
 .console-nav-item:hover { background: var(--ghost-hover); color: var(--text-primary); }
-.console-nav-item.active { background: var(--ghost-active); color: var(--brand); font-weight: 600; }
+/* 选中态用 DSH 侧栏的中性灰胶囊（#ECEEF0 一支），不用大面积品牌色 */
+.console-nav-item.active {
+  background: var(--nav-active-bg);
+  color: var(--brand);
+  font-weight: 500;
+}
 
 .console-nav-foot {
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding-top: 14px;
+  gap: 6px;
+  padding-top: 12px;
   border-top: 1px solid var(--border-soft);
 }
 
@@ -109,37 +144,42 @@ body.console-surface {
   display: flex;
   align-items: center;
   gap: 7px;
-  min-height: 24px;
+  min-height: 20px;
   padding: 0 8px;
   color: var(--text-secondary);
   font-size: 12px;
 }
+
+.console-status .dot { width: 7px; height: 7px; }
 
 .console-version {
   padding: 0 8px;
   color: var(--text-tertiary);
   font-family: var(--font-mono);
   font-size: 11px;
+  letter-spacing: -0.01em;
 }
 
 .console-return {
   display: flex;
   align-items: center;
-  gap: 7px;
-  width: 100%;
-  min-height: 38px;
-  padding: 0 11px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
+  gap: 8px;
+  width: calc(100% - 4px);
+  min-height: 36px;
+  margin: 0 2px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 12px;
   background: transparent;
-  color: var(--text-primary);
+  color: var(--text-secondary);
   font-family: var(--font);
   font-size: 12.5px;
   text-align: left;
   cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
 }
 
-.console-return:hover { background: var(--ghost-hover); }
+.console-return:hover { background: var(--ghost-hover); color: var(--text-primary); }
 
 /* ---------- 内容区 ---------- */
 
@@ -149,7 +189,9 @@ body.console-surface {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 28px 36px 56px;
+  scrollbar-gutter: stable;
+  padding: 32px var(--console-gutter) 56px;
+  background: var(--surface);
 }
 
 #consoleContent > .page {
@@ -162,17 +204,18 @@ body.console-surface {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 38px;
-  margin: 0 0 18px;
+  min-height: 32px;
+  margin: 0 0 20px;
   padding: 0;
   border: none;
 }
 
 #consoleContent .page-title {
   margin-right: auto;
-  font-size: 22px;
-  font-weight: 650;
-  line-height: 32px;
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 28px;
+  letter-spacing: 0;
 }
 
 /* 一级页面切换由左侧导航负责，各页不再需要「← 返回」；这里只兜底旧标记。 */
@@ -181,9 +224,14 @@ body.console-surface {
 /* 页头副标题（概览显示产品名，其余页面可留空） */
 .page-subtitle {
   color: var(--text-tertiary);
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: 13px;
+  line-height: 20px;
+  letter-spacing: 0.01em;
 }
+
+/* 页头按钮收紧一档，避免抢标题的视觉重心 */
+#consoleContent .page-header .btn { height: 32px; padding: 0 12px; font-size: 12.5px; }
+#consoleContent .page-header .btn.primary { height: 32px; }
 
 /* 通用页：上半状态 / 主操作两栏，下半偏好设置分组通栏 —— 两行共用 --general-cols，
    所以四个卡片落在同一条竖缝上（此前两行各自的列宽不同，右缘对不齐）。 */
@@ -203,37 +251,49 @@ body.console-surface {
 
 #pageGeneral > .page-header { grid-area: head; margin-bottom: 0; }
 #statusCard { grid-area: status; }
-#pageGeneral .main-actions { grid-area: actions; }
+#pageGeneral .main-actions { grid-area: actions; align-self: stretch; justify-content: center; }
 #crashNote { grid-area: crash; }
 #envWarnCard { grid-area: envwarn; }
 #portWarnCard { grid-area: portwarn; }
 #pageGeneral .settings-groups { grid-area: groups; }
 
 #consoleContent .card { margin-bottom: 0; }
-/* 与上半两栏同源（--general-cols）：这样"界面与使用"的左右缘与上方状态卡严格对齐 */
-#consoleContent .settings-groups { display: grid; grid-template-columns: var(--general-cols); gap: 16px; align-items: start; }
 
-.settings-group { padding-top: 16px; }
+/* 状态卡：4 行 48px，紧凑且有节奏 */
+#statusCard { padding: 8px 16px; }
+
+/* 与上半两栏同源（--general-cols）：这样"界面与使用"的左右缘与上方状态卡严格对齐 */
+#consoleContent .settings-groups { display: grid; grid-template-columns: var(--general-cols); gap: 16px; align-items: stretch; }
+
+.settings-group { padding: 14px 16px 6px; }
 .group-title {
-  margin: -2px 0 10px;
-  color: var(--text-tertiary);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .08em;
-  text-transform: uppercase;
+  margin: 0 0 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  letter-spacing: 0;
 }
 
+.settings-group .row { min-height: 52px; }
 .settings-group .row:not(.hidden) + .row:not(.hidden) { border-top: 1px solid var(--border-soft); }
-.settings-group .row { min-height: 44px; }
+
+/* 设置行里的操作按钮比页头再小一档 */
+.settings-group .btn.sm { height: 28px; padding: 0 10px; font-size: 12px; }
 
 #envCards {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
 
 #envCards .env-card { margin-bottom: 0; }
+
+#pageEnv {
+  display: flex;
+  flex-direction: column;
+}
 
 #pageEnv > .card { margin-bottom: 16px; }
 
@@ -248,33 +308,36 @@ body.console-surface {
 #pageLog > .page-header { flex: none; margin-bottom: 0; }
 
 /* 服务状态 + 服务操作 + 注意情况 + 健康检查点：压成一张紧凑卡片 */
-.diag-card { display: flex; flex-direction: column; gap: 10px; }
+.diag-card { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
 
 .diag-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.diag-state { display: flex; align-items: center; gap: 8px; margin-right: auto; font-size: 13.5px; font-weight: 600; }
+.diag-state { display: flex; align-items: center; gap: 8px; margin-right: auto; font-size: 14px; font-weight: 500; }
 .diag-state .dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--text-tertiary); }
-.diag-state .dot.running { background: var(--success); }
-.diag-state .dot.stopped { background: var(--danger); }
+.diag-state .dot.running { background: var(--success); box-shadow: 0 0 0 3px var(--success-tint); }
+.diag-state .dot.stopped { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-tint); }
 .diag-ops { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.diag-ops .btn { height: 28px; padding: 0 10px; font-size: 12px; }
 
 .diag-note {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: var(--ghost-hover);
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--inset);
   color: var(--text-secondary);
-  font-size: 12.5px;
-  line-height: 19px;
+  font-size: 12px;
+  line-height: 18px;
 }
 
-.diag-note.warn { background: rgba(245, 158, 11, 0.12); color: #B45309; }
-.diag-note-icon { flex: none; font-weight: 700; }
+.diag-note.warn { background: var(--warning-tint); color: var(--warning-text); }
+.diag-note-icon { flex: none; font-weight: 700; color: var(--success-text); }
+.diag-note.warn .diag-note-icon { color: var(--warning-text); }
 
 .diag-slots-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 2px; }
 .diag-label { margin-right: auto; color: var(--text-secondary); font-size: 12.5px; font-weight: 600; }
 .diag-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.diag-tools .btn { height: 28px; padding: 0 12px; font-size: 12px; }
 
 .recovery-slots { display: flex; flex-direction: column; gap: 6px; }
 
@@ -282,12 +345,15 @@ body.console-surface {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  background: var(--card);
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--inset);
   font-size: 12.5px;
+  transition: border-color 120ms ease;
 }
+
+.recovery-row:hover { border-color: var(--border); }
 
 .recovery-row-name { flex: none; font-weight: 600; color: var(--text-primary); }
 .recovery-row-name.muted { color: var(--text-tertiary); font-weight: 500; }
@@ -298,79 +364,97 @@ body.console-surface {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
 }
 .recovery-row-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.recovery-row-actions .btn { height: 28px; padding: 0 11px; font-size: 12px; }
 
 /* 日志区 + 反馈区 */
-.logs-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.logs-head { display: flex; align-items: center; gap: 10px; margin-bottom: 0; flex-wrap: wrap; }
 .logs-head .recovery-title { margin: 0; }
 .logs-head #logHint { margin-left: auto; }
-/* 运行日志容器（.logs-card pre）的样式只有一处声明：见下方「日志与反馈」段。
-   这里原来还写过一条 height/min-height/overflow，与那段重复且从未生效（后者覆盖前者）。 */
 
 /* 服务侧失败的一句话原因：只有真的出过事时才占版面（就绪后主进程会清掉 serviceError） */
 .logs-cause {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: var(--danger-hover);
+  margin-top: 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--danger-tint);
 }
 .logs-cause-text {
   flex: 1 1 auto;
   min-width: 0;
   font-size: 12px;
   line-height: 18px;
-  color: var(--danger);
+  color: var(--danger-text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.logs-cause .btn { flex: none; }
+.logs-cause .btn { flex: none; height: 28px; padding: 0 10px; font-size: 12px; }
 
 .feedback-links {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin-top: 4px;
-  padding-top: 10px;
+  margin-top: 2px;
+  padding-top: 12px;
   border-top: 1px solid var(--border-soft);
 }
+.feedback-links .btn { height: 28px; padding: 0 10px; font-size: 12px; }
+
+/* 日志来源切换：胶囊比设置页小一档 */
+#logSources .chip { height: 28px; padding: 0 12px; font-size: 12px; }
 
 /* npm 插件：只读状态胶囊（替代点不动的开关；只有手机连接保留真开关） */
 .plugin-state-pill {
   display: inline-flex;
   align-items: center;
   flex: none;
-  height: 24px;
-  padding: 0 10px;
-  border-radius: 999px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: var(--radius-pill);
   background: var(--ghost-hover);
   color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 11.5px;
+  font-weight: 500;
   white-space: nowrap;
 }
 
-.plugin-state-pill.ok { background: rgba(34, 197, 94, 0.13); color: #15803D; }
-.plugin-state-pill.warn { background: rgba(245, 158, 11, 0.15); color: #B45309; }
-.plugin-state-pill.error { background: var(--danger-hover); color: var(--danger); }
-.plugin-state-pill.busy { background: var(--ghost-active); color: var(--brand); }
+.plugin-state-pill.ok { background: var(--success-tint); color: var(--success-text); }
+.plugin-state-pill.warn { background: var(--warning-tint); color: var(--warning-text); }
+.plugin-state-pill.error { background: var(--danger-tint); color: var(--danger-text); }
+.plugin-state-pill.busy { background: var(--brand-soft); color: var(--brand-text); }
 .plugin-state-pill.muted { background: var(--ghost-hover); color: var(--text-secondary); }
-#pageWizard { max-width: 820px; }
+
+/* 首次设置向导：居中窄卡片（必须用 #consoleContent > #pageWizard 压过上一行 #consoleContent > .page 的 1,1,0） */
+#pageWizard { margin: 3vh auto 24px; }
+#consoleContent > #pageWizard { max-width: 560px; }
 
 /* 弹窗在控制台整个视图上居中，不受内容区滚动影响。 */
 .modal-overlay { position: fixed; inset: 0; }
 
 /* ---------- 响应式：窗口仍是唯一窗口，窄宽时退化为图标栏/顶部导航 ---------- */
 
+@media (max-width: 1180px) {
+  .recovery-row { flex-wrap: wrap; }
+  .recovery-row-meta { white-space: normal; }
+  #pageGeneral {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "head" "status" "actions" "crash" "envwarn" "portwarn" "groups";
+  }
+  #consoleContent .settings-groups { grid-template-columns: minmax(0, 1fr); }
+}
+
 @media (max-width: 960px) {
-  :root { --console-nav-w: 70px; }
-  #consoleContent { padding: 24px 24px 48px; }
-  .console-brand { justify-content: center; padding-inline: 0; }
+  :root { --console-nav-w: 72px; --console-gutter: 24px; }
+  #consoleContent { padding: 28px 24px 48px; }
+  .console-brand { justify-content: center; padding: 2px 0 18px; }
   .console-brand-copy,
   .console-nav-item span,
   .console-status span:last-child,
@@ -384,6 +468,7 @@ body.console-surface {
     grid-template-areas: "head" "status" "actions" "crash" "envwarn" "portwarn" "groups";
   }
   #consoleContent .settings-groups { grid-template-columns: minmax(0, 1fr); }
+  #pageLog { display: flex; flex-direction: column; }
 }
 
 @media (max-width: 720px) {
@@ -420,23 +505,23 @@ body.console-surface {
 /* 只做文字说明：这里不放跳转按钮，插件管理仍走 DSH 内置插件市场 */
 .plugin-page-intro {
   margin-bottom: 16px;
-  padding: 14px 16px;
-  border: 1px solid var(--border-soft);
-  border-radius: 12px;
-  background: var(--ghost-hover);
+  padding: 12px 16px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--inset);
 }
 
 .plugin-page-heading {
-  margin-bottom: 3px;
-  font-size: 15px;
-  font-weight: 650;
+  margin-bottom: 4px;
+  font-size: 14px;
+  font-weight: 500;
   line-height: 22px;
 }
 
 .plugin-page-subtitle {
   color: var(--text-secondary);
-  font-size: 12.5px;
-  line-height: 19px;
+  font-size: 13px;
+  line-height: 20px;
 }
 
 /* 环境级故障提示条：一批插件同一原因失败时，用一条解释代替 N 张卡片各写一遍「操作失败」。 */
@@ -445,10 +530,10 @@ body.console-surface {
   align-items: flex-start;
   gap: 10px;
   margin-bottom: 14px;
-  padding: 11px 14px;
-  border: 1px solid var(--border-soft);
-  border-radius: 12px;
-  background: rgba(239, 68, 68, 0.08);
+  padding: 12px 16px;
+  border: 1px solid rgba(229, 72, 77, 0.22);
+  border-radius: var(--radius-lg);
+  background: var(--danger-tint);
   font-size: 13px;
   line-height: 20px;
 }
@@ -461,52 +546,68 @@ body.console-surface {
   flex: none;
   margin-top: 6px;
   border-radius: 50%;
-  background: #EF4444;
+  background: var(--danger);
 }
 
 .plugin-env-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.plugin-env-title { font-weight: 600; }
+.plugin-env-title { font-weight: 600; color: var(--danger-text); }
 .plugin-env-detail { color: var(--text-secondary); }
-.plugin-env-actions { display: flex; flex: none; gap: 8px; margin-left: auto; }
-
-[data-theme="dark"] .plugin-env-bar { background: rgba(239, 68, 68, 0.14); }
+.plugin-env-actions { display: flex; flex: none; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.plugin-env-actions .btn { height: 28px; padding: 0 11px; font-size: 12px; }
 
 /* 升级代价提示行：只有真有插件会在目标版本下失效（或判不了）时才出现，全兼容时这行不存在。
    用 warn 色（黄）而不是 error 色（红）：插件不加载不是故障，是这次升级的代价。 */
 .upgrade-cost {
   display: block;
-  padding: 9px 12px;
+  padding: 10px 12px;
   border-radius: 10px;
-  background: rgba(245, 158, 11, 0.12);
+  background: var(--warning-tint);
   font-size: 12.5px;
   line-height: 19px;
 }
 
 .upgrade-cost.hidden { display: none; }
 
-[data-theme="dark"] .upgrade-cost { background: rgba(245, 158, 11, 0.18); }
-
 .plugin-page-summary {
   flex: none;
-  padding: 5px 11px;
-  border-radius: 999px;
-  background: var(--ghost-hover);
+  padding: 4px 11px;
+  border-radius: var(--radius-pill);
+  background: var(--inset);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 18px;
   white-space: nowrap;
 }
 
 .plugin-toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 14px;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
 }
 
-.plugin-search {
-  width: min(320px, 44vw);
-  min-width: 180px;
+.plugin-toolbar .plugin-search {
+  /* 独占一行：flex-basis 100% 保证它总是换到筛选/操作按钮的下一行，而不是挤在它们中间 */
+  flex: 1 1 100%;
+  min-width: 200px;
+  width: auto;
+  height: 34px;
+  line-height: 32px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
 }
+
+.plugin-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-left: auto; /* 与筛选按钮同一行，贴右端 */
+}
+
+.plugin-toolbar-actions .btn { height: 32px; }
 
 .plugin-filters {
   display: flex;
@@ -527,196 +628,9 @@ body.console-surface {
 
 .plugin-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 16px;
-  align-items: stretch;
-}
-
-.plugin-card {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 220px;
-  padding: 18px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--card);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
-}
-
-.plugin-card.busy { opacity: 0.82; }
-
-.plugin-card-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-}
-
-.plugin-icon {
-  display: grid;
-  place-items: center;
-  width: 42px;
-  height: 42px;
-  flex: none;
-  border-radius: 12px;
-  background: var(--ghost-hover);
-  font-size: 22px;
-  line-height: 1;
-}
-
-.plugin-card-title { min-width: 0; flex: 1; }
-
-.plugin-name-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.plugin-name {
-  overflow: hidden;
-  color: var(--text-primary);
-  font-size: 15px;
-  font-weight: 650;
-  line-height: 22px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.plugin-subtitle {
-  overflow: hidden;
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 17px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.plugin-status {
-  flex: none;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 17px;
-  white-space: nowrap;
-}
-
-.plugin-status-ok { color: #15803D; background: rgba(34, 197, 94, 0.13); }
-.plugin-status-warn { color: #B45309; background: rgba(245, 158, 11, 0.15); }
-.plugin-status-error { color: var(--danger); background: var(--danger-hover); }
-.plugin-status-busy { color: var(--brand); background: var(--ghost-active); }
-.plugin-status-muted { color: var(--text-secondary); background: var(--ghost-hover); }
-[data-theme="dark"] .plugin-status-ok { color: #4ADE80; }
-[data-theme="dark"] .plugin-status-warn { color: #FBBF24; }
-
-.plugin-description {
-  margin-top: 14px;
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 20px;
-}
-
-.plugin-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 10px;
-  margin-top: 12px;
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-  line-height: 18px;
-}
-
-.plugin-meta span { white-space: nowrap; }
-.plugin-meta span + span::before { margin-right: 10px; color: var(--border); content: '·'; }
-
-.plugin-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: auto;
-  padding-top: 18px;
-}
-
-.plugin-actions .btn { flex: none; }
-.plugin-action-hint { color: var(--text-tertiary); font-size: 12px; line-height: 28px; }
-
-.plugin-feedback {
-  margin-top: 10px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 18px;
-  word-break: break-word;
-}
-
-.plugin-feedback.hidden { display: none; }
-
-.plugin-empty {
-  padding: 42px 0;
-  color: var(--text-tertiary);
-  font-size: 13px;
-  text-align: center;
-}
-
-@media (max-width: 960px) {
-  .plugin-toolbar { align-items: stretch; flex-direction: column; }
-  .plugin-search { width: 100%; }
-}
-
-@media (max-width: 720px) {
-  .plugin-grid { grid-template-columns: minmax(0, 1fr); }
-  .plugin-card { min-height: 0; }
-}
-/* ---------- 插件页卡片（对齐 DSH「设置 → 插件」的排版，覆盖上方旧样式） ---------- */
-
-.plugin-toolbar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.plugin-toolbar .plugin-search {
-  /* 独占一行：flex-basis 100% 保证它总是换到筛选/操作按钮的下一行，而不是挤在它们中间 */
-  flex: 1 1 100%;
-  min-width: 200px;
-  width: auto;
-  height: 36px;
-  line-height: 34px;
-  border-radius: 10px;
-  font-size: 13.5px;
-}
-
-.plugin-toolbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-  margin-left: auto; /* 与筛选按钮同一行，贴右端 */
-}
-
-.plugin-toolbar-actions .btn { height: 36px; border-radius: 10px; }
-
-.plugin-page-summary {
-  margin-left: 10px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  background: var(--ghost-hover);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 18px;
-  white-space: nowrap;
-}
-
-/* 卡片紧凑版：列宽自适应（宽屏 3 列）、行距与内边距都收紧一档 */
-.plugin-grid {
-  display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
 }
 
 /* 「Profile 中的其他插件」分组小标题：横跨整行 + 一条上分隔线，把它下面的卡片与 DSHL
@@ -728,42 +642,45 @@ body.console-surface {
   align-items: baseline;
   gap: 3px 10px;
   margin-top: 2px;
-  padding-top: 12px;
+  padding-top: 14px;
   border-top: 1px solid var(--border-soft);
 }
 
 .plugin-group-title {
-  font-size: 13.5px;
-  font-weight: 650;
-  line-height: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
 }
 
 .plugin-group-note {
   color: var(--text-secondary);
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: 13px;
+  line-height: 20px;
 }
 
 .plugin-card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
   min-width: 0;
   min-height: 0;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  padding: 16px;
+  border: 0;
+  border-radius: var(--radius-lg);
   background: var(--card);
-  box-shadow: none;
+  box-shadow: var(--elevation-panel);
+  transition: box-shadow 120ms ease;
 }
 
-.plugin-card.busy { opacity: 0.8; }
+.plugin-card:hover { box-shadow: var(--elevation-prominent); }
+.plugin-card.busy { opacity: 0.78; }
 
-/* 「Profile 中的其他插件」的卡片：虚线边框 + 淡底。位置靠不住 —— 排序是「已安装优先」，
+/* 「Profile 中的其他插件」的卡片：虚线边框 + 透明底。位置靠不住 —— 排序是「已安装优先」，
    未安装的清单内卡片会排在这一组后面，所以归属要标在卡片自己身上。 */
 .plugin-card.plugin-card-other {
-  border: 1px dashed var(--border-soft);
-  background: var(--ghost-hover);
+  border: 1px dashed var(--border);
+  background: transparent;
+  box-shadow: none;
 }
 
 .plugin-card-head {
@@ -778,9 +695,10 @@ body.console-surface {
   min-width: 0;
   overflow: hidden;
   color: var(--text-primary);
-  font-size: 14.5px;
-  font-weight: 650;
-  line-height: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+  letter-spacing: -0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -791,9 +709,10 @@ button.plugin-name {
   border: 0;
   background: none;
   font: inherit;
-  font-size: 14.5px;
-  font-weight: 650;
-  line-height: 20px;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+  letter-spacing: -0.01em;
   text-align: left;
   cursor: pointer;
 }
@@ -821,39 +740,26 @@ button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offs
   gap: 6px;
 }
 
-/* Deepseek 官方推荐：与「DSHL预装」同形状，只换色调（品牌蓝），两种标签一眼能分开 */
-.plugin-badge-official {
-  flex: none;
-  padding: 3px 12px;
-  border-radius: 999px;
-  color: #1D4ED8;
-  background: rgba(77, 107, 254, 0.13);
-  font-size: 15px;
-  font-weight: 600;
-  line-height: 20px;
-  white-space: nowrap;
-}
-
-[data-theme="dark"] .plugin-badge-official { color: #7C9CFF; }
-
-/* 标题行右端的归属标签（原「添加备注」入口位置）：字号比 .plugin-name 大一号 */
+/* 归属标签：小号软色胶囊（文字色比底色深一档），两种标签靠色相区分 */
+.plugin-badge-official,
 .plugin-badge-preinstall {
+  display: inline-flex;
+  align-items: center;
   flex: none;
-  padding: 3px 12px;
-  border-radius: 999px;
-  color: #15803D;
-  background: rgba(34, 197, 94, 0.13);
-  font-size: 15px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
   font-weight: 600;
-  line-height: 20px;
+  line-height: 18px;
   white-space: nowrap;
 }
 
-[data-theme="dark"] .plugin-badge-preinstall { color: #4ADE80; }
+.plugin-badge-official { color: var(--brand-text); background: var(--brand-soft); }
+.plugin-badge-preinstall { color: var(--success-text); background: var(--success-tint); }
 
 /* 不是「正常预装」的状态说明（已关闭自动安装 / 不自动安装 / 已关闭 / payload 不可用）：中性灰，不用绿色 */
 .plugin-badge-preinstall.muted { color: var(--text-secondary); background: var(--ghost-hover); }
-[data-theme="dark"] .plugin-badge-preinstall.muted { color: var(--text-tertiary); }
 
 /* 说明最多两行：长描述不再把卡片撑高 */
 .plugin-description {
@@ -861,59 +767,112 @@ button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offs
   overflow: hidden;
   margin: 0;
   color: var(--text-secondary);
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 18px;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 
-/* 卡片不被拉高：footer 只跟在内容后面，不再用 auto 顶到底部 */
-.plugin-card-footer { margin-top: 2px; }
+.plugin-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 2px;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 18px;
+}
 
-/* 底部只留开关与操作：状态已由标题行胶囊 + 开关本身表达，省下的宽度给按钮 */
-.plugin-card-footer .plugin-state { display: none; }
-.plugin-actions .plugin-latest { margin-right: auto; }
-/* 操作按钮比全局 .btn 小一档，配合紧凑卡片 */
-.plugin-action-btn { height: 30px; padding: 0 10px; border-radius: 15px; font-size: 12.5px; }
+.plugin-meta span { white-space: nowrap; }
+.plugin-meta span + span::before { margin-right: 10px; color: var(--border); content: '·'; }
 
+/* 卡片底部：开关 + 操作；footer 只跟在内容后面，不再用 auto 顶到底部 */
 .plugin-card-footer {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   margin-top: auto;
-  padding-top: 10px;
+  padding-top: 12px;
 }
 
-.plugin-state {
+/* 状态已由标题行胶囊 + 开关本身表达，底部不再重复一枚状态胶囊 */
+.plugin-card-footer .plugin-state { display: none; }
+
+.plugin-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex: none;
-  padding: 0 10px;
-  border-radius: 999px;
-  height: 26px;
-  background: var(--ghost-hover);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 26px;
-  white-space: nowrap;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  flex-wrap: nowrap;
 }
 
-.plugin-state-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--text-tertiary); }
-.plugin-state-dot.ok { background: var(--success); }
-.plugin-state-dot.warn { background: #F59E0B; }
-.plugin-state-dot.error { background: var(--danger); }
-.plugin-state-dot.busy { background: var(--brand); }
-.plugin-state-dot.muted { background: var(--text-tertiary); }
+.plugin-actions .plugin-latest { margin-right: auto; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.plugin-latest { color: var(--text-tertiary); font-size: 11.5px; white-space: nowrap; }
+/* 「需授权后更新到 vX」：不是报错，但也不是常规信息 —— 与状态胶囊 warn 同一支色，让它在那列里跳出来 */
+.plugin-latest.gate { color: #B45309; }
+[data-theme="dark"] .plugin-latest.gate { color: var(--warning-text); }
 
+/* 卡片操作按钮：描边胶囊（默认中性 / 主操作品牌色 / 危险项红色），比全局 .btn 小一档 */
+.plugin-action-btn {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.plugin-action-btn:hover { background: var(--ghost-hover); border-color: var(--border); }
+
+.plugin-action-btn.primary {
+  border-color: var(--primary-fill);
+  background: var(--primary-fill);
+  color: var(--primary-fore);
+}
+
+.plugin-action-btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+
+.plugin-action-btn.danger {
+  border-color: rgba(229, 72, 77, 0.32);
+  background: transparent;
+  color: var(--danger-text);
+}
+
+.plugin-action-btn.danger:hover { background: var(--danger-tint); border-color: rgba(229, 72, 77, 0.45); }
+
+.plugin-action-hint { color: var(--text-tertiary); font-size: 12px; line-height: 28px; }
+
+.plugin-feedback {
+  margin-top: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-word;
+}
+
+.plugin-feedback.hidden { display: none; }
+
+.plugin-empty {
+  padding: 48px 0;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* 启停开关：40×22 胶囊轨道，开启时用品牌蓝 */
 .plugin-switch {
   position: relative;
   display: inline-flex;
   flex: none;
   align-items: center;
-  width: 44px;
-  height: 24px;
+  width: 40px;
+  height: 22px;
 }
 
 .plugin-switch input {
@@ -930,166 +889,149 @@ button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offs
 
 .plugin-switch-track {
   display: block;
-  width: 44px;
-  height: 24px;
-  border-radius: 999px;
+  width: 40px;
+  height: 22px;
+  border-radius: var(--radius-pill);
   background: var(--border);
   transition: background 0.15s ease;
 }
 
 .plugin-switch-thumb {
   display: block;
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   margin: 2px;
   border-radius: 50%;
   background: #FFFFFF;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 1px 2px rgba(15, 17, 21, 0.25);
   transition: transform 0.15s ease;
 }
 
-.plugin-switch input:checked + .plugin-switch-track { background: var(--success); }
-.plugin-switch input:checked + .plugin-switch-track .plugin-switch-thumb { transform: translateX(20px); }
+.plugin-switch input:checked + .plugin-switch-track { background: var(--brand); }
+.plugin-switch input:checked + .plugin-switch-track .plugin-switch-thumb { transform: translateX(18px); }
 .plugin-switch input:disabled + .plugin-switch-track { opacity: 0.5; }
+.plugin-switch input:focus-visible + .plugin-switch-track { box-shadow: var(--focus-ring); }
 
-.plugin-actions {
+/* 旧版状态胶囊（部分渲染路径仍可能带）：保留基础外观 */
+.plugin-state {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex: 1;
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+  padding: 0 10px;
+  border-radius: var(--radius-pill);
+  height: 26px;
+  background: var(--ghost-hover);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 26px;
+  white-space: nowrap;
 }
 
-.plugin-latest { color: var(--text-tertiary); font-size: 11.5px; white-space: nowrap; }
-/* 「需授权后更新到 vX」：不是报错，但也不是常规信息 —— 与状态胶囊 warn 同一支色，让它在那列里跳出来 */
-.plugin-latest.gate { color: #B45309; }
+.plugin-state-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--text-tertiary); }
+.plugin-state-dot.ok { background: var(--success); }
+.plugin-state-dot.warn { background: var(--warning); }
+.plugin-state-dot.error { background: var(--danger); }
+.plugin-state-dot.busy { background: var(--brand); }
+.plugin-state-dot.muted { background: var(--text-tertiary); }
 
-/* 卡片操作按钮统一外观：描边胶囊（默认中性 / 主操作品牌色 / 危险项红色）
-   与 DSH「设置 → 插件」的卸载按钮一致，overlap 掉基础 .btn 的透明无边框样式 */
-.plugin-action-btn {
-  height: 30px;
-  padding: 0 14px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--text-primary);
-  font-size: 12.5px;
-}
-
-.plugin-action-btn:hover { background: var(--ghost-hover); }
-
-.plugin-action-btn.primary {
-  border-color: var(--brand);
-  background: var(--brand);
-  color: #FFFFFF;
-}
-
-.plugin-action-btn.primary:hover { background: var(--brand-hover); }
-
-.plugin-action-btn.danger {
-  border-color: rgba(220, 38, 38, 0.45);
-  background: transparent;
-  color: var(--danger);
-}
-
-.plugin-action-btn.danger:hover { background: var(--danger-hover); }
-
-.plugin-feedback { margin-top: 0; }
-
-@media (max-width: 960px) {
-  /* 单列时卡片撑满可用宽度，避免固定 420px 在窄窗口右留空白 */
-  .plugin-grid { grid-template-columns: minmax(0, 1fr); }
-}
-
-@media (max-width: 760px) {
-  .plugin-toolbar-actions { width: 100%; }
-  .plugin-toolbar-actions .btn { flex: 1; }
-}
-
-@media (max-width: 620px) {
-  .plugin-card-footer { flex-wrap: wrap; }
-  .plugin-actions { justify-content: flex-start; }
-}
-/* ---------- 服务与诊断 ---------- */
-
-.card-divider {
-  height: 1px;
-  margin: 16px 0 14px;
-  background: var(--border-soft);
-}
-
-.log-preview-head {
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-.log-preview-head .recovery-title { margin: 0 auto 0 0; }
-
-.console-log-preview {
-  max-height: 220px;
-  overflow: auto;
-}
-
-/* ---------- 日志与反馈 ---------- */
-
-.logs-card { display: flex; flex-direction: column; }
-/* 运行日志：可选中 + 自动换行（与 #envLog / #wizardLog 同一套写法）。
-   ① 可选中：正文默认可选，日志仍显式声明，避免后续局部样式退化；
-   ② 自动换行：<pre> 默认 white-space:pre，长路径/URL/堆栈只会在右边横向滚出去，
-      右侧内容看不见也选不到；折行后纵向滚动即可看全。 */
-.logs-card pre {
-  height: calc(100vh - 200px);
-  min-height: 260px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  user-select: text;
-  -webkit-user-select: text;
-  cursor: text;
-}
-
+/* 日志与反馈页：宽窗口双列（日志主列 + 反馈右列），窄窗口自动堆叠 */
 .feedback-card {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  padding: 14px 16px;
 }
 .feedback-card .recovery-title { margin: 0; }
+.feedback-card .actions { margin-top: 2px; }
 .feedback-card textarea,
 .feedback-card input[type="text"] {
   width: 100%;
   box-sizing: border-box;
-  padding: 9px 11px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+}
+.feedback-card textarea:hover,
+.feedback-card input[type="text"]:hover { border-color: var(--border); }
+.feedback-card textarea {
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
   color: var(--text-primary);
-  background: var(--card);
+  background: var(--inset);
   font-family: var(--font);
   font-size: 13px;
   line-height: 20px;
   resize: vertical;
   outline: none;
 }
+.feedback-card input[type="text"] {
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  background: var(--inset);
+  font-family: var(--font);
+  font-size: 13px;
+  outline: none;
+}
 .feedback-card textarea:focus,
-.feedback-card input[type="text"]:focus { border-color: var(--brand); }
-.feedback-card .actions { margin-top: 2px; }
+.feedback-card input[type="text"]:focus {
+  border-color: var(--brand);
+  background: var(--card);
+  box-shadow: var(--focus-ring);
+}
 
-/* 宽窗口：服务/诊断卡通栏，日志占主列、反馈在右列；窄窗口自动堆叠 */
-@media (min-width: 1100px) {
+@media (min-width: 1220px) {
   #pageLog {
     display: grid;
-    grid-template-columns: minmax(0, 62%) minmax(300px, 1fr);
+    grid-template-columns: minmax(0, 62%) minmax(320px, 1fr);
     gap: 16px;
-    align-items: start;
+    /* 两栏拉伸到同一行高：右列反馈卡的内容高度决定这一行，左列日志卡跟着对齐。
+       不再用 align-items:start —— 那样左列会被日志区的固定高度撑得比右列长一截。 */
+    align-items: stretch;
+    /* 覆盖 styles.css 里 #pageLog 的 height:100%：页面高度随内容走，日志区才不会
+       在窗口变高时继续拉长（旧写法 pre 高度 = 100vh - 510px，窗口越高超出越多）。 */
+    height: auto;
   }
   #pageLog > .page-header { grid-column: 1 / -1; }
   #pageLog > .diag-card { grid-column: 1 / -1; }
   #pageLog > .logs-card { grid-column: 1; }
   #pageLog > .feedback-card { grid-column: 2; }
+  /* 日志 <pre> 吃掉卡片剩余高度：卡片与右列同高，日志区自动收窄/长高。
+     选择器刻意写成 > pre（不是 .logs-card pre），避免与唯一的 .logs-card pre 声明重复。 */
+  #pageLog > .logs-card > pre {
+    height: auto;
+    flex: 1 1 0;
+    min-height: 0;
+  }
 }
+
+/* ---------- 日志容器（唯一声明：.logs-card pre） ---------- */
+/* 运行日志：可选中 + 自动换行（与 #envLog / #wizardLog 同一套写法）。
+   ① 可选中：正文默认可选，日志仍显式声明，避免后续局部样式退化；
+   ② 自动换行：<pre> 默认 white-space:pre，长路径/URL/堆栈只会在右边横向滚出去，
+      右侧内容看不见也选不到；折行后纵向滚动即可看全。 */
+.logs-card { display: flex; flex-direction: column; padding: 14px 16px; }
+.logs-card pre {
+  height: calc(100vh - 510px);
+  min-height: 260px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+  background: var(--log-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 19px;
+  color: var(--text-secondary);
+}
+
 /* ---------- 插件变更提示条（跨内容区顶部） ---------- */
 
 .pending-bar {
@@ -1098,11 +1040,11 @@ button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offs
   gap: 10px;
   grid-column: 2;
   grid-row: 1;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border-soft);
-  background: rgba(245, 158, 11, 0.10);
+  padding: 10px 24px;
+  border-bottom: 1px solid rgba(180, 83, 9, 0.18);
+  background: var(--warning-tint);
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 20px;
 }
 
@@ -1113,38 +1055,38 @@ button.plugin-name:focus-visible { outline: 2px solid var(--brand); outline-offs
   height: 8px;
   flex: none;
   border-radius: 50%;
-  background: #F59E0B;
+  background: var(--warning);
 }
 
 .pending-bar-text { font-weight: 600; }
 .pending-bar-hint { color: var(--text-secondary); }
-.pending-bar .btn { margin-left: auto; flex: none; }
+.pending-bar .btn { margin-left: auto; flex: none; height: 28px; padding: 0 12px; font-size: 12px; }
 
-[data-theme="dark"] .pending-bar { background: rgba(245, 158, 11, 0.16); }
 /* 插件开关反馈：启停后 DSH 页面会延迟 1s 自动刷新，先给用户一个短提示。 */
 .console-toast {
   position: fixed;
-  left: calc(50% + 112px);
-  bottom: 28px;
+  top: 56px;
+  left: 50%;
   z-index: 80;
-  max-width: min(520px, calc(100vw - 280px));
-  padding: 10px 16px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--card);
-  color: var(--text-primary);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
-  font-size: 13px;
-  line-height: 20px;
+  max-width: min(640px, calc(100vw - 48px));
+  padding: 12px 16px;
+  border-radius: var(--radius-lg);
+  background: var(--toast-bg);
+  color: var(--toast-fg);
+  box-shadow: var(--shadow-lv3);
+  font-size: 14px;
+  line-height: 22px;
   opacity: 0;
   pointer-events: none;
-  transform: translateX(-50%) translateY(8px);
+  transform: translateX(-50%) translateY(-6px);
   transition: opacity 0.18s ease, transform 0.18s ease;
 }
 
 .console-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .console-toast.hidden { display: none; }
 
-@media (max-width: 960px) {
-  .console-toast { left: 50%; max-width: calc(100vw - 48px); }
+/* 暗色主题的开关拇指用 label 色（DSH switch-thumb 令牌） */
+[data-theme="dark"] .plugin-switch-thumb { background: #ADB2B8; }
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] .plugin-switch-thumb { background: #ADB2B8; }
 }

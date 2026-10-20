@@ -43,14 +43,15 @@ test('插件管理页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方�
   assert.match(main, /bridgePayloadReady \? '已关闭自动安装' : 'payload 不可用'/, '手机连接（远程连接）也是预装集合成员')
   assert.match(app, /plugin-badge-preinstall/, 'DSHL预装标签应渲染绿色胶囊')
   assert.match(app, /plugin-badge-official/, '官方推荐标签要渲染另一种胶囊')
-  assert.match(css, /\.plugin-badge-preinstall \{\n  flex: none;/, '标签应是标题行右端的胶囊（不再跟在包名后面）')
-  assert.match(css, /\.plugin-badge-preinstall \{[^}]*font-size: 15px;/, '标签字号应比标题（14.5px）大一号')
-  assert.match(css, /\.plugin-badge-official \{[^}]*font-size: 15px;/, '官方推荐与预装标签同尺寸，只换色调')
+  assert.match(css, /\.plugin-badge-preinstall[^}]*\{[^}]*flex: none;/, '标签应是标题行右端的胶囊（不再跟在包名后面）')
+  // 2026-10 视觉重设计：归属标签是元信息，改成小号软色胶囊（11px，小于 14.5px 标题），不再做成比标题更大的色块
+  assert.match(css, /\.plugin-badge-preinstall[^}]*\{[^}]*font-size: 11px;/, '归属标签字号应小于标题（14.5px），做成紧凑胶囊')
+  assert.match(css, /\.plugin-badge-official[^}]*\{[^}]*font-size: 11px;/, '官方推荐与预装标签同尺寸，只换色调')
   assert.match(css, /\.plugin-badge-preinstall\.muted/, '非正常预装的状态说明应有中性灰样式')
   // 卡片紧凑版契约：自适应列宽 + 说明最多两行 + 小一档的按钮 + 标签挂在标题行
   assert.match(css, /repeat\(auto-fill, minmax\(320px, 1fr\)\)/, '卡片网格应按最小 320px 自适应列宽')
   assert.match(css, /-webkit-line-clamp: 2/, '插件说明最多两行（长描述不撑高卡片）')
-  assert.match(css, /\.plugin-action-btn \{ height: 30px;/, '操作按钮比全局 .btn 小一档')
+  assert.match(css, /\.plugin-action-btn \{\n  height: 30px;/, '操作按钮比全局 .btn 小一档')
   assert.match(app, /head\.appendChild\(wrap\)/, '标签组应挂在标题行右端')
   // 备注编辑已按用户要求整体移除，避免留下点不到的入口
   assert.doesNotMatch(app, /plugin-note-toggle/, '渲染层不应再有备注入口')
@@ -59,22 +60,25 @@ test('插件管理页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方�
 })
 
 // 用户实测反馈：清单外的卡片和预装卡片同构渲染，只差没挂归属标签 —— 平铺在一起会被读成
-// "预装清单里混进来一堆野插件"。B 方案：卡片位置不动，只加一枚分组小标题把它们隔开。
-test('Profile 中的其他插件：分组小标题隔开清单外卡片，判据用主进程发的 profile: 前缀', () => {
+// "预装清单里混进来一堆野插件"。分组契约（2026-10-20 收紧）：
+//   清单内卡片先按原顺序渲染；然后插一次小标题；小标题后面**只**跟清单外卡片。
+// 旧做法（在第一张清单外卡片前插标题）在排序把未安装清单内卡片排在它后面时，
+// 标题下面会混进不属于这一组的卡（QA 实测「Profile 中的其他插件（2）」下有 3 张，
+// 其中「会话导入」是清单内卡片）。
+test('Profile 中的其他插件：清单内先渲染，小标题后只跟清单外卡片', () => {
   assert.match(app, /p\.id\.startsWith\('profile:'\)/, '分组判据要用主进程统一发的 profile: 前缀，不按有没有标签猜')
   assert.doesNotMatch(app, /tags\.length === 0[\s\S]{0,80}plugin-group/, '不能按"没标签"认这一组：关掉自动安装的预装插件也没标签')
-  assert.match(app, /const others = visible\.filter\(isProfileInventoryCard\)\.length/,
+  assert.match(app, /const inventory = visible\.filter\(isProfileInventoryCard\)/,
     '小标题里的数字要按当前筛选下可见的那批算，跟下面真正渲染的卡片同口径')
-  assert.match(app, /cards\.appendChild\(pluginGroupHeadEl\(others\)\)/, '第一张清单外卡片前要插一次分组小标题')
+  assert.match(app, /cards\.appendChild\(pluginGroupHeadEl\(inventory\.length\)\)/, '清单内卡片之后插一次分组小标题')
   assert.match(app, /'Profile 中的其他插件（' \+ count \+ '）'/, '小标题文案要写明这是 Profile 中的其他插件')
   assert.match(app, /不在 DSHL 清单中/, '小标题要一句话说清它们为什么在这儿')
   assert.match(css, /\.plugin-group-head \{\n  grid-column: 1 \/ -1;/, '小标题要横跨整个卡片网格，不能挤成一格')
   assert.match(css, /\.plugin-group-head \{[^}]*border-top: 1px solid var\(--border-soft\)/, '要有分隔线与预装卡片区分')
-  assert.match(css, /\.plugin-card\.plugin-card-other \{[^}]*border: 1px dashed/, '清单外卡片要自带虚线边框：排序会把它和清单内卡片打散，归属不能只靠位置')
+  assert.match(css, /\.plugin-card\.plugin-card-other \{[^}]*border: 1px dashed/, '清单外卡片要自带虚线边框')
 })
 
-// 上面那条只能钉住"代码里写了什么"。插了几次、插在谁前面、数字算的是哪一批，正则全挡不住 ——
-// 所以这里把渲染片段真的跑起来：抠出源码 + 一个最小 DOM 桩，直接看渲染出来的节点序列。
+// 上面那条只能钉住"代码里写了什么"。分组顺序、标题位置、数字口径用真渲染验证。
 function pluginRenderHarness(source) {
   const start = source.indexOf('function pluginCardEl(')
   const end = source.indexOf('function renderPendingRestart(')
@@ -97,10 +101,9 @@ function pluginRenderHarness(source) {
       appendChild(child) { this.children.push(child); return child },
       setAttribute() {},
     }
-    // 卡片渲染里有 `if (wrap.childNodes.length)` 这种判空：桩必须有 childNodes，否则真渲染跑不起来
+    // 卡片渲染里有 wrap.childNodes.length 这种判空：桩必须有 childNodes，否则真渲染跑不起来
     Object.defineProperty(node, 'childNodes', { get: () => node.children })
-    // textContent 按真实 DOM 语义实现：写它 = 清空子节点。renderPlugins 每次用 `cards.textContent = ''`
-    // 清屏，桩要是只当普通属性存着，三次渲染的卡片会累加起来（第一版就是这么假失败的）。
+    // textContent 按真实 DOM 语义实现：写它 = 清空子节点。
     let text = ''
     Object.defineProperty(node, 'textContent', {
       get: () => text,
@@ -117,13 +120,14 @@ function pluginRenderHarness(source) {
   const win = {}
   // 只实现本用例要用的两档筛选：'all' 与 'other'（其他档位与分组无关）
   const pluginMatches = (p, filter) => !(filter === 'other' && (Array.isArray(p.tags) ? p.tags : []).length)
-  const factory = new Function('window', 'document', '$', 'pluginMatches', 'renderInstallAll',
+  const factory = new Function('window', 'document', '$', 'pluginMatches', 'renderInstallAll', 'pluginOpBusyNow',
     source.slice(start, end) + '\nreturn { renderPlugins, pluginCardEl, isProfileInventoryCard, pluginGroupHeadEl };')
-  const api = factory(win, { createElement: makeEl }, (id) => nodes.get(id) || null, pluginMatches, () => {})
+  // pluginOpBusyNow：profile 写锁桩（本用例只关心分组，锁始终空闲；真实现见 app.js）
+  const api = factory(win, { createElement: makeEl }, (id) => nodes.get(id) || null, pluginMatches, () => {}, () => false)
   return { ...api, win, cards: el('pluginCards') }
 }
 
-test('Profile 中的其他插件：真跑渲染 —— 小标题只插一次、落在第一张清单外卡片之前、数字同口径', () => {
+test('Profile 中的其他插件：真跑渲染 —— 清单内先渲染、小标题只插一次且后面只跟清单外卡片', () => {
   const h = pluginRenderHarness(app)
   const kindsOf = () => h.cards.children.map((c) => (c.className === 'plugin-group-head' ? 'HEAD' : c.dataset.pluginId))
   const marked = () => h.cards.children
@@ -140,21 +144,20 @@ test('Profile 中的其他插件：真跑渲染 —— 小标题只插一次、�
   ]
   h.renderPlugins(list, true)
   assert.deepEqual(kindsOf(),
-    ['dshmarket', 'rewind', 'HEAD', 'profile:dsh-image-gen', 'profile:dsh-mcp-panel', 'codex-ui'],
-    '小标题只能插一次，且必须在第一张清单外卡片之前（卡片顺序本身不动）')
-  const head = h.cards.children[2]
+    ['dshmarket', 'rewind', 'codex-ui', 'HEAD', 'profile:dsh-image-gen', 'profile:dsh-mcp-panel'],
+    '清单内卡片全部先渲染；小标题只插一次，后面只跟清单外卡片（未安装的清单内卡片不再混进标题下）')
+  const head = h.cards.children[3]
   const headText = head.children.map((c) => c.textContent).join(' ')
   assert.match(headText, /Profile 中的其他插件（2）/, '数字要按这一组里真正渲染出来的张数算')
   assert.match(headText, /不在 DSHL 清单中/, '小标题要一句话说清它们为什么在这儿')
-  // 排序把未安装的清单内卡片（codex-ui）压在这一组**后面**：归属只能靠卡片自己的标记，不能靠位置
-  assert.ok(marked(), '清单外卡片要带 plugin-card-other，清单内卡片（含排在这一组后面的）不能带')
+  assert.ok(marked(), '清单外卡片要带 plugin-card-other，清单内卡片不能带')
 
-  // 筛选到「其他」这一档：整页只剩清单外卡片，小标题照样要有（否则这一屏又变成"没有归属的野卡片"）
+  // 筛选到「其他」这一档：清单内无标签卡片先渲染，之后才是小标题 + 清单外卡片
   h.win._pluginFilter = 'other'
   h.renderPlugins(list, true)
-  assert.deepEqual(kindsOf(), ['HEAD', 'profile:dsh-image-gen', 'profile:dsh-mcp-panel', 'codex-ui'],
-    '只剩清单外卡片时小标题仍在最前（清单内的未安装卡片按标签口径也落在这档，但它不属于这一组）')
-  assert.match(h.cards.children[0].children.map((c) => c.textContent).join(' '), /（2）/, '数字跟当前筛选下的可见张数一致')
+  assert.deepEqual(kindsOf(), ['codex-ui', 'HEAD', 'profile:dsh-image-gen', 'profile:dsh-mcp-panel'],
+    '「其他」档里清单内无标签卡片在前，标题后只跟清单外卡片')
+  assert.match(h.cards.children[1].children.map((c) => c.textContent).join(' '), /（2）/, '数字跟当前筛选下的可见张数一致')
   assert.ok(marked(), '换筛选后归属标记不能丢')
 
   // 没有清单外卡片时，一枚标题都不该出现
@@ -299,10 +302,10 @@ test('插件变更挂起：批量安装不中途重启，顶部提示条一键�
   assert.match(html, /id="pendingRestartBar"/, '应有插件变更提示条')
   assert.match(html, /id="btnApplyRestart"/, '提示条应有立即重启按钮')
   assert.match(main, /function deferPluginChange\(verb, name, label\)/, '主进程挂起逻辑统一按重启生效')
-  assert.match(main, /async function applyPendingPluginChanges\(\)/, '应有「立即重启生效」入口')
+  assert.match(main, /async function applyPendingPluginChanges\(trigger = 'user'\)/, '应有「立即重启生效」入口（带触发来源，区分用户点击 / 批量更新收尾）')
   assert.match(main, /case 'pluginsApplyRestart'/, '应有生效命令')
   assert.match(main, /pluginPendingRestart: \{/, 'state 应下发挂起状态')
-  assert.match(main, /deferPluginChange\('install', descriptor\.npm, descriptor\.name\)/, '推荐插件应支持延迟重启')
+  assert.match(main, /deferPluginChange\(action, descriptor\.npm, descriptor\.name\)/, '推荐插件应支持延迟重启，且动词跟随真实动作（update/reinstall 不能写成已安装）')
   assert.match(app, /function renderPendingRestart\(info\)/, '控制台应渲染提示条')
   assert.match(app, /cmd\('pluginsApplyRestart'\)/, '按钮应触发立即重启')
 })
@@ -729,6 +732,10 @@ test('筛选按钮：六档单选（全部 / DSHL预装 / Deepseek 官方推荐 
   assert.equal(matches(presetOff, 'preinstall', ''), true, '关掉自动安装的仍算 DSHL 预装成员')
   assert.equal(matches(bare, 'other', ''), true, '「其他」= 两枚标签都不带')
   assert.equal(matches(officialOnly, 'installed', ''), false, '安装状态档照旧')
+  // 口径必须与右上角「N 个已安装」一致：enabled 但没装（手机连接 payload 缺失）不算已安装
+  const enabledOnly = P({ installed: false, enabled: true, tags: [] })
+  assert.equal(matches(enabledOnly, 'installed', ''), false, 'enabled 但未安装不能算进「已安装」')
+  assert.equal(matches(enabledOnly, 'available', ''), true, '它应出现在「未安装」里')
   assert.equal(matches(officialOnly, 'available', ''), true)
   assert.equal(matches(officialOnly, 'official', 'zzz'), false, '筛选与搜索是叠加的')
   assert.equal(matches(officialOnly, 'official', 'pkg'), true, '搜索命中就显示')

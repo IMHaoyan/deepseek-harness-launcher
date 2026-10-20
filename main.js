@@ -907,6 +907,9 @@ async function handlePortOccupied(source, retryDepth = 0) {
       }
       server.gen++ // 旧世代的尾读/裁决就此作废
       clearClaimed()
+      // 接管的是**另一个进程**（不是本轮 spawn 的 child）：上一轮解析出的「插件没生效」证据
+      // 描述的不是它。dshl 读不到外部实例的 stderr，所以这里只清、不再补 —— 留着旧证据才是假信息。
+      resetActivationEvidence()
       server.adoptedPid = pid
       server.adoptedAlive = pid !== 0
       server.launchUrl = null
@@ -1038,8 +1041,7 @@ async function startServerInner(occupantRetry = 0) {
   server.phaseLine = '' // 新进程的"当前环节"从零开始（上一轮的最后一条日志不能说成这一轮的动静）
   server.phaseAt = 0
   server.errTail = [] // 上一代的 stderr 不能当成本代的失败原因
-  server.activationWindow = []
-  server.activationIssues = []
+  resetActivationEvidence() // 插件"没生效"的证据同样随世代清空（含滑动窗口；见 resetActivationEvidence 注释）
   void runBridgeImportCheck() // 启动前自检：异步跑，不拖启动；结果只进日志与卡片
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
@@ -1438,6 +1440,10 @@ async function abandonChild(child) {
 // 不发通知、不闪烁、不累加崩溃计数（自重启不是故障）；也不清计数窗口（清空需要健康证明）。
 function claimSuccessor(matchedPid, listenerPid, meta) {
   if (!matchedPid || matchedPid !== listenerPid) return false
+  // 自重启也换了一代服务：上一轮解析出的「插件没生效」证据不再描述这个新进程。
+  // 这是"在 DSH 内更新插件 → 在 DSH 内点重启服务"的实际路径；不清的话，插件已经好了，
+  // 插件页的 ⚠ 还会挂着（并且自称"重启不会改变它"），直到 dshl 自己再重启一次。
+  resetActivationEvidence()
   server.claimedPid = matchedPid
   server.claimedAlive = true
   server.tokenPending = true // 尾读窗口内；到点仍无 token → authPending，页面切"需要新凭据"说明页
@@ -1776,6 +1782,27 @@ function noteActivationEvidence(line) {
 /** 某个包本轮启动的未生效证据（没有则 undefined）。 */
 function activationIssueOf(packageName) {
   return pluginActivation.findActivationIssue(server.activationIssues, packageName)
+}
+
+/**
+ * 新的一代服务开始：上一轮 stderr 解析出的「插件没生效」证据一律作废。
+ *
+ * 每条证据只描述**打这些日志的那个进程**。换进程不只有 dshl 自己 spawn 这一条路：
+ *   - DSH 自重启（用户在 DSH 内更新插件后点「重启服务」走的就是它）→ claimSuccessor 认领后继；
+ *   - 端口被外部 DSH 接管 → handlePortOccupied 的 adopt 分支。
+ * 这两条都不经过 startServerInner，不在这里清的话，插件在自重启后已经正常加载了，
+ * 卡片还会一直挂着上一轮的 ⚠（重启也不会改变它——因为压根没重算），直到 dshl 自己再重启一次。
+ *
+ * 滑动窗口必须一起清：后继若继承了同一根 stderr 管道，旧窗口里的行会被再解析一次，
+ * 清完证据却留着窗口等于把旧结论重新记回来。清完后继启动时的新跳过行会正常落进新证据。
+ *
+ * 这里连启动器的 import 自检条目一起清：那是「起服务之前」对磁盘 payload 的一次性结论，
+ * 会在下一次由 dshl 拉起服务时重跑并重新记（startServerInner 里的 runBridgeImportCheck）；
+ * 跨进程留着一个"启动前"结论，既没有归属者，payload 被换掉后还会变成假警报。
+ */
+function resetActivationEvidence() {
+  server.activationWindow = []
+  server.activationIssues = []
 }
 
 /**
@@ -2814,17 +2841,20 @@ function deferPluginChange(verb, name, label) {
   if (what && !pending.names.includes(what)) pending.names = pending.names.concat([what]).slice(-20)
   pending.mode = 'restart'
   try { saveConfig() } catch { /* noop */ }
-  const action = verb === 'install' ? '已安装' : verb === 'uninstall' ? '已卸载' : '已切换'
+  const action = verb === 'install' ? '已安装'
+    : verb === 'update' ? '已更新'
+      : verb === 'reinstall' ? '已重新安装'
+        : verb === 'uninstall' ? '已卸载' : '已切换'
   log('plugins: ' + action + ' ' + what + '，等待用户重启生效')
   broadcastState()
 }
 
 /** 让挂起的插件变更立即生效：复用 applyPluginChange 的停→起→刷页面路径。 */
-async function applyPendingPluginChanges() {
+async function applyPendingPluginChanges(trigger = 'user') {
   const pending = Config.pluginPendingRestart || { count: 0, names: [], mode: 'restart' }
   const count = pending.count || 0
   if (!count) return { ok: true, applied: false }
-  log('plugins: 用户点「立即重启生效」（挂起 ' + count + ' 项：' + (pending.names || []).join('、') + '）')
+  log('plugins: 应用挂起的插件变更（触发：' + (trigger === 'batch' ? '批量更新收尾' : '用户点「立即重启生效」') + '；挂起 ' + count + ' 项：' + (pending.names || []).join('、') + '）')
   clearPendingPluginRestart()
   broadcastState()
   const ok = await applyPluginChange('install', '', { name: '', profile: market.PROFILE_NAME, logTag: 'plugins', label: '插件变更' })
@@ -3269,6 +3299,9 @@ let pluginInstallAllTarget = 0
 let pluginInstallAllDone = 0
 let pluginInstallAllCurrent = ''
 let pluginInstallAllError = ''
+// 最近一次批量流程的「结果回执」：页面在 running true→false 后播一次 toast。
+// 旧实现只把按钮文案恢复，用户不知道这批跑完没有、成功了几个（2026-10-20 反馈） 。
+let pluginBatchResult = null
 
 // ---------- 插件安装的环境级故障聚合 ----------
 // 一次批量安装里 N 个插件同一原因失败时，逐张卡片各写一条「操作失败」会让人以为插件本身有问题。
@@ -3574,6 +3607,13 @@ async function installAllManagedPlugins() {
     pluginInstallAllCurrent = ''
     pluginInstallAllError = stopFailed || (failed.length ? failed.join('；') : '')
     releaseProfileOp()
+    // 结果回执：失败原因优先；否则说清装了几个 / 都已装好 / 缺的都需先授权
+    const batchMessage = stopFailed
+      || (failed.length ? failed.length + ' 个插件安装失败：' + failed.join('；')
+        : (installed > 0 ? '已安装 ' + installed + ' 个插件，点顶部「立即重启生效」后启用'
+          : (gatedNames.length ? gatedNames.length + ' 个缺失的预装插件需先授权，请在卡片上点「授权并安装」'
+            : '所有预装插件都已安装')))
+    pluginBatchResult = { at: Date.now(), kind: 'install', ok: !stopFailed && failed.length === 0, message: batchMessage }
     broadcastState()
   }
   const blocked = gatedNames.length
@@ -3673,18 +3713,26 @@ async function updateAllManagedPlugins() {
     releaseProfileOp()
     broadcastState()
   }
-  if (stopFailed) return { ok: false, error: stopFailed, updated }
+  if (stopFailed) {
+    pluginBatchResult = { at: Date.now(), kind: 'update', ok: false, message: stopFailed }
+    broadcastState()
+    return { ok: false, error: stopFailed, updated }
+  }
   if (!updated) {
     // 一个都没更新成：没有可更新的（正常收尾）、全失败了、或全被门禁挡着（要用户先授权）
     const blocked = skippedNames.length
       ? skippedNames.length + ' 个插件需先授权才能更新（在卡片上点「授权并更新到 vX」）：' + skippedNames.join('、')
       : ''
+    const batchMessage = failed.length ? failed.length + ' 个插件更新失败：' + failed.join('；')
+      : blocked || '所有插件都已是最新'
+    pluginBatchResult = { at: Date.now(), kind: 'update', ok: !failed.length && !blocked, message: batchMessage }
+    broadcastState()
     if (failed.length) return { ok: false, error: [failed.join('；'), blocked].filter(Boolean).join('；'), updated: 0, failed: failed.length, skipped: skippedNames.length }
     if (blocked) return { ok: false, error: blocked, updated: 0, skipped: skippedNames.length }
     return { ok: true, updated: 0, message: '所有插件都已是最新' }
   }
   // 全部更新完 → 只在这里重启一次，这就是「更新完所有的一起重启」的落点
-  const applied = await applyPendingPluginChanges()
+  const applied = await applyPendingPluginChanges('batch')
   broadcastState()
   const restarted = !!(applied && applied.ok)
   const skippedNote = skippedNames.length
@@ -3693,6 +3741,16 @@ async function updateAllManagedPlugins() {
   notify('DeepSeek Harness', restarted
     ? ('已更新 ' + updated + ' 个插件，服务已重启生效' + skippedNote)
     : ('已更新 ' + updated + ' 个插件，但重启失败，请到控制台重试' + skippedNote), undefined, 'recovery')
+  pluginBatchResult = {
+    at: Date.now(),
+    kind: 'update',
+    ok: restarted && !failed.length,
+    message: failed.length
+      ? failed.length + ' 个插件更新失败：' + failed.join('；')
+      : restarted ? '已更新 ' + updated + ' 个插件，服务已重启生效' + skippedNote
+        : '插件已更新，但服务重启失败，请到控制台重试',
+  }
+  broadcastState()
   if (failed.length) return { ok: false, error: failed.join('；'), updated, restarted, failed: failed.length, skipped: skippedNames.length }
   return { ok: restarted, updated, restarted, skipped: skippedNames.length, error: restarted ? '' : '重启失败' }
 }
@@ -4044,7 +4102,7 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
     // 装/更新不能把用户关掉的开关悄悄打开；禁用状态继续压在新版本上。
     if (wasDisabled) pluginSwitch.setEnabled(descriptor.npm, false)
     notePluginAutoDeclined(descriptor.id, false) // 手动装回来 → 以后继续自动维护
-    if (opts.defer) deferPluginChange('install', descriptor.npm, descriptor.name)
+    if (opts.defer) deferPluginChange(action, descriptor.npm, descriptor.name)
     else await applyPluginChange('install', r.version || '', { name: descriptor.npm, profile: market.PROFILE_NAME, logTag: 'plugins', label: descriptor.name })
     return { ok: true, version: r.version || '', releaseAge: r.releaseAge || null }
   }
@@ -4476,7 +4534,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       latestVersion: m.version || '',
       outdated: false,
       payloadReady: true,
-      busy: m.busy || '',
+      busy: marketAct || m.busy || '', // 动作忙态覆盖到重启结束（旧实现只写 m.busy，动作期间开关仍可点）
       error: m.error || '',
       activation: activationText(market.PLUGIN_NAME),
       lastChange: pluginReceiptText(m),
@@ -4509,7 +4567,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       latestVersion: b.payloadVersion || '',
       outdated: bridgeOutdated,
       payloadReady: bridgePayloadReady,
-      busy: b.busy || '',
+      busy: bridgeAct || b.busy || '', // 同插件市场：动作忙态必须反映到卡片上
       error: b.error || (bridgeEnabled && !bridgePayloadReady ? (b.payloadError || '插件 payload 不可用') : ''),
       activation: activationText(bridge.PLUGIN_NAME),
       lastChange: pluginReceiptText(b),
@@ -5563,10 +5621,8 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       zoomFactor: Config.webZoom / 100,
       // 页面视图同样挂安全桥：供注入的分屏聚焦控件（✕/⋯）回传意图
       preload: path.join(__dirname, 'browser-preload.js'),
-      // 只把本机 DSH 地址交给 preload：它据此决定要不要暴露 dshDesktop 标记。
-      // sandbox preload 只能 require electron/events/timers/url，读不到本文件的 WEB_URL，
-      // 只能经 argv 带进去（外部网页与 file:// 说明页的 origin 对不上，因此拿不到标记）。
-      additionalArguments: [`--dshl-dsh-origin=${WEB_URL}`],
+      // 注意：故意不注入 dshDesktop 标记（让 DSH 走 web 登录路径，登录链接才能交给系统浏览器；
+      // 见 browser-preload.js 顶部说明与 tests/dsh-login-web-mode.test.js）
     },
   })
   const tab = {
@@ -5584,7 +5640,37 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
   // 外部链接（target=_blank / window.open）→ 统一交给系统默认浏览器打开，避免被 Electron 吞掉
   wc.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) { try { shell.openExternal(url) } catch { /* noop */ } }
+    // DSH 的「登录账号」是「先 window.open('about:blank') 预开标签页 → 拿到 Host 授权的
+    // authorizeUrl 后再写进 popup.location」两步式（见 dsh-client-ui-settings-account 的 BrowserLogin）。
+    // 若这里把 about:blank 也 deny，登录弹窗拿不到 popup，只能退化成「复制链接」让用户手动粘贴。
+    // 放行一个隐藏窗口接住这次预开，等它第一次真正导航时改交系统浏览器（见下面的 did-create-window）。
+    if (url === '' || url === 'about:blank') {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          show: false,
+          skipTaskbar: true,
+          webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+        },
+      }
+    }
     return { action: 'deny' }
+  })
+  // 接住「登录账号」预开的隐藏页：它一旦导航到真实授权地址，就交给系统默认浏览器并销毁隐藏窗口。
+  // DSH 侧不靠这个弹窗接收回调（它轮询 Host 的 attempt 状态），所以改交外部浏览器不影响登录闭环。
+  wc.on('did-create-window', (child) => {
+    try { child.hide() } catch { /* noop */ }
+    try { child.setSkipTaskbar(true) } catch { /* noop */ }
+    const childWc = child.webContents
+    const handOffToBrowser = (event, targetUrl) => {
+      if (!/^https?:\/\//i.test(String(targetUrl || ''))) return
+      event.preventDefault()
+      try { shell.openExternal(targetUrl) } catch { /* noop */ }
+      try { log('external auth link handed to system browser: ' + new URL(targetUrl).host) } catch { /* noop */ }
+      try { child.destroy() } catch { /* noop */ }
+    }
+    childWc.on('will-navigate', handOffToBrowser)
+    childWc.on('will-redirect', handOffToBrowser)
   })
   try { view.setBackgroundColor('#F9FAFB') } catch { /* 旧版无此 API，忽略 */ }
   wc.on('page-title-updated', (_e, t) => { tab.title = t || 'DeepSeek Harness'; webPushState() })
@@ -6252,7 +6338,17 @@ function stateJson() {
       done: pluginInstallAllDone,
       current: pluginInstallAllCurrent,
       error: pluginInstallAllError,
+      // 这批跑完的最后结果（页面据此播一次 toast；见 app.js renderInstallAll）
+      result: pluginBatchResult || null,
     },
+    // 插件写锁（profile 锁）：占用期间所有卡片按钮/开关/批量按钮都要禁用 ——
+    // 否则用户点了才发现"另一个插件操作正在进行"（日志里那一串 profile-lock 拒绝就是这么来的）。
+    pluginOp: {
+      busy: profileOpBusy(),
+      label: (profileOp && profileOp.label) || '',
+    },
+    // npm 版本查询失败的插件（限流/网络）：页面在刷新后提示"暂时无法判断更新"，不装作已是最新
+    pluginVersionQueryErrors: [...npmVersionErrors.keys()],
     // 插件变更已落到 profile 但还没重启生效：控制台顶部提示条据此显示「立即重启」
     pluginPendingRestart: {
       count: (Config.pluginPendingRestart && Config.pluginPendingRestart.count) || 0,
@@ -6509,10 +6605,11 @@ function buildFeedbackPack(text, contact, includeLogs) {
     `- 环境报告：${JSON.stringify(env)}`,
   )
   if (includeLogs) {
-    // 折叠重复行再入正文：反馈日志的长度主因是同一种错误重复几十上百次（见 feedback-pack.js）
-    parts.push('', '## 日志 dshl.log（末尾 200 行）', '```', compactLog(tailOf(TRAY_LOG, 200)), '```')
-    parts.push('', '## 日志 server.out.log（末尾 100 行）', '```', compactLog(tailOf(OUT_LOG, 100)), '```')
-    parts.push('', '## 日志 server.err.log（末尾 100 行）', '```', compactLog(tailOf(ERR_LOG, 100)), '```')
+    // 折叠重复行再入正文：反馈日志的长度主因是同一种错误/生命周期事件重复几十次（见 feedback-pack.js）。
+    // 只带「启动器时间线 + 服务错误」两段：server.out.log 是例行心跳/模型列表，信息量低且会顶出额外的
+    // 飞书消息，不再附带（日志仍在 ~/.dsh/dshl-logs 里，需要时作者会另行索取）。
+    parts.push('', '## 日志 dshl.log（末尾 120 行）', '```', compactLog(tailOf(TRAY_LOG, 120)), '```')
+    parts.push('', '## 日志 server.err.log（末尾 60 行）', '```', compactLog(tailOf(ERR_LOG, 60)), '```')
   }
   const raw = parts.join('\n')
   let body = raw
@@ -6891,6 +6988,9 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           const text = String(value && value.text || '').trim()
           if (!text) return JSON.stringify({ ok: false, error: '请先填写问题描述' })
           const contact = String(value && value.contact || '').trim().slice(0, 200)
+          // 联系方式必填（作者要能回访）：渲染层先拦一次，这里再守一次 ——
+          // 旧界面/直接调 IPC 都绕不过去，也不会再把"没留联系方式"的反馈发进群。
+          if (!contact) return JSON.stringify({ ok: false, error: '请填写联系方式（邮箱 / 飞书号 / QQ 等），方便作者回访' })
           const pack = buildFeedbackPack(text, contact, value && value.includeLogs !== false)
           if (!effectiveFeishuWebhook()) {
             return JSON.stringify({ ok: false, needWebhook: true, filePath: pack.filePath })

@@ -273,7 +273,10 @@ test('一键更新/一键安装不替用户授权：跳过需授权的那批，�
   assert.match(main, /const targets = all\.filter\(\(t\) => !t\.gated\)/, '批量目标要排除需授权的')
   assert.match(app, /const gated = outdated\.filter\(\(p\) => p\.gate && p\.gate\.state === 'gated'\)/, '前台的确认文案要说明这批里没有它们')
   assert.match(app, /另有 ' \+ gated\.length \+ ' 个需先授权/, '确认弹窗要说清跳过了谁')
-  assert.match(app, /updateBtn\.disabled = !updatable\.length/, '全是被挡住的插件时按钮不该可点')
+  // 2026-10-20 交互修复：全是被挡住的插件时按钮仍可点 —— 点一下由 handler 给出「需先授权」的 toast；
+  // 旧实现把按钮置灰，handler 里那段 0 目标提示永远到不了用户眼前。
+  assert.match(app, /updateBtn\.disabled = false;\s*\n\s*updateBtn\.title = updatable\.length/, '按钮保持可点，理由由 toast 讲')
+  assert.match(app, /这些插件需先授权：请在卡片上点「授权并更新到 vX」/, '被挡住的插件要通过 toast 告诉用户下一步')
   // 构建产物同步：wwwroot 由 ui-src 生成，改完 UI 必须同步
   assert.match(read('wwwroot/app.js'), /function pluginGateHint\(p\)/, 'wwwroot 未同步：请执行 npm run build:assets')
   assert.match(read('wwwroot/index.html'), /id="btnPluginEnvGrant"/, 'wwwroot 未同步：请执行 npm run build:assets')

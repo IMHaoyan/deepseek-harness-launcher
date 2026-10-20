@@ -32,13 +32,40 @@ test('compactLog：没有时间戳前缀的日志同样折叠（老日志、DSH 
   assert.deepEqual(out.split('\n'), ['boom  … ×3', 'ok'])
 })
 
-test('compactLog：不折叠空行，也不把不同内容混在一起', () => {
+test('compactLog：dshl.log 的本地时间戳格式也要剥掉再比较（空格分隔、无时区）', () => {
+  // 真实反馈里 dshl.log 200 行有 35×"打开窗口"、25×"已是最新"；旧 STAMP_RE 只认 ISO+T，
+  // 这些行连时间戳一起比较 → 一行都折不动，成为多条飞书消息的主因。
+  const local = (t) => `[2026-10-19 14:34:${String(t).padStart(2, '0')}]`
+  const out = pack.compactLog([
+    `${local(1)} open DeepSeek Harness window`,
+    `${local(2)} dsh-update: 已是最新`,
+    `${local(3)} open DeepSeek Harness window`,
+    `${local(4)} open DeepSeek Harness window`,
+  ].join('\n'))
+  assert.deepEqual(out.split('\n'), [
+    'open DeepSeek Harness window  … ×3（2026-10-19 14:34:01 → 2026-10-19 14:34:04）',
+    `${local(2)} dsh-update: 已是最新`,
+  ])
+})
+
+test('compactLog：不折叠空行；同一行体即使不相邻也折叠', () => {
   const out = pack.compactLog(['a', '', '', 'a', 'b'].join('\n'))
-  assert.deepEqual(out.split('\n'), ['a', '', '', 'a', 'b'])
+  assert.deepEqual(out.split('\n'), ['a  … ×2', '', '', 'b'])
+})
+
+test('compactLog：交替重复（服务 stdout 心跳的真实形态）也折叠，并保留首末时间', () => {
+  // 真实形态：同一条心跳与另一条输出交替出现，旧实现（只比相邻行）一条都折不掉
+  const a = (t) => `${stamp(t)} [usage-billing] swallowed: opencode-auth-missing`
+  const b = (t) => `${stamp(t)} [llm-deepseek-account] model listing loaded 2 model(s)`
+  const out = pack.compactLog([a(1), b(2), a(3), b(4), a(5)].join('\n'))
+  assert.deepEqual(out.split('\n'), [
+    '[usage-billing] swallowed: opencode-auth-missing  … ×3（2026-09-21T18:39:01.610+08:00 → 2026-09-21T18:39:05.610+08:00）',
+    '[llm-deepseek-account] model listing loaded 2 model(s)  … ×2（2026-09-21T18:39:02.610+08:00 → 2026-09-21T18:39:04.610+08:00）',
+  ])
 })
 
 test('compactLog：真实形态的日志显著变短（这是它能解决截断的原因）', () => {
-  // 真实反馈日志的形态：一轮一轮的重试，每轮里同一句错误重复十几遍
+  // 真实反馈日志的形态：一轮一轮的重试，每轮里同一句错误重复十几遍；跨轮次的同类行也合并
   const lines = []
   for (let round = 0; round < 12; round++) {
     lines.push(`${stamp(round)} starting DSH web`)
@@ -47,10 +74,12 @@ test('compactLog：真实形态的日志显著变短（这是它能解决截断�
   }
   const raw = lines.join('\n')
   const out = pack.compactLog(raw)
-  assert.ok(out.length * 4 < raw.length, `折叠后应至少缩小到 1/4：raw=${raw.length} out=${out.length}`)
-  assert.match(out, /… ×18/, '每轮那 18 条重复必须折成一行')
+  const outLines = out.split('\n')
+  assert.equal(outLines.length, 3, '12 轮 × 3 种行体 → 3 行')
+  assert.match(out, /… ×216/, '12 轮共 216 条重复（同一行体）必须折成一行')
+  assert.match(out, /starting DSH web  … ×12/, '跨轮次的同一行体也要折叠')
   assert.ok(out.includes('plugin tree failed to load'), '根因行不能被丢掉')
-  assert.equal(out.split('\n').length, 36, '12 轮 × 3 行')
+  assert.ok(out.length * 4 < raw.length, `折叠后应至少缩小到 1/4：raw=${raw.length} out=${out.length}`)
 })
 
 test('clampChunkChars：夹到合法区间，非法值回落默认', () => {
@@ -160,8 +189,9 @@ test('sendChunked：可重试但一直失败 → 用完重试次数后报错', a
 test('接线：折叠与分片必须真的用在反馈路径上（别只写模块不用）', () => {
   const main = read('main.js')
   assert.match(main, /const \{ compactLog, sendChunked, clampChunkChars \} = require\('\.\/feedback-pack'\)/, '必须引入 feedback-pack')
-  assert.match(main, /compactLog\(tailOf\(TRAY_LOG/, 'dshl.log 必须折叠后再入正文')
-  assert.match(main, /compactLog\(tailOf\(ERR_LOG/, 'server.err.log 必须折叠后再入正文')
+  assert.match(main, /compactLog\(tailOf\(TRAY_LOG, 120\)/, 'dshl.log 末尾 120 行、折叠后入正文')
+  assert.match(main, /compactLog\(tailOf\(ERR_LOG, 60\)/, 'server.err.log 末尾 60 行、折叠后入正文')
+  assert.doesNotMatch(main, /compactLog\(tailOf\(OUT_LOG/, '例行 server.out.log 不再附带（心跳/模型列表信息量低，会顶出额外飞书消息）')
   assert.match(main, /sendChunked\(\{ text: pack\.body, maxChars, sendOne/, '发送必须走分片发送器')
   assert.doesNotMatch(main, /trimUtf8\(/, '旧的按字节截断单条消息的路径必须移除（它会丢尾部）')
   assert.match(main, /retryable/, '限流错误必须标记 retryable，供退避重试判定')

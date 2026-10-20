@@ -51,6 +51,26 @@ test('上下两行共用同一个两栏定义（卡片竖缝不能错开）', ()
   assert.match(builtConsole, /var\(--general-cols\)/, 'wwwroot 未同步：请执行 npm run build:assets')
 })
 
+test('日志与反馈：宽屏两栏底部对齐（日志区不再比右侧长一截）', () => {
+  const consoleCss = read('ui-src/console.css')
+  const builtConsole = read('wwwroot/console.css')
+  // 背景（用户截图反馈）：日志区高度 = 100vh - 510px，窗口越高它越长；右列反馈卡是内容高度，
+  // 于是两栏底部差出几十到几百 px。契约：两栏 stretch 到同一行高，页面高度随内容，日志 <pre>
+  // 吃卡片剩余高度（flex:1 1 0），不再写死视口高度。
+  const wide = /@media \(min-width: 1220px\) \{([\s\S]*?)\n\}/u.exec(consoleCss)
+  assert.ok(wide, '应有宽屏双列媒体查询')
+  const pageBlock = /#pageLog \{([\s\S]*?)\n  \}/u.exec(wide[1])
+  assert.ok(pageBlock, '媒体查询里应有 #pageLog 的网格定义')
+  assert.match(pageBlock[1], /align-items: stretch;/, '两栏必须 stretch 才能底部对齐')
+  assert.match(pageBlock[1], /height: auto;/, '必须覆盖 styles.css 的 height:100%，页面高度随内容')
+  const preOverride = /#pageLog > \.logs-card > pre \{([\s\S]{0,220}?)\}/u.exec(consoleCss)
+  assert.ok(preOverride, '应有宽屏日志区高度覆盖规则（选择器避开唯一的 .logs-card pre 声明）')
+  assert.match(preOverride[1], /height: auto;/, '日志区不再用「视口高度 - 固定值」')
+  assert.match(preOverride[1], /flex: 1 1 0;/, '日志区由卡片剩余空间决定高度')
+  assert.match(preOverride[1], /min-height: 0;/, '允许收缩，避免把两栏顶成左长右短')
+  assert.match(builtConsole, /align-items: stretch;/, 'wwwroot 未同步：请执行 npm run build:assets')
+})
+
 test('wwwroot 与源码同步（改了 ui-src 必须重新构建）', () => {
   assert.match(builtCss, /--label-col:\s*\d+px;/, 'wwwroot 未同步：请执行 npm run build:assets')
   assert.match(builtCss, /\.label \{[\s\S]{0,120}?width: var\(--label-col\);/, 'wwwroot 里仍是旧规则')

@@ -463,6 +463,11 @@ function render(state) {
   }
 
   // 插件页：卡片完全由 state.plugins 驱动；新增插件不需要改这里
+  // 插件操作锁（profile 写锁）：主进程同一时刻只允许一个流程改 profile。页面必须让
+  // 「别的卡片/按钮」一起进入禁用态，否则用户点了才收到「另一个插件操作正在进行」的失败，
+  // 看起来像插件坏了（2026-10-19 日志里就有一串这样的 profile-lock 拒绝）。
+  window._pluginOpBusy = !!(state.pluginOp && state.pluginOp.busy)
+  window._pluginVersionQueryErrors = Array.isArray(state.pluginVersionQueryErrors) ? state.pluginVersionQueryErrors : []
   renderPlugins(state.plugins);
   renderInstallAll(state.pluginInstallAll, state.plugins);
   renderPendingRestart(state.pluginPendingRestart);
@@ -1602,9 +1607,17 @@ $('btnDshCheckHover').addEventListener('click', () => {
 });
 
 // ---------- 插件页：state.plugins 数据驱动，新增插件无需改渲染逻辑 ----------
+/** 主进程 profile 写锁是否被占用：占用期间所有插件写操作按钮/开关都要禁用。 */
+function pluginOpBusyNow() {
+  return !!window._pluginOpBusy
+}
+
 function pluginMatches(p, filter, query) {
-  if (filter === 'installed' && !(p.installed || p.enabled)) return false;
-  if (filter === 'available' && (p.installed || p.enabled)) return false;
+  // 口径与右上角「N 个已安装」严格一致：只认 installed。
+  // 不能把 enabled 也算进来 —— 手机连接「已开启但 payload 没装」时会出现
+  // 「计数 7、筛已安装出来 8 张」这种自相矛盾。
+  if (filter === 'installed' && !p.installed) return false;
+  if (filter === 'available' && p.installed) return false;
   // 归属标签筛选：按标签的 key 算（不是文案）——「已关闭自动安装」仍然算 DSHL 预装成员
   const tags = Array.isArray(p.tags) ? p.tags : [];
   if (filter === 'preinstall' && !tags.some((t) => t.key === 'preinstall')) return false;
@@ -1683,14 +1696,16 @@ function pluginCardEl(p) {
 
   // 真实启停：手机连接走装/卸，npm 插件走 user patch layer（不卸载、可直接热切换）。
   // 不能识别加载项的插件仍退化为只读状态胶囊，避免出现点了没反应的开关。
+  // locked：别的插件正在改 profile —— 开关/按钮一起禁用，别让用户点了才吃 profile-lock。
+  const locked = !p.busy && pluginOpBusyNow();
   const switchWrap = document.createElement('label'); switchWrap.className = 'plugin-switch';
   const switchInput = document.createElement('input');
   switchInput.type = 'checkbox';
   switchInput.checked = !!p.enabled;
-  switchInput.disabled = !!p.busy;
+  switchInput.disabled = !!p.busy || locked;
   if (p.toggleAction) switchInput.dataset.pluginAction = p.toggleAction;
   switchInput.dataset.pluginId = p.id;
-  switchInput.title = p.busy ? '处理中…' : (p.enabled ? '关闭' : '开启');
+  switchInput.title = p.busy ? '处理中…' : locked ? '另一个插件操作正在进行，请稍候' : (p.enabled ? '关闭' : '开启');
   switchInput.setAttribute('aria-label', switchInput.title);
   const switchTrack = document.createElement('span'); switchTrack.className = 'plugin-switch-track';
   const switchThumb = document.createElement('span'); switchThumb.className = 'plugin-switch-thumb';
@@ -1743,7 +1758,8 @@ function pluginCardEl(p) {
     if (act.confirmTitle) btn.dataset.confirmTitle = act.confirmTitle;
     if (act.confirmBody) btn.dataset.confirmBody = act.confirmBody;
     btn.textContent = act.label || act.action;
-    if (p.busy) btn.disabled = true;
+    if (p.busy || locked) btn.disabled = true;
+    if (locked) btn.title = '另一个插件操作正在进行，请稍候';
     actions.appendChild(btn);
   }
   footer.appendChild(p.toggleAction ? switchWrap : statePill); footer.appendChild(actions);
@@ -1813,16 +1829,16 @@ function renderPlugins(plugins, force) {
     summary.title = envNote;
   }
   cards.textContent = '';
-  // 「Profile 中的其他插件」小标题：这些卡片与预装卡片同构渲染，只差没挂归属标签 —— 不加标题
-  // 就会被读成"预装清单里混进来一堆野插件"（实测反馈）。只插一次，数字按**当前筛选下可见**的那批算。
-  const others = visible.filter(isProfileInventoryCard).length;
-  let groupHeadDone = false;
-  for (const p of visible) {
-    if (!groupHeadDone && isProfileInventoryCard(p)) {
-      groupHeadDone = true;
-      cards.appendChild(pluginGroupHeadEl(others));
-    }
-    cards.appendChild(pluginCardEl(p));
+  // 「Profile 中的其他插件」分组：先渲染清单内卡片，再插入小标题 + 只渲染清单外卡片。
+  // 旧写法是「在第一张清单外卡片前插一次标题」——排序把未安装的清单内卡片排在它后面时，
+  // 标题下面会混进不属于这一组的卡（QA 实测「Profile 中的其他插件（2）」下面有 3 张，
+  // 其中「会话导入」是清单内卡片）。分组语义不能靠卡片位置，索性把这一组整体放到最后。
+  const managed = visible.filter((p) => !isProfileInventoryCard(p))
+  const inventory = visible.filter(isProfileInventoryCard)
+  for (const p of managed) cards.appendChild(pluginCardEl(p))
+  if (inventory.length) {
+    cards.appendChild(pluginGroupHeadEl(inventory.length))
+    for (const p of inventory) cards.appendChild(pluginCardEl(p))
   }
   const empty = $('pluginEmpty');
   if (empty) empty.classList.toggle('hidden', visible.length > 0);
@@ -1846,11 +1862,18 @@ function renderPendingRestart(info) {
   const btn = $('btnApplyRestart');
   if (hint) hint.textContent = '重启后才会生效';
   if (btn) {
-    btn.disabled = false;
-    btn.textContent = '立即重启生效';
-    btn.title = '立即重启 DSH 服务并刷新页面';
+    // 重启本身就是一次 profile 操作：进行中（含状态推送到达时）绝不能再让它可点，
+    // 旧实现每次状态推送都把它重置为 enabled，用户会看到按钮在"重启中…"和可点之间闪。
+    const applying = !!window._applyRestartBusy;
+    const locked = pluginOpBusyNow();
+    btn.disabled = applying || locked;
+    btn.textContent = applying ? '重启中…' : '立即重启生效';
+    btn.title = locked && !applying ? '另一个插件操作正在进行，请稍候' : '立即重启 DSH 服务并刷新页面';
   }
-  if (!count) return;
+  if (!count) {
+    if (window._applyRestartBusy) window._applyRestartBusy = false; // 挂起项已清空：重启结束（或无需重启）
+    return;
+  }
   if (text) {
     const what = names.length ? names.join('、') : (count + ' 个插件');
     text.textContent = '插件已变更，需要重启服务：' + what;
@@ -1859,21 +1882,26 @@ function renderPendingRestart(info) {
 
 // 生效按钮：停服务 → 起服务 → 刷新窗口。
 $('btnApplyRestart').addEventListener('click', async () => {
+  if (window._applyRestartBusy || pluginOpBusyNow()) return;
+  window._applyRestartBusy = true;
   const btn = $('btnApplyRestart');
   const old = btn.textContent;
   btn.disabled = true;
   btn.textContent = '重启中…';
   const r = await cmd('pluginsApplyRestart');
+  window._applyRestartBusy = false;
   if (!r || !r.ok) {
     btn.disabled = false;
     btn.textContent = old;
+    showConsoleToast('✕ 重启失败：' + ((r && r.error) || '无响应，请查看日志'));
   }
 });
 
 /**
  * 插件页两个批量按钮的进度与可用态（共用主进程同一份 pluginInstallAll 状态）：
  * 跑的是哪一批由 kind 决定 —— 只有发起那批的按钮显示进度，另一个禁用但不假装在干活。
- * 没在跑时，「一键更新」按当前有没有可更新的卡片决定能不能点（没得更新就不给一个点了没反应的按钮）。
+ * 空闲时两个按钮都不按「当前没目标」置灰：点一下会得到可读的解释（disabled 的 title 不可靠，
+ * 而且旧实现把「没有可更新的插件」那段提示永久关在 disabled 后面，用户只看到一个死按钮）。
  */
 function renderInstallAll(info, list) {
   window._pluginInstallAll = info || null;
@@ -1882,20 +1910,46 @@ function renderInstallAll(info, list) {
   const total = (info && info.target) || 0;
   const done = (info && info.done) || 0;
   const current = info && info.current ? ' · ' + info.current : '';
+  const locked = pluginOpBusyNow();
+  const plugins = Array.isArray(list) ? list : [];
+
+  // 批量完成回执：主进程把这批的最后结果写进 result（成功 / 失败 / 一个都没得装都算），
+  // 页面在 running 结束后播一次 toast。旧实现只把按钮文案恢复，用户不知道跑完了没有、结果如何。
+  const result = info && info.result;
+  if (result && result.at && result.at !== window._batchResultShownAt) {
+    const age = Date.now() - Number(result.at || 0);
+    const shouldToast = window._batchSawRunning || age < 15000; // 重开控制台时不重播旧回执
+    window._batchResultShownAt = result.at;
+    if (shouldToast && result.message) showConsoleToast((result.ok ? '' : '✕ ') + result.message);
+  }
+  if (running) window._batchSawRunning = true;
+  else if (result) window._batchSawRunning = false;
 
   const installBtn = $('btnPluginsInstallAll');
   if (installBtn) {
-    installBtn.disabled = running;
+    const pending = plugins.filter((p) => p && p.preset && !p.installed);
+    const pendingGated = pending.filter((p) => p.gate && p.gate.state === 'gated');
+    const installable = pending.filter((p) => !(p.gate && p.gate.state === 'gated'));
+    installBtn.disabled = running || locked;
     installBtn.textContent = running && kind !== 'update'
       ? '安装中 (' + done + '/' + total + ')' + current + '…'
       : '一键安装所有预装插件';
+    if (!running) {
+      installBtn.title = locked
+        ? '另一个插件操作正在进行，请稍候'
+        : installable.length
+          ? '依次安装 ' + installable.length + ' 个缺失的预装插件（装完点顶部「立即重启生效」）'
+            + (pendingGated.length ? '；另有 ' + pendingGated.length + ' 个需先授权：' + pendingGated.map((p) => p.name).join('、') : '')
+          : (pendingGated.length
+            ? '缺失的预装插件都需先授权（' + pendingGated.map((p) => p.name).join('、') + '）：请在卡片上点「授权并安装」'
+            : '所有预装插件都已安装');
+    }
   }
 
   const updateBtn = $('btnPluginsUpdate');
   if (updateBtn) {
-    const outdated = (Array.isArray(list) ? list : []).filter((p) => p && p.outdated);
-    // 被版本门禁挡住的那些不归「一键更新」管（授权必须由用户在卡片上单独拍板一次），
-    // 所以可用态只数真正能更新的：否则会出现"点了却一个都没更新"。
+    const outdated = plugins.filter((p) => p && p.outdated);
+    // 被版本门禁挡住的那些不归「一键更新」管（授权必须由用户在卡片上单独拍板一次）。
     const updatable = outdated.filter((p) => !(p.gate && p.gate.state === 'gated'));
     const gated = outdated.filter((p) => p.gate && p.gate.state === 'gated');
     updateBtn.textContent = '一键更新';
@@ -1906,8 +1960,11 @@ function renderInstallAll(info, list) {
     } else if (running) {
       updateBtn.disabled = true;
       updateBtn.title = '另一个插件批量操作正在进行中';
+    } else if (locked) {
+      updateBtn.disabled = true;
+      updateBtn.title = '另一个插件操作正在进行，请稍候';
     } else {
-      updateBtn.disabled = !updatable.length;
+      updateBtn.disabled = false;
       updateBtn.title = updatable.length
         ? '更新 ' + updatable.length + ' 个可更新的插件（' + updatable.map((p) => p.name).join('、') + '）；全部完成后自动重启一次 DSH 生效'
           + (gated.length ? '。另有 ' + gated.length + ' 个需先授权（' + gated.map((p) => p.name).join('、') + '），请在卡片上单独点「授权并更新」' : '')
@@ -2096,6 +2153,10 @@ $('pluginCards').addEventListener('click', async (e) => {
   }
   const btn = e.target.closest('button[data-plugin-action]');
   if (!btn) return;
+  if (pluginOpBusyNow()) {
+    showConsoleToast('另一个插件操作正在进行，请稍候');
+    return;
+  }
   const id = btn.dataset.pluginId;
   const action = btn.dataset.pluginAction;
   if (btn.dataset.confirmTitle) {
@@ -2141,6 +2202,11 @@ $('pluginCards').addEventListener('change', async (e) => {
   const id = input.dataset.pluginId;
   const turnOn = input.checked;
   const action = turnOn ? 'enable' : 'disable';
+  if (pluginOpBusyNow()) {
+    input.checked = !turnOn;
+    showConsoleToast('另一个插件操作正在进行，请稍候');
+    return;
+  }
   input.disabled = true;
   if (id === 'bridge-next') {
     const ok = await confirmDialog({
@@ -2162,12 +2228,14 @@ $('pluginCards').addEventListener('change', async (e) => {
   if (!r || !r.ok) {
     input.checked = !turnOn;
     input.disabled = false;
+    const msg = (r && r.error) || '操作失败，请查看日志';
     const card = input.closest('.plugin-card');
     const feedback = card && card.querySelector('.plugin-feedback');
     if (feedback) {
-      feedback.textContent = '✕ ' + ((r && r.error) || '操作失败，请查看日志');
+      feedback.textContent = '✕ ' + msg;
       feedback.classList.remove('hidden');
     }
+    showConsoleToast('✕ ' + (turnOn ? '开启' : '关闭') + '「' + pluginDisplayName(id) + '」失败：' + msg);
   }
 });
 
@@ -2179,6 +2247,17 @@ $('btnPluginsRefresh').addEventListener('click', async () => {
   try {
     const fresh = await cmd('pluginCheckUpdates');
     if (fresh) renderPlugins(fresh, true);
+    // 旧实现刷新完只把按钮文案换回去：npm 限流（HTTP 429）时「可更新」消失、一键更新变灰，
+    // 用户完全不知道"是查失败了"还是"真没更新"。这里必须给一句可读结果。
+    if (!fresh) {
+      showConsoleToast('✕ 检查更新失败：请查看日志');
+      return;
+    }
+    const outdated = (fresh || []).filter((p) => p && p.outdated).length;
+    const errors = Array.isArray(window._pluginVersionQueryErrors) ? window._pluginVersionQueryErrors : [];
+    showConsoleToast(errors.length
+      ? '已刷新；' + errors.length + ' 个插件的版本查询失败（可能被 npm 限流），暂时无法判断更新'
+      : outdated ? '已刷新：' + outdated + ' 个插件可更新' : '已刷新：所有插件都是最新版');
   } finally {
     btn.disabled = false;
     btn.textContent = old;
@@ -2188,9 +2267,28 @@ $('btnPluginsRefresh').addEventListener('click', async () => {
 // 一键安装所有预装插件：只装未安装的，进度由主进程 state 推送驱动
 $('btnPluginsInstallAll').addEventListener('click', async () => {
   const btn = $('btnPluginsInstallAll');
+  if (pluginOpBusyNow()) {
+    showConsoleToast('另一个插件操作正在进行，请稍候');
+    return;
+  }
+  const pending = (window._plugins || []).filter((p) => p && p.preset && !p.installed);
+  const gated = pending.filter((p) => p.gate && p.gate.state === 'gated');
+  const targets = pending.filter((p) => !(p.gate && p.gate.state === 'gated'));
+  // 「全都装好了 / 缺的都需先授权」不该还弹一个"开始安装"然后什么也不发生：
+  // 直接说清当前没有可装项，以及需授权的去哪里点。
+  if (!targets.length) {
+    showConsoleToast(gated.length
+      ? '缺失的预装插件都需先授权：请在卡片上点「授权并安装」'
+      : '所有预装插件都已安装');
+    return;
+  }
   const ok = await confirmDialog({
     title: '一键安装所有预装插件？',
-    body: '会依次装好本页所有尚未安装的预装插件（插件市场、手机连接与各推荐插件）。安装前会先停止 DSH 服务，进行中的会话会中断；中途不重启，装完后点顶部「立即重启生效」重新启动服务。',
+    body: '会依次装好本页 ' + targets.length + ' 个尚未安装的预装插件（插件市场、手机连接与各推荐插件）。安装前会先停止 DSH 服务，进行中的会话会中断；中途不重启，装完后点顶部「立即重启生效」重新启动服务。'
+      + (gated.length
+        ? '\n\n另有 ' + gated.length + ' 个需先授权（' + gated.map((p) => p.name).join('、') + '），不在这批里：'
+          + '请在卡片上单独点「授权并安装」（授权是风险接受，只对这一对精确版本生效）。'
+        : ''),
     confirmText: '开始安装',
   });
   if (!ok) return;
@@ -2207,6 +2305,10 @@ $('btnPluginsInstallAll').addEventListener('click', async () => {
 // 一键更新：把所有「可更新」的插件更新一遍 —— 中途不重启，全部更新完自动重启一次 DSH 生效
 $('btnPluginsUpdate').addEventListener('click', async () => {
   const btn = $('btnPluginsUpdate');
+  if (pluginOpBusyNow()) {
+    showConsoleToast('另一个插件操作正在进行，请稍候');
+    return;
+  }
   const outdated = (window._plugins || []).filter((p) => p && p.outdated);
   // 需先授权的那些不进这批：批量里静默替用户接受不兼容风险是错的，它们由卡片上的按钮单独拍板
   const gated = outdated.filter((p) => p.gate && p.gate.state === 'gated');
@@ -2262,11 +2364,21 @@ $('envCards').addEventListener('click', (e) => {
 });
 
 // ---------- 反馈问题对话框 ----------
+// 联系方式是必填项（作者要能回访）：渲染层与主进程 feedbackSend 用同一判据各拦一次。
+const FEEDBACK_CONTACT_REQUIRED = '请填写联系方式（邮箱 / 飞书号 / QQ 等），方便作者回访';
+function feedbackContact() {
+  const el = $('feedbackContact');
+  return el ? el.value.trim() : '';
+}
 function showFeedbackStatus(text, kind) {
   const el = $('feedbackStatus');
   el.textContent = text;
   el.className = 'modal-status' + (kind ? ' ' + kind : '');
 }
+// 填上联系方式后立刻撤掉"必填"提示：字段已有值、提示还挂着会被读成矛盾
+$('feedbackContact').addEventListener('input', () => {
+  if ($('feedbackStatus').textContent === FEEDBACK_CONTACT_REQUIRED) showFeedbackStatus('', '');
+});
 // 反馈表单已从弹窗搬进「日志与反馈」页：入口只负责跳页并聚焦
 function openFeedback() {
   showPage('logs');
@@ -2281,7 +2393,7 @@ $('btnFeedback').addEventListener('click', openFeedback);
 $('btnFeedbackCopy').addEventListener('click', async () => {
   const text = $('feedbackText').value.trim();
   if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
-  const pack = await cmd('feedbackBuild', { text, contact: $('feedbackContact').value, includeLogs: $('feedbackLogs').checked });
+  const pack = await cmd('feedbackBuild', { text, contact: feedbackContact(), includeLogs: $('feedbackLogs').checked });
   if (pack && pack.body) {
     await cmd('clipboardWrite', pack.body);
     showFeedbackStatus('已复制完整反馈内容（含版本/环境/日志），粘贴到任意地方发送即可', 'ok');
@@ -2292,8 +2404,13 @@ $('btnFeedbackCopy').addEventListener('click', async () => {
 $('btnFeedbackSend').addEventListener('click', async () => {
   const text = $('feedbackText').value.trim();
   if (!text) { showFeedbackStatus('请先填写问题描述', 'error'); return; }
+  if (!feedbackContact()) {
+    showFeedbackStatus(FEEDBACK_CONTACT_REQUIRED, 'error');
+    $('feedbackContact').focus();
+    return;
+  }
   showFeedbackStatus('正在提交…');
-  const r = await cmd('feedbackSend', { text, contact: $('feedbackContact').value, includeLogs: $('feedbackLogs').checked });
+  const r = await cmd('feedbackSend', { text, contact: feedbackContact(), includeLogs: $('feedbackLogs').checked });
   if (!r) { showFeedbackStatus('提交失败：无响应', 'error'); return; }
   if (r.ok) {
     const extra = r.chunks > 1 ? `（日志较长，已分 ${r.chunks} 条发送）` : '';
