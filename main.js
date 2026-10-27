@@ -35,6 +35,7 @@ const { probePid, terminateProcess, waitForCompletion } = require('./service-ter
 const handover = require('./service-handover')
 const trust = require('./trust')
 const fileOpen = require('./file-open')
+const workspaceMapModule = require('./workspace-map')
 const { createConsoleSurface } = require('./console-surface')
 const { createUpdateWindow } = require('./update-window')
 const changelog = require('./changelog')
@@ -111,6 +112,8 @@ const HEALTH_SNAPSHOT_DIR = path.join(HOME, 'dshl', 'health-snapshots')
 const CONFIG_PATH = SELF_TEST
   ? path.join(os.tmpdir(), 'dshl-selftest-config.json')
   : path.join(HOME, 'dshl', 'config.json')
+// DSH 自己维护的「工作区 → 会话」映射：Ctrl+点击相对路径链接时用它把相对路径还原成绝对路径。
+const workspaceMap = workspaceMapModule.createWorkspaceMap(path.join(HOME, 'storages', 'workspace.json'))
 // 桌面壳就绪标记：Host 侧登录辅助 bundle（assets/dshl-desktop-signin）只认这个文件。
 // 桥就绪时写、关闭/退出时删 —— DSH 退回 web runtime 时登录辅助插件必须严格 no-op。
 const DESKTOP_SHELL_MARKER = path.join(HOME, 'dshl', 'desktop-shell.active')
@@ -6821,6 +6824,30 @@ function registerIpc() {
       event.returnValue = { host: HOST, port: String(PORT) }
     } catch {
       event.returnValue = null
+    }
+  })
+  // 相对路径链接的解析（同步）：preload 必须在点击的当拍就决定「拦下还是放行 DSH 的预览」，
+  // 所以走 sendSync。只做只读判断（会话 → 工作区根目录 → 拼绝对路径 → 文件存在），**不执行打开**；
+  // 真正的打开仍走下面的 dsh:file-open 并重新校验发送方/路径/存在性。
+  ipcMain.on('dshl:file-open:resolve', (event, payload) => {
+    try {
+      if (!isDshPageSender(event)) {
+        event.returnValue = { ok: false }
+        return
+      }
+      const value = payload && typeof payload === 'object' ? payload : {}
+      const sessionId = typeof value.sessionId === 'string' ? value.sessionId : ''
+      const relativePath = typeof value.path === 'string' ? value.path.trim() : ''
+      const cwd = workspaceMap.pathForSession(sessionId)
+      const filePath = workspaceMapModule.filePathInWorkspace(cwd, relativePath)
+      if (filePath === '' || !fs.existsSync(filePath)) {
+        event.returnValue = { ok: false }
+        return
+      }
+      log('file-open: 解析相对路径 ' + relativePath + ' → ' + filePath)
+      event.returnValue = { ok: true, path: filePath }
+    } catch {
+      event.returnValue = { ok: false }
     }
   })
   ipcMain.handle('dsh:file-open', async (event, payload) => {

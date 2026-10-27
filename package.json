@@ -70,6 +70,7 @@
       "service-handover.js",
       "trust.js",
       "file-open.js",
+    "workspace-map.js",
       "plugin-repo.js",
       "wwwroot/**/*",
       "assets/**/*",

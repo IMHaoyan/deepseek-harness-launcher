@@ -140,14 +140,16 @@ if (desktopShellConfig && isDesktopShellPage(desktopShellConfig)) exposeDesktopS
 //   ③ @ 提及 chip（title 是原始 mention 文本 `@path` / `@"path with spaces"`）。
 // 后两类的共同点是：preload 手里只有 href/mention 文本，没有会话工作区根目录，自己拼不出绝对路径。
 //
-// 因此分两条路：
+// 因此分三条路：
 //   A) title 能归一化成"本地绝对路径"→ 拦截点击，直接请主进程打开（无副作用，原行为）；
-//   B) 拿不到绝对路径 → **放行** DSH 的普通点击（它本来就会在右侧栏打开文档预览），再观察预览
-//      头部 `[data-textpreview-path]`（DSH PathLabel，title = Host 解析后的绝对路径）在 2 秒内
-//      新出现 / 由隐藏变为可见的那一条，交给主进程打开。图片、二进制、不可预览文件也走同一个
-//      预览头部，所以三类入口一起修好；代价是预览面板仍会照常打开（这正是今天拦截失败时的
-//      既有行为，不是新增副作用）。图片链接的 hover 预览与图片预览都没有路径文本，不能替代。
-const FILE_OPEN = { ORIGIN: 'dshl:file-open:origin', OPEN: 'dsh:file-open' }
+//   B) title 是相对路径（相对链接 / 相对 @ 提及）→ 从点击所在会话节点 `data-conversation-session`
+//      拿 sessionId，同步请主进程用 DSH 自己的 ~/.dsh/storages/workspace.json（会话 → 工作区根目录）
+//      还原绝对路径；还原成功同样拦下点击直接打开。2026-10-27 第二轮真机证据：文本文件的预览头部
+//      只显示**相对路径**（图片等 bytes 预览才有 absolutePath），所以相对路径不能靠预览兜底。
+//   C) title 缺失 / 还原不出来（图片链接等）→ 放行 DSH 打开右侧栏预览，再观察预览头部
+//      `[data-textpreview-path]`（title = Host 解析后的绝对路径）在 2 秒内新出现 / 变为可见的那一条。
+//      代价是预览面板会照常打开，与今天拦截失败时的既有行为一致，不是新增副作用。
+const FILE_OPEN = { ORIGIN: 'dshl:file-open:origin', RESOLVE: 'dshl:file-open:resolve', OPEN: 'dsh:file-open' }
 // 与 file-open.js 的校验保持一致：盘符或 UNC（DSH 的 title 可能是 C:\ 或 C:/）
 const FILE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])/u
 // 文档预览头部的路径标签（PathLabel，title 是 Host 解析后的绝对路径）
@@ -187,11 +189,61 @@ function isFileOpenPage(origin) {
  * @returns {string}
  */
 function absoluteFilePath(raw) {
+  const value = unmentioned(raw)
+  return FILE_PATH_RE.test(value) ? value : ''
+}
+
+/** 去掉 @ 提及前缀与可选引号，返回用户真正写的路径文本（绝对/相对都可能）。 */
+function unmentioned(raw) {
   let value = typeof raw === 'string' ? raw.trim() : ''
   if (value.startsWith('@')) value = value.slice(1).trim()
   const quoted = /^(["'])([\s\S]*)\1$/u.exec(value)
   if (quoted !== null) value = quoted[2].trim()
-  return FILE_PATH_RE.test(value) ? value : ''
+  return value
+}
+
+/** 按钮的 title 原文（没有就是空串）。 */
+function buttonTitle(button) {
+  try {
+    if (button === null) return ''
+    return String(button.getAttribute('title') || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 点击位置所在会话的 id（DSH 会话正文节点带 data-conversation-session）。
+ * 优先最近的祖先；不在会话正文里（例如预览面板里的链接）就退回页面上第一个会话。
+ */
+function sessionIdNear(button) {
+  try {
+    const owner = button !== null && typeof button.closest === 'function'
+      ? button.closest('[data-conversation-session]')
+      : null
+    const element = owner ?? (typeof document !== 'undefined' && typeof document.querySelector === 'function'
+      ? document.querySelector('[data-conversation-session]')
+      : null)
+    if (!element || typeof element.getAttribute !== 'function') return ''
+    const value = element.getAttribute('data-conversation-session')
+    return typeof value === 'string' ? value.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 让主进程把「会话 + 相对路径」还原成绝对路径（同步：点击当拍就要决定拦不拦）。
+ * 解析失败返回空串，调用方放行 DSH 原行为。
+ */
+function resolveRelativePath(sessionId, relativePath) {
+  try {
+    const result = ipcRenderer.sendSync(FILE_OPEN.RESOLVE, { sessionId, path: relativePath })
+    if (!result || result.ok !== true) return ''
+    return typeof result.path === 'string' ? result.path.trim() : ''
+  } catch {
+    return ''
+  }
 }
 
 /** 点击落到的 <button>（DSH 的文件入口都是按钮；不是按钮就返回 null）。 */
@@ -202,16 +254,6 @@ function clickButton(target) {
     return button && typeof button.getAttribute === 'function' ? button : null
   } catch {
     return null
-  }
-}
-
-/** 从按钮 title 上取绝对路径（取不到返回空串，交给预览兜底）。 */
-function filePathFromClick(button) {
-  try {
-    if (button === null) return ''
-    return absoluteFilePath(button.getAttribute('title'))
-  } catch {
-    return ''
   }
 }
 
@@ -336,24 +378,43 @@ function watchPreviewResolution(mode, buttonText) {
   }, PREVIEW_WAIT_MS)
 }
 
+/** 直接打开/定位一个已验证的绝对路径（拦下 DSH 的右侧栏预览）。 */
+function openAbsolutePath(path, event) {
+  try { event.preventDefault() } catch { /* noop */ }
+  try { event.stopImmediatePropagation() } catch { /* noop */ }
+  const mode = event.shiftKey ? 'reveal' : 'open'
+  const pending = ipcRenderer.invoke(FILE_OPEN.OPEN, { path, mode })
+  if (pending && typeof pending.catch === 'function') pending.catch(() => { /* 失败只留主进程日志 */ })
+}
+
 /** 捕获阶段拦截 Ctrl/Cmd+点击；返回是否拦截（测试/调试用）。 */
 function interceptFileOpenClick(event) {
   try {
     if (!event.ctrlKey && !event.metaKey) return false
     const button = clickButton(event.target)
-    const path = filePathFromClick(button)
-    if (path !== '') {
-      try { event.preventDefault() } catch { /* noop */ }
-      try { event.stopImmediatePropagation() } catch { /* noop */ }
-      const mode = event.shiftKey ? 'reveal' : 'open'
-      const pending = ipcRenderer.invoke(FILE_OPEN.OPEN, { path, mode })
-      if (pending && typeof pending.catch === 'function') pending.catch(() => { /* 失败只留主进程日志 */ })
+    if (button === null) return false
+    const title = buttonTitle(button)
+    // A) title 直接是本地绝对路径（含 `@C:\…` 形式的提及）：不打开预览，直接交给主进程
+    const absolute = absoluteFilePath(title)
+    if (absolute !== '') {
+      openAbsolutePath(absolute, event)
       return true
     }
-    // 相对路径 / 图片链接 / @ 提及：不拦截，让 DSH 自己打开右侧栏预览，再读 Host 解析后的绝对路径
-    if (button !== null) {
-      watchPreviewResolution(event.shiftKey ? 'reveal' : 'open', button.textContent)
+    // B) title 是相对路径（相对路径链接 / 相对 @ 提及）：用「点击所在会话 + DSH 工作区映射」还原绝对路径，
+    //    能还原就同样不打开预览；还原不出来就放行 DSH 原行为，绝不猜路径。
+    const relative = unmentioned(title)
+    if (relative !== '') {
+      const sessionId = sessionIdNear(button)
+      if (sessionId !== '') {
+        const resolved = resolveRelativePath(sessionId, relative)
+        if (resolved !== '') {
+          openAbsolutePath(resolved, event)
+          return true
+        }
+      }
     }
+    // C) title 缺失/不可解析（图片链接等）：放行 DSH 打开右侧栏预览，再从预览头部读 Host 解析后的绝对路径
+    watchPreviewResolution(event.shiftKey ? 'reveal' : 'open', button.textContent)
     return false
   } catch {
     return false
