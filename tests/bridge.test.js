@@ -270,3 +270,48 @@ test('initBridge：payload 可用时 state 带出版本与 payloadReady', () => 
   assert.equal(s.payloadPackageVersion, s.payloadVersion)
   bridge.initBridge({})
 })
+
+test('getState：npm 外部安装 → external=true，且不再拿随包 payload 版本判「可更新」', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-bridge-ext-'))
+  const profileDir = path.join(home, 'profiles', 'web')
+  const pkgDir = path.join(profileDir, 'node_modules', ...NAME.split('/'))
+  try {
+    fs.mkdirSync(pkgDir, { recursive: true })
+    fs.writeFileSync(path.join(profileDir, 'package.json'), JSON.stringify({
+      name: 'dsh-profile-web',
+      dependencies: { [NAME]: '^2.0.2' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', NAME] } },
+    }))
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: NAME, version: '2.0.2' }))
+    bridge.initBridge({ home, payloadRoot: PAYLOAD_DIR, log: () => {} })
+    const s = bridge.getState()
+    assert.equal(s.installed, true)
+    assert.equal(s.external, true, 'npm 规格属于外部安装')
+    assert.equal(s.specMatchesPayload, false)
+    assert.equal(s.outdated, false, '外部安装不能判成「可更新到随包版本」')
+    assert.equal(s.installedPackageVersion, '2.0.2')
+  } finally {
+    bridge.initBridge({})
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('getState：启动器 payload 安装（link: bridge-payloads）不算外部安装', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-bridge-pay-'))
+  const profileDir = path.join(home, 'profiles', 'web')
+  try {
+    fs.mkdirSync(profileDir, { recursive: true })
+    fs.writeFileSync(path.join(profileDir, 'package.json'), JSON.stringify({
+      name: 'dsh-profile-web',
+      dependencies: { [NAME]: 'link:C:/Users/x/.dsh/dshl/bridge-payloads/2.0.0-dev.11-abc/bridge-next.tgz' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', NAME] } },
+    }))
+    bridge.initBridge({ home, payloadRoot: PAYLOAD_DIR, log: () => {} })
+    const s = bridge.getState()
+    assert.equal(s.installed, true)
+    assert.equal(s.external, false)
+  } finally {
+    bridge.initBridge({})
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})

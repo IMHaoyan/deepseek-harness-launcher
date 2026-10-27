@@ -540,8 +540,11 @@ function getState() {
   const want = payload ? { version: payloadInstalledVersion(), spec: expectedSpec() } : null
   const specMatchesPayload = state.installed && !!want && sameSpec(state.spec, want.spec)
     && satisfied(cur, want, materialized.version)
+  // 外部安装（npm / git / 手工 link）：启动器不拥有它。不能拿随包 payload 的版本/规格去判"可更新"，
+  // 否则界面会承诺把 npm 版本换回随包版本（2026-10-27 覆盖事故的同源问题）。
+  const external = state.installed && externalInstallSpec(state.spec)
   // 已装但版本/patch/规格与随包 payload 不一致 → 控制台提示可更新/修复
-  const outdated = state.installed && !!payload
+  const outdated = state.installed && !!payload && !external
     && (!materialized.patchReady || materialized.version === '' || materialized.version !== payloadInstalledVersion() || !specMatchesPayload)
   return {
     installed: state.installed,
@@ -549,6 +552,7 @@ function getState() {
     installedPackageVersion: materialized.version,
     materializedPatchReady: materialized.patchReady,
     specMatchesPayload,
+    external,
     bundle: state.bundle,
     spec: state.spec,
     busy: state.busy,

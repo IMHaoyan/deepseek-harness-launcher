@@ -2184,7 +2184,7 @@ function setPluginFilter(filter) {
 // 耗时与说明页同口径（loading.js 的 plugin 档：约 10~60 秒），所以进度与结果都必须显式说出来。
 const PLUGIN_ACTION_VERB = {
   install: '安装', uninstall: '卸载', reinstall: '重新安装', update: '更新',
-  enable: '启用', disable: '关闭',
+  enable: '启用', disable: '关闭', switch: '切换',
 };
 function pluginDisplayName(id) {
   const p = (window._plugins || []).find((x) => x.id === id);

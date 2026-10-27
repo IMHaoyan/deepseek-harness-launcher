@@ -4547,7 +4547,7 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
   if (pid === 'bridge-next') {
     if (act === 'enable' || act === 'install' || act === 'toggle') return setRemoteConnectManaged(!Config.remoteConnect.enabled, { defer })
     if (act === 'disable' || act === 'uninstall') return setRemoteConnectManaged(false, { defer })
-    if (act === 'reinstall') return reinstallRemoteConnectManaged({ defer })
+    if (act === 'switch' || act === 'reinstall') return reinstallRemoteConnectManaged({ defer })
   }
   return { ok: false, error: '未知插件或操作：' + pid + '/' + act }
 }
@@ -4568,6 +4568,7 @@ function pluginBusyLabel(action) {
   const a = String(action || '')
   if (a === 'install' || a === 'grant-install') return '安装中…'
   if (a === 'uninstall') return '卸载中…'
+  if (a === 'switch') return '切换中…'
   if (a === 'reinstall') return '重新安装中…'
   if (a === 'update') return '更新中…'
   if (a === 'grant-update') return '授权并更新中…'
@@ -4687,6 +4688,54 @@ function pluginCardActions(opts) {
   return out
 }
 
+/**
+ * 远程连接卡片视图：把 bridge.getState() 映射成卡片状态/按钮（纯函数，便于单测）。
+ *
+ * 外部安装（npm / git / 手工 link）不是启动器托管的版本。旧实现会拿随包 payload 版本去比
+ * 「可更新到 v2.0.0-dev.11 / 重新安装」，而按钮点下去（force）会把 npm 版本换回随包版本
+ * —— 与真实动作不符，也是 2026-10-27 覆盖事故的同源问题。外部安装单独映射：
+ *   - 状态写「外部版本」（悬停解释：启动器不托管、不会自动替换）；
+ *   - 不显示「可更新/重新安装」；开关不渲染（不是启动器在管）；
+ *   - 只保留两个显式动作：「改用随包版本」（确认后 force 切回）与「卸载」。
+ * @param {object} b bridge.getState() 的结果
+ * @param {boolean} enabled Config.remoteConnect.enabled（是否由启动器托管）
+ * @param {boolean} busy 是否有插件动作在进行
+ * @param {string} busyAction 进行中的动作（安装中/卸载中…）
+ * @param {(action:string)=>string} [busyLabel] 忙态文案（测试可注入桩）
+ */
+function remoteConnectCardView(b, enabled, busy, busyAction, busyLabel = pluginBusyLabel) {
+  const external = !!b.external
+  const act = String(busyAction || '')
+  let status
+  if (busy) status = { label: act ? busyLabel(act) : (b.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
+  else if (b.error) status = { label: '操作失败', tone: 'error' }
+  else if (external) status = { label: '外部版本', tone: 'ok', title: '由 npm 等方式安装，启动器不托管：不会自动替换为随包版本' }
+  else if (enabled && !b.payloadReady) status = { label: '待安装', tone: 'warn' }
+  else if (enabled && !b.installed) status = { label: '需要安装', tone: 'warn' }
+  else if (enabled && b.outdated) status = { label: '可更新', tone: 'warn' }
+  else if (enabled) status = { label: '已开启', tone: 'ok' }
+  else status = { label: '已关闭', tone: 'muted' }
+
+  if (!external) return { external: false, status, latestVersion: '', outdated: false, toggleAction: '', actions: [] }
+  const actions = busy ? [] : [
+    {
+      action: 'switch',
+      label: '改用随包版本',
+      tone: 'default',
+      confirmTitle: '改用随包版本？',
+      confirmBody: '会把当前插件替换为启动器随包的内置版本（v' + (b.payloadVersion || '') + '），并停止、重启 DSH 服务；进行中的会话会中断。随包版本可能比当前版本旧。',
+    },
+    {
+      action: 'uninstall',
+      label: '卸载',
+      tone: 'danger',
+      confirmTitle: '卸载手机连接？',
+      confirmBody: '会从当前 profile 卸载这个外部安装的插件，并停止、重启 DSH 服务；进行中的会话会中断。',
+    },
+  ]
+  return { external: true, status, latestVersion: '', outdated: false, toggleAction: '', actions }
+}
+
 function buildPluginCatalog(marketState, bridgeState, notes) {
   const noteOf = (id) => String((notes && notes[id]) || '')
   const m = marketState || {}
@@ -4700,6 +4749,9 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
   const bridgeInstalled = !!b.installed
   const bridgeOutdated = !!b.outdated
   const bridgePayloadReady = !!b.payloadReady
+  // 外部安装（npm 等）不归启动器托管：单独映射状态/按钮，避免"可更新到随包版本/重新安装"的假承诺
+  const bridgeView = remoteConnectCardView(b, bridgeEnabled, bridgeBusy, bridgeAct)
+  const bridgeExternal = bridgeView.external
 
   // 「未生效」优先于「已开启 / 已安装」这类清单态：后者读的是 profile 文件，前者是运行中的真相。
   // DSH 对「bundle 被跳过 / 行没激活」只写 stderr、服务照常就绪，于是市场会一直说"重启后生效"，
@@ -4723,17 +4775,7 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       : (m.installed
         ? (marketDisabled ? { label: '已关闭', tone: 'muted' } : { label: marketToggle ? '已启用' : '已安装', tone: 'ok' })
         : { label: '未安装', tone: 'muted' })))
-  const bridgeStatus = unresolvedStatus(bridge.PLUGIN_NAME, bridgeBusy
-    ? { label: bridgeAct ? pluginBusyLabel(bridgeAct) : (b.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
-    : (b.error
-      ? { label: '操作失败', tone: 'error' }
-      : (bridgeEnabled && !bridgePayloadReady
-        ? { label: '待安装', tone: 'warn' }
-        : (bridgeEnabled && !bridgeInstalled
-          ? { label: '需要安装', tone: 'warn' }
-          : (bridgeEnabled && bridgeOutdated
-            ? { label: '可更新', tone: 'warn' }
-            : (bridgeEnabled ? { label: '已开启', tone: 'ok' } : { label: '已关闭', tone: 'muted' }))))))
+  const bridgeStatus = unresolvedStatus(bridge.PLUGIN_NAME, bridgeView.status)
 
   const marketActions = pluginCardActions({
     busy: marketBusy,
@@ -4743,9 +4785,10 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
     uninstallBody: '会重启 DSH 服务，正在运行的会话会中断；之后可随时重新安装。',
   })
 
-  // 手机连接多一个「未开启」态：未开启且未装 → 单独的开启按钮；其余与其它插件同形态
+  // 手机连接多一个「未开启」态：未开启且未装 → 单独的开启按钮；其余与其它插件同形态。
+  // 外部安装（npm 等）不在这里算按钮：它的动作由 remoteConnectCardView 单独给（改用随包版本/卸载）。
   let bridgeActions = []
-  if (!bridgeBusy) {
+  if (!bridgeBusy && !bridgeExternal) {
     if (!bridgeEnabled && !bridgeInstalled) {
       bridgeActions = [{ action: 'enable', label: '开启手机连接', tone: 'primary' }]
     } else {
@@ -4891,22 +4934,24 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       installed: bridgeInstalled,
       enabled: bridgeEnabled,
       version: b.installedPackageVersion || b.version || '',
-      latestVersion: b.payloadVersion || '',
-      outdated: bridgeOutdated,
+      latestVersion: bridgeExternal ? '' : (b.payloadVersion || ''),
+      outdated: bridgeExternal ? false : bridgeOutdated,
       payloadReady: bridgePayloadReady,
       busy: bridgeAct || b.busy || '', // 同插件市场：动作忙态必须反映到卡片上
       error: b.error || (bridgeEnabled && !bridgePayloadReady ? (b.payloadError || '插件 payload 不可用') : ''),
       activation: activationText(bridge.PLUGIN_NAME),
       lastChange: pluginReceiptText(b),
-      autoInstall: bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
+      autoInstall: !bridgeExternal && bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
       tags: pluginTagsOf({
-        preset: true, // 随启动器分发
-        autoInstall: bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
-        offLabel: bridgeEnabled ? (bridgePayloadReady ? '已关闭自动安装' : 'payload 不可用') : '已关闭',
+        preset: !bridgeExternal, // 外部安装不是"随启动器分发"
+        autoInstall: !bridgeExternal && bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
+        offLabel: bridgeExternal
+          ? '外部版本'
+          : (bridgeEnabled ? (bridgePayloadReady ? '已关闭自动安装' : 'payload 不可用') : '已关闭'),
       }),
-      toggleAction: 'toggle', // 开关有真实语义：开启=装插件，关闭=卸载插件
+      toggleAction: bridgeExternal ? '' : 'toggle', // 开关有真实语义：开启=装插件，关闭=卸载插件；外部安装不归启动器托管
       status: bridgeStatus,
-      actions: bridgeActions,
+      actions: bridgeExternal ? bridgeView.actions : bridgeActions,
     },
     ...npmEntries,
     // Profile 里真实存在、但不在上面的注册表里的插件（见 pluginInventoryCards）。

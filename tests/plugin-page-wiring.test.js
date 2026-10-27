@@ -183,7 +183,7 @@ test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.match(main, /case 'pluginsInstallAll'/, '应有一键安装命令')
   assert.match(main, /pluginInstallAll: \{/, 'state 应下发一键安装进度')
   assert.match(main, /key: 'bridge-next', label: '手机连接'/, '一键安装应覆盖手机连接')
-  assert.match(main, /toggleAction: 'toggle'/, '手机连接开关应有真实启停语义')
+  assert.match(main, /toggleAction: bridgeExternal \? '' : 'toggle'/, '手机连接开关：托管安装可启停，外部安装不渲染（不是启动器在管）')
   assert.match(main, /require\('\.\/plugin-switch'\)/, '主进程应加载 user patch layer 启停模块')
   assert.match(main, /pluginSwitch\.setEnabled\(d\.npm, action === 'enable'\)|pluginSwitch\.setEnabled\(descriptor\.npm, action === 'enable'\)/, 'npm 插件开关应走 user patch layer')
   assert.match(main, /reconcileDisabledPackages\(MANAGED_NPM_PLUGINS/, '启动时应把 DSH market 的禁用状态落到 patch 层')
@@ -479,6 +479,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     sliceFn('function pluginReceiptText(raw) {', '\n}\n'),
     sliceFn('function pluginRepoOf(id) {', '\n}\n'),
     sliceFn('function pluginTagsOf(opts) {', '\n}\n'),
+    sliceFn('function remoteConnectCardView(b, enabled, busy, busyAction, busyLabel = pluginBusyLabel) {', '\n}\n'),
     sliceFn('function buildPluginCatalog(marketState, bridgeState, notes) {', '\n}\n'),
   ].join('\n')
   const installed = new Set(registry.map((d) => d.npm))
