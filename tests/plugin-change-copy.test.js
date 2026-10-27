@@ -12,15 +12,12 @@ test('批量确认说明开始先停服、会话中断、最后手动启动，�
   assert.match(body, /重新启动服务/)
   assert.doesNotMatch(read('README.md'), /变更不打断会话/)
 })
-test('手机连接开关在发命令前说明安装/卸载与重启，取消恢复勾选且不执行', () => {
-  const start = ui.indexOf("$('pluginCards').addEventListener('change'")
-  const body = ui.slice(start, ui.indexOf("$('btnPluginsRefresh')", start))
-  assert.match(body, /id === 'bridge-next'/)
-  assert.match(body, /会安装手机连接插件/)
-  assert.match(body, /会卸载手机连接插件/)
-  assert.match(body, /进行中的会话会中断/)
-  assert.ok(body.indexOf('await confirmDialog') < body.indexOf("await cmd('pluginAction'"))
-  assert.match(body, /if \(!ok\) \{ input\.checked = !turnOn; input\.disabled = false; return; \}/)
+test('npm 插件开关直接改 patch 层：不再有手机连接专用的安装/卸载确认', () => {
+  const startAt = ui.indexOf("$('pluginCards').addEventListener('change'")
+  const body = ui.slice(startAt, ui.indexOf("$('btnPluginsRefresh')", startAt))
+  assert.doesNotMatch(body, /id === 'bridge-next'/, '不再有手机连接专用分支')
+  assert.doesNotMatch(body, /会安装手机连接插件|会卸载手机连接插件/, '开关不再安装/卸载包')
+  assert.match(body, /await cmd\('pluginAction'/, '开关仍走通用 pluginAction 命令')
 })
 test('启动器更新失败保留重试入口和失败解释', () => {
   const update = read('ui-src/update.js')

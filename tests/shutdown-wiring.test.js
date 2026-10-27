@@ -110,37 +110,17 @@ test('停止过程中旧 child 退出并产生同签名后继，必须再次停�
   assert.deepEqual(h.calls, [42, 43])
   assert.equal(h.server.claimedPid, 0)
 })
-test('在途启动准备必须取消且等它结束，不能停服成功后晚到 spawn', async () => {
-  const h = stopHarness()
-  h.server.child = null
-  h.server.startPromise = null
-  let release, spawned = 0, prepared
-  const preparing = new Promise((resolve) => { prepared = resolve })
-  const ctx = {
-    server: h.server, reallyExit: false, serviceStopping: () => false,
-    // 桌面快捷键模式默认开启：本条只验证"在途启动准备可被取消"，用 SELF_TEST 走原分支（不引入桥/登录辅助）
-    SELF_TEST: true,
-    // 远程连接开启：桥自愈是启动准备里最慢的一步，正好用来验证"在途准备可被取消"
-    Config: { desktopShell: true, remoteConnect: { enabled: true } },
-    setDesktopShellGate: () => {},
-    markLoadingProgress: () => {}, portOpen: async () => false,
-    envReport: { plan: { dshBin: 'mock-bin', nodeCmd: 'mock-node' } },
-    fs: { existsSync: () => true },
-    bridge: { ensureRuntimeDeps: () => new Promise((resolve) => { release = resolve; prepared() }), getState: () => ({ installed: false }) },
-    spawn: () => { spawned++; throw new Error('不能启动') }, log: () => {},
-  }
-  const body = source.slice(source.indexOf('async function ensureBridgeStartupMaintenance('), source.indexOf('function killPid('))
-  vm.runInNewContext(body + ';globalThis.start=startServerInner', ctx)
-  h.server.startPromise = ctx.start()
-  await preparing
-  let completed = false
-  const stopping = h.stop({ managedOnly: true, force: true }).then((result) => { completed = true; return result })
-  await Promise.resolve()
-  assert.equal(completed, false)
-  release()
-  assert.equal(await stopping, true)
-  assert.equal(await h.server.startPromise, false)
-  assert.equal(spawned, 0)
+test('启动准备顺序：先迁移旧 payload → 再打运行时补丁 → 最后才 spawn', () => {
+  const body = source.slice(source.indexOf('async function maybeMigrateBridgePayloadInstall('), source.indexOf('function killPid('))
+  assert.ok(body.includes('async function startServerInner('), '切片应覆盖 startServerInner')
+  const migrateAt = body.indexOf('await maybeMigrateBridgePayloadInstall()')
+  const patchAt = body.indexOf('bridgePatch.apply({ profileDir: DSH_PROFILE_DIR, log })')
+  const spawnAt = body.indexOf('child = spawn(')
+  assert.ok(migrateAt > 0, '启动前要先做旧 payload → npm 迁移')
+  assert.ok(patchAt > migrateAt, '迁移之后才给 npm 版打运行时补丁（否则补丁打不到新装的版本）')
+  assert.ok(spawnAt > patchAt, '补丁完成之后才 spawn 服务（profile 改写不能与 dsh 进程并行）')
+  assert.match(body, /迁移检查异常（不阻断启动）/, '迁移失败不能阻断启动')
+  assert.match(body, /运行时补丁异常（不阻断启动）/, '补丁失败不能阻断启动')
 })
 test('更新期禁止普通启动，只有 DSH 更新协调器允许自己的校验启动', async () => {
   let calls = 0

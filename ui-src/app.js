@@ -2229,7 +2229,7 @@ $('pluginCards').addEventListener('click', async (e) => {
   const verb = PLUGIN_ACTION_VERB[action] || '处理';
   btn.disabled = true;
   btn.textContent = '处理中…';
-  const changeHint = (action === 'enable' || action === 'disable') && id !== 'bridge-next'
+  const changeHint = (action === 'enable' || action === 'disable')
     ? '修改启用状态后，需要手动重启服务生效'
     : '会停止并重启 DSH 服务，进行中的会话会中断，约 10~60 秒';
   setPluginCardFeedback(btn, `正在${verb}「${name}」…（${changeHint}）`);
@@ -2251,7 +2251,7 @@ $('pluginCards').addEventListener('click', async (e) => {
   if (fresh) renderPlugins(fresh, true);
 });
 
-// 开关式插件（如手机连接）：勾选即开启、取消即关闭并卸载
+// 开关式插件（走 user patch layer 的真实启停）：勾选即启用、取消即停用（不卸载包）
 $('pluginCards').addEventListener('change', async (e) => {
   const input = e.target.closest('input[data-plugin-action]');
   if (!input) return;
@@ -2264,20 +2264,10 @@ $('pluginCards').addEventListener('change', async (e) => {
     return;
   }
   input.disabled = true;
-  if (id === 'bridge-next') {
-    const ok = await confirmDialog({
-      title: turnOn ? '开启手机连接？' : '关闭手机连接？',
-      body: (turnOn ? '会安装手机连接插件' : '会卸载手机连接插件') + '，并停止、重新启动 DSH 服务；进行中的会话会中断。',
-      confirmText: turnOn ? '安装并开启' : '卸载并关闭',
-      danger: !turnOn,
-    });
-    if (!ok) { input.checked = !turnOn; input.disabled = false; return; }
-  }
   const r = await cmd('pluginAction', { id, action });
   if (r && r.ok) {
     const verb = turnOn ? '已开启' : '已关闭';
-    showConsoleToast(r.restartPending ? `插件${verb}；点顶部「立即重启生效」后生效`
-      : id === 'bridge-next' ? `手机连接${verb}，服务已重启生效` : `插件${verb}`);
+    showConsoleToast(r.restartPending ? `插件${verb}；点顶部「立即重启生效」后生效` : `插件${verb}`);
   }
   const fresh = await cmd('pluginsGetState');
   if (fresh) renderPlugins(fresh, true);

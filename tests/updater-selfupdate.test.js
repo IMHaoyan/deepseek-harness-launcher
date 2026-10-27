@@ -45,16 +45,14 @@ test('electron-updater 的 logger 挂到启动器日志（否则它的报错打�
   assert.match(init, /\[updater\]/, '日志要带前缀，便于在启动器日志里过滤')
 })
 
-test('主进程接线：启动前 import 自检跑起来，失败进日志与卡片', () => {
-  assert.match(mainSrc, /void runBridgeImportCheck\(\)/, '启动流程要触发一次自检（不拖启动）')
-  assert.match(mainSrc, /await bridge\.importCheckPayload\(\)/, '自检要真的调用 bridge 的实现')
-  assert.match(mainSrc, /启动前 import 自检失败（重启不会改变，插件不会生效）/, '失败要落日志并说明重启无用')
-  assert.match(mainSrc, /pluginActivation\.importCheckIssue\(bridge\.PLUGIN_NAME/, '失败要挂到插件卡片上')
-  assert.match(mainSrc, /启动前 import 自检异常（不阻断启动）/, '自检自身出问题也不能阻断启动')
+test('主进程接线：启动服务前先把旧 payload 迁到 npm 版本，并给 npm 版打运行时补丁', () => {
+  assert.match(mainSrc, /await maybeMigrateBridgePayloadInstall\(\)/, '启动流程要触发一次性迁移')
+  assert.match(mainSrc, /bridgePatch\.apply\(\{ profileDir: DSH_PROFILE_DIR, log \}\)/, '启动前要给已装 npm 版打补丁')
+  assert.match(mainSrc, /async function maybeMigrateBridgePayloadInstall\(\)/, '迁移逻辑必须存在',)
+  assert.match(mainSrc, /迁移检查异常（不阻断启动）/, '迁移自身出问题也不能阻断启动')
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'))
+  assert.ok(pkg.build.files.includes('bridge-patch.js'), 'bridge-patch.js 要进打包清单')
+  assert.ok(pkg.build.files.includes('dsh-cli.js'), 'dsh-cli.js 要进打包清单')
+  assert.ok(!pkg.build.files.includes('bridge.js'), 'bridge.js 已退役，不应再进打包清单')
 })
 
-test('自检结论不参与启动判定（只做证据，不改变启动结果）', () => {
-  const fn = mainSrc.slice(mainSrc.indexOf('async function runBridgeImportCheck'))
-  const body = fn.slice(0, fn.indexOf('\n}\n'))
-  assert.doesNotMatch(body, /return false|throw /, '自检不得让 startServer 失败')
-})

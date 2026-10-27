@@ -81,7 +81,6 @@ test('开关失败、重启失败必须有 toast；重启按钮不会被状态�
 
 test('卡片 busy 合并动作忙态：市场/手机连接操作期间开关与按钮也要禁用', () => {
   assert.match(main, /busy: marketAct \|\| m\.busy/, '插件市场卡片要合并动作忙态，不能只写 m.busy')
-  assert.match(main, /busy: bridgeAct \|\| b\.busy/, '手机连接卡片同理')
 })
 
 test('筛选计数口径一致：已安装只认 installed（与右上角 N 个已安装同口径）', () => {

@@ -25,6 +25,7 @@ const health = require('./health')
 const diagnostics = require('./diagnostics')
 const recoveryPlan = require('./recovery-plan')
 const market = require('./market')
+const dshCli = require('./dsh-cli')
 const pluginSwitch = require('./plugin-switch')
 const pluginInventory = require('./plugin-inventory')
 const pluginRepo = require('./plugin-repo')
@@ -40,7 +41,7 @@ const changelog = require('./changelog')
 const notifyPolicy = require('./notify-policy')
 const crashNote = require('./crash-note')
 const startProgress = require('./start-progress')
-const bridge = require('./bridge')
+const bridgePatch = require('./bridge-patch')
 const desktopShell = require('./desktop-shell')
 const desktopSignin = require('./desktop-signin')
 const pluginActivation = require('./plugin-activation')
@@ -127,7 +128,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgeExternalAdopt: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -176,15 +177,14 @@ function initEnvRuntime() {
         await refreshEnv(true)
         if (silent) {
           log('silent install done, detection switched (service left as-is)')
-          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallPluginMarket(); void maybeAutoInstallBridge(); void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
+          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallPluginMarket(); void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
           return
         }
         if (envReady()) {
           log('environment ready after install, starting service')
           await handleStart()
           void maybeAutoInstallPluginMarket() // 首次安装环境完成后：默认装上插件市场
-          void maybeAutoInstallBridge() // 以及远程连接插件
-          void maybeAutoInstallRecommendedPlugins() // 以及默认代装的推荐插件
+          void maybeAutoInstallRecommendedPlugins() // 以及默认代装的推荐插件（含手机连接）
           void maybeRemoveRetiredPlugins() // 以及自动卸掉已从注册表摘除的退役插件（老用户升级后生效）
           if (server.running()) {
             await sleep(400)
@@ -252,8 +252,7 @@ function maybeStartDeferred() {
     log('environment became ready, starting deferred service')
     void handleStart()
     void maybeAutoInstallPluginMarket() // 环境/服务刚就绪：补上插件市场默认安装
-    void maybeAutoInstallBridge() // 远程连接插件同样补装
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 对话回退）同样补装
+    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（手机连接 / 用量与计费 / 技能管理 / 对话回退）同样补装
     void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）同样补卸
   }
 }
@@ -397,7 +396,7 @@ function applyConfigJson(cfg) {
   }
   // tabsEnabled：设置页开关已移除，恒为关闭（精简标题栏）；历史配置里的值不再生效
   // 桌面快捷键模式（默认开启；SELF_TEST 恒关）：旧配置没有这个键 → 本版起一次性自动开启并留痕，
-  // 用户显式关闭则永远尊重（与 remoteConnect 的迁移语义一致）。真正的启用还有"激活闸门"：
+  // 用户显式关闭则永远尊重（与插件默认代装的语义一致）。真正的启用还有"激活闸门"：
   // 桥就绪 + 登录辅助已被当前服务加载，否则本次按 web runtime 跑（见 desktopGate）。
   if (typeof cfg.desktopShell === 'boolean') {
     Config.desktopShell = cfg.desktopShell
@@ -482,19 +481,8 @@ function applyConfigJson(cfg) {
       if (typeof key === 'string' && key && typeof val === 'string' && val) Config.pluginNotes[key] = val.slice(0, 500)
     }
   }
-  // 远程连接（DSH Bridge Next）：默认开启；旧配置没有这个键 → 升级后自动开启并留痕
-  // 与 Config 默认值严格比较：只有「旧配置没有这个键」才自动开启（缺字段的畸形对象不触发）
-  if (cfg.remoteConnect === undefined) {
-    Config.remoteConnect = { enabled: true, autoEnabledFor: app.getVersion(), declined: false }
-  } else if (cfg.remoteConnect && typeof cfg.remoteConnect === 'object') {
-    if (typeof cfg.remoteConnect.enabled === 'boolean') Config.remoteConnect.enabled = cfg.remoteConnect.enabled
-    // 老配置从没有 enabled 字段 → 同样按「升级后自动开启」处理
-    else Config.remoteConnect = { enabled: true, autoEnabledFor: app.getVersion(), declined: false }
-    if (typeof cfg.remoteConnect.autoEnabledFor === 'string') Config.remoteConnect.autoEnabledFor = cfg.remoteConnect.autoEnabledFor
-    if (typeof cfg.remoteConnect.declined === 'boolean') Config.remoteConnect.declined = cfg.remoteConnect.declined
-  }
-  // 外部安装接管只做一次：记录已完成，避免每次启动都检查/打日志
-  if (typeof cfg.bridgeExternalAdopt === 'string') Config.bridgeExternalAdopt = cfg.bridgeExternalAdopt
+  // 旧版「随包 payload」→ npm 版本的一次性迁移：只做一次，避免每次启动都读 profile
+  if (typeof cfg.bridgePayloadMigrated === 'string') Config.bridgePayloadMigrated = cfg.bridgePayloadMigrated
   // 通知分类开关与「每版本只提醒一次」记账：类型不符一律回默认值（缺省即默认）
   if (cfg.notifyCategories !== undefined) Config.notifyCategories = notifyPolicy.normalizeNotifyCategories(cfg.notifyCategories)
   if (typeof cfg.notifiedLauncherVersion === 'string') Config.notifiedLauncherVersion = cfg.notifiedLauncherVersion
@@ -1043,95 +1031,51 @@ function startServer(occupantRetry = 0, allowDuringUpdate = false) {
   return p
 }
 
-// 「外部安装接管」一次性标记：profile 里的同名插件如果不是启动器 payload 装的（npm / git / 手工 link），
-// 说明启动器不是它的主人 → 不再用 payload 覆盖，并关掉远程连接托管。标记只对这条路径生效。
-const BRIDGE_EXTERNAL_ADOPT = 'bridge-external-1'
+// 「手机连接」已改成和其它预装插件一样的 npm 托管：启动器不再随包分发 payload。
+// 旧版本装的是 link:<...>/bridge-payloads/.../bridge-next.tgz，启动服务前一次性换成 npm 版本。
+const BRIDGE_PLUGIN = '@agents-anywhere/dsh-bridge-next'
+const BRIDGE_PAYLOAD_MIGRATION = 'bridge-payload-to-npm-1'
 
-/**
- * 启动前检查：profile 里的远程连接插件是不是"外部安装"（不是启动器 payload）。
- *
- * 为什么需要（2026-10-27 事故）：用户自己从 npm 装了 2.0.2，启动器的启动自愈把"规格不匹配"
- * 当成"安装内容不完整"，直接重装成随包 payload，等于用自愈覆盖用户选择；随后 payload 的依赖
- * 镜像还悬空了（Cannot find module 'qrcode'）。现在的边界：
- *   - payload 安装（本启动器自己的）→ 什么都不做，交给 ensureBridgeStartupMaintenance() 正常自愈；
- *   - 外部安装（npm / git / 手工 link）→ 启动器不再动它的 profile，并把 remoteConnect 托管关掉，
- *     避免启动自愈 / 自动安装 / 导入自检继续拿 payload 的结论去评价它。
- * 读不到 profile 时不写标记（下次启动重试）；payload 情况也不写标记（以后可能变成外部安装）。
- * @returns {Promise<boolean>} 是否因"发现外部安装"而调整了托管开关
- */
-async function maybeAdoptExternalBridgeInstall() {
-  if (SELF_TEST) return false
-  if (Config.bridgeExternalAdopt === BRIDGE_EXTERNAL_ADOPT) return false
-  const snap = bridge.getState()
-  if (!snap.installed) {
-    Config.bridgeExternalAdopt = BRIDGE_EXTERNAL_ADOPT
-    saveConfig()
-    return false
-  }
-  if (!bridge.externalInstallSpec(snap.spec)) return false // 启动器 payload：自己的，照常自愈
-  let changed = false
-  if (Config.remoteConnect && Config.remoteConnect.enabled) {
-    Config.remoteConnect = Object.assign({}, Config.remoteConnect, { enabled: false, declined: true })
-    log('bridge: 远程连接插件由外部版本提供（' + snap.spec + '），已关闭启动器托管')
-    changed = true
-  } else {
-    log('bridge: 远程连接插件由外部版本提供（' + snap.spec + '），启动器不替换它')
-  }
-  Config.bridgeExternalAdopt = BRIDGE_EXTERNAL_ADOPT
-  saveConfig()
-  if (changed && typeof broadcastState === 'function') broadcastState()
-  return changed
+/** 纯函数：是不是旧版随包 payload 的安装规格（link:/file: 指向 bridge-payloads 或 bridge-next.tgz）。 */
+function isBridgePayloadSpec(spec) {
+  const text = String(spec || '')
+  if (!/^(?:link:|file:)/iu.test(text)) return false
+  return /bridge-payloads/iu.test(text) || /bridge-next\.tgz$/iu.test(text.replace(/\\/gu, '/'))
 }
 
 /**
- * 启动前维护远程连接插件：自愈 payload 解析镜像，必要时重装插件本体。
+ * 一次性迁移：把旧版随包 payload 安装换成 npm 版本。
  *
- * 2026-10-27 本机事故后的两条硬约束：
- *   1. 用户显式关闭远程连接（Config.remoteConnect.enabled=false）时**一律不碰 profile**。
- *      同名插件可能是用户自己从 npm 装的版本（规格是 `^2.0.2`，不是启动器的 `link:`），
- *      旧逻辑把"规格不匹配"径直当成"安装内容不完整"去重装，等于借自愈覆盖用户选择 ——
- *      本机就是这么把 npm 2.0.2 换成自带 2.0.0-dev.11 的。
- *   2. 重装成功后再刷一次运行依赖镜像。ensureRuntimeDeps 先于 install 跑时，镜像会从
- *      "install 马上要剪掉的旧依赖"取源（junction 指向 profile node_modules）；install 完成后
- *      这些 junction 悬空，payload 入口直接 `Cannot find module 'qrcode'` —— 修好了安装却加载失败。
- * @returns {Promise<boolean>} 是否执行了维护（关闭远程连接时 false，用于测试/日志断言）
+ * 放在启动服务前（pnpm 改写 profile 时不能有 dsh 进程占用）。失败不标记、下次启动重试：
+ * 旧 payload 还在 profile 里，服务照样能起来，不会因为迁移失败把人挡在门外。
+ * 成功后清掉旧 payload 缓存；补丁由 startServerInner 里统一的 bridgePatch.apply 打。
  */
-async function ensureBridgeStartupMaintenance() {
-  const before = bridge.getState()
-  if (!Config.remoteConnect || !Config.remoteConnect.enabled) {
-    if (before.installed) log('bridge: 远程连接已关闭，跳过启动前自愈/修复（保留 profile 中现有插件）')
+async function maybeMigrateBridgePayloadInstall() {
+  if (SELF_TEST) return false
+  if (Config.bridgePayloadMigrated === BRIDGE_PAYLOAD_MIGRATION) return false
+  const cur = market.getState(BRIDGE_PLUGIN)
+  if (!cur.installed || !isBridgePayloadSpec(cur.spec)) {
+    Config.bridgePayloadMigrated = BRIDGE_PAYLOAD_MIGRATION
+    saveConfig()
     return false
   }
+  log('bridge: 检测到旧版随包 payload 安装（' + cur.spec + '），迁移到 npm 版本 …')
   try {
-    await bridge.ensureRuntimeDeps()
-  } catch (err) {
-    log('bridge: 启动前运行依赖自愈失败：' + ((err && err.message) || String(err)))
-  }
-  try {
-    const bridgeSnap = bridge.getState()
-    const wouldRepair = bridgeSnap.installed && bridgeSnap.payloadReady
-      && (!bridgeSnap.materializedPatchReady || !bridgeSnap.specMatchesPayload)
-    if (wouldRepair && bridge.externalInstallSpec(bridgeSnap.spec)) {
-      // 外部版本（npm 等）不是 payload 的产物：启动器不替换它（2026-10-27 覆盖事故的护栏）
-      log('bridge: 远程连接插件由外部版本提供（' + bridgeSnap.spec + '），跳过 payload 修复')
-    } else if (wouldRepair) {
-      log('bridge: 远程连接插件安装内容不完整（缺少 bundle patch），启动前修复 …')
-      const repaired = await bridge.install()
-      if (!repaired.ok) {
-        log('bridge: 启动前修复失败：' + (repaired.error || '未知原因'))
-      } else {
-        log('bridge: 启动前修复完成 v' + (repaired.version || bridgeSnap.payloadVersion))
-        try {
-          await bridge.ensureRuntimeDeps()
-        } catch (err) {
-          log('bridge: 修复后运行依赖刷新失败：' + ((err && err.message) || String(err)))
-        }
-      }
+    const upgraded = await market.installByName(BRIDGE_PLUGIN, { force: true })
+    if (!upgraded.ok) {
+      log('bridge: 迁移到 npm 版本失败（下次启动重试）：' + (upgraded.error || '未知原因'))
+      return false
     }
+    Config.bridgePayloadMigrated = BRIDGE_PAYLOAD_MIGRATION
+    saveConfig()
+    log('bridge: 已迁移到 npm 版本 ' + (upgraded.version || '') + '；手机连接此后随 npm 更新')
+    // 旧 payload 缓存（~/.dsh/dshl/bridge-payloads）不再需要；删不掉也不影响功能
+    try { fs.rmSync(path.join(HOME, 'dshl', 'bridge-payloads'), { recursive: true, force: true }) } catch { /* noop */ }
+    return true
   } catch (err) {
-    log('bridge: 启动前完整性检查失败：' + ((err && err.message) || String(err)))
+    log('bridge: 迁移到 npm 版本异常（下次启动重试）：' + ((err && err.message) || String(err)))
+    return false
   }
-  return true
 }
 
 async function startServerInner(occupantRetry = 0) {
@@ -1160,17 +1104,18 @@ async function startServerInner(occupantRetry = 0) {
     if (plan.kind === 'source') log('（源码版需要先构建：在仓库运行 pnpm install && pnpm run build）')
     return false
   }
-  // 启动前检查：外部安装（npm 等）不归启动器托管 —— 只调整托管开关，不改 profile。
+  // 「手机连接」旧版随包 payload → 一次性迁移到 npm 版本；再给已装的 npm 版打运行时补丁
+  // （设置左栏入口 / 直接铺开面板 / 嵌套弹层关闭 / 进程查询修复）。任何一步失败都不阻断启动。
   try {
-    await maybeAdoptExternalBridgeInstall()
+    await maybeMigrateBridgePayloadInstall()
   } catch (err) {
-    log('bridge: 外部安装检查异常（不阻断启动）：' + ((err && err.message) || String(err)))
+    log('bridge: 迁移检查异常（不阻断启动）：' + ((err && err.message) || String(err)))
   }
-  // Bridge Next 是 profile 的 bundle 层。市场改 profile 时可能剪掉 Bridge 依赖的
-  // DSH 注入包，缓存里的 junction 会悬空；每次启动先自愈，再判断是否需要重装插件本体。
-  // 维护逻辑收进 ensureBridgeStartupMaintenance()：它要能单测，且必须尊重
-  // Config.remoteConnect.enabled（用户关了远程连接就不能借自愈改写 profile）。
-  await ensureBridgeStartupMaintenance()
+  try {
+    bridgePatch.apply({ profileDir: DSH_PROFILE_DIR, log })
+  } catch (err) {
+    log('bridge: 运行时补丁异常（不阻断启动）：' + ((err && err.message) || String(err)))
+  }
   // 桌面快捷键模式（Config.desktopShell）：连接快捷键持久化桥 + 安装 Host 侧登录辅助 bundle。
   // 必须在 spawn 之前完成：preload 的同步配置只认"桥就绪 + 登录辅助已被本代服务加载"，
   // 且 profile 改写不能有 dsh 进程占用。任何一步失败都 fail-closed → 本次按 web runtime 运行
@@ -1208,7 +1153,6 @@ async function startServerInner(occupantRetry = 0) {
   server.phaseAt = 0
   server.errTail = [] // 上一代的 stderr 不能当成本代的失败原因
   resetActivationEvidence() // 插件"没生效"的证据同样随世代清空（含滑动窗口；见 resetActivationEvidence 注释）
-  void runBridgeImportCheck() // 启动前自检：异步跑，不拖启动；结果只进日志与卡片
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
   let child
   try {
@@ -1966,43 +1910,12 @@ function activationIssueOf(packageName) {
  * 滑动窗口必须一起清：后继若继承了同一根 stderr 管道，旧窗口里的行会被再解析一次，
  * 清完证据却留着窗口等于把旧结论重新记回来。清完后继启动时的新跳过行会正常落进新证据。
  *
- * 这里连启动器的 import 自检条目一起清：那是「起服务之前」对磁盘 payload 的一次性结论，
- * 会在下一次由 dshl 拉起服务时重跑并重新记（startServerInner 里的 runBridgeImportCheck）；
- * 跨进程留着一个"启动前"结论，既没有归属者，payload 被换掉后还会变成假警报。
+ * 这里连启动器的 import 自检条目一起清：那是「起服务之前」对磁盘条目的历史结论，跨进程留着
+ * 既没有归属者，条目被换掉后还会变成假警报。
  */
 function resetActivationEvidence() {
   server.activationWindow = []
   server.activationIssues = []
-}
-
-/**
- * 启动前 import 自检：DSH 加载器对"插件模块导入失败"只回一句 `… : failed to import`，
- * 真正的原因（缺哪个包 / 哪个命名导出没了 / Node 太老）被吞掉，"装了却永远不生效"于是只能靠人工复现。
- * 这里用**运行中的 Node** 试一次 payload 入口，把原因带回日志与卡片。
- * 只读、异步、失败不阻断启动。
- */
-async function runBridgeImportCheck() {
-  try {
-    // 远程连接被用户关闭时，payload 自检结论与 profile 里实际装的（可能是用户自己从 npm
-    // 装的版本）插件无关；跑它只会把 payload 的缺口误报成"插件未生效"的假警报。
-    if (!Config.remoteConnect || !Config.remoteConnect.enabled) return
-    const snap = bridge.getState()
-    if (!snap.installed || !snap.payloadReady) return
-    // 外部版本（npm 等）不是 payload 的产物：拿 payload 的 import 结论评价它只会误报"插件未生效"
-    if (bridge.externalInstallSpec(snap.spec)) return
-    const check = await bridge.importCheckPayload()
-    if (!check) return
-    if (check.ok) {
-      log('bridge: 启动前 import 自检通过（payload v' + (snap.installedPackageVersion || '') + '）')
-      return
-    }
-    const detail = redact(String(check.error || '').trim() || '未知原因')
-    log('bridge: 启动前 import 自检失败（重启不会改变，插件不会生效）：' + detail)
-    server.activationIssues.push(pluginActivation.importCheckIssue(bridge.PLUGIN_NAME, detail))
-    broadcastState() // 卡片立刻显示"未生效 + 真实原因"
-  } catch (err) {
-    log('bridge: 启动前 import 自检异常（不阻断启动）：' + ((err && err.message) || String(err)))
-  }
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
@@ -2988,7 +2901,6 @@ function pluginReceiptText(raw) {
 function clearPluginReceipts() {
   let n = 0
   try { n += market.clearLastChanges() } catch { /* noop */ }
-  try { n += bridge.clearLastChanges() } catch { /* noop */ }
   return n
 }
 
@@ -2996,7 +2908,6 @@ function clearPluginReceipts() {
 function expirePluginReceipts() {
   let n = 0
   try { n += market.expireLastChanges(LAST_CHANGE_TTL_MS) } catch { /* noop */ }
-  try { n += bridge.expireLastChanges(LAST_CHANGE_TTL_MS) } catch { /* noop */ }
   if (n > 0) {
     log('[plugins] ' + n + ' 条动作回执超过 ' + Math.round(LAST_CHANGE_TTL_MS / 1000) + 's 未生效，已退场')
     broadcastState()
@@ -3115,20 +3026,7 @@ async function maybeAutoInstallPluginMarket() {
   }
 }
 
-// ---------- 远程连接（DSH Bridge Next） ----------
-let bridgeAutoInstalling = false
-let bridgeAutoTriedFor = ''
-let bridgeAutoLastError = ''
-
-/** payload 目录：打包后由 extraResources 放在 resources/bridge-next；开发态用仓库 assets。 */
-function resolveBridgePayloadRoot() {
-  const resourceDir = path.join(process.resourcesPath || '', 'bridge-next')
-  const devDir = path.join(ASSETS_DIR, 'bridge-next')
-  const dir = app.isPackaged ? resourceDir : devDir
-  return fs.existsSync(path.join(dir, 'version.json')) ? dir : devDir
-}
-
-/** 桌面壳登录辅助 bundle 的 payload 目录（打包后 extraResources / 开发态仓库 assets）。 */
+// ---------- 桌面壳登录辅助 bundle ----------
 function resolveDesktopSigninPayloadRoot() {
   const resourceDir = path.join(process.resourcesPath || '', 'dshl-desktop-signin')
   const devDir = path.join(ASSETS_DIR, 'dshl-desktop-signin')
@@ -3290,95 +3188,6 @@ async function stopServiceForPluginChange() {
   return { ok: true }
 }
 
-/** 手动开启/关闭远程连接：装/卸插件并重启服务生效。 */
-/**
- * 开启/关闭远程连接（改 profile）。opts.defer=true 时不重启，交给批量流程攒着。
- * 注意：即使 defer，也要先把服务停掉——pnpm 改写 profile 依赖树时不能让 dsh 进程在跑。
- */
-async function applyRemoteConnect(enabled, opts = {}) {
-  const snap = bridge.getState()
-  const stop = await stopServiceForPluginChange()
-  if (!stop.ok) return stop
-  if (enabled) {
-    // 外部版本（npm 等）已经在 profile 里：启动器的 payload 安装会把它换掉，属于覆盖用户选择。
-    // 只有显式 force（控制台「重装」）才允许切回 payload 版本。
-    const current = bridge.getState()
-    if (!opts.force && current.installed && bridge.externalInstallSpec(current.spec)) {
-      log('bridge: 远程连接插件由外部版本提供（' + current.spec + '），跳过 payload 安装')
-      return { ok: true, external: true, version: current.installedPackageVersion || '' }
-    }
-    const r = await bridge.install({ force: !!opts.force })
-    if (!r.ok) return r
-    if (opts.defer) deferPluginChange('install', bridge.PLUGIN_NAME, '手机连接')
-    else await applyPluginChange('install', r.version || snap.payloadVersion, { name: bridge.PLUGIN_NAME, profile: bridge.PROFILE_NAME, logTag: 'bridge', label: '远程连接插件' })
-    return { ok: true, version: r.version || '' }
-  }
-  const r = await bridge.uninstall()
-  if (!r.ok) return r
-  if (opts.defer) deferPluginChange('uninstall', bridge.PLUGIN_NAME, '手机连接')
-  else await applyPluginChange('uninstall', '', { name: bridge.PLUGIN_NAME, profile: bridge.PROFILE_NAME, logTag: 'bridge', label: '远程连接插件' })
-  return { ok: true }
-}
-
-/**
- * 远程连接插件自动安装（幂等，可多处调用）：
- *   - 「远程连接」开启（默认开启；旧配置升级后自动开启）时保证插件已装；
- *   - 每次启动器运行时最多真正尝试一次（bridgeAutoTriedFor 记账，失败不刷屏），
- *     页面加载成功会重新武装（见 noteBridgeRuntime），所以失败后不必手动重启启动器；
- *   - payload 不可用 / 环境未就绪 / 服务未跑起来时都不记账、不打扰。
- */
-async function maybeAutoInstallBridge() {
-  if (SELF_TEST) return
-  if (bridgeAutoInstalling) return
-  if (!Config.remoteConnect || !Config.remoteConnect.enabled) return
-  if (bridgeAutoTriedFor === app.getVersion()) return
-  const snap = bridge.getState()
-  if (!snap.payloadReady) return
-  // 外部版本（npm 等）已经在 profile 里：不再用 payload 版本替换它（2026-10-27 覆盖事故的护栏）
-  if (snap.installed && bridge.externalInstallSpec(snap.spec)) {
-    bridgeAutoTriedFor = app.getVersion()
-    return
-  }
-  // 已装、启用，且物化版本就是当前 payload 的版本：不去动正在运行的服务，并记账避免每次 onTick 都重复读 profile。
-  // 启动器升级带了新的 payload（tgz 文件名不变、包版本变了）时 snap.outdated=true，这里会走一次重装。
-  if (snap.installed && !snap.outdated) { bridgeAutoTriedFor = app.getVersion(); return }
-  if (!server.running()) return // 等页面加载成功后由 noteBridgeRuntime 再次驱动
-  if (!envReady()) return
-  if (!envReport || !envReport.pnpm || envReport.pnpm.status !== 'ok') {
-    const detail = envReport && envReport.pnpm ? (envReport.pnpm.detail || '未就绪') : '未检测到 pnpm'
-    log('bridge: pnpm 未就绪，暂不自动安装远程连接插件（' + detail + '）')
-    return
-  }
-  bridgeAutoInstalling = true
-  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装远程连接插件')
-  if (!releaseProfileOp) { bridgeAutoInstalling = false; return }
-  try {
-    bridgeAutoTriedFor = app.getVersion()
-    log('bridge: 自动安装远程连接插件 …')
-    const r = await applyRemoteConnect(true)
-    if (r.ok) {
-      bridgeAutoLastError = ''
-      log('bridge: 自动安装完成')
-    } else {
-      bridgeAutoLastError = (r && r.error) || '未知原因'
-      log('bridge: 自动安装失败：' + bridgeAutoLastError)
-      notify('DeepSeek Harness Launcher', '远程连接插件自动安装失败（可在插件页手动重试）：' + String(bridgeAutoLastError).slice(0, 120), undefined, 'recovery')
-    }
-  } finally {
-    bridgeAutoInstalling = false
-    releaseProfileOp()
-    broadcastState()
-  }
-}
-
-/** 页面加载成功（服务真正就绪）后重新武装自动安装：一次运行内允许再次尝试（如服务刚起来那次）。 */
-function noteBridgeRuntime() {
-  if (SELF_TEST) return
-  if (bridgeAutoInstalling) return
-  if (bridgeAutoTriedFor !== app.getVersion()) return
-  bridgeAutoTriedFor = ''
-  void maybeAutoInstallBridge()
-}
 // ---------- 插件注册表（控制台「插件」页的唯一数据源） ----------
 // 以后新增插件：在 buildPluginCatalog() 里补一条描述，并在 runManagedPluginAction() 里补动作分支。
 // 页面只消费 state.plugins，不需要再为每个插件写专用 DOM / 事件。
@@ -3432,33 +3241,6 @@ async function uninstallManagedMarket(opts = {}) {
   return r
 }
 
-async function setRemoteConnectManaged(enabled, opts = {}) {
-  const decline = !enabled
-  const r = await applyRemoteConnect(enabled, { defer: !!opts.defer })
-  if (r.ok) {
-    Config.remoteConnect.enabled = enabled
-    Config.remoteConnect.declined = decline
-    try { saveConfig() } catch { /* noop */ }
-  }
-  if (enabled) bridgeAutoTriedFor = app.getVersion()
-  else bridgeAutoLastError = ''
-  broadcastState()
-  return r
-}
-
-async function reinstallRemoteConnectManaged(opts = {}) {
-  bridgeAutoTriedFor = app.getVersion()
-  const r = await applyRemoteConnect(true, { force: true, defer: !!opts.defer })
-  if (r.ok) {
-    Config.remoteConnect.enabled = true
-    Config.remoteConnect.declined = false
-    bridgeAutoLastError = ''
-    try { saveConfig() } catch { /* noop */ }
-  }
-  broadcastState()
-  return r
-}
-
 // profile 里可能是精确版本、"^1.2.6" 或 "file:…" 规格；只取纯 semver，取不到就当未知（不显示可更新）。
 function cleanInstalledVersion(spec) {
   const s = String(spec || '')
@@ -3478,6 +3260,18 @@ function cleanInstalledVersion(spec) {
 // 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
 // tests/plugin-page-wiring.test.js 的默认代装断言与 README「插件管理」小节。
 const MANAGED_NPM_PLUGINS = [
+  {
+    id: 'bridge-next',
+    order: 20,
+    npm: '@agents-anywhere/dsh-bridge-next',
+    name: '手机连接',
+    autoInstall: true,
+    subtitle: 'DSH Bridge Next · 远程连接',
+    description: '在 DSH 设置页提供「手机连接」分区，支持手机扫码、云端登录和本机会话管理。',
+    icon: '📱',
+    category: '远程连接',
+    repo: '', // 没有公开仓库：标题保持不可点
+  },
   {
     id: 'better-sidebar',
     order: 30,
@@ -3671,7 +3465,7 @@ function pluginInventoryCards() {
     inventoryCardsCache = { key, cards: [] }
     return []
   }
-  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm).concat([market.PLUGIN_NAME, bridge.PLUGIN_NAME]))
+  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm).concat([market.PLUGIN_NAME]))
   let cards = []
   try {
     cards = pluginInventory.inventoryCards({
@@ -3710,7 +3504,6 @@ function invalidatePluginInventory() {
 /** 插件卡片 / 提示条用的人类可读名字。 */
 function pluginDisplayName(id) {
   if (id === 'dshmarket') return '插件市场'
-  if (id === 'bridge-next') return '手机连接'
   if (String(id || '').startsWith(pluginInventory.INVENTORY_ID_PREFIX)) {
     return pluginInventory.shortName(String(id).slice(pluginInventory.INVENTORY_ID_PREFIX.length))
   }
@@ -3844,14 +3637,14 @@ async function resolveNpmVersion(name) {
 async function checkManagedPluginUpdates() {
   await Promise.all(MANAGED_NPM_PLUGINS.map((d) => resolveNpmVersion(d.npm)))
   broadcastState()
-  return buildPluginCatalog(market.getState(), bridge.getState(), Config.pluginNotes)
+  return buildPluginCatalog(market.getState(), Config.pluginNotes)
 }
 
 /** 插件卡片上的本地备注：只存 DSHL 配置（~/.dsh/dshl/config.json），不写进 DSH profile。 */
 function setManagedPluginNote(id, text) {
   const pid = String(id || '').slice(0, 80)
   if (!pid) return { ok: false, error: '插件 id 不能为空' }
-  const known = pid === 'dshmarket' || pid === 'bridge-next' || MANAGED_NPM_PLUGINS.some((d) => d.id === pid)
+  const known = pid === 'dshmarket' || MANAGED_NPM_PLUGINS.some((d) => d.id === pid)
   if (!known) return { ok: false, error: '未知插件：' + pid }
   const note = String(text == null ? '' : text).replace(/\s+/gu, ' ').trim().slice(0, 500)
   if (note) Config.pluginNotes[pid] = note
@@ -3897,7 +3690,6 @@ async function installAllManagedPlugins() {
       targets.push({ key: d.id, label: d.name, run: () => runNpmPluginAction(d, 'install', { defer: true }) })
     }
     if (!market.getState().installed) targets.push({ key: 'dshmarket', label: '插件市场', run: () => installManagedMarket({ defer: true }) })
-    if (!bridge.getState().installed) targets.push({ key: 'bridge-next', label: '手机连接', run: () => setRemoteConnectManaged(true, { defer: true }) })
     if (gatedNames.length) log('[plugins] 一键安装跳过 ' + gatedNames.length + ' 个需先授权的插件：' + gatedNames.join('、'))
     pluginInstallAllTarget = targets.length
     if (targets.length) {
@@ -3960,14 +3752,13 @@ async function installAllManagedPlugins() {
 /** 本页所有「可更新」的插件。目标与卡片同源：都来自 buildPluginCatalog 的 outdated。 */
 function outdatedManagedPluginTargets() {
   const targets = []
-  for (const card of buildPluginCatalog(market.getState(), bridge.getState(), Config.pluginNotes)) {
+  for (const card of buildPluginCatalog(market.getState(), Config.pluginNotes)) {
     if (!card.outdated) continue
     // gated = 目标版本会被 DSH 的版本门禁拒绝（卡片上写着「需授权后更新到 vX」的那批）。
     // 一键更新必须跳过它们，并且**不**代用户授权：授权是风险接受，只能在卡片上单独拍板一次。
     const gated = !!(card.gate && card.gate.state === 'gated')
     const def = MANAGED_NPM_PLUGINS.find((d) => d.id === card.id)
     if (def) targets.push({ key: def.id, label: def.name, gated, run: () => runNpmPluginAction(def, 'update', { defer: true }) })
-    else if (card.id === 'bridge-next') targets.push({ key: 'bridge-next', label: '手机连接', gated: false, run: () => reinstallRemoteConnectManaged({ defer: true }) })
   }
   return targets
 }
@@ -4161,7 +3952,7 @@ async function maybeAutoInstallRecommendedPlugins() {
   if (recommendedAutoInstalling) return
   const ver = app.getVersion()
   if (Config.pluginAutoInstallTriedVersion === ver) return
-  if (marketAutoInstalling || bridgeAutoInstalling || pluginInstallAllRunning) return
+  if (marketAutoInstalling || pluginInstallAllRunning) return
   const targets = pendingAutoInstallPlugins()
   if (!targets.length) {
     // 没什么可装的也记账：省掉之后每个 tick 都去读 profile 判断
@@ -4303,7 +4094,7 @@ async function maybeRemoveRetiredPlugins() {
   if (retiredPluginCleanupRunning) return
   const ver = app.getVersion()
   if (Config.pluginRetiredCleanupVersion === ver) return
-  if (marketAutoInstalling || bridgeAutoInstalling || recommendedAutoInstalling || pluginInstallAllRunning) return
+  if (marketAutoInstalling || recommendedAutoInstalling || pluginInstallAllRunning) return
   const targets = pendingRetiredPlugins()
   if (!targets.length) {
     Config.pluginRetiredCleanupVersion = ver
@@ -4429,6 +4220,9 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
     // 装/更新不能把用户关掉的开关悄悄打开；禁用状态继续压在新版本上。
     if (wasDisabled) pluginSwitch.setEnabled(descriptor.npm, false)
     notePluginAutoDeclined(descriptor.id, false) // 手动装回来 → 以后继续自动维护
+    // 「手机连接」装/更新成功后立刻打运行时补丁（设置左栏入口 / 页面形态 / 进程查询修复）；
+    // 其它插件不受影响（bridge-patch 只认这一个包）。补丁失败不影响安装结果。
+    try { bridgePatch.apply({ profileDir: DSH_PROFILE_DIR, log }) } catch { /* fail-open */ }
     if (opts.defer) deferPluginChange(action, descriptor.npm, descriptor.name)
     else await applyPluginChange('install', r.version || '', { name: descriptor.npm, profile: market.PROFILE_NAME, logTag: 'plugins', label: descriptor.name })
     return { ok: true, version: r.version || '', releaseAge: r.releaseAge || null }
@@ -4543,11 +4337,6 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
       }
       return r
     }
-  }
-  if (pid === 'bridge-next') {
-    if (act === 'enable' || act === 'install' || act === 'toggle') return setRemoteConnectManaged(!Config.remoteConnect.enabled, { defer })
-    if (act === 'disable' || act === 'uninstall') return setRemoteConnectManaged(false, { defer })
-    if (act === 'switch' || act === 'reinstall') return reinstallRemoteConnectManaged({ defer })
   }
   return { ok: false, error: '未知插件或操作：' + pid + '/' + act }
 }
@@ -4688,70 +4477,12 @@ function pluginCardActions(opts) {
   return out
 }
 
-/**
- * 远程连接卡片视图：把 bridge.getState() 映射成卡片状态/按钮（纯函数，便于单测）。
- *
- * 外部安装（npm / git / 手工 link）不是启动器托管的版本。旧实现会拿随包 payload 版本去比
- * 「可更新到 v2.0.0-dev.11 / 重新安装」，而按钮点下去（force）会把 npm 版本换回随包版本
- * —— 与真实动作不符，也是 2026-10-27 覆盖事故的同源问题。外部安装单独映射：
- *   - 状态写「外部版本」（悬停解释：启动器不托管、不会自动替换）；
- *   - 不显示「可更新/重新安装」；开关不渲染（不是启动器在管）；
- *   - 只保留两个显式动作：「改用随包版本」（确认后 force 切回）与「卸载」。
- * @param {object} b bridge.getState() 的结果
- * @param {boolean} enabled Config.remoteConnect.enabled（是否由启动器托管）
- * @param {boolean} busy 是否有插件动作在进行
- * @param {string} busyAction 进行中的动作（安装中/卸载中…）
- * @param {(action:string)=>string} [busyLabel] 忙态文案（测试可注入桩）
- */
-function remoteConnectCardView(b, enabled, busy, busyAction, busyLabel = pluginBusyLabel) {
-  const external = !!b.external
-  const act = String(busyAction || '')
-  let status
-  if (busy) status = { label: act ? busyLabel(act) : (b.busy === 'installing' ? '安装中…' : '卸载中…'), tone: 'busy' }
-  else if (b.error) status = { label: '操作失败', tone: 'error' }
-  else if (external) status = { label: '外部版本', tone: 'ok', title: '由 npm 等方式安装，启动器不托管：不会自动替换为随包版本' }
-  else if (enabled && !b.payloadReady) status = { label: '待安装', tone: 'warn' }
-  else if (enabled && !b.installed) status = { label: '需要安装', tone: 'warn' }
-  else if (enabled && b.outdated) status = { label: '可更新', tone: 'warn' }
-  else if (enabled) status = { label: '已开启', tone: 'ok' }
-  else status = { label: '已关闭', tone: 'muted' }
-
-  if (!external) return { external: false, status, latestVersion: '', outdated: false, toggleAction: '', actions: [] }
-  const actions = busy ? [] : [
-    {
-      action: 'switch',
-      label: '改用随包版本',
-      tone: 'default',
-      confirmTitle: '改用随包版本？',
-      confirmBody: '会把当前插件替换为启动器随包的内置版本（v' + (b.payloadVersion || '') + '），并停止、重启 DSH 服务；进行中的会话会中断。随包版本可能比当前版本旧。',
-    },
-    {
-      action: 'uninstall',
-      label: '卸载',
-      tone: 'danger',
-      confirmTitle: '卸载手机连接？',
-      confirmBody: '会从当前 profile 卸载这个外部安装的插件，并停止、重启 DSH 服务；进行中的会话会中断。',
-    },
-  ]
-  return { external: true, status, latestVersion: '', outdated: false, toggleAction: '', actions }
-}
-
-function buildPluginCatalog(marketState, bridgeState, notes) {
+function buildPluginCatalog(marketState, notes) {
   const noteOf = (id) => String((notes && notes[id]) || '')
   const m = marketState || {}
-  const b = bridgeState || {}
-  // 动作忙态优先：它覆盖「停服务 → 改 profile → 重启服务」整段（market/bridge 自己的 busy 只到 pnpm 结束）
+  // 动作忙态优先：它覆盖「停服务 → 改 profile → 重启服务」整段（market 自己的 busy 只到 pnpm 结束）
   const marketAct = String(pluginActionBusy.get('dshmarket') || '')
-  const bridgeAct = String(pluginActionBusy.get('bridge-next') || '')
   const marketBusy = !!marketAct || m.busy === 'installing' || m.busy === 'uninstalling'
-  const bridgeBusy = !!bridgeAct || b.busy === 'installing' || b.busy === 'uninstalling'
-  const bridgeEnabled = !!Config.remoteConnect.enabled
-  const bridgeInstalled = !!b.installed
-  const bridgeOutdated = !!b.outdated
-  const bridgePayloadReady = !!b.payloadReady
-  // 外部安装（npm 等）不归启动器托管：单独映射状态/按钮，避免"可更新到随包版本/重新安装"的假承诺
-  const bridgeView = remoteConnectCardView(b, bridgeEnabled, bridgeBusy, bridgeAct)
-  const bridgeExternal = bridgeView.external
 
   // 「未生效」优先于「已开启 / 已安装」这类清单态：后者读的是 profile 文件，前者是运行中的真相。
   // DSH 对「bundle 被跳过 / 行没激活」只写 stderr、服务照常就绪，于是市场会一直说"重启后生效"，
@@ -4775,8 +4506,6 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       : (m.installed
         ? (marketDisabled ? { label: '已关闭', tone: 'muted' } : { label: marketToggle ? '已启用' : '已安装', tone: 'ok' })
         : { label: '未安装', tone: 'muted' })))
-  const bridgeStatus = unresolvedStatus(bridge.PLUGIN_NAME, bridgeView.status)
-
   const marketActions = pluginCardActions({
     busy: marketBusy,
     installed: !!m.installed,
@@ -4784,26 +4513,6 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
     uninstallTitle: '卸载插件市场？',
     uninstallBody: '会重启 DSH 服务，正在运行的会话会中断；之后可随时重新安装。',
   })
-
-  // 手机连接多一个「未开启」态：未开启且未装 → 单独的开启按钮；其余与其它插件同形态。
-  // 外部安装（npm 等）不在这里算按钮：它的动作由 remoteConnectCardView 单独给（改用随包版本/卸载）。
-  let bridgeActions = []
-  if (!bridgeBusy && !bridgeExternal) {
-    if (!bridgeEnabled && !bridgeInstalled) {
-      bridgeActions = [{ action: 'enable', label: '开启手机连接', tone: 'primary' }]
-    } else {
-      bridgeActions = pluginCardActions({
-        busy: false,
-        installed: bridgeInstalled,
-        outdated: bridgeEnabled && bridgeOutdated,
-        latestVersion: b.payloadVersion || '',
-        name: '手机连接',
-        uninstallAction: 'disable',
-        uninstallTitle: '卸载手机连接？',
-        uninstallBody: '会卸载 DSH Bridge Next 并重启 DSH 服务，正在运行的会话会中断；之后可随时重新安装。',
-      })
-    }
-  }
 
   // 推荐插件（npm 分发）——卡片完全数据驱动，新增插件只需改 MANAGED_NPM_PLUGINS。
   const npmEntries = MANAGED_NPM_PLUGINS.map((d) => {
@@ -4918,40 +4627,6 @@ function buildPluginCatalog(marketState, bridgeState, notes) {
       toggleAction: marketToggle ? 'toggle' : '',
       status: marketStatus,
       actions: marketActions,
-    },
-    {
-            note: noteOf('bridge-next'),
-      id: 'bridge-next',
-      order: 20,
-      preset: true, // 随启动器分发
-      name: '手机连接',
-      subtitle: 'DSH Bridge Next · 远程连接',
-      description: '在 DSH 设置页提供「手机连接」分区，支持手机扫码、云端登录和本机会话管理。',
-      icon: '📱',
-      category: '远程连接',
-      sourceLabel: '随启动器分发',
-      repo: '', // 随启动器分发、没有公开仓库：标题保持不可点
-      installed: bridgeInstalled,
-      enabled: bridgeEnabled,
-      version: b.installedPackageVersion || b.version || '',
-      latestVersion: bridgeExternal ? '' : (b.payloadVersion || ''),
-      outdated: bridgeExternal ? false : bridgeOutdated,
-      payloadReady: bridgePayloadReady,
-      busy: bridgeAct || b.busy || '', // 同插件市场：动作忙态必须反映到卡片上
-      error: b.error || (bridgeEnabled && !bridgePayloadReady ? (b.payloadError || '插件 payload 不可用') : ''),
-      activation: activationText(bridge.PLUGIN_NAME),
-      lastChange: pluginReceiptText(b),
-      autoInstall: !bridgeExternal && bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
-      tags: pluginTagsOf({
-        preset: !bridgeExternal, // 外部安装不是"随启动器分发"
-        autoInstall: !bridgeExternal && bridgeEnabled && !Config.remoteConnect.declined && bridgePayloadReady,
-        offLabel: bridgeExternal
-          ? '外部版本'
-          : (bridgeEnabled ? (bridgePayloadReady ? '已关闭自动安装' : 'payload 不可用') : '已关闭'),
-      }),
-      toggleAction: bridgeExternal ? '' : 'toggle', // 开关有真实语义：开启=装插件，关闭=卸载插件；外部安装不归启动器托管
-      status: bridgeStatus,
-      actions: bridgeExternal ? bridgeView.actions : bridgeActions,
     },
     ...npmEntries,
     // Profile 里真实存在、但不在上面的注册表里的插件（见 pluginInventoryCards）。
@@ -6090,7 +5765,6 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       const loaded = (() => { try { return wc.getURL() || '' } catch { return '' } })()
       if (loaded.startsWith(WEB_URL) && !server.authPending) {
         maybeCaptureHealthy('page-loaded')
-        noteBridgeRuntime() // 服务真正就绪：必要时补装远程连接插件
       }
     }
     // 鉴权兜底：新 DSH 的 401 提示页（"dsh web authentication required..."）。
@@ -6648,8 +6322,6 @@ function stateJson() {
     logTail = lines.slice(-60).join('\n')
   } catch { /* noop */ }
   const marketState = market.getState()
-  const bridgeState = bridge.getState()
-  const remoteConnectState = { enabled: Config.remoteConnect.enabled, declined: Config.remoteConnect.declined, autoEnabledFor: Config.remoteConnect.autoEnabledFor, plugin: bridgeState }
   return JSON.stringify({
     running: server.running(),
     owned: server.owned(),
@@ -6737,8 +6409,7 @@ function stateJson() {
       checkpoints: recoveryCheckpoints(),
     },
     pluginMarket: marketState,
-    remoteConnect: remoteConnectState,
-    plugins: buildPluginCatalog(marketState, bridgeState, Config.pluginNotes),
+    plugins: buildPluginCatalog(marketState, Config.pluginNotes),
     pluginInstallAll: {
       running: pluginInstallAllRunning,
       kind: pluginBatchKind, // 'install' | 'update'：两个按钮据此决定谁显示进度
@@ -6898,8 +6569,7 @@ function onTick() {
   expirePluginReceipts() // 动作回执超时兜底：不重启的机器上也要自己退场
   maybeStartDeferred() // 安装完成/启动请求时环境未就绪 → 就绪后自动补启动
   if (envReady()) void maybeRepairPnpm() // pnpm 缺失/版本不匹配时后台对齐一次
-  if (envReady() && server.running()) void maybeAutoInstallBridge() // 服务就绪且开关开启时补装远程连接插件
-  if (envReady() && server.running()) void maybeAutoInstallRecommendedPlugins() // 服务就绪时补装默认代装插件（含服务刚起来那次）
+  if (envReady() && server.running()) void maybeAutoInstallRecommendedPlugins() // 服务就绪时补装默认代装插件（含手机连接）
   if (envReady() && server.running()) void maybeRemoveRetiredPlugins() // 服务就绪时清理退役插件（成功即记账，之后不再读 profile）
   // 交接裁决自己驱动状态，不叠第二份探测
   if (!server.settling && (server.claimed() || server.adoptedPid)) void watchTrackedService()
@@ -7603,7 +7273,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         // ---------- 通用插件注册表（控制台「插件」页） ----------
         // 凡是会改 profile 的入口一律走 profile 写锁：并发改写同一份依赖树是
         // "装完插件 DSH 就起不来" 的直接来源（详见 PROFILE_BUSY_ERROR 上方的说明）。
-        case 'pluginsGetState': return JSON.stringify(buildPluginCatalog(market.getState(), bridge.getState(), Config.pluginNotes))
+        case 'pluginsGetState': return JSON.stringify(buildPluginCatalog(market.getState(), Config.pluginNotes))
         case 'pluginCheckUpdates': return JSON.stringify(await checkManagedPluginUpdates())
         case 'pluginSetNote': return JSON.stringify(setManagedPluginNote(value && value.id, value && value.text))
         case 'pluginsApplyRestart': return JSON.stringify(await withProfileOp('重启生效', () => applyPendingPluginChanges()))
@@ -7639,10 +7309,6 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'pluginsRetryEnvFailed': return JSON.stringify(await withProfileOp('重试失败的插件', () => retryPluginEnvFailures()))
         case 'pluginsAckGateNotice': return JSON.stringify(ackPluginGateNotice())
         case 'pluginsGrantEnvFailed': return JSON.stringify(await withProfileOp('授权并重试失败的插件', () => grantAndRetryPluginEnvFailures()))
-        // ---------- 远程连接（DSH Bridge Next 插件安装/卸载） ----------
-        case 'remoteConnectGetState': return JSON.stringify({ enabled: Config.remoteConnect.enabled, declined: Config.remoteConnect.declined, autoEnabledFor: Config.remoteConnect.autoEnabledFor, plugin: bridge.getState() })
-        case 'remoteConnectSet': return JSON.stringify(await withProfileOp('手机连接开关', () => setRemoteConnectManaged(!!(value && value.enabled))))
-        case 'remoteConnectReinstall': return JSON.stringify(await withProfileOp('重装手机连接', () => reinstallRemoteConnectManaged()))
         case 'openDshDir': { // 源码形态"手动更新"：打开源码仓库目录
           const dir = envReport && envReport.dsh && envReport.dsh.dir
           if (dir) {
@@ -8606,8 +8272,8 @@ function init() {
   // 插件市场（market.js）：把 dshmarket 装进 DSH 的 web profile（dsh plugin add/remove 薄封装）
   market.initMarket({ home: realHome, envDetect, log })
   pluginSwitch.initPluginSwitch({ home: HOME, log })
-  // 远程连接（bridge.js）：把随包分发的 DSH Bridge Next 装进 DSH 的 web profile
-  bridge.initBridge({ home: realHome, envDetect, log, payloadRoot: resolveBridgePayloadRoot() })
+  // dsh CLI 薄封装：桌面壳登录辅助等仍需往 profile 里装 link: 包（dsh-cli.js）
+  dshCli.initCli({ home: realHome, envDetect, log })
   // DSH market 的禁用选择也要落到 patch 层：carrier 插件（如 codex-ui）只关自己的
   // hot mount 会留下它对外层 sidebar 的 disabled:true，导致侧栏整块消失。
   const initialPluginSync = pluginSwitch.reconcileDisabledPackages(MANAGED_NPM_PLUGINS.map((d) => d.npm).concat([market.PLUGIN_NAME]))
@@ -8639,8 +8305,7 @@ function init() {
       return
     }
     void maybeAutoInstallPluginMarket() // 插件市场默认安装（每个版本只自动尝试一次）
-    void maybeAutoInstallBridge() // 远程连接插件（默认开启，见 Config.remoteConnect）
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（用量与计费 / 技能管理 / 对话回退）
+    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（手机连接 / 用量与计费 / 技能管理 / 对话回退）
     void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）老用户升级后自动卸载
     if (args.console) {
       showConsolePage('main')

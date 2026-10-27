@@ -157,8 +157,6 @@ test('profile 写锁：所有会改 profile 的入口都必须过锁', () => {
     ['pluginAction', /case 'pluginAction':[\s\S]{0,400}?withProfileOp\(/],
     ['pluginsInstallAll', /case 'pluginsInstallAll':[\s\S]{0,400}?profileOpBusy\(\)/],
     ['pluginsRetryEnvFailed', /case 'pluginsRetryEnvFailed': return JSON\.stringify\(await withProfileOp\(/],
-    ['remoteConnectSet', /case 'remoteConnectSet': return JSON\.stringify\(await withProfileOp\(/],
-    ['remoteConnectReinstall', /case 'remoteConnectReinstall': return JSON\.stringify\(await withProfileOp\(/],
     ['pluginsApplyRestart', /case 'pluginsApplyRestart': return JSON\.stringify\(await withProfileOp\(/],
   ]
   for (const [name, re] of guarded) {
@@ -167,11 +165,11 @@ test('profile 写锁：所有会改 profile 的入口都必须过锁', () => {
 })
 
 test('后台自动流程也要占锁，拿不到就跳过且不记账', () => {
-  for (const label of ['自动安装插件市场', '自动安装远程连接插件', '自动安装推荐插件']) {
+  for (const label of ['自动安装插件市场', '自动安装推荐插件']) {
     assert.match(main, new RegExp(`tryBeginBackgroundProfileOp\\('${label}'\\)`), `${label} 必须占锁`)
   }
   // 一行式：拿不到锁就把单飞标志复位并返回（不能把"已尝试过"记账写下去）
-  assert.match(main, /if \(!releaseProfileOp\) \{ (marketAutoInstalling|bridgeAutoInstalling|recommendedAutoInstalling) = false; return \}/, '拿不到锁必须复位标志并返回')
+  assert.match(main, /if \(!releaseProfileOp\) \{ (marketAutoInstalling|recommendedAutoInstalling) = false; return \}/, '拿不到锁必须复位标志并返回')
 })
 
 test('锁是 fail-fast：后来者立刻拿到可读的拒绝，不排队', () => {
@@ -229,7 +227,6 @@ test('锁：fn 抛错也必须释放（否则整个插件页会永久卡住）',
 test('停服务失败时调用方必须中止（不得在别人占着依赖树时改写 profile）', () => {
   assert.match(main, /async function stopServiceForPluginChange\(\)[\s\S]{0,700}?return \{ ok: false, error: '服务正在停止中，请稍候重试'/, '停不下来必须如实返回失败')
   assert.match(main, /const stop = await stopServiceForPluginChange\(\)\s*\n\s*if \(!stop\.ok\) return stop/, 'dispatchManagedPluginAction 必须检查返回值')
-  assert.match(main, /const stop = await stopServiceForPluginChange\(\)\s*\n\s*if \(!stop\.ok\) return stop/, 'applyRemoteConnect 必须检查返回值')
 })
 
 // ---------- 启动互斥 ----------

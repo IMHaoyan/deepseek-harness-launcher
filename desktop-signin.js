@@ -6,7 +6,7 @@
 // 不补这半步登录弹窗就只能停在「复制登录链接」。
 //
 // 做法：随启动器分发一个极小的 DSH host bundle（assets/dshl-desktop-signin，插件根目录见下），
-// 用官方 CLI 语义 `dsh plugin --profile web add link:<dir>` 装进 web profile（与 bridge.js 同一机制）。
+// 用官方 CLI 语义 `dsh plugin --profile web add link:<dir>` 装进 web profile（与 dsh-cli.js 同一机制）。
 // 该插件只做一件事：watch 账号尝试，发现新的 authorizeUrl 就交给系统默认浏览器。
 //
 // 安装时机：仅当 Config.desktopShell=true，且在 startServerInner **拉起服务之前**（此刻服务已停，
@@ -15,7 +15,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const bridge = require('./bridge')
+const dshCli = require('./dsh-cli')
 
 const PKG_NAME = 'dshl-desktop-signin'
 const PROFILE_NAME = 'web'
@@ -185,7 +185,7 @@ function readProfileManifest() {
   const manifestPath = path.join(profileDir(), 'package.json')
   let st
   try { st = fs.lstatSync(manifestPath) } catch { return undefined }
-  // 与 bridge.js 同一判据：profile 的 package.json 本身不能是符号链接（防被指向任意位置）
+  // 与 dsh-cli.js 同一判据：profile 的 package.json 本身不能是符号链接（防被指向任意位置）
   if (st.isSymbolicLink() || !st.isFile() || st.size > PROFILE_MANIFEST_MAX_BYTES) return undefined
   try {
     const value = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
@@ -277,10 +277,10 @@ async function ensure() {
       const installedAt = recordInstalled(spec, false)
       return { ok: true, installed: true, updated: false, version: payload.version, installedAtMs: installedAt }
     }
-    if (typeof bridge.runCli !== 'function') throw new Error('bridge.runCli 不可用（bridge 未初始化）')
+    if (typeof dshCli.runCli !== 'function') throw new Error('dshCli.runCli 不可用（dsh-cli 未初始化）')
     const target = materialize()
     log('安装到 profile：link:' + target)
-    await bridge.runCli(['add', 'link:' + target.replace(/\\/gu, '/')])
+    await dshCli.runCli(['add', 'link:' + target.replace(/\\/gu, '/')])
     const after = readProfileManifest()
     if (!pluginSatisfied({ manifest: after, spec, version: payload.version, materializedPackage: materializedPackageInfo() })) {
       throw new Error('安装后校验失败（profile dependencies / bundles / node_modules 不一致）')

@@ -14,7 +14,6 @@ const path = require('node:path')
 const root = path.resolve(__dirname, '..')
 const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n?/gu, '\n')
 const main = read('main.js')
-const bridgeSrc = read('bridge.js')
 const market = require('../market')
 
 // ---------- market：进程内回执 ----------
@@ -55,30 +54,6 @@ test('market.expireLastChanges：过期的清掉、新鲜的留着、没时刻�
   market.clearLastChanges()
 })
 
-// ---------- bridge：同一套语义（切片执行真实实现 + 注入假 state） ----------
-
-test('bridge：回执带时刻，clear / expire 语义与 market 一致', () => {
-  const start = bridgeSrc.indexOf('function noteLastChange(text) {')
-  const end = bridgeSrc.indexOf('\n}\n', bridgeSrc.indexOf('function expireLastChanges(maxAgeMs) {')) + 3
-  assert.ok(start > 0 && end > start, '找不到 bridge 的回执实现')
-  const src = bridgeSrc.slice(start, end)
-  const state = { lastChange: '', lastChangeAt: 0 }
-  const api = new Function('state', src + '\nreturn { noteLastChange, clearLastChanges, expireLastChanges }')(state)
-
-  api.noteLastChange('已安装远程连接插件 v2.0.0')
-  assert.equal(state.lastChange, '已安装远程连接插件 v2.0.0')
-  assert.ok(state.lastChangeAt > 0)
-  assert.equal(api.expireLastChanges(60 * 1000), 0, '新鲜的不清')
-  state.lastChangeAt = Date.now() - 10 * 60 * 1000
-  assert.equal(api.expireLastChanges(60 * 1000), 1, '过期的要清')
-  assert.equal(state.lastChange, '')
-  api.noteLastChange('已卸载远程连接插件')
-  assert.equal(api.clearLastChanges(), 1, '生效即清')
-  assert.equal(state.lastChange, '')
-  assert.equal(api.lastChangeAt, undefined)
-  assert.equal(state.lastChangeAt, 0)
-})
-
 // ---------- main：卡片上的显示规则 ----------
 
 test('pluginReceiptText：过期的回执不再上卡片，没时刻的老回执照旧显示', () => {
@@ -116,7 +91,6 @@ test('超时兜底：tick 里清过期回执并推状态，策略是 main 里唯
   const start = main.indexOf('function expirePluginReceipts() {')
   const fn = main.slice(start, main.indexOf('\n}\n', start) + 3)
   assert.match(fn, /market\.expireLastChanges\(LAST_CHANGE_TTL_MS\)/, 'market 的回执按同一份策略过期')
-  assert.match(fn, /bridge\.expireLastChanges\(LAST_CHANGE_TTL_MS\)/, 'bridge 的回执同理')
   assert.match(fn, /if \(n > 0\)[\s\S]{0,200}broadcastState\(\)/, '清掉了才推状态（让那行真的消失）')
   assert.match(fn, /log\('\[plugins\] '/, '退场要留一条日志（便于事后解释）')
 })
@@ -124,11 +98,8 @@ test('超时兜底：tick 里清过期回执并推状态，策略是 main 里唯
 test('卡片接线：三类卡片的回执都过 pluginReceiptText，不再直接摊原始字段', () => {
   assert.match(main, /lastChange: pluginReceiptText\(raw\)/, 'npm 插件卡片')
   assert.match(main, /lastChange: pluginReceiptText\(m\)/, '插件市场卡片')
-  assert.match(main, /lastChange: pluginReceiptText\(b\)/, '手机连接卡片')
   assert.doesNotMatch(main, /lastChange: raw\.lastChange \|\| ''/, '不该再直接摊原始字段')
   // 写回执的两个模块都要带时刻（不然过期判据永远拿不到值）
   assert.match(read('market.js'), /s\.lastChangeAt = Date\.now\(\)/, 'market 写回执要带时刻')
-  assert.match(bridgeSrc, /state\.lastChangeAt = Date\.now\(\)/, 'bridge 写回执要带时刻')
   assert.match(read('market.js'), /lastChangeAt: s\.lastChangeAt/, 'market 要把时刻交给主进程')
-  assert.match(bridgeSrc, /lastChangeAt: state\.lastChangeAt/, 'bridge 同理')
 })

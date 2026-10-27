@@ -62,7 +62,7 @@ function claimSuccessorHarness() {
   }
   vm.createContext(ctx)
   const helperStart = main.indexOf('function resetActivationEvidence(')
-  const helperEnd = main.indexOf('async function runBridgeImportCheck(')
+  const helperEnd = main.indexOf('// 记录一次服务侧失败')
   const claimStart = main.indexOf('function claimSuccessor(')
   const claimEnd = main.indexOf('async function runHandover(')
   assert.ok(helperStart > 0 && helperEnd > helperStart, '找不到 resetActivationEvidence 片段')
@@ -102,10 +102,9 @@ test('插件卡片：「未生效」覆盖清单态，且三类卡片都带 acti
   assert.match(main, /const unresolvedStatus = \(packageName, status\) =>/, '状态要有统一入口')
   assert.match(main, /label: '未生效', tone: 'warn'/, '未生效要有独立状态胶囊')
   assert.match(main, /const marketStatus = unresolvedStatus\(market\.PLUGIN_NAME,/, '插件市场卡片')
-  assert.match(main, /const bridgeStatus = unresolvedStatus\(bridge\.PLUGIN_NAME,/, '手机连接卡片')
   assert.match(main, /const status = unresolvedStatus\(d\.npm,/, 'npm 推荐插件卡片')
   const hits = main.match(/activation: activationText\(/g) || []
-  assert.equal(hits.length, 3, '三类卡片都要带上 activation 文案（市场 / 手机连接 / npm）')
+  assert.equal(hits.length, 2, '两类卡片都要带上 activation 文案（市场 / npm）')
 })
 
 test('界面：⚠ 单独一行显示未生效，胶囊 tooltip 给出原因原文', () => {

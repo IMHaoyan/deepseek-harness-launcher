@@ -40,7 +40,7 @@ test('插件管理页：定位说明 + 绿色「DSHL预装」/ 蓝色「官方�
   assert.doesNotMatch(app, /btnOpenDshMarket/, '渲染层不应再有跳转按钮接线')
   assert.match(main, /label: o\.autoInstall \? 'DSHL预装' : String\(o\.offLabel/, 'DSHL 预装这枚标签应叫「DSHL预装」')
   assert.match(main, /key: 'official', label: '官方推荐', tone: 'official'/, '官方推荐是第二枚标签')
-  assert.match(main, /bridgePayloadReady \? '已关闭自动安装' : 'payload 不可用'/, '手机连接（远程连接）也是预装集合成员')
+  assert.match(main, /id: 'bridge-next',[\s\S]{0,200}?autoInstall: true,/, '手机连接（npm 托管）也是预装集合成员')
   assert.match(app, /plugin-badge-preinstall/, 'DSHL预装标签应渲染绿色胶囊')
   assert.match(app, /plugin-badge-official/, '官方推荐标签要渲染另一种胶囊')
   assert.match(css, /\.plugin-badge-preinstall[^}]*\{[^}]*flex: none;/, '标签应是标题行右端的胶囊（不再跟在包名后面）')
@@ -168,8 +168,8 @@ test('Profile 中的其他插件：真跑渲染 —— 清单内先渲染、小�
 })
 
 test('插件卡片由 state.plugins 数据驱动', () => {
-  assert.match(main, /function buildPluginCatalog\(marketState, bridgeState, notes\)/, '主进程应构建插件注册表状态')
-  assert.match(main, /plugins: buildPluginCatalog\(marketState, bridgeState, Config\.pluginNotes\)/, 'stateJson 应下发 plugins')
+  assert.match(main, /function buildPluginCatalog\(marketState, notes\)/, '主进程应构建插件注册表状态')
+  assert.match(main, /plugins: buildPluginCatalog\(marketState, Config\.pluginNotes\)/, 'stateJson 应下发 plugins')
   assert.match(main, /case 'pluginsGetState'/, '应有插件状态刷新命令')
   assert.match(main, /case 'pluginAction'/, '应有通用插件动作命令')
   assert.match(app, /function renderPlugins\(plugins, force\)/, '控制台应有通用插件渲染器')
@@ -182,8 +182,7 @@ test('插件卡片：状态/开关 + 一键安装契约', () => {
   assert.match(main, /async function installAllManagedPlugins\(\)/, '主进程应有一键安装逻辑')
   assert.match(main, /case 'pluginsInstallAll'/, '应有一键安装命令')
   assert.match(main, /pluginInstallAll: \{/, 'state 应下发一键安装进度')
-  assert.match(main, /key: 'bridge-next', label: '手机连接'/, '一键安装应覆盖手机连接')
-  assert.match(main, /toggleAction: bridgeExternal \? '' : 'toggle'/, '手机连接开关：托管安装可启停，外部安装不渲染（不是启动器在管）')
+  assert.match(main, /for \(const d of MANAGED_NPM_PLUGINS\) \{/, '一键安装应遍历注册表（含手机连接）')
   assert.match(main, /require\('\.\/plugin-switch'\)/, '主进程应加载 user patch layer 启停模块')
   assert.match(main, /pluginSwitch\.setEnabled\(d\.npm, action === 'enable'\)|pluginSwitch\.setEnabled\(descriptor\.npm, action === 'enable'\)/, 'npm 插件开关应走 user patch layer')
   assert.match(main, /reconcileDisabledPackages\(MANAGED_NPM_PLUGINS/, '启动时应把 DSH market 的禁用状态落到 patch 层')
@@ -339,13 +338,11 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
       { id: 'b', name: '插件B', npm: 'pkg-b' },
     ],
     market: { getState: () => ({ installed: false }) },
-    bridge: { getState: () => ({ installed: false }) },
     // 门禁预判：这个用例只关心"每个插件都带 defer、全程不重启"，判定本身另有专门用例
     npmVersionCache: new Map(),
     pluginGateVerdict: () => ({ state: 'ok', dshVersion: '', peers: [], reason: 'test' }),
     runNpmPluginAction: async (d, action, opts) => { deferCalls.push({ id: d.id, action, defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
     installManagedMarket: async (opts) => { deferCalls.push({ id: "dshmarket", action: "install", defer: !!(opts && opts.defer) }); return { ok: true, version: "1.0.0" } },
-    setRemoteConnectManaged: async (enabled, opts) => { deferCalls.push({ id: "bridge-next", action: "install", defer: !!(opts && opts.defer) }); return { ok: true } },
     applyPluginChange: async (verb) => { applied.push(verb); return true },
     deferPluginChange: () => {},
     clearPluginEnvFailure: () => {},
@@ -357,11 +354,10 @@ test('批量安装：每个插件都带 defer，全程不重启（注入桩执�
   const result = await fn(...names.map((k) => ctx[k]))()
 
   assert.equal(stopped, 1, '整个批量流程只应停一次服务')
-  assert.equal(deferCalls.length, 4, '两个推荐插件 + 插件市场 + 手机连接都应参与')
-  assert.ok(deferCalls.some((c) => c.id === 'bridge-next' && c.defer), '手机连接也要带 defer 一起装')
+  assert.equal(deferCalls.length, 3, '两个推荐插件 + 插件市场都应参与')
   assert.ok(deferCalls.every((c) => c.defer), '每个插件都必须带 defer（否则会装一个重启一次）')
   assert.deepEqual(applied, [], '批量流程不得调用 applyPluginChange（那是重启入口）')
-  assert.equal(result.installed, 4)
+  assert.equal(result.installed, 3)
   assert.equal(result.pendingRestart, true, '结果应标记「待重启生效」')
 
   // 锁被占用：一个都不许装（并发改写同一份依赖树正是 profile 损坏的来源）
@@ -392,12 +388,10 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
     stopServiceForPluginChange: async () => ({ ok: false, error: '服务正在停止中，请稍候重试', busy: true }),
     MANAGED_NPM_PLUGINS: [{ id: 'a', name: '插件A', npm: 'pkg-a' }],
     market: { getState: () => ({ installed: false }) },
-    bridge: { getState: () => ({ installed: false }) },
     npmVersionCache: new Map(),
     pluginGateVerdict: () => ({ state: 'ok', dshVersion: '', peers: [], reason: 'test' }),
     runNpmPluginAction: async () => { deferCalls.push('a'); return { ok: true } },
     installManagedMarket: async () => { deferCalls.push('m'); return { ok: true } },
-    setRemoteConnectManaged: async () => { deferCalls.push('b'); return { ok: true } },
     applyPluginChange: async () => true,
     deferPluginChange: () => {},
     clearPluginEnvFailure: () => {},
@@ -449,7 +443,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const marketRepo = marketRepoMatch[1]
 
   // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
-  assert.equal(registry.length, 8, '推荐插件（npm 分发）应为 8 个（会话归档 / MCP Lens 已摘出）')
+  assert.equal(registry.length, 9, '推荐插件（npm 分发）应为 9 个（含手机连接；会话归档 / MCP Lens 已摘出）')
   assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
   assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
   for (const d of registry) {
@@ -459,8 +453,8 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     assert.match(d.npm, /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u, `${d.id} 的 npm 包名不合法：${d.npm}`)
     // 标题要跳到 GitHub 发布页：每条推荐插件都得声明仓库，且存的就是归一化形式
     // （不合法/缺失都会被解析成空串，标题就不再可点 —— 这里把它钉成契约，别让卡片悄悄少一个入口）
-    assert.ok(d.repo, `${d.id} 缺少 repo（标题会不可点）`)
-    assert.equal(pluginRepo.normalizeRepo(d.repo), d.repo, `${d.id} 的 repo 应是归一化的 GitHub 仓库地址：${d.repo}`)
+    if (d.id !== 'bridge-next') assert.ok(d.repo, `${d.id} 缺少 repo（标题会不可点）`)
+    if (d.id !== 'bridge-next') assert.equal(pluginRepo.normalizeRepo(d.repo), d.repo, `${d.id} 的 repo 应是归一化的 GitHub 仓库地址：${d.repo}`)
   }
 
   // 3. 真 buildPluginCatalog + 真 pluginCardActions：每个注册项都必须渲染成一张卡片
@@ -479,8 +473,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     sliceFn('function pluginReceiptText(raw) {', '\n}\n'),
     sliceFn('function pluginRepoOf(id) {', '\n}\n'),
     sliceFn('function pluginTagsOf(opts) {', '\n}\n'),
-    sliceFn('function remoteConnectCardView(b, enabled, busy, busyAction, busyLabel = pluginBusyLabel) {', '\n}\n'),
-    sliceFn('function buildPluginCatalog(marketState, bridgeState, notes) {', '\n}\n'),
+    sliceFn('function buildPluginCatalog(marketState, notes) {', '\n}\n'),
   ].join('\n')
   const installed = new Set(registry.map((d) => d.npm))
   const ctx = {
@@ -488,7 +481,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     PLUGIN_MARKET_REPO: marketRepo,
     pluginRepo,
     LAST_CHANGE_TTL_MS: 60 * 1000,
-    Config: { pluginMarketDeclined: false, pluginNotes: {}, remoteConnect: { enabled: true, declined: false } },
+    Config: { pluginMarketDeclined: false, pluginNotes: {} },
     pluginActionBusy: new Map(),
     // 门禁预判：这里只关心卡片渲染（状态/按钮/顺序），判定本身在 tests/plugin-version-gate.test.js 里钉死。
     // 默认 unknown = 界面按"未能确认"处理，不改变按钮语义。
@@ -512,7 +505,6 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     semver: { valid: () => true, lt: () => false },
     pluginAutoDeclined: () => false,
     // 「插件没生效」的证据注入点：默认没有（见下面第二个用例）
-    bridge: require('../bridge'),
     pluginActivation: require('../plugin-activation'),
     activationIssueOf: (name) => (typeof activationStub === 'function' ? activationStub(name) : undefined),
   }
@@ -520,10 +512,9 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const names = Object.keys(ctx)
   const build = new Function(...names, src + '\nreturn buildPluginCatalog')(...names.map((k) => ctx[k]))
   const marketArg = { installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }
-  const bridgeArg = { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }
-  const catalog = build(marketArg, bridgeArg, {})
+  const catalog = build(marketArg, {})
 
-  assert.equal(catalog.length, registry.length + 2, '插件页应渲染「插件市场 + 手机连接 + 全部推荐插件」')
+  assert.equal(catalog.length, registry.length + 1, '插件页应渲染「插件市场 + 全部注册表插件（含手机连接）」')
   for (const d of registry) {
     const card = catalog.find((c) => c.id === d.id)
     assert.ok(card, '注册表里的 ' + d.id + ' 没有渲染成卡片')
@@ -578,11 +569,11 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   // 3c. 「未生效」必须盖过"已开启/已安装"这类清单态：DSH 对 bundle 被跳过 / 行没激活
   //     只写 stderr、服务照常就绪，于是插件市场一直说"重启后生效"、重启永远不改变它。
   ctx.pluginActionBusy.clear()
-  const target = registry[0]
+  const target = registry.find((d) => d.id !== 'bridge-next')
   activationStub = (name) => (name === target.npm
     ? { kind: 'inactive', packageName: name, entryId: 'some-entry', detail: 'failed to import', services: [] }
     : undefined)
-  const issueCatalog = build(marketArg, bridgeArg, {})
+  const issueCatalog = build(marketArg, {})
   const issueCard = issueCatalog.find((c) => c.id === target.id)
   assert.equal(issueCard.status.label, '未生效', '清单态说"已安装"、运行态没起来时必须说未生效')
   assert.equal(issueCard.status.tone, 'warn')
@@ -592,7 +583,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   activationStub = null
   ctx.pluginActionBusy.delete('better-sidebar')
   assert.deepEqual(
-    build({ installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }, { installed: true, busy: '', error: '', payloadReady: true, installedPackageVersion: '0.1.0', payloadVersion: '0.1.0', lastChange: '' }, {})
+    build({ installed: true, busy: '', error: '', version: '1.46.1', lastChange: '' }, {})
       .find((c) => c.id === 'better-sidebar').actions.map((a) => a.action),
     ['reinstall', 'uninstall'],
     '忙态释放后按钮要回来',
@@ -607,7 +598,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
 
   const notInstalled = ['@michengai/dsh-codex-ui', 'dsh-chat-import', 'dsh-sidebar-qa']
   for (const npm of notInstalled) installed.delete(npm)
-  const mixed = build(marketArg, bridgeArg, {})
+  const mixed = build(marketArg, {})
   assert.deepEqual(mixed.map((c) => c.id), [
     'dshmarket',
     'bridge-next',
@@ -651,10 +642,11 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   // 4. 真 pendingAutoInstallPlugins：默认代装集合 = 注册表里 autoInstall 的那批，且只挑缺失的
   const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
   assert.deepEqual(autoIds, [
+    'bridge-next',
     'usage-billing',
     'skills-manager',
     'rewind',
-  ], '默认代装集合应保持稳定（会话归档 / MCP Lens 摘出注册表后只剩这 3 个）')
+  ], '默认代装集合应保持稳定（手机连接 + 用量与计费 / 技能管理 / 对话回退）')
   for (const d of registry.filter((x) => x.autoInstall)) {
     const card = catalog.find((c) => c.id === d.id)
     assert.deepEqual(card.tags.map((t) => t.label), ['DSHL预装'], d.id + ' 卡片应标「DSHL预装」')
@@ -752,6 +744,7 @@ test('一键更新：目标只取「可更新」的卡片（与卡片同一份�
   const calls = []
   const ctx = {
     MANAGED_NPM_PLUGINS: [
+      { id: 'bridge-next', name: '手机连接', npm: '@agents-anywhere/dsh-bridge-next' },
       { id: 'rewind', name: '对话回退', npm: 'dsh-rewind-plugin' },
       { id: 'context', name: '上下文洞察', npm: 'dsh-context' },
       { id: 'chat-import', name: '会话导入', npm: 'dsh-chat-import' },
@@ -765,10 +758,8 @@ test('一键更新：目标只取「可更新」的卡片（与卡片同一份�
       { id: 'chat-import', outdated: false },
     ],
     market: { getState: () => ({}), PROFILE_NAME: 'web' },
-    bridge: { getState: () => ({}) },
     Config: { pluginNotes: {} },
     runNpmPluginAction: (d, action, opts) => { calls.push({ id: d.id, action, defer: !!(opts && opts.defer) }); return Promise.resolve({ ok: true }) },
-    reinstallRemoteConnectManaged: (opts) => { calls.push({ id: 'bridge-next', action: 'update', defer: !!(opts && opts.defer) }); return Promise.resolve({ ok: true }) },
   }
   const names = Object.keys(ctx)
   const fn = new Function(...names, src + '\nreturn outdatedManagedPluginTargets')(...names.map((k) => ctx[k]))
@@ -778,7 +769,7 @@ test('一键更新：目标只取「可更新」的卡片（与卡片同一份�
   return Promise.all(targets.map((t) => t.run())).then(() => {
     assert.deepEqual(calls.map((c) => c.id), ['bridge-next', 'rewind', 'context'], '每个目标都真的被执行')
     assert.ok(calls.every((c) => c.defer), '更新必须带 defer：否则会更新一个重启一次')
-    assert.deepEqual(calls.filter((c) => c.id !== 'bridge-next').map((c) => c.action), ['update', 'update'], 'npm 插件走 update 动作')
+    assert.deepEqual(calls.map((c) => c.action), ['update', 'update', 'update'], '所有预装插件都走 update 动作')
   })
 })
 

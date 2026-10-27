@@ -95,21 +95,19 @@ test('一次性放行参数只注入 add / remove，且不重复注入', () => {
   assert.deepEqual(ra.withOverride(undefined), [])
 })
 
-test('market.js 与 bridge.js 共用这一份判定，不许再有第二份副本', () => {
-  // 这次故障的**结构性**成因：两个模块各有一份复制粘贴的标记表，注释还写着"口径一致"，
-  // 实际是两份各自会漂移的常量 —— 2026-10-12 两份同时漏掉了第三种表现。
-  for (const rel of ['market.js', 'bridge.js']) {
+test('market.js 与 dsh-cli.js 共用这一份判定，不许再有第二份副本', () => {
+  // 这次故障的**结构性**成因：多个模块各有一份复制粘贴的标记表，注释还写着"口径一致"，
+  // 实际是各自会漂移的常量 —— 2026-10-12 两份同时漏掉了第三种表现。
+  // 现在只保留 release-age.js 一份；bridge.js 退役后，profile 改写的另一个入口是 dsh-cli.js。
+  for (const rel of ['market.js', 'dsh-cli.js']) {
     const src = read(rel)
     assert.match(src, /require\('\.\/release-age'\)/, rel + ' 要从 release-age.js 取判定')
     assert.ok(!/const RELEASE_AGE_MARKERS = \[/.test(src), rel + ' 不许再定义自己的标记表')
     assert.ok(!/was published at \(\[,\\s\]\+\)/u.test(src), rel + ' 不许再定义自己的抠条目正则')
   }
-  // 两个模块导出的行为必须一致（同一个函数，不是"看起来一样"）
   const market = require('../market')
-  const bridge = require('../bridge')
   for (const probe of [REAL_PRECISE, 'ERR_PNPM_EPERM: nope', '']) {
-    assert.equal(market.releaseAgeViolation(probe), bridge.releaseAgeViolation(probe), '两侧判定必须同一口径')
-    assert.equal(market.releaseAgeViolation(probe), ra.isViolation(probe))
+    assert.equal(market.releaseAgeViolation(probe), ra.isViolation(probe), 'market 与 release-age 必须同一口径')
   }
   assert.equal(market.releaseAgeRecoversAt(ra.parseEntries(REAL_PRECISE)), '2026-10-13T05:30:14.858Z')
 })
