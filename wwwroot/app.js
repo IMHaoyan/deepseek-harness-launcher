@@ -43,6 +43,12 @@ const LAUNCHER_CHANNEL_VALUES = [
   { key: 'latest', label: 'latest' },
   { key: 'alpha', label: 'alpha' },
 ];
+// 启动器更新源：auto = GitHub 优先、失败回退国内加速；github = 只用官方；domestic = 只用国内源
+const LAUNCHER_SOURCE_VALUES = [
+  { key: 'auto', label: '自动' },
+  { key: 'github', label: 'GitHub' },
+  { key: 'domestic', label: '国内加速' },
+];
 
 // ---------- 缩放滑块：5% 一档；右侧文本框实时显示，点击即可输入 ----------
 function makeZoomWidget(id, min, max, cmdName, resetCmdName) {
@@ -310,6 +316,14 @@ function render(state) {
     window._lastLauncherChannel = launcherChannel;
     buildChips('launcherChannelChips', LAUNCHER_CHANNEL_VALUES, launcherChannel, (c) => cmd('setLauncherChannel', c.key));
   }
+  // 启动器更新源（设置页）：auto = GitHub 优先、失败回退国内加速；显式选择后不做跨源回退
+  const launcherSource = state.launcherUpdateSource === 'github' || state.launcherUpdateSource === 'domestic'
+    ? state.launcherUpdateSource
+    : 'auto';
+  if (window._lastLauncherSource !== launcherSource) {
+    window._lastLauncherSource = launcherSource;
+    buildChips('launcherSourceChips', LAUNCHER_SOURCE_VALUES, launcherSource, (c) => cmd('setLauncherSource', c.key));
+  }
 
   // 状态
   const running = window._running;
@@ -474,8 +488,9 @@ function render(state) {
   renderPluginEnvIssue(state.pluginEnvIssue, state.pluginEnvNote);
   void renderPluginGateNotice(state.pluginGateNotice);
 
-  // 通知分类开关（设置页）+ 恢复页（检查点/回退记录/服务操作）
+  // 通知分类开关（设置页）+ 桌面快捷键模式状态 + 恢复页（检查点/回退记录/服务操作）
   renderNotifyCategories(state.notifyCategories);
+  renderDesktopShell(state.desktopShell);
   renderRecovery(state);
 
   // 缩放微调按钮（拖动/双击输入；值变化时应用）
@@ -1001,6 +1016,42 @@ const NOTIFY_CATEGORY_VALUES = [
   { key: 'update', label: '更新提醒' },
 ];
 
+// ---------- 桌面快捷键模式（设置页 · 界面与使用） ----------
+// 开关只是「意愿」；真正是否生效由主进程的激活闸门决定（桥就绪 + 登录辅助已被当前服务加载）。
+// 提示文案必须与真实状态一一对应：没生效就写清原因，不能只写"已开启"让用户以为 Ctrl+B 已经能用。
+const DESKTOP_SHELL_REASON_TEXT = {
+  'bridge-not-ready': '桥不可用，按网页模式运行',
+  'signin-not-installed': '服务重启后生效',
+  'signin-not-loaded': '服务重启后生效',
+  'signin-install-failed': '登录辅助安装失败，按网页模式运行',
+  'service-identity-unknown': '正在确认服务状态…',
+};
+
+function renderDesktopShell(info) {
+  const enabled = !!(info && info.enabled);
+  renderToggleChip('btnDesktopShell', enabled, '开启', '关闭');
+  const chip = $('btnDesktopShell');
+  if (chip) {
+    chip.title = enabled
+      ? '已开启：快捷键按桌面运行时解析（Ctrl+B 等可用）；点击关闭后需重启启动器生效'
+      : '已关闭：快捷键按浏览器白名单解析；点击开启后需重启启动器生效';
+  }
+  const hint = $('desktopShellHint');
+  if (!hint) return;
+  let text = '';
+  if (info) {
+    if (info.restartPending) text = '重启启动器后生效';
+    else if (!enabled) text = '';
+    else if (info.active) text = '已生效';
+    else if (DESKTOP_SHELL_REASON_TEXT[info.reason]) text = DESKTOP_SHELL_REASON_TEXT[info.reason];
+    else if (info.reason === 'disabled') text = '重启启动器后生效';
+    else if (info.reason === 'initializing' || info.reason === 'service-not-running') text = '等待服务启动…';
+    else text = '重启启动器后生效';
+  }
+  hint.textContent = text;
+  hint.title = text;
+}
+
 function renderNotifyCategories(cats) {
   const box = $('notifyCategoryChips');
   if (!box) return;
@@ -1358,12 +1409,17 @@ $('btnNotify').addEventListener('click', () => {
   const chip = $('btnNotify');
   cmd('setNotify', !chip.classList.contains('checked'));
 });
+// 桌面快捷键模式：切换只写配置；真正生效需重启启动器（preload 在页面脚本前决定 runtime）
+$('btnDesktopShell').addEventListener('click', () => {
+  const chip = $('btnDesktopShell');
+  void cmd('setDesktopShell', !chip.classList.contains('checked'));
+});
 $('btnOpenEnv').addEventListener('click', () => showPage('env'));
 $('btnEnvBack').addEventListener('click', () => showPage('settings'));
 $('btnReset').addEventListener('click', async () => {
   const ok = await confirmDialog({
     title: '恢复默认设置？',
-    body: '会重置缩放、主题、端口、更新渠道与通知开关，并把窗口恢复为默认尺寸；已安装的 Node / pnpm / DSH 与 DSH 自己的数据不受影响。',
+    body: '会重置缩放、主题、端口、更新渠道、通知开关与桌面快捷键模式，并把窗口恢复为默认尺寸；已安装的 Node / pnpm / DSH 与 DSH 自己的数据不受影响。',
     confirmText: '恢复默认',
     danger: true,
   });

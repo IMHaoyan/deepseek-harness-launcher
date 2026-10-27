@@ -18,8 +18,15 @@
 //   1) 只认「裸」组合。带 Shift/Alt 的变体一律让给 DSH —— 上游的默认绑定大量使用
 //      Ctrl+Alt+X / Ctrl+Shift+X（那正是它白名单允许的形态）。
 //   2) 有功能开关的动作必须跟着开关走。分屏恒关时仍吞 Ctrl+\ 的话，按键既被 preventDefault
-//      又什么都不发生，是个死键；而 Ctrl+\ 恰好是 DSH 白名单里**允许**绑定的少数单修饰键之一。
+//      又什么都不发生，是个死键；而 Ctrl+\ 在 web runtime 下恰好是 DSH 白名单里**允许**绑定的
+//      少数单修饰键之一（desktop runtime 下无白名单限制），让给它才是正确归属。
 //   3) 拿不准就放行。返回 null 的成本是「快捷键可能不生效」，误吞的成本是「用户的键凭空消失」。
+//
+// 2026-10-27 补充（桌面壳模式，见 desktop-shell.js）：Config.desktopShell 打开后 DSH 以
+// desktop runtime 运行、快捷键由原生键盘桥投递。这里返回 null 的键会被 main.js 转发给 DSH，
+// 返回 hit 的键仍然由 dshl 先接管 —— 也就是说表中这组"dshl 保留键"在两种 runtime 下都是
+// 保留的；用户若在 DSH 设置里给 Ctrl+F / Ctrl+R 等绑定命令，会被启动器抢走。这是有意契约，
+// 改动前先看 tests/page-keys.test.js 的归属网格。
 'use strict'
 
 /** 页面视图：完整接管集（查找条 + 分屏 + 聚焦分屏 + 刷新） */

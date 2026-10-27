@@ -64,4 +64,22 @@ function decideCommand(sender, loadingPageUrl, name) {
   return isLoadingPageUrl(sender.url, loadingPageUrl) ? 'allow' : 'deny'
 }
 
-module.exports = { LOADING_PAGE_COMMANDS, isLoadingPageUrl, decideCommand }
+/**
+ * 发送方是否就是 DSH 应用页（桌面壳桥的唯一信任域）。
+ *
+ * 桌面壳桥（dshl:desktop-shell:*）会持久化键位、驱动原生快捷键、关窗口，只能给 DSH 应用页；
+ * 说明页（file://）、外部站点、浏览器标签的其它页面一律不给。判定用「同源 + 路径前缀」，
+ * 不能用裸 startsWith：`http://127.0.0.1:3080.evil` 不该过。
+ * @param {string} url 发送方当前 URL（webContents.getURL()）
+ * @param {string} webUrl 本机 DSH 根地址（http://127.0.0.1:<port>，不含尾斜杠）
+ * @returns {boolean}
+ */
+function isDshAppUrl(url, webUrl) {
+  if (typeof url !== 'string' || typeof webUrl !== 'string') return false
+  if (!url || !webUrl) return false
+  const base = webUrl.endsWith('/') ? webUrl.slice(0, -1) : webUrl
+  if (!base) return false
+  return url === base || url.startsWith(base + '/')
+}
+
+module.exports = { LOADING_PAGE_COMMANDS, isLoadingPageUrl, decideCommand, isDshAppUrl }

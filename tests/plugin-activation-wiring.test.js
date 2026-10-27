@@ -53,6 +53,7 @@ function claimSuccessorHarness() {
     cancelRestartRetry: () => {},
     scheduleHealthyCapture: () => {},
     probeClaimedAuth: () => {},
+    refreshDesktopShellGate: () => {},
     log: () => {},
     lifecycle: { emit: () => { seen.emits += 1 } },
     broadcastState: () => {

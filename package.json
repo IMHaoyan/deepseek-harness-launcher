@@ -59,6 +59,8 @@
       "plugin-activation.js",
       "dsh-plugin-compat.js",
       "bridge.js",
+      "desktop-shell.js",
+      "desktop-signin.js",
       "console-surface.js",
       "update-window.js",
       "changelog.js",
@@ -79,6 +81,10 @@
       {
         "from": "assets/bridge-next",
         "to": "bridge-next"
+      },
+      {
+        "from": "assets/dshl-desktop-signin",
+        "to": "dshl-desktop-signin"
       }
     ],
     "directories": {

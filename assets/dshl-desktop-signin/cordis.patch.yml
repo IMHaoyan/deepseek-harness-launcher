@@ -1,0 +1,6 @@
+# 由 DSHL 安装的桌面壳登录辅助 bundle（见仓库 desktop-signin.js）。
+# 只做一件事：桌面壳模式下，账号登录走到 waiting-browser 时把 authorizeUrl 交给系统浏览器。
+- insert:
+    - id: dshl-desktop-signin
+      name: dshl-desktop-signin
+      config: {}

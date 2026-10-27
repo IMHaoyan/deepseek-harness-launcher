@@ -33,6 +33,81 @@ function normalizeChannel(value) {
   return value === 'alpha' ? 'alpha' : 'latest'
 }
 
+// ---------- 更新源链：GitHub → 国内源 ----------
+//
+// electron-updater 默认只读 app-update.yml 里的 GitHub provider。国内网络下
+// github.com 与 release-assets.githubusercontent.com 经常不可达，自动更新就只剩
+// 「手动下载」一条死路（而下载页也在 GitHub）。运行时可以用 setFeedURL 换源：
+//   - github   —— 官方 provider（现状，也是更新的事实来源）；
+//   - domestic —— generic provider，指向一个提供 latest.yml / alpha.yml 的静态目录。
+//
+// 零成本方案：不托管任何文件，把 GitHub 的 releases/latest/download/ 别名挂到公共加速代理后面。
+// 该别名只指向**正式版**（GitHub 的 latest 语义），所以 alpha 渠道没有公共加速源；
+// 自建镜像（launcherUpdateMirror）可以同时放 latest.yml / alpha.yml，覆盖两个渠道。
+//
+// 安全边界：加速代理搬运的是 GitHub 上的公开文件，latest.yml 里的 sha512 只能校验
+// 「下载完整、与清单一致」，防不了代理同时替换清单和安装包（安装包未做代码签名）。
+// 因此默认只在 GitHub 失败后回退 —— 能直连 GitHub 的机器永远不经过第三方；设置页可固定为 GitHub。
+const GITHUB_REPO = 'IMHaoyan/deepseek-harness-launcher'
+const GITHUB_LATEST_DOWNLOAD = `https://github.com/${GITHUB_REPO}/releases/latest/download/`
+// 只列实测可代理 Releases 资产、支持 Range 的域名；换代理只改这里。
+const PUBLIC_PROXIES = [
+  { host: 'ghfast.top', base: 'https://ghfast.top/' },
+  { host: 'gh-proxy.com', base: 'https://gh-proxy.com/' },
+  { host: 'ghproxy.net', base: 'https://ghproxy.net/' },
+]
+const UPDATE_SOURCES = ['auto', 'github', 'domestic']
+
+function normalizeUpdateSource(value) {
+  return value === 'github' || value === 'domestic' ? value : 'auto'
+}
+
+/** 归一化自建镜像 base：只认 http(s)，末尾补 /；非法值返回 ''（不拿坏地址去请求）。 */
+function normalizeMirror(value) {
+  const raw = String(value == null ? '' : value).trim()
+  if (!raw) return ''
+  let u
+  try { u = new URL(raw) } catch { return '' }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return ''
+  if (!u.pathname.endsWith('/')) u.pathname += '/'
+  u.hash = ''
+  return u.toString()
+}
+
+/**
+ * 纯函数：按「用户选择 + 渠道 + 自建镜像 + 上次成功源」生成有序源列表。
+ * auto：GitHub 优先（官方源是事实来源），失败后依次回退；上次成功的源提到最前，
+ *       让国内用户只在第一次检查时付一次 GitHub 的超时。github/domestic 是显式选择，不回退。
+ * @returns {Array<{id:string,label:string,feed:object}>}
+ */
+function buildUpdateSources(opts = {}) {
+  const configSource = normalizeUpdateSource(opts.source)
+  const channel = normalizeChannel(opts.channel)
+  const mirror = normalizeMirror(opts.mirror)
+  const lastOk = typeof opts.lastOk === 'string' ? opts.lastOk : ''
+  const github = { id: 'github', label: 'GitHub', feed: { provider: 'github', owner: 'IMHaoyan', repo: 'deepseek-harness-launcher' } }
+  const domestic = []
+  if (mirror) {
+    domestic.push({ id: 'mirror', label: '自建镜像', feed: { provider: 'generic', url: mirror, useMultipleRangeRequest: false } })
+  } else if (channel === 'latest') {
+    for (const proxy of PUBLIC_PROXIES) {
+      domestic.push({
+        id: 'proxy:' + proxy.host,
+        label: '国内加速 ' + proxy.host,
+        feed: { provider: 'generic', url: proxy.base + GITHUB_LATEST_DOWNLOAD, useMultipleRangeRequest: false },
+      })
+    }
+  }
+  if (configSource === 'github') return [github]
+  if (configSource === 'domestic') return domestic
+  const ordered = [github, ...domestic]
+  if (lastOk) {
+    const i = ordered.findIndex((s) => s.id === lastOk)
+    if (i > 0) ordered.unshift(ordered.splice(i, 1)[0])
+  }
+  return ordered
+}
+
 const state = {
   status: 'idle', // idle | dev | checking | up-to-date | downloading | downloaded | error
   current: '0.0.0',
@@ -44,6 +119,8 @@ const state = {
   errorKind: '', // network | blocked | not-found | checksum | install | unknown
   errorHint: '',
   channel: 'latest',
+  // 当前实际使用的更新源 id（github / mirror / proxy:<host>）：只用于日志与排障，界面不直接展示
+  activeSource: '',
   // 上一次"点更新→退出安装"的结果：{ target, applied, from }。用户报"点更新就闪退"时，
   // 这条就是唯一能事后说清"到底装上了没有"的证据（见 recordSelfUpdate/readSelfUpdateOutcome）。
   lastSelfUpdate: null,
@@ -126,6 +203,96 @@ function applyChannel() {
   return channel
 }
 
+// ---------- 源链运行时（仅存在于本次进程；每次重新检查按配置重建） ----------
+let sources = []
+let sourceIndex = 0
+let attemptedSources = new Set()
+let fallbackTimer = null
+let readSourcePref = () => 'auto'
+let readMirror = () => ''
+let readLastSource = () => ''
+let recordLastSource = () => {}
+
+function currentSource() {
+  return sources[sourceIndex] || null
+}
+
+/** 当前是否已经试过非 GitHub 的源（失败文案据此承认"国内加速也试过"）。 */
+function domesticAttempted() {
+  for (const id of attemptedSources) if (id !== 'github') return true
+  const cur = currentSource()
+  return !!cur && cur.id !== 'github'
+}
+
+/**
+ * 把当前源落到 electron-updater。reset=true 时按最新配置重建源链并回到第一个。
+ * setFeedURL 在旧版 electron / 测试桩里可能不可用：吞掉并留日志，不让更新器初始化失败。
+ */
+function applySource(reset) {
+  if (reset) {
+    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null }
+    sources = buildUpdateSources({ source: readSourcePref(), channel: state.channel, mirror: readMirror(), lastOk: readLastSource() })
+    sourceIndex = 0
+    attemptedSources = new Set()
+  }
+  const source = currentSource()
+  if (!source) { state.activeSource = ''; return null }
+  state.activeSource = source.id
+  try {
+    autoUpdater.setFeedURL(source.feed)
+    log('updater: source=' + source.id)
+  } catch (err) {
+    log('updater: 设置更新源失败（' + source.id + '）：' + ((err && err.message) || String(err)))
+  }
+  return source
+}
+
+/** 当前源失败后前进到下一个未尝试的源；没有下一个返回 null。 */
+function advanceSource(reason) {
+  const failed = currentSource()
+  if (failed) attemptedSources.add(failed.id)
+  while (sourceIndex + 1 < sources.length) {
+    sourceIndex += 1
+    const next = sources[sourceIndex]
+    if (attemptedSources.has(next.id)) continue
+    state.activeSource = next.id
+    try {
+      autoUpdater.setFeedURL(next.feed)
+    } catch (err) {
+      log('updater: 设置更新源失败（' + next.id + '）：' + ((err && err.message) || String(err)))
+    }
+    log(`updater: 更新源 ${failed ? failed.id : '-'} 失败（${reason || 'unknown'}），回退到 ${next.id}`)
+    return next
+  }
+  return null
+}
+
+/**
+ * 检查/下载失败后切到下一个源重试。返回 true 表示已安排重试（状态由重试接管）。
+ * 用 setTimeout 而不是同步重试：electron-updater 的 downloadPromise 要在本次失败的
+ * finally 里清掉，立刻 check 会拿到同一个旧 promise。
+ */
+function fallbackToNextSource(reason) {
+  if (installHandedOff || state.status === 'downloaded') return false
+  if (fallbackTimer) return true // 同一次失败可能连发多条 error：只回退一次
+  const next = advanceSource(reason)
+  if (!next) return false
+  fallbackTimer = setTimeout(() => {
+    fallbackTimer = null
+    if (installHandedOff || state.status === 'downloaded') return
+    setStatus('checking', { error: '', errorKind: '', errorHint: '' })
+    void runCheck()
+  }, 100)
+  return true
+}
+
+/** 源真的返回了更新信息（更新可用或已是最新）才记账：下次自动检查优先用它。 */
+function noteSourceSucceeded() {
+  const source = currentSource()
+  if (!source) return
+  if (readLastSource() !== source.id) recordLastSource(source.id)
+}
+
 /**
  * 目标版本是否**严格高于**当前版本。
  * 取不到合法版本号时 fail-open（放行）：宁可多给一次更新，也不要拦住真实的升级。
@@ -178,6 +345,47 @@ function describeUpdateError(err) {
   return desc('unknown', '检查更新失败：' + raw)
 }
 
+/**
+ * 所有源都失败后的最终说明（纯函数）。
+ * 与单源失败的区别：要让用户知道「国内加速也试过了」，而不是以为只有 GitHub 一条路；
+ * alpha 渠道另有边界 —— 公共加速只覆盖正式版，反复重试也不会成功。
+ * @param {{kind:string,text:string,hint:string}} desc describeUpdateError 的结果
+ * @param {string} channel latest / alpha
+ * @param {boolean} domesticTried 本次是否已经试过国内源
+ * @param {boolean} [githubTried] 本次是否试过 GitHub（显式 domestic 时不会试，文案不能替用户说"GitHub 也连不上"）
+ */
+function finalFailure(desc, channel, domesticTried, githubTried) {
+  if (channel === 'alpha') {
+    if (desc.kind === 'network' || desc.kind === 'blocked') {
+      return {
+        kind: desc.kind,
+        text: desc.text,
+        hint: 'alpha 渠道没有国内加速源（公共加速只覆盖正式版）：可切回 latest，或换到能访问 GitHub 的网络后重试。',
+      }
+    }
+    return desc
+  }
+  if (!domesticTried) return desc
+  if (desc.kind === 'network' || desc.kind === 'blocked') {
+    const triedGithub = githubTried !== false
+    return {
+      kind: desc.kind,
+      text: triedGithub ? '网络不可达：GitHub 与国内加速源都连不上' : '网络不可达：国内加速源都连不上',
+      hint: triedGithub
+        ? '可稍后重试；或让能访问 GitHub 的同事下载安装包后传给你（覆盖安装不会丢配置）。'
+        : '可稍后重试；或在设置页把「启动器更新源」改为自动/GitHub（需要能访问 GitHub），也可让能访问的同事下载安装包后传给你。',
+    }
+  }
+  if (desc.kind === 'not-found') {
+    return {
+      kind: desc.kind,
+      text: desc.text + '（国内加速源也没有该渠道的更新信息）',
+      hint: '可稍后重试；若长期如此，多半是发布产物尚未同步到加速源。',
+    }
+  }
+  return desc
+}
+
 function initUpdater(opts = {}) {
   if (initDone) return
   initDone = true
@@ -188,6 +396,11 @@ function initUpdater(opts = {}) {
   beforeInstall = opts.beforeInstall || null
   onEvent = opts.onEvent || null
   readChannel = typeof opts.getChannel === 'function' ? opts.getChannel : readChannel
+  // 更新源由主进程注入：auto/github/domestic + 可选的自建镜像 base + 上次成功的源
+  readSourcePref = typeof opts.getSource === 'function' ? opts.getSource : readSourcePref
+  readMirror = typeof opts.getMirror === 'function' ? opts.getMirror : readMirror
+  readLastSource = typeof opts.getLastSource === 'function' ? opts.getLastSource : readLastSource
+  recordLastSource = typeof opts.recordSource === 'function' ? opts.recordSource : recordLastSource
   state.current = opts.currentVersion || app.getVersion()
   selfUpdatePath = opts.selfUpdatePath || ''
   if (!selfUpdatePath) {
@@ -223,9 +436,12 @@ function initUpdater(opts = {}) {
   // 禁止库绕过异步收尾在 quit 事件里直接安装；普通退出由 main 验证后调用 installOnExit。
   autoUpdater.autoInstallOnAppQuit = false
   applyChannel()
+  // 渠道定了才能定源链：alpha 没有公共加速源（latest/download 别名只指向正式版）
+  applySource(true)
 
   autoUpdater.on('checking-for-update', () => setStatus('checking', { error: '', errorKind: '', errorHint: '' }))
   autoUpdater.on('update-available', (info) => {
+    noteSourceSucceeded() // 这个源确实返回了可用信息：下次自动检查优先用它
     // 兜底闸（与 applyChannel 那道一起）：更新源给的版本必须**真的比当前新**。
     // 不新就当作"已是最新"——界面文案与真实动作必须一致，降级绝不能披着"可更新到"的外衣。
     if (!isNewerVersion(info.version, state.current)) {
@@ -237,6 +453,7 @@ function initUpdater(opts = {}) {
     setStatus('downloading', { latest: info.version, percent: 0, error: '', errorKind: '', errorHint: '' })
   })
   autoUpdater.on('update-not-available', () => {
+    noteSourceSucceeded()
     log('updater: already up to date')
     // 必须清掉 latest：否则上一次"已下载"留下的版本号会一直在，界面就会拿它渲染「可更新到 vX」
     setStatus('up-to-date', { latest: '', error: '', errorKind: '', errorHint: '' })
@@ -264,8 +481,13 @@ function initUpdater(opts = {}) {
     if (state.status !== 'downloaded') {
       // 原始英文报错只进日志；界面拿到的是"分类 + 可执行指引"（否则用户对着
       // net::ERR_INTERNET_DISCONNECTED 既不知道是不是 VPN 问题，也不知道下一步做什么）
-      const desc = describeUpdateError(err)
-      setStatus('error', { error: desc.text, errorKind: desc.kind, errorHint: desc.hint })
+      let desc = describeUpdateError(err)
+      // 还有下一个源（GitHub → 国内加速）就切过去重试；安装类失败换源无意义，直接报。
+      // 同一次失败的多条 error 事件由 fallbackToNextSource 自己合并，只回退一次。
+      if (desc.kind === 'install' || !fallbackToNextSource(desc.kind)) {
+        desc = finalFailure(desc, state.channel, domesticAttempted(), attemptedSources.has('github'))
+        setStatus('error', { error: desc.text, errorKind: desc.kind, errorHint: desc.hint })
+      }
     }
     if (onEvent) { try { onEvent('update.launcher', { status: 'error', error: (err && err.message || String(err)).slice(0, 128) }) } catch { /* noop */ } }
   })
@@ -284,11 +506,28 @@ async function check() {
     setStatus('dev', { error: '' })
     return
   }
+  // 每次检查都从源链第一个开始（排序已考虑"上次成功的源"，所以不会反复卡在同一个源）
+  if (!applySource(true)) {
+    setStatus('error', {
+      error: 'alpha 渠道没有可用的国内更新源：公共加速只覆盖正式版',
+      errorKind: 'not-found',
+      errorHint: '在设置页把「启动器更新源」改为自动/GitHub，或把「启动器更新渠道」切回 latest。',
+    })
+    return
+  }
+  await runCheck()
+}
+
+/** 真正发起一次 electron-updater 检查；失败回退重试也走这里（不重建源链）。 */
+async function runCheck() {
   try {
     await autoUpdater.checkForUpdates()
   } catch (err) {
     log('updater check failed: ' + (err && err.message ? err.message : String(err)))
-    const desc = describeUpdateError(err)
+    // 已经切到下一个源：状态交给重试流程，别在这里提前写最终错误
+    if (fallbackTimer) return
+    let desc = describeUpdateError(err)
+    desc = finalFailure(desc, state.channel, domesticAttempted(), attemptedSources.has('github'))
     setStatus('error', { error: desc.text, errorKind: desc.kind, errorHint: desc.hint })
   }
 }
@@ -316,8 +555,24 @@ function onChannelChanged() {
   state.latest = ''
   state.percent = 0
   state.status = 'idle'
+  applySource(true) // 渠道变了，公共加速/自建镜像的可用性跟着变（alpha 没有公共加速源）
   push()
   return channel
+}
+
+/**
+ * 更新源设置改变时调用（配置已更新之后）：
+ *   1. 重建源链并落到 electron-updater；
+ *   2. 作废已下载的包 —— 它可能来自刚才那个源（例如用户从「自动/国内加速」切回
+ *      「GitHub」时，不希望再安装一个经第三方搬运来的包）。重新检查会按新源再下一个。
+ */
+function onSourceChanged() {
+  state.latest = ''
+  state.percent = 0
+  state.status = 'idle'
+  applySource(true)
+  log('updater: source switched to ' + (state.activeSource || '(none)'))
+  push()
 }
 
 function installNow() {
@@ -371,4 +626,4 @@ function installOnExit() {
   return installNow()
 }
 
-module.exports = { initUpdater, getState, check, autoCheck, installNow, installOnExit, isInstalling, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome, describeUpdateError, FAILURE_GUIDE }
+module.exports = { initUpdater, getState, check, autoCheck, installNow, installOnExit, isInstalling, onChannelChanged, normalizeChannel, isNewerVersion, CHANNELS, selfUpdateOutcome, describeUpdateError, FAILURE_GUIDE, onSourceChanged, normalizeUpdateSource, normalizeMirror, buildUpdateSources, UPDATE_SOURCES, PUBLIC_PROXIES, finalFailure }

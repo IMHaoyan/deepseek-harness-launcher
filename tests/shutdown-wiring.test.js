@@ -58,10 +58,12 @@ function stopHarness({ fail = false, external = false, busy = false } = {}) {
     child, claimedPid: 0, claimedAlive: false, adoptedPid: external ? 88 : 0,
     adoptedAlive: external, gen: 0, settling: false, stopping: false,
     owned() { return !!this.child }, claimed() { return this.claimedAlive }, managed() { return this.owned() || this.claimed() },
+    running() { return this.managed() || (this.adoptedPid !== 0 && this.adoptedAlive) },
   }
   const ctx = {
-    server, process: { env: {} }, log: () => {}, redact: (s) => s,
+    server, process: { env: {} }, log: () => {}, redact: (s) => s, SELF_TEST: false,
     beginServiceStop: () => !busy, endServiceStop: () => {}, cancelRestartRetry: () => {}, broadcastState: () => {},
+    setDesktopShellGate: () => {},
     stopPidVerified: async (pid) => { calls.push(pid); if (fail) throw new Error('still alive') },
     clearClaimed: () => { server.claimedPid = 0; server.claimedAlive = false }, lastServiceError: '', waitForCompletion,
   }
@@ -116,6 +118,10 @@ test('在途启动准备必须取消且等它结束，不能停服成功后晚�
   const preparing = new Promise((resolve) => { prepared = resolve })
   const ctx = {
     server: h.server, reallyExit: false, serviceStopping: () => false,
+    // 桌面快捷键模式默认开启：本条只验证"在途启动准备可被取消"，用 SELF_TEST 走原分支（不引入桥/登录辅助）
+    SELF_TEST: true,
+    Config: { desktopShell: true },
+    setDesktopShellGate: () => {},
     markLoadingProgress: () => {}, portOpen: async () => false,
     envReport: { plan: { dshBin: 'mock-bin', nodeCmd: 'mock-node' } },
     fs: { existsSync: () => true },
@@ -138,7 +144,8 @@ test('在途启动准备必须取消且等它结束，不能停服成功后晚�
 test('更新期禁止普通启动，只有 DSH 更新协调器允许自己的校验启动', async () => {
   let calls = 0
   const ctx = {
-    reallyExit: false, exitCleanupComplete: false, server: { startPromise: null },
+    reallyExit: false, exitCleanupComplete: false, server: { startPromise: null, running: () => false },
+    SELF_TEST: false, setDesktopShellGate: () => {},
     updater: { isInstalling: () => false }, dshUpdater: { getState: () => ({ status: 'updating' }) },
     startServerInner: async () => { calls++; return true },
   }

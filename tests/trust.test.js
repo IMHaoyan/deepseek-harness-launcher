@@ -76,3 +76,19 @@ test('isLoadingPageUrl：参数非法/空值不抛错且判否', () => {
     assert.equal(trust.isLoadingPageUrl(u, base), false)
   }
 })
+
+// 桌面壳桥（dshl:desktop-shell:*）只认 DSH 应用页：它能写键位、驱动原生快捷键、关窗口。
+test('isDshAppUrl：只认同源 DSH 应用页，同前缀仿冒/说明页/外部站点都拒绝', () => {
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3080/', DSH_PAGE), true)
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3080', DSH_PAGE), true)
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3080/?token=abc', DSH_PAGE), true, '带 token 的首次加载也是应用页')
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3080/session/x', DSH_PAGE), true)
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3080.evil/', DSH_PAGE), false, '同前缀仿冒域名必须拒绝')
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3080.evil', DSH_PAGE), false)
+  assert.equal(trust.isDshAppUrl('http://127.0.0.1:3081/', DSH_PAGE), false, '换端口是另一个 origin')
+  assert.equal(trust.isDshAppUrl(AUTH_PAGE, DSH_PAGE), false, '说明页不是 DSH 应用页')
+  assert.equal(trust.isDshAppUrl(OTHER_SITE, DSH_PAGE), false)
+  for (const [u, base] of [[null, DSH_PAGE], [DSH_PAGE, null], ['', DSH_PAGE], [DSH_PAGE, ''], [123, DSH_PAGE]]) {
+    assert.equal(trust.isDshAppUrl(u, base), false)
+  }
+})

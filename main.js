@@ -40,6 +40,8 @@ const notifyPolicy = require('./notify-policy')
 const crashNote = require('./crash-note')
 const startProgress = require('./start-progress')
 const bridge = require('./bridge')
+const desktopShell = require('./desktop-shell')
+const desktopSignin = require('./desktop-signin')
 const pluginActivation = require('./plugin-activation')
 const bootFailure = require('./boot-failure')
 const pageKeys = require('./page-keys')
@@ -107,6 +109,9 @@ const HEALTH_SNAPSHOT_DIR = path.join(HOME, 'dshl', 'health-snapshots')
 const CONFIG_PATH = SELF_TEST
   ? path.join(os.tmpdir(), 'dshl-selftest-config.json')
   : path.join(HOME, 'dshl', 'config.json')
+// 桌面壳就绪标记：Host 侧登录辅助 bundle（assets/dshl-desktop-signin）只认这个文件。
+// 桥就绪时写、关闭/退出时删 —— DSH 退回 web runtime 时登录辅助插件必须严格 no-op。
+const DESKTOP_SHELL_MARKER = path.join(HOME, 'dshl', 'desktop-shell.active')
 const SELFTEST_RESULT = path.join(os.tmpdir(), 'dshl-selftest-result.txt')
 // DSH 侧的声明式状态文件：服务起不来时，坏掉的往往就是这几个，
 // 而启动器自己的 config.json 一点没变 —— 所以健康快照必须把它们一起纳入（见 health.js 顶部说明）。
@@ -121,11 +126,30 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
 let webZoomLoaded = false // 对话界面缩放是否来自用户持久化设置（未设置过才跟随系统默认）
+
+// 桌面快捷键模式的「激活闸门」：开关打开 ≠ 本次已启用。只有桥就绪 + 登录辅助已被当前服务加载，
+// 才允许 preload 写 data-platform / dshDesktop（否则切 desktop 会让登录退化成"复制链接"）。
+// adopted 服务（上次非受控退出遗留）通常没加载过辅助 → 本次保持 web，等服务重启后自动生效。
+let desktopGate = { active: false, reason: 'initializing' }
+// 用户刚改过开关、但还没重启启动器：界面必须如实标"重启后生效"，不能只按当前运行态显示
+let desktopShellTogglePending = false
+function desktopShellModeActive() {
+  return Config.desktopShell === true && !SELF_TEST && desktopGate.active === true
+}
+
+// 桌面壳 preload 的同步配置通道：必须早于任何窗口创建注册（SELF_TEST 会在 init 的早退分支里建窗口，
+// 没有 handler 时渲染进程会卡在 sendSync 上，连 did-finish-load 都到不了）。
+desktopShell.registerConfigChannel(ipcMain, {
+  isEnabled: () => Config.desktopShell === true,
+  isLoginReady: () => desktopShellModeActive(),
+  getOrigin: () => ({ host: HOST, port: PORT }),
+  platform: process.platform,
+})
 
 // ---------- 环境探测/安装（env-detect.js / env-install.js） ----------
 let envReport = null
@@ -201,6 +225,10 @@ async function refreshEnv(force = false) {
         log(`ENV-DIAG legacy-node: ${s.legacyNode.dir}（v${s.legacyNode.version || '?'}${s.legacyNode.otherGlobals.length ? `，另有 ${s.legacyNode.otherGlobals.length} 个全局包` : ''}）→ 可迁移到官方 MSI（只迁移 DSH）`)
       }
       broadcastState()
+    }
+    // 桌面壳桥：环境一就绪就尝试连接（失败 fail-closed 回 web runtime，绝不阻塞启动）
+    if (Config.desktopShell && report && report.plan) {
+      void ensureDesktopShellPrepared().then((result) => { if (result.ok) markDesktopShellReady() })
     }
     return report
   } catch (err) {
@@ -367,6 +395,16 @@ function applyConfigJson(cfg) {
     consoleZoomLoaded = true
   }
   // tabsEnabled：设置页开关已移除，恒为关闭（精简标题栏）；历史配置里的值不再生效
+  // 桌面快捷键模式（默认开启；SELF_TEST 恒关）：旧配置没有这个键 → 本版起一次性自动开启并留痕，
+  // 用户显式关闭则永远尊重（与 remoteConnect 的迁移语义一致）。真正的启用还有"激活闸门"：
+  // 桥就绪 + 登录辅助已被当前服务加载，否则本次按 web runtime 跑（见 desktopGate）。
+  if (typeof cfg.desktopShell === 'boolean') {
+    Config.desktopShell = cfg.desktopShell
+  } else if (cfg.desktopShell === undefined) {
+    Config.desktopShell = true
+    Config.desktopShellAutoEnabledFor = app.getVersion()
+  }
+  if (typeof cfg.desktopShellAutoEnabledFor === 'string') Config.desktopShellAutoEnabledFor = cfg.desktopShellAutoEnabledFor
   if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
   if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
   // 反馈分片上限（字符）：界面无入口，作者按飞书实测截断点调；0/缺失 = 用默认值
@@ -383,6 +421,16 @@ function applyConfigJson(cfg) {
   if (cfg.dshChannel === 'alpha' || cfg.dshChannel === 'latest') Config.dshChannel = cfg.dshChannel
   // 启动器自身的更新渠道：只认这两个值，写坏了就保持默认（绝不因为配置脏就去拉预发布包）
   if (cfg.launcherChannel === 'alpha' || cfg.launcherChannel === 'latest') Config.launcherChannel = cfg.launcherChannel
+  // 启动器更新源：auto（GitHub 优先，失败回退国内加速）/ github（只用官方）/ domestic（只用国内源）。
+  // 只认这三个值，写坏了回 auto（国内网络默认也能拿到更新）；升级前的旧配置没有这个键 → 同样回 auto。
+  if (cfg.launcherUpdateSource === 'auto' || cfg.launcherUpdateSource === 'github' || cfg.launcherUpdateSource === 'domestic') {
+    Config.launcherUpdateSource = cfg.launcherUpdateSource
+  }
+  // 自建镜像（可选）：放在国内对象存储/内网静态服务上的 latest.yml + 安装包目录。
+  // 非法地址（非 http/https、空串之外的垃圾）直接丢空 —— 不拿坏地址去发更新请求。
+  if (typeof cfg.launcherUpdateMirror === 'string') Config.launcherUpdateMirror = updater.normalizeMirror(cfg.launcherUpdateMirror)
+  // 上次真正成功的源（github / mirror / proxy:<host>）：auto 模式下下次优先用它，避免反复卡 GitHub。
+  if (typeof cfg.launcherUpdateSourceOk === 'string') Config.launcherUpdateSourceOk = cfg.launcherUpdateSourceOk.slice(0, 120)
   if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
   if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
   if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
@@ -916,6 +964,9 @@ async function handlePortOccupied(source, retryDepth = 0) {
       server.launchSig = null
       log(`detected existing DSH on port ${PORT} (PID ${server.adoptedPid}), adopting`)
       lifecycle.emit('service.adopt', { pid: server.adoptedPid, port: PORT, source: source || 'start' })
+      // 接管的外部服务可能早于登录辅助安装 → 本次保持 web runtime（登录行为不变），
+      // 闸门会用进程启动时刻 vs 安装时刻给出证据；下次服务重启后自动切换。
+      void refreshDesktopShellGate('adopt')
       return true
     }
     if (verdict === 'retry-start') {
@@ -979,7 +1030,13 @@ function startServer(occupantRetry = 0, allowDuringUpdate = false) {
   const p = startServerInner(occupantRetry)
   server.startPromise = p
   const clear = () => { if (server.startPromise === p) server.startPromise = null }
-  p.then(clear, clear)
+  // 启动失败：撤销"预激活"的桌面快捷键模式（闸门在 spawn 前就置 true，失败后必须落回 web）。
+  // 只在确实没有服务在跑时撤销——端口冲突走到 "adopt" 分支时 server.running() 为真，不能误伤。
+  const settle = (ok) => {
+    clear()
+    if (ok !== true && !SELF_TEST && !server.running()) setDesktopShellGate(false, 'start-failed', 'start')
+  }
+  p.then(settle, () => settle(false))
   return p
 }
 
@@ -1026,6 +1083,28 @@ async function startServerInner(occupantRetry = 0) {
     }
   } catch (err) {
     log('bridge: 启动前完整性检查失败：' + ((err && err.message) || String(err)))
+  }
+  // 桌面快捷键模式（Config.desktopShell）：连接快捷键持久化桥 + 安装 Host 侧登录辅助 bundle。
+  // 必须在 spawn 之前完成：preload 的同步配置只认"桥就绪 + 登录辅助已被本代服务加载"，
+  // 且 profile 改写不能有 dsh 进程占用。任何一步失败都 fail-closed → 本次按 web runtime 运行
+  // （登录行为不变，绝不出现"桌面快捷键可用但登录退化"的半套状态）。
+  if (Config.desktopShell && !SELF_TEST) {
+    const prepared = await ensureDesktopShellPrepared()
+    if (!prepared.ok) {
+      setDesktopShellGate(false, 'bridge-not-ready', 'start')
+      log('desktop-shell: 桥未就绪，本次按 web runtime 运行：' + (prepared.error || '未知原因'))
+    } else {
+      const signin = await ensureDesktopSigninInstalled()
+      if (signin.ok) {
+        setDesktopShellGate(true, 'managed-service', 'start')
+        log('desktop-shell: 已启用（自管服务 + 登录辅助 v' + (signin.version || '?') + '）')
+      } else {
+        setDesktopShellGate(false, 'signin-install-failed', 'start')
+        log('desktop-shell: 登录辅助未安装，本次按 web runtime 运行（登录保持网页模式）')
+      }
+    }
+  } else if (!SELF_TEST) {
+    setDesktopShellGate(false, 'disabled', 'start')
   }
   // 环境/插件准备期间也可能收到退出或停止，不能晚到再启动一个无人收尾的孩子。
   if (reallyExit || serviceStopping() || server.gen !== startGeneration) return false
@@ -1459,6 +1538,7 @@ function claimSuccessor(matchedPid, listenerPid, meta) {
   if (!server.launchUrl && !server.tailOpen) void probeClaimedAuth(server.gen)
   log(`DSH 自重启已确认：新进程 PID ${matchedPid}（命令行与本轮启动签名一致），不计为崩溃${meta.elapsedMs ? `，交接耗时 ${meta.elapsedMs}ms` : ''}`)
   lifecycle.emit('service.handover', { fromPid: meta.fromPid || 0, toPid: matchedPid, verdict: 'self-restart', source: meta.source || 'handover', port: PORT, elapsedMs: meta.elapsedMs || 0 })
+  void refreshDesktopShellGate('claim-successor')
   broadcastState()
   return true
 }
@@ -1537,6 +1617,7 @@ function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
       : '服务意外退出', WEB_URL, 'service')
   }
   broadcastState()
+  void refreshDesktopShellGate('service-exited')
   void maybeAutoRestart()
 }
 
@@ -1642,6 +1723,8 @@ async function stopServerInner({ managedOnly = false, force = false } = {}) {
     server.stopping = false
     endServiceStop()
     cancelRestartRetry() // 用户主动停止 = 取消待触的延后重启，看护不得把服务复活
+    // 服务停了就撤销桌面快捷键模式的就绪标记：下一次激活必须由新的自管启动重新证明（不应跨世代残活）
+    if (!SELF_TEST && !server.running()) setDesktopShellGate(false, 'service-not-running', 'stop')
     broadcastState()
   }
 }
@@ -2951,6 +3034,146 @@ function resolveBridgePayloadRoot() {
   const devDir = path.join(ASSETS_DIR, 'bridge-next')
   const dir = app.isPackaged ? resourceDir : devDir
   return fs.existsSync(path.join(dir, 'version.json')) ? dir : devDir
+}
+
+/** 桌面壳登录辅助 bundle 的 payload 目录（打包后 extraResources / 开发态仓库 assets）。 */
+function resolveDesktopSigninPayloadRoot() {
+  const resourceDir = path.join(process.resourcesPath || '', 'dshl-desktop-signin')
+  const devDir = path.join(ASSETS_DIR, 'dshl-desktop-signin')
+  const dir = app.isPackaged ? resourceDir : devDir
+  return fs.existsSync(path.join(dir, 'package.json')) ? dir : devDir
+}
+
+// ---------- 桌面快捷键模式（Config.desktopShell）与激活闸门 ----------
+let desktopShellPreparePromise = null
+let desktopShellReloadDone = false
+
+/** 写/删就绪标记。只有"真正激活"时才存在——Host 登录插件只认这个文件，不能让它跨模式残活。 */
+function writeDesktopShellMarker(active) {
+  try {
+    if (active) {
+      fs.mkdirSync(path.dirname(DESKTOP_SHELL_MARKER), { recursive: true })
+      fs.writeFileSync(DESKTOP_SHELL_MARKER, JSON.stringify({
+        pid: process.pid,
+        at: new Date().toISOString(),
+        version: desktopShell.getState().version || '',
+      }))
+    } else {
+      fs.rmSync(DESKTOP_SHELL_MARKER, { force: true })
+    }
+  } catch { /* 标记失败不影响桥本身；登录插件会降级为"复制链接" */ }
+}
+
+/** 状态变化时同步标记文件（幂等，可在任意时序调用）。 */
+function syncDesktopShellMarker() {
+  writeDesktopShellMarker(desktopShellModeActive())
+}
+
+/**
+ * 更新激活闸门并留证据。只在真正变化时写一行日志 + 推送状态，避免每次 tick 刷屏。
+ * @param {boolean} active
+ * @param {string} reason 机器可读的稳定原因（disabled / bridge-not-ready / signin-not-installed / signin-not-loaded ...）
+ * @param {string} [detail] 日志定位用的触发来源（不进入状态机，避免 UI 匹配被污染）
+ */
+function setDesktopShellGate(active, reason, detail) {
+  const next = { active: active === true, reason: String(reason || '') }
+  const changed = next.active !== desktopGate.active || next.reason !== desktopGate.reason
+  desktopGate = next
+  syncDesktopShellMarker()
+  if (!changed) return
+  log('desktop-shell: ' + (next.active ? 'enabled' : 'disabled') + '（reason=' + next.reason
+    + (detail ? '，trigger=' + detail : '') + '）')
+  try { broadcastState() } catch { /* 早期时序下控制台可能还没建好 */ }
+}
+
+/**
+ * 重新计算激活闸门（异步：需要读 adopted/claimed 进程的启动时刻）。
+ * fail-closed：任何一步拿不到证据都保持 web runtime。
+ * @param {string} trigger 触发来源，仅用于日志定位
+ */
+async function refreshDesktopShellGate(trigger) {
+  if (SELF_TEST) {
+    if (desktopGate.active) setDesktopShellGate(false, 'selftest')
+    return
+  }
+  if (!Config.desktopShell) return setDesktopShellGate(false, 'disabled')
+  if (!desktopShell.ready()) return setDesktopShellGate(false, 'bridge-not-ready')
+  let signin = null
+  try { signin = desktopSignin.getState() } catch { /* 读 profile 失败按未安装处理 */ }
+  if (!signin || !signin.installed) return setDesktopShellGate(false, 'signin-not-installed', trigger)
+  if (server.managed()) return setDesktopShellGate(true, 'managed-service', trigger)
+  const pid = server.claimed() ? server.claimedPid : server.adoptedPid
+  if (!pid) return setDesktopShellGate(false, 'service-not-running', trigger)
+  let identity = null
+  try { identity = await readProcessIdentity(pid) } catch { identity = null }
+  if (!identity) return setDesktopShellGate(false, 'service-identity-unknown', trigger)
+  const loaded = desktopSignin.helperLoadedByService({
+    platform: process.platform,
+    owned: false,
+    serviceStartedAtMs: desktopSignin.windowsTicksToUnixMs(identity.startedAt),
+    installedAtMs: signin.installedAtMs,
+  })
+  setDesktopShellGate(loaded, loaded ? 'service-loaded-signin' : 'signin-not-loaded', trigger)
+}
+
+/**
+ * 桥/闸门变化后调用：如果当前页面已经按 web runtime 加载完、而闸门现在允许 desktop runtime，
+ * 重载一次标签页让客户端插件按 desktop runtime 重新初始化。只做一次。
+ */
+function markDesktopShellReady() {
+  void refreshDesktopShellGate('prepared').then(() => {
+    if (!desktopShellModeActive() || desktopShellReloadDone) return
+    try {
+      const loaded = webTabs.some((tab) => {
+        try { return !tab.view.webContents.isDestroyed() && trust.isDshAppUrl(tab.view.webContents.getURL(), WEB_URL) } catch { return false }
+      })
+      if (!loaded) return
+      desktopShellReloadDone = true
+      log('desktop-shell: 激活晚于页面加载，重载标签页以切换 desktop runtime')
+      void refreshWebUiOnReady(true)
+    } catch { /* 重载失败不影响桥能力，用户手动刷新即可 */ }
+  })
+}
+
+/**
+ * 连上 DSH 安装树里的 ShortcutPersistence。失败不抛：页面会按 web runtime 加载（fail-closed）。
+ * 只在 Config.desktopShell 打开时才尝试；环境未就绪时直接返回失败、不缓存（下次环境就绪再试）。
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+function ensureDesktopShellPrepared() {
+  if (!Config.desktopShell) return Promise.resolve({ ok: false, error: 'disabled' })
+  if (SELF_TEST) return Promise.resolve({ ok: false, error: 'selftest' })
+  if (desktopShell.ready()) return Promise.resolve({ ok: true })
+  if (desktopShellPreparePromise) return desktopShellPreparePromise
+  const report = envReport
+  if (!report || !report.plan) return Promise.resolve({ ok: false, error: '环境未就绪' })
+  const layout = { dshBin: report.plan.dshBin, harnessRoot: report.plan.cwd || harnessRoot }
+  desktopShellPreparePromise = desktopShell.prepare(layout).then((result) => {
+    if (!result.ok) desktopShellPreparePromise = null // 允许环境变化（重装/升级）后重试
+    return result
+  }, (error) => {
+    desktopShellPreparePromise = null
+    return { ok: false, error: (error && error.message) || String(error) }
+  })
+  return desktopShellPreparePromise
+}
+
+/**
+ * 安装 Host 侧登录辅助 bundle（仅桌面快捷键模式开启时）。
+ * 必须在服务停止期间调用：它会经 `dsh plugin --profile web add` 让 pnpm 改写 profile 依赖树。
+ * 失败只记录并返回失败：调用方据此**不激活** desktop runtime（登录保持现有 web 行为，不退化）。
+ */
+async function ensureDesktopSigninInstalled() {
+  if (!Config.desktopShell) return { ok: false, error: 'disabled' }
+  try {
+    const result = await desktopSignin.ensure()
+    if (!result.ok) log('desktop-shell: 登录辅助插件未就绪：' + result.error)
+    return result
+  } catch (error) {
+    const message = (error && error.message) || String(error)
+    log('desktop-shell: 登录辅助插件安装异常：' + message)
+    return { ok: false, error: message }
+  }
 }
 
 /**
@@ -5761,25 +5984,37 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
   // Ctrl+Del 关闭聚焦分屏、Shift+Alt+S 交换左右、F5/Ctrl+R 刷新聚焦页。
   // 归属判定全在 page-keys.js —— 那是唯一事实来源，也是"哪些键归 dshl、哪些必须让给 DSH"
   // 的契约（由 tests/page-keys.test.js 的归属网格钉住，新增拦截会让测试变红）。
-  wc.on('before-input-event', (_event, input) => {
-    const hit = pageKeys.routeKey(input, {
+  // dshl 不接管的键：桌面壳模式下再转给 DSH 的原生键盘桥（web runtime 下 ready=false，不做事）。
+  wc.on('before-input-event', (event, input) => {
+    // 录键期间把整条链都让开：DSH 的录键器靠 DOM keydown 收键，dshl 这里既不能吞（page-keys），
+    // 也不能再转发给原生桥（否则同一个组合会被当成一次命令执行）。
+    const recording = desktopShellModeActive() && desktopShell.recordingActive()
+    const hit = recording ? null : pageKeys.routeKey(input, {
       scope: pageKeys.SCOPE_PAGE,
       tabsEnabled: Config.tabsEnabled,
       findOpen: tab.findOpen,
       findInputFocused: tab.findInputFocused,
     })
-    if (hit === null) return
-    _event.preventDefault()
-    switch (hit.action) {
-      case 'find-open': void webOpenFindFromPage(tab); return
-      case 'find-close': webFindClose(tab); return
-      case 'find-prev': void webFindFromInput(tab, false); return
-      case 'find-next': void webFindFromInput(tab, true); return
-      case 'find-submit': void webFindFromInput(tab, hit.forward); return
-      case 'split-toggle': webToggleSplit(); return
-      case 'pane-close': webCloseFocused(); return
-      case 'pane-swap': webSwap(); return
-      case 'pane-reload': webReloadFocusedPane(); return
+    if (hit !== null) {
+      event.preventDefault()
+      switch (hit.action) {
+        case 'find-open': void webOpenFindFromPage(tab); return
+        case 'find-close': webFindClose(tab); return
+        case 'find-prev': void webFindFromInput(tab, false); return
+        case 'find-next': void webFindFromInput(tab, true); return
+        case 'find-submit': void webFindFromInput(tab, hit.forward); return
+        case 'split-toggle': webToggleSplit(); return
+        case 'pane-close': webCloseFocused(); return
+        case 'pane-swap': webSwap(); return
+        case 'pane-reload': webReloadFocusedPane(); return
+      }
+      return
+    }
+    // 只转发给真正的 DSH 应用页，且只有本次真正启用 desktop runtime 时才占用 IPC
+    if (desktopShellModeActive() && !recording) {
+      try {
+        if (trust.isDshAppUrl(wc.getURL(), WEB_URL)) desktopShell.forwardKey(wc, input)
+      } catch { /* 取 URL 失败 = 不转发（安全侧） */ }
     }
   })
   if (opts.loading && !SELF_TEST) beginLoadingProgress(opts.loadingReason || reasonForPhase(servicePhase())) // 首屏说明页（启动流程）
@@ -6297,6 +6532,29 @@ function stateJson() {
     notify: Config.notify,
     autoRestart: Config.autoRestart,
     tabsEnabled: Config.tabsEnabled,
+    // 桌面快捷键模式：enabled=开关；active=本次真正切了 desktop runtime；reason=未激活的稳定原因（控制台文案依据）。
+    // 注意：这里只读内存/小文件，不做进程探测（进程启动时刻已在闸门刷新时算过）。
+    desktopShell: (() => {
+      let signin = { installed: false, version: '', installedAtMs: 0 }
+      try {
+        const s = desktopSignin.getState()
+        signin = { installed: !!s.installed, version: s.version || '', installedAtMs: s.installedAtMs || 0 }
+      } catch { /* noop */ }
+      let bridge = { ready: false, version: '', error: '' }
+      try {
+        const b = desktopShell.getState()
+        bridge = { ready: !!b.ready, version: b.version || '', error: b.error || '' }
+      } catch { /* noop */ }
+      return {
+        enabled: Config.desktopShell === true,
+        active: desktopShellModeActive(),
+        reason: desktopGate.reason,
+        restartPending: desktopShellTogglePending,
+        autoEnabledFor: Config.desktopShellAutoEnabledFor || '',
+        bridge,
+        signin,
+      }
+    })(),
     consoleOpen: consoleIsOpen(),
     zoom: Config.consoleZoom,
     cssZoom: Config.consoleZoom,
@@ -6306,6 +6564,7 @@ function stateJson() {
     // 升级代价预判（只读）：目标版本下哪些插件会被 DSH 门禁拒绝；没有待升级版本时为 null
     dshUpdate: Object.assign({}, dshUpdater.getState(), { pluginCompat: dshPluginCompat() }),
     launcherChannel: Config.launcherChannel,
+    launcherUpdateSource: Config.launcherUpdateSource,
     log: logTail,
     // 稳定性状态（控制台"上次未正常退出/已回退配置"提示用）
     lastExit: runGuardHandle ? (runGuardHandle.previousRun ? 'crashed' : 'clean') : 'unknown',
@@ -6439,6 +6698,7 @@ async function watchTrackedService() {
       else server.adoptedAlive = true
       log(`服务重新在线（PID ${trackedPid}）`)
       void refreshWebUiOnReady() // 错误页/空白页需要一次补拉
+      void refreshDesktopShellGate('watchdog-online')
       broadcastState()
     }
     // 端口有应答 ≠ 应答者还是原来那个进程：定期复核持有者，否则认领状态会悄悄失真
@@ -6474,6 +6734,7 @@ async function watchTrackedService() {
   if (server.claimed()) { clearClaimed(); server.handoverPromise = null }
   else { server.adoptedPid = 0; server.adoptedAlive = false }
   trackedDownTicks = 0
+  void refreshDesktopShellGate('watchdog-down')
   log(`服务端口连续 ${Math.round(ADOPT_DOWN_CONFIRM_MS / 1000)}s 无人应答（原 PID ${trackedPid || '未知'}）：进入交接裁决，确认是否有后续进程`)
   server.settlingServing = false
   server.handoverPromise = runHandover(trackedPid, null, null).catch((err) => {
@@ -6894,6 +7155,28 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           return '{}'
         }
         case 'setNotify': Config.notify = !!value; saveConfig(); broadcastState(); return '{}'
+        case 'setDesktopShell': {
+          // 桌面快捷键模式开关。保存后需重启启动器才生效（preload 在页面脚本执行前决定 runtime）；
+          // 关闭时立即撤掉就绪标记，Host 登录插件马上退回 no-op（不必等重启）。
+          const enabled = value === true || value === 'true'
+          if (Config.desktopShell !== enabled) {
+            Config.desktopShell = enabled
+            Config.desktopShellAutoEnabledFor = enabled ? app.getVersion() : ''
+            desktopShellTogglePending = true
+            saveConfig()
+            if (enabled) {
+              // 提前把桥连上（下次启动更快），但**不改当前页面的 runtime**：
+              // preload 同步配置只在页面加载时读一次，所以开关语义是"重启启动器后生效"。
+              void ensureDesktopShellPrepared().then((result) => {
+                if (!result.ok) log('desktop-shell: 已打开开关，但桥暂时不可用：' + (result.error || '未知原因'))
+              })
+            }
+            // 关闭也不立即改当前页面：本会话保持现有桌面运行时（登录辅助标记仍是真相），
+            // 下次启动时 startServerInner 会按开关落闸并撤标记。界面用 restartPending 如实提示。
+            broadcastState()
+          }
+          return JSON.stringify({ ok: true, enabled: Config.desktopShell === true, restartRequired: true })
+        }
         case 'resetDefaults': {
           // 恢复默认设置：所有选项回到默认值，窗口恢复默认尺寸与位置
           const zoomDefault = defaultWebZoomPct()
@@ -6916,6 +7199,11 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           Config.pnpmVersion = '11.8.0'
           Config.dshChannel = 'latest' // 更新渠道也回默认
           Config.launcherChannel = 'latest' // 启动器更新渠道同理（默认只收正式版）
+          Config.launcherUpdateSource = 'auto' // 更新源也回默认（GitHub 优先、失败回退国内加速）
+          Config.launcherUpdateMirror = ''
+          Config.launcherUpdateSourceOk = ''
+          updater.onChannelChanged() // 渠道+源都回默认：作废已下载的旧渠道/旧源安装包
+          updater.onSourceChanged()
           Config.nodeMajor = 22
           Config.nodeMirror = ''
           Config.npmRegistry = ''
@@ -6929,6 +7217,8 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           Config.crashStreak = 0
           Config.lastCrashReportedAt = ''
           Config.notifyCategories = notifyPolicy.defaultCategories()
+          Config.desktopShell = true // 桌面快捷键模式也回默认（开启）；下次启动生效
+          Config.desktopShellAutoEnabledFor = ''
           Config.notifiedLauncherVersion = ''
           Config.notifiedDshVersion = ''
           applyRuntimePort()
@@ -6974,6 +7264,17 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
             try { saveConfig() } catch { /* noop */ }
             updater.onChannelChanged() // 落到 electron-updater，并作废已下载的旧渠道包
             void updater.check() // 换渠道后立刻按新渠道检查一次（打包态才真正联网）
+          }
+          broadcastState()
+          return '{}'
+        }
+        case 'setLauncherSource': {
+          const src = updater.normalizeUpdateSource(value)
+          if (Config.launcherUpdateSource !== src) {
+            Config.launcherUpdateSource = src
+            try { saveConfig() } catch { /* noop */ }
+            updater.onSourceChanged() // 重建源链并作废旧源已下载的包（不安装来路已变的产物）
+            void updater.check() // 立刻按新源检查一次（打包态才真正联网）
           }
           broadcastState()
           return '{}'
@@ -7937,6 +8238,38 @@ function init() {
   health.initHealth({ configPath: CONFIG_PATH, snapshotDir: HEALTH_SNAPSHOT_DIR, extraFiles: healthExtraFiles(), log })
   diagnostics.initDiagnostics({ dir: DIAG_DIR, log })
   registerIpc()
+  // 桌面壳桥（desktop-shell.js）：给 DSH 页面提供 data-platform + dshDesktop.keyboard/shortcuts。
+  // ipc handler 必须早于任何窗口创建；真正的连接在环境就绪后由 ensureDesktopShellPrepared() 完成，
+  // 失败则页面按 web runtime 加载（fail-closed）。
+  desktopShell.init({
+    ipcMain,
+    log,
+    isEnabled: () => Config.desktopShell === true,
+    isLoginReady: () => desktopShellModeActive(),
+    getOrigin: () => ({ host: HOST, port: PORT }),
+    isTrustedSender: (event) => {
+      try {
+        const sender = event && event.sender
+        if (!sender || typeof sender.getURL !== 'function') return false
+        if (!trust.isDshAppUrl(sender.getURL(), WEB_URL)) return false
+        return webTabs.some((tab) => tab && tab.view && tab.view.webContents === sender)
+      } catch {
+        return false
+      }
+    },
+    getTabs: () => webTabs,
+    // DSH「关闭当前页面/窗口」最后一步（page.close → shortcuts.closeWindow → 原生关窗）：
+    // 与托盘「关闭」同语义 —— 只隐藏窗口，进程与服务继续常驻。
+    closeWindow: () => { if (webWin && !webWin.isDestroyed()) webWin.hide() },
+    userDataDir: SELF_TEST ? path.join(HOME, 'userdata') : app.getPath('userData'),
+    platform: process.platform,
+  })
+  // Host 侧登录辅助 bundle（登录授权页由它打开；见 desktop-signin.js）。
+  // home 用有效 HOME：SELF_TEST 下是隔离目录，正常模式才是 ~/.dsh。
+  desktopSignin.init({ home: HOME, envDetect, log, payloadRoot: resolveDesktopSigninPayloadRoot() })
+  // 启动即清掉上一次运行遗留的就绪标记：Host 登录插件只认这个文件，只有本次真正激活后才会重写。
+  // （旧版本只在"开关关闭"时清；升级默认开启后必须无条件清，避免把上次的激活状态带进本次 web 模式。）
+  try { fs.rmSync(DESKTOP_SHELL_MARKER, { force: true }) } catch { /* noop */ }
 
   if (SELF_TEST) {
     openWebUi({ hidden: true })
@@ -7995,6 +8328,16 @@ function init() {
     currentVersion: app.getVersion(),
     // 渠道由配置说了算（设置页可切）：latest=只收正式版，alpha=预发布版
     getChannel: () => Config.launcherChannel,
+    // 更新源：auto=GitHub 优先、失败回退国内加速（默认）；github=只用官方；domestic=只用国内源。
+    // 自建镜像可选（launcherUpdateMirror），没配时国内源=公共 GitHub 加速代理。
+    getSource: () => Config.launcherUpdateSource,
+    getMirror: () => Config.launcherUpdateMirror,
+    getLastSource: () => Config.launcherUpdateSourceOk,
+    recordSource: (id) => {
+      if (Config.launcherUpdateSourceOk === id) return
+      Config.launcherUpdateSourceOk = id
+      try { saveConfig() } catch { /* noop */ }
+    },
     // 更新通知统一 update 分类；"已下载"按版本跨重启去重（同一版本只提醒一次）
     onNotify: (title, message, meta) => {
       const version = meta && meta.version ? String(meta.version) : ''
@@ -8137,6 +8480,9 @@ app.on('before-quit', (event) => {
   void requestExit('quit')
 })
 app.on('will-quit', () => {
+  // 桌面壳桥收尾：撤掉 Host 登录辅助插件的就绪标记（它只应在 dshl 以桌面壳身份运行时存在）
+  try { fs.rmSync(DESKTOP_SHELL_MARKER, { force: true }) } catch { /* noop */ }
+  try { desktopShell.dispose() } catch { /* noop */ }
   // 兜底：任何走到 will-quit 的路径都算受控退出（幂等，重复调用无副作用）
   try { if (runGuardHandle) runGuardHandle.markClean() } catch { /* noop */ }
 })

@@ -74,6 +74,17 @@ test('集成：能真的从 app.asar 里取出文件，且与仓库文件逐字�
     t.skip(`当前版本（${pkgVersion}）还没有完整构建产物，先跑一次打包`)
     return
   }
+  // 同一版本号迭代（改了源码、还没重新打包）时，拿旧 asar 做逐字节对比只会制造噪声——
+  // 这与文件头注释一致：版本没 bump 的构建产物属于"上一轮产物"。发布流程不依赖这条单测做产物断言：
+  // release.mjs 在 dist:win **之后**单独跑 tools/assert-package.cjs（那里没有"旧产物"可言）。
+  const exeMtime = fs.statSync(exe).mtimeMs
+  const newestSource = tool.packagedSources().reduce((newest, rel) => {
+    try { return Math.max(newest, fs.statSync(path.join(root, rel)).mtimeMs) } catch { return newest }
+  }, 0)
+  if (newestSource > exeMtime) {
+    t.skip(`构建产物早于源码（${new Date(exeMtime).toISOString()} < 源码最新修改），先重新打包再断言`)
+    return
+  }
   const session = tool.asarOpen(ASAR)
   try {
     for (const rel of ['wwwroot/app.js', 'wwwroot/index.html', 'dsh-update.js']) {

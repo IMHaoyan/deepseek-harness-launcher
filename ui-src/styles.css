@@ -634,6 +634,14 @@ select, input[type="checkbox"], input[type="radio"], input[type="range"] {
 }
 
 /* 检查更新后的"目标版本"（→ vX (next)）：常驻到本次检查结果改变为止 */
+.desktop-shell-hint {
+  flex: none;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
 .version-target {
   flex: none;
   max-width: 168px;

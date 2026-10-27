@@ -179,6 +179,13 @@
           <button class="btn sm" id="btnTest">测试通知</button>
         </div>
       </div>
+      <div class="row long-label" title="开启后 DSH 以桌面运行时运行：快捷键不再受浏览器白名单限制（如 Ctrl+B）；登录授权页改由系统浏览器打开。需要重启启动器生效；首次启用会在下次服务重启时安装登录辅助，安装失败则保持网页模式（登录不受影响）。">
+        <span class="label">桌面快捷键模式</span>
+        <div class="chips">
+          <button class="chip" id="btnDesktopShell">开启</button>
+          <span class="desktop-shell-hint" id="desktopShellHint"></span>
+        </div>
+      </div>
       <div class="row long-label" title="关闭某类后该类的系统通知不再弹出（日志仍逐条记录）；关闭上面的「消息提醒」则全部静默。">
         <span class="label">提醒内容</span>
         <div class="chips" id="notifyCategoryChips"></div>
@@ -211,6 +218,10 @@
       <div class="row" title="latest：只收启动器正式版（默认）；alpha：跟随预发布版，能提前拿到新功能。切回 latest 不会把已装的 alpha 降级——等下一个正式版即可；切换后立即按新渠道重新检查。">
         <span class="label">启动器更新渠道</span>
         <div class="chips" id="launcherChannelChips"></div>
+      </div>
+      <div class="row" title="自动（默认）：优先 GitHub，连不上时自动回退国内加速源（公共 GitHub 加速代理，只覆盖正式版；不经过任何托管，无需自己搭镜像）。GitHub：只用官方源，失败也不走第三方。国内加速：直接用国内源（alpha 渠道需要另配自建镜像，否则不可用）。切换后立即按新源重新检查。">
+        <span class="label">启动器更新源</span>
+        <div class="chips" id="launcherSourceChips"></div>
       </div>
       <div class="row">
         <span class="label">恢复默认</span>

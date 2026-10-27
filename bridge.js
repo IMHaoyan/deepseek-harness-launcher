@@ -1095,6 +1095,9 @@ module.exports = {
   installed,
   install,
   uninstall,
+  // 复用 `dsh plugin --profile web ...` 的薄封装（desktop-signin.js 用它装登录辅助 bundle；
+  // 与 install() 共享 pnpm 工具链环境与 24h 观察期放行策略，不各写一套）
+  runCli,
   verifyPayload,
   payloadVersion,
   // 动作回执的生命周期（生效即清 / 超时兜底，策略在 main.js）
