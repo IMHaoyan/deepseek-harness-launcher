@@ -123,7 +123,7 @@ if (desktopShellConfig && isDesktopShellPage(desktopShellConfig)) exposeDesktopS
 
 // ---------- 文件链接：Ctrl/Cmd+点击 → 用系统默认程序打开 ----------
 //
-// 背景：DSH 的 Markdown 文件链接渲染成 `<button title="<路径>">`，普通点击落到右侧栏预览，
+// 背景：DSH 的 Markdown 文件链接渲染成 `<button title="<链接原文>">`，普通点击落到右侧栏预览，
 // 不会交给操作系统。这里在 preload 隔离世界里加一个捕获阶段监听，把明确带修饰键的点击截下来：
 //   Ctrl/Cmd+点击        → shell.openPath（Windows 上等于双击：exe 直接运行、文档用默认程序打开）
 //   Ctrl/Cmd+Shift+点击  → 在文件管理器里定位（Explorer 选中该文件）
@@ -132,9 +132,30 @@ if (desktopShellConfig && isDesktopShellPage(desktopShellConfig)) exposeDesktopS
 // 页面（含渲染进聊天的任意内容）没法主动调用，只有真实用户手势能触发。
 // 信任域与桌面壳桥一致：主进程同步给出 DSH 页的 host/port，只有本机 DSH 页才挂监听；
 // 主进程收到请求后仍会用 trust.isDshAppUrl 复核发送方，并校验"绝对本地路径 + 文件存在"。
+//
+// 2026-10-27 真机反馈：能直接拿到绝对路径的入口只有两类 —— Markdown 文件链接写成绝对路径时，
+// 以及 deliverables 文件卡片（title 是 Host 解析后的绝对路径）。另外三类全被静默漏掉：
+//   ① 相对路径链接（回答里最常见的 `[x](dsh-update.js#L24)`，title 就是相对路径）；
+//   ② 图片链接（DSH 对可解析图片**故意不写 title**，选择器 button[title] 直接落空）；
+//   ③ @ 提及 chip（title 是原始 mention 文本 `@path` / `@"path with spaces"`）。
+// 后两类的共同点是：preload 手里只有 href/mention 文本，没有会话工作区根目录，自己拼不出绝对路径。
+//
+// 因此分两条路：
+//   A) title 能归一化成"本地绝对路径"→ 拦截点击，直接请主进程打开（无副作用，原行为）；
+//   B) 拿不到绝对路径 → **放行** DSH 的普通点击（它本来就会在右侧栏打开文档预览），再观察预览
+//      头部 `[data-textpreview-path]`（DSH PathLabel，title = Host 解析后的绝对路径）在 2 秒内
+//      新出现 / 由隐藏变为可见的那一条，交给主进程打开。图片、二进制、不可预览文件也走同一个
+//      预览头部，所以三类入口一起修好；代价是预览面板仍会照常打开（这正是今天拦截失败时的
+//      既有行为，不是新增副作用）。图片链接的 hover 预览与图片预览都没有路径文本，不能替代。
 const FILE_OPEN = { ORIGIN: 'dshl:file-open:origin', OPEN: 'dsh:file-open' }
 // 与 file-open.js 的校验保持一致：盘符或 UNC（DSH 的 title 可能是 C:\ 或 C:/）
 const FILE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])/u
+// 文档预览头部的路径标签（PathLabel，title 是 Host 解析后的绝对路径）
+const PREVIEW_PATH_SELECTOR = '[data-textpreview-path]'
+// 从"放行点击"到"预览头部出现绝对路径"的等待上限；DSH 打开预览、读元数据都在本机，通常 <300ms
+const PREVIEW_WAIT_MS = 2000
+const PREVIEW_POLL_MS = 120
+let previewWatch = null
 
 /** 同步问主进程：本机 DSH 页的地址。拿不到就按"不启用"处理（fail-closed）。 */
 function readFileOpenOrigin() {
@@ -159,32 +180,181 @@ function isFileOpenPage(origin) {
   }
 }
 
-/** 从点击目标上找到 DSH 文件链接的绝对路径（没有就返回空串，让原行为继续）。 */
-function filePathFromClick(event) {
+/**
+ * 把文件入口的文本归一化成可直接交给主进程的路径；不是本地绝对路径就返回空串。
+ * 兼容 @ 提及语法（`@C:\a.txt` / `@"C:\Program Files\a b.txt"`）和 DSH 的前斜杠写法。
+ * @param {unknown} raw title / mention 原文
+ * @returns {string}
+ */
+function absoluteFilePath(raw) {
+  let value = typeof raw === 'string' ? raw.trim() : ''
+  if (value.startsWith('@')) value = value.slice(1).trim()
+  const quoted = /^(["'])([\s\S]*)\1$/u.exec(value)
+  if (quoted !== null) value = quoted[2].trim()
+  return FILE_PATH_RE.test(value) ? value : ''
+}
+
+/** 点击落到的 <button>（DSH 的文件入口都是按钮；不是按钮就返回 null）。 */
+function clickButton(target) {
   try {
-    const target = event.target
-    if (!target || typeof target.closest !== 'function') return ''
-    const button = target.closest('button[title]')
-    if (!button) return ''
-    const title = String(button.getAttribute('title') || '').trim()
-    return FILE_PATH_RE.test(title) ? title : ''
+    if (!target || typeof target.closest !== 'function') return null
+    const button = target.closest('button')
+    return button && typeof button.getAttribute === 'function' ? button : null
+  } catch {
+    return null
+  }
+}
+
+/** 从按钮 title 上取绝对路径（取不到返回空串，交给预览兜底）。 */
+function filePathFromClick(button) {
+  try {
+    if (button === null) return ''
+    return absoluteFilePath(button.getAttribute('title'))
   } catch {
     return ''
   }
+}
+
+/** 预览头部是否对用户可见（隐藏的旧标签页不能当作这次点击的结果）。 */
+function isVisiblePreviewNode(node) {
+  try {
+    if (typeof node.closest === 'function' && node.closest('[hidden],[aria-hidden="true"]') !== null) return false
+    if (typeof node.getClientRects === 'function' && node.getClientRects().length === 0) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 当前 DOM 里的预览路径：path → 是否可见（同一路径出现在多个标签页时以可见者为准）。 */
+function previewPathEntries() {
+  const entries = new Map()
+  try {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return entries
+    const nodes = document.querySelectorAll(PREVIEW_PATH_SELECTOR)
+    for (const node of nodes) {
+      let path = ''
+      try { path = absoluteFilePath(node.getAttribute('title')) } catch { path = '' }
+      if (path === '') continue
+      entries.set(path, entries.get(path) === true || isVisiblePreviewNode(node))
+    }
+  } catch { /* 拿不到 DOM 就当作没有候选 */ }
+  return entries
+}
+
+function baseNameOf(path) {
+  const parts = String(path).split(/[\\/]/u)
+  return (parts[parts.length - 1] || '').toLowerCase()
+}
+
+/** 在可见预览里挑出这次点击打开的那一个：优先新出现的，多个时按按钮文本里的文件名收敛。 */
+function previewCandidate(watch) {
+  const visible = []
+  const matched = []
+  for (const [path, shown] of previewPathEntries()) {
+    if (!shown) continue
+    if (watch.before.get(path) === true) {
+      // 点击前就可见：只有按钮文本里出现同名文件时才认（重复点击同一个已打开的文件）
+      if (watch.text !== '' && watch.text.includes(baseNameOf(path))) matched.push(path)
+      continue
+    }
+    visible.push(path)
+  }
+  if (visible.length === 1) return visible[0]
+  if (visible.length > 1) {
+    const hits = visible.filter((path) => watch.text !== '' && watch.text.includes(baseNameOf(path)))
+    return hits.length === 1 ? hits[0] : ''
+  }
+  return matched.length === 1 ? matched[0] : ''
+}
+
+function stopPreviewWatch() {
+  const watch = previewWatch
+  if (watch === null) return
+  previewWatch = null
+  try { watch.observer?.disconnect() } catch { /* noop */ }
+  try { clearTimeout(watch.pollTimer) } catch { /* noop */ }
+  try { clearTimeout(watch.deadlineTimer) } catch { /* noop */ }
+}
+
+/** 预览头部解析出绝对路径 → 停表并请主进程打开（同一轮只发一次）。 */
+function openResolvedPreview(watch, path) {
+  if (watch.done) return
+  watch.done = true
+  stopPreviewWatch()
+  const pending = ipcRenderer.invoke(FILE_OPEN.OPEN, { path, mode: watch.mode })
+  if (pending && typeof pending.catch === 'function') pending.catch(() => { /* 失败只留主进程日志 */ })
+}
+
+/**
+ * 放行点击后观察 DSH 预览头部解析出的绝对路径。
+ * @param {'open'|'reveal'} mode Ctrl+Shift 时定位而不是打开
+ * @param {string} buttonText 按钮可见文本（用于在多个预览页里收敛）
+ */
+function watchPreviewResolution(mode, buttonText) {
+  stopPreviewWatch()
+  const watch = {
+    mode,
+    text: typeof buttonText === 'string' ? buttonText.trim().toLowerCase() : '',
+    before: previewPathEntries(),
+    done: false,
+    observer: null,
+    pollTimer: null,
+    deadlineTimer: null,
+  }
+  previewWatch = watch
+  const check = () => {
+    if (watch.done) return true
+    const candidate = previewCandidate(watch)
+    if (candidate === '') return false
+    openResolvedPreview(watch, candidate)
+    return true
+  }
+  try {
+    if (typeof MutationObserver === 'function') {
+      watch.observer = new MutationObserver(() => { check() })
+      const root = (typeof document !== 'undefined' && document.documentElement) || document
+      watch.observer.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['title', 'hidden', 'aria-hidden'],
+      })
+    }
+  } catch { watch.observer = null }
+  // 轮询兜底：MutationObserver 漏掉（React 原地改属性/可见性切换）时也能在 2 秒内收敛
+  const tick = () => {
+    if (watch.done) return
+    if (check()) return
+    watch.pollTimer = setTimeout(tick, PREVIEW_POLL_MS)
+  }
+  watch.pollTimer = setTimeout(tick, PREVIEW_POLL_MS)
+  watch.deadlineTimer = setTimeout(() => {
+    if (watch.done) return
+    watch.done = true
+    stopPreviewWatch()
+  }, PREVIEW_WAIT_MS)
 }
 
 /** 捕获阶段拦截 Ctrl/Cmd+点击；返回是否拦截（测试/调试用）。 */
 function interceptFileOpenClick(event) {
   try {
     if (!event.ctrlKey && !event.metaKey) return false
-    const path = filePathFromClick(event)
-    if (!path) return false
-    try { event.preventDefault() } catch { /* noop */ }
-    try { event.stopImmediatePropagation() } catch { /* noop */ }
-    const mode = event.shiftKey ? 'reveal' : 'open'
-    const pending = ipcRenderer.invoke(FILE_OPEN.OPEN, { path, mode })
-    if (pending && typeof pending.catch === 'function') pending.catch(() => { /* 失败只留主进程日志 */ })
-    return true
+    const button = clickButton(event.target)
+    const path = filePathFromClick(button)
+    if (path !== '') {
+      try { event.preventDefault() } catch { /* noop */ }
+      try { event.stopImmediatePropagation() } catch { /* noop */ }
+      const mode = event.shiftKey ? 'reveal' : 'open'
+      const pending = ipcRenderer.invoke(FILE_OPEN.OPEN, { path, mode })
+      if (pending && typeof pending.catch === 'function') pending.catch(() => { /* 失败只留主进程日志 */ })
+      return true
+    }
+    // 相对路径 / 图片链接 / @ 提及：不拦截，让 DSH 自己打开右侧栏预览，再读 Host 解析后的绝对路径
+    if (button !== null) {
+      watchPreviewResolution(event.shiftKey ? 'reveal' : 'open', button.textContent)
+    }
+    return false
   } catch {
     return false
   }
