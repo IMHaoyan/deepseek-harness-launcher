@@ -120,7 +120,8 @@ test('在途启动准备必须取消且等它结束，不能停服成功后晚�
     server: h.server, reallyExit: false, serviceStopping: () => false,
     // 桌面快捷键模式默认开启：本条只验证"在途启动准备可被取消"，用 SELF_TEST 走原分支（不引入桥/登录辅助）
     SELF_TEST: true,
-    Config: { desktopShell: true },
+    // 远程连接开启：桥自愈是启动准备里最慢的一步，正好用来验证"在途准备可被取消"
+    Config: { desktopShell: true, remoteConnect: { enabled: true } },
     setDesktopShellGate: () => {},
     markLoadingProgress: () => {}, portOpen: async () => false,
     envReport: { plan: { dshBin: 'mock-bin', nodeCmd: 'mock-node' } },
@@ -128,7 +129,7 @@ test('在途启动准备必须取消且等它结束，不能停服成功后晚�
     bridge: { ensureRuntimeDeps: () => new Promise((resolve) => { release = resolve; prepared() }), getState: () => ({ installed: false }) },
     spawn: () => { spawned++; throw new Error('不能启动') }, log: () => {},
   }
-  const body = source.slice(source.indexOf('async function startServerInner('), source.indexOf('function killPid('))
+  const body = source.slice(source.indexOf('async function ensureBridgeStartupMaintenance('), source.indexOf('function killPid('))
   vm.runInNewContext(body + ';globalThis.start=startServerInner', ctx)
   h.server.startPromise = ctx.start()
   await preparing

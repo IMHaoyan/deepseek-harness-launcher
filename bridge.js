@@ -1089,6 +1089,24 @@ async function uninstall() {
   }
 }
 
+/**
+ * 纯函数：这个依赖规格是不是**启动器自己的 payload 安装**（link:/file: 指向 bridge-payloads 或
+ * bridge-next.tgz）。只有这种安装归启动器托管；npm 规格 / git / 其它本地链接都算"外部管理"，
+ * 启动器不去替换它（2026-10-27 覆盖事故的护栏）。
+ * @param {string} spec profile 里的依赖规格
+ * @returns {boolean}
+ */
+function payloadInstallSpec(spec) {
+  const text = String(spec || '')
+  if (!/^(?:link:|file:)/iu.test(text)) return false
+  return /bridge-payloads/iu.test(text) || /bridge-next\.tgz$/iu.test(text.replace(/\\/gu, '/'))
+}
+
+/** 纯函数：外部规格（非启动器 payload）——npm 版本、git、其它本地链接都算。 */
+function externalInstallSpec(spec) {
+  return !!String(spec || '') && !payloadInstallSpec(spec)
+}
+
 module.exports = {
   initBridge,
   getState,
@@ -1107,6 +1125,8 @@ module.exports = {
   // 纯函数（测试用）
   pluginStateOf,
   needsInstall,
+  payloadInstallSpec,
+  externalInstallSpec,
   withReleaseAgeOverride,
   releaseAgeViolation,
   parseReleaseAgeEntries,

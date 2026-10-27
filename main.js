@@ -33,6 +33,7 @@ const stopGuard = require('./service-stop-guard')
 const { probePid, terminateProcess, waitForCompletion } = require('./service-termination')
 const handover = require('./service-handover')
 const trust = require('./trust')
+const fileOpen = require('./file-open')
 const { createConsoleSurface } = require('./console-surface')
 const { createUpdateWindow } = require('./update-window')
 const changelog = require('./changelog')
@@ -126,7 +127,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, remoteConnect: { enabled: true, autoEnabledFor: '', declined: false }, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgeExternalAdopt: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -492,6 +493,8 @@ function applyConfigJson(cfg) {
     if (typeof cfg.remoteConnect.autoEnabledFor === 'string') Config.remoteConnect.autoEnabledFor = cfg.remoteConnect.autoEnabledFor
     if (typeof cfg.remoteConnect.declined === 'boolean') Config.remoteConnect.declined = cfg.remoteConnect.declined
   }
+  // 外部安装接管只做一次：记录已完成，避免每次启动都检查/打日志
+  if (typeof cfg.bridgeExternalAdopt === 'string') Config.bridgeExternalAdopt = cfg.bridgeExternalAdopt
   // 通知分类开关与「每版本只提醒一次」记账：类型不符一律回默认值（缺省即默认）
   if (cfg.notifyCategories !== undefined) Config.notifyCategories = notifyPolicy.normalizeNotifyCategories(cfg.notifyCategories)
   if (typeof cfg.notifiedLauncherVersion === 'string') Config.notifiedLauncherVersion = cfg.notifiedLauncherVersion
@@ -1040,6 +1043,97 @@ function startServer(occupantRetry = 0, allowDuringUpdate = false) {
   return p
 }
 
+// 「外部安装接管」一次性标记：profile 里的同名插件如果不是启动器 payload 装的（npm / git / 手工 link），
+// 说明启动器不是它的主人 → 不再用 payload 覆盖，并关掉远程连接托管。标记只对这条路径生效。
+const BRIDGE_EXTERNAL_ADOPT = 'bridge-external-1'
+
+/**
+ * 启动前检查：profile 里的远程连接插件是不是"外部安装"（不是启动器 payload）。
+ *
+ * 为什么需要（2026-10-27 事故）：用户自己从 npm 装了 2.0.2，启动器的启动自愈把"规格不匹配"
+ * 当成"安装内容不完整"，直接重装成随包 payload，等于用自愈覆盖用户选择；随后 payload 的依赖
+ * 镜像还悬空了（Cannot find module 'qrcode'）。现在的边界：
+ *   - payload 安装（本启动器自己的）→ 什么都不做，交给 ensureBridgeStartupMaintenance() 正常自愈；
+ *   - 外部安装（npm / git / 手工 link）→ 启动器不再动它的 profile，并把 remoteConnect 托管关掉，
+ *     避免启动自愈 / 自动安装 / 导入自检继续拿 payload 的结论去评价它。
+ * 读不到 profile 时不写标记（下次启动重试）；payload 情况也不写标记（以后可能变成外部安装）。
+ * @returns {Promise<boolean>} 是否因"发现外部安装"而调整了托管开关
+ */
+async function maybeAdoptExternalBridgeInstall() {
+  if (SELF_TEST) return false
+  if (Config.bridgeExternalAdopt === BRIDGE_EXTERNAL_ADOPT) return false
+  const snap = bridge.getState()
+  if (!snap.installed) {
+    Config.bridgeExternalAdopt = BRIDGE_EXTERNAL_ADOPT
+    saveConfig()
+    return false
+  }
+  if (!bridge.externalInstallSpec(snap.spec)) return false // 启动器 payload：自己的，照常自愈
+  let changed = false
+  if (Config.remoteConnect && Config.remoteConnect.enabled) {
+    Config.remoteConnect = Object.assign({}, Config.remoteConnect, { enabled: false, declined: true })
+    log('bridge: 远程连接插件由外部版本提供（' + snap.spec + '），已关闭启动器托管')
+    changed = true
+  } else {
+    log('bridge: 远程连接插件由外部版本提供（' + snap.spec + '），启动器不替换它')
+  }
+  Config.bridgeExternalAdopt = BRIDGE_EXTERNAL_ADOPT
+  saveConfig()
+  if (changed && typeof broadcastState === 'function') broadcastState()
+  return changed
+}
+
+/**
+ * 启动前维护远程连接插件：自愈 payload 解析镜像，必要时重装插件本体。
+ *
+ * 2026-10-27 本机事故后的两条硬约束：
+ *   1. 用户显式关闭远程连接（Config.remoteConnect.enabled=false）时**一律不碰 profile**。
+ *      同名插件可能是用户自己从 npm 装的版本（规格是 `^2.0.2`，不是启动器的 `link:`），
+ *      旧逻辑把"规格不匹配"径直当成"安装内容不完整"去重装，等于借自愈覆盖用户选择 ——
+ *      本机就是这么把 npm 2.0.2 换成自带 2.0.0-dev.11 的。
+ *   2. 重装成功后再刷一次运行依赖镜像。ensureRuntimeDeps 先于 install 跑时，镜像会从
+ *      "install 马上要剪掉的旧依赖"取源（junction 指向 profile node_modules）；install 完成后
+ *      这些 junction 悬空，payload 入口直接 `Cannot find module 'qrcode'` —— 修好了安装却加载失败。
+ * @returns {Promise<boolean>} 是否执行了维护（关闭远程连接时 false，用于测试/日志断言）
+ */
+async function ensureBridgeStartupMaintenance() {
+  const before = bridge.getState()
+  if (!Config.remoteConnect || !Config.remoteConnect.enabled) {
+    if (before.installed) log('bridge: 远程连接已关闭，跳过启动前自愈/修复（保留 profile 中现有插件）')
+    return false
+  }
+  try {
+    await bridge.ensureRuntimeDeps()
+  } catch (err) {
+    log('bridge: 启动前运行依赖自愈失败：' + ((err && err.message) || String(err)))
+  }
+  try {
+    const bridgeSnap = bridge.getState()
+    const wouldRepair = bridgeSnap.installed && bridgeSnap.payloadReady
+      && (!bridgeSnap.materializedPatchReady || !bridgeSnap.specMatchesPayload)
+    if (wouldRepair && bridge.externalInstallSpec(bridgeSnap.spec)) {
+      // 外部版本（npm 等）不是 payload 的产物：启动器不替换它（2026-10-27 覆盖事故的护栏）
+      log('bridge: 远程连接插件由外部版本提供（' + bridgeSnap.spec + '），跳过 payload 修复')
+    } else if (wouldRepair) {
+      log('bridge: 远程连接插件安装内容不完整（缺少 bundle patch），启动前修复 …')
+      const repaired = await bridge.install()
+      if (!repaired.ok) {
+        log('bridge: 启动前修复失败：' + (repaired.error || '未知原因'))
+      } else {
+        log('bridge: 启动前修复完成 v' + (repaired.version || bridgeSnap.payloadVersion))
+        try {
+          await bridge.ensureRuntimeDeps()
+        } catch (err) {
+          log('bridge: 修复后运行依赖刷新失败：' + ((err && err.message) || String(err)))
+        }
+      }
+    }
+  } catch (err) {
+    log('bridge: 启动前完整性检查失败：' + ((err && err.message) || String(err)))
+  }
+  return true
+}
+
 async function startServerInner(occupantRetry = 0) {
   const startGeneration = server.gen
   if (server.owned() || server.claimed()) return true // 已有我们负责的服务在跑（含认领的自重启后继）
@@ -1066,24 +1160,17 @@ async function startServerInner(occupantRetry = 0) {
     if (plan.kind === 'source') log('（源码版需要先构建：在仓库运行 pnpm install && pnpm run build）')
     return false
   }
+  // 启动前检查：外部安装（npm 等）不归启动器托管 —— 只调整托管开关，不改 profile。
+  try {
+    await maybeAdoptExternalBridgeInstall()
+  } catch (err) {
+    log('bridge: 外部安装检查异常（不阻断启动）：' + ((err && err.message) || String(err)))
+  }
   // Bridge Next 是 profile 的 bundle 层。市场改 profile 时可能剪掉 Bridge 依赖的
   // DSH 注入包，缓存里的 junction 会悬空；每次启动先自愈，再判断是否需要重装插件本体。
-  try {
-    await bridge.ensureRuntimeDeps()
-  } catch (err) {
-    log('bridge: 启动前运行依赖自愈失败：' + ((err && err.message) || String(err)))
-  }
-  try {
-    const bridgeSnap = bridge.getState()
-    if (bridgeSnap.installed && bridgeSnap.payloadReady && (!bridgeSnap.materializedPatchReady || !bridgeSnap.specMatchesPayload)) {
-      log('bridge: 远程连接插件安装内容不完整（缺少 bundle patch），启动前修复 …')
-      const repaired = await bridge.install()
-      if (repaired.ok) log('bridge: 启动前修复完成 v' + (repaired.version || bridgeSnap.payloadVersion))
-      else log('bridge: 启动前修复失败：' + (repaired.error || '未知原因'))
-    }
-  } catch (err) {
-    log('bridge: 启动前完整性检查失败：' + ((err && err.message) || String(err)))
-  }
+  // 维护逻辑收进 ensureBridgeStartupMaintenance()：它要能单测，且必须尊重
+  // Config.remoteConnect.enabled（用户关了远程连接就不能借自愈改写 profile）。
+  await ensureBridgeStartupMaintenance()
   // 桌面快捷键模式（Config.desktopShell）：连接快捷键持久化桥 + 安装 Host 侧登录辅助 bundle。
   // 必须在 spawn 之前完成：preload 的同步配置只认"桥就绪 + 登录辅助已被本代服务加载"，
   // 且 profile 改写不能有 dsh 进程占用。任何一步失败都 fail-closed → 本次按 web runtime 运行
@@ -1896,8 +1983,13 @@ function resetActivationEvidence() {
  */
 async function runBridgeImportCheck() {
   try {
+    // 远程连接被用户关闭时，payload 自检结论与 profile 里实际装的（可能是用户自己从 npm
+    // 装的版本）插件无关；跑它只会把 payload 的缺口误报成"插件未生效"的假警报。
+    if (!Config.remoteConnect || !Config.remoteConnect.enabled) return
     const snap = bridge.getState()
     if (!snap.installed || !snap.payloadReady) return
+    // 外部版本（npm 等）不是 payload 的产物：拿 payload 的 import 结论评价它只会误报"插件未生效"
+    if (bridge.externalInstallSpec(snap.spec)) return
     const check = await bridge.importCheckPayload()
     if (!check) return
     if (check.ok) {
@@ -3208,6 +3300,13 @@ async function applyRemoteConnect(enabled, opts = {}) {
   const stop = await stopServiceForPluginChange()
   if (!stop.ok) return stop
   if (enabled) {
+    // 外部版本（npm 等）已经在 profile 里：启动器的 payload 安装会把它换掉，属于覆盖用户选择。
+    // 只有显式 force（控制台「重装」）才允许切回 payload 版本。
+    const current = bridge.getState()
+    if (!opts.force && current.installed && bridge.externalInstallSpec(current.spec)) {
+      log('bridge: 远程连接插件由外部版本提供（' + current.spec + '），跳过 payload 安装')
+      return { ok: true, external: true, version: current.installedPackageVersion || '' }
+    }
     const r = await bridge.install({ force: !!opts.force })
     if (!r.ok) return r
     if (opts.defer) deferPluginChange('install', bridge.PLUGIN_NAME, '手机连接')
@@ -3235,6 +3334,11 @@ async function maybeAutoInstallBridge() {
   if (bridgeAutoTriedFor === app.getVersion()) return
   const snap = bridge.getState()
   if (!snap.payloadReady) return
+  // 外部版本（npm 等）已经在 profile 里：不再用 payload 版本替换它（2026-10-27 覆盖事故的护栏）
+  if (snap.installed && bridge.externalInstallSpec(snap.spec)) {
+    bridgeAutoTriedFor = app.getVersion()
+    return
+  }
   // 已装、启用，且物化版本就是当前 payload 的版本：不去动正在运行的服务，并记账避免每次 onTick 都重复读 profile。
   // 启动器升级带了新的 payload（tgz 文件名不变、包版本变了）时 snap.outdated=true，这里会走一次重装。
   if (snap.installed && !snap.outdated) { bridgeAutoTriedFor = app.getVersion(); return }
@@ -6913,6 +7017,24 @@ function senderOf(event) {
   } catch { return { kind: 'none' } }
 }
 
+/**
+ * 页面里的「打开本地文件」只信任本机 DSH 应用页（与桌面壳桥同一判定：同源 + 路径前缀）。
+ * 说明页（file://）、外部站点、其它标签页一律拒绝；页面脚本也拿不到 ipcRenderer，无法绕过 preload。
+ * @param {Electron.IpcMainEvent|Electron.IpcMainInvokeEvent} event
+ * @returns {boolean}
+ */
+function isDshPageSender(event) {
+  try {
+    const wc = event && event.sender
+    if (!wc || wc.isDestroyed()) return false
+    const known = (webWin && !webWin.isDestroyed() && wc === webWin.webContents)
+      || webTabs.some((tab) => tab && tab.view && tab.view.webContents === wc)
+    return known && trust.isDshAppUrl(wc.getURL(), WEB_URL)
+  } catch {
+    return false
+  }
+}
+
 function registerIpc() {
     // 更新窗口专用通道：与 dsh:cmd 完全分开，避免把「内部工具窗口」塞进信任表
   // （trust.decideCommand 对无法归类的发送方一律 deny，这是有测试守护的安全不变量）。
@@ -6967,6 +7089,50 @@ function registerIpc() {
       webHandleFindCommand(tab, message && message.action, message && message.payload)
     } catch { /* 查找失败不能影响页面主流程 */ }
     return '{}'
+  })
+
+  // 文件链接的 Ctrl/Cmd+点击（preload 捕获真实用户手势后发出）：用系统默认程序打开 / 定位本地文件。
+  // 能力不暴露到页面主世界（页面脚本拿不到 ipcRenderer）；这里仍复核发送方是本机 DSH 页，
+  // 并与 file-open.js 一起把路径收成"存在的本地绝对路径"——失败只回执原因并记日志。
+  ipcMain.on('dshl:file-open:origin', (event) => {
+    try {
+      event.returnValue = { host: HOST, port: String(PORT) }
+    } catch {
+      event.returnValue = null
+    }
+  })
+  ipcMain.handle('dsh:file-open', async (event, payload) => {
+    try {
+      if (!isDshPageSender(event)) {
+        log('file-open: rejected from untrusted sender')
+        return JSON.stringify({ ok: false, error: '不可信的调用方' })
+      }
+      const request = fileOpen.classifyOpenRequest(payload)
+      if (!request.ok) {
+        log('file-open: rejected (' + request.error + ')')
+        return JSON.stringify({ ok: false, error: request.error })
+      }
+      if (!fs.existsSync(request.path)) {
+        log('file-open: missing ' + request.path)
+        return JSON.stringify({ ok: false, error: '文件不存在', path: request.path })
+      }
+      if (request.mode === 'reveal') {
+        shell.showItemInFolder(request.path)
+        log('file-open: 定位 ' + request.path)
+        return JSON.stringify({ ok: true, mode: 'reveal', path: request.path })
+      }
+      const failure = await shell.openPath(request.path)
+      if (failure) {
+        log('file-open: 打开失败 ' + request.path + '：' + failure)
+        return JSON.stringify({ ok: false, error: failure, path: request.path })
+      }
+      log('file-open: 用默认程序打开 ' + request.path)
+      return JSON.stringify({ ok: true, mode: 'open', path: request.path })
+    } catch (err) {
+      const message = (err && err.message) || String(err)
+      log('file-open: 异常：' + message)
+      return JSON.stringify({ ok: false, error: message })
+    }
   })
 
 ipcMain.handle('dsh:cmd', async (event, name, value) => {

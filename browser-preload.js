@@ -120,3 +120,81 @@ function exposeDesktopShell(config) {
 
 const desktopShellConfig = readDesktopShellConfig()
 if (desktopShellConfig && isDesktopShellPage(desktopShellConfig)) exposeDesktopShell(desktopShellConfig)
+
+// ---------- 文件链接：Ctrl/Cmd+点击 → 用系统默认程序打开 ----------
+//
+// 背景：DSH 的 Markdown 文件链接渲染成 `<button title="<路径>">`，普通点击落到右侧栏预览，
+// 不会交给操作系统。这里在 preload 隔离世界里加一个捕获阶段监听，把明确带修饰键的点击截下来：
+//   Ctrl/Cmd+点击        → shell.openPath（Windows 上等于双击：exe 直接运行、文档用默认程序打开）
+//   Ctrl/Cmd+Shift+点击  → 在文件管理器里定位（Explorer 选中该文件）
+//
+// 为什么放在 preload 而不是页面脚本：这条能力不暴露到主世界（不挂到 browserBridge 上），
+// 页面（含渲染进聊天的任意内容）没法主动调用，只有真实用户手势能触发。
+// 信任域与桌面壳桥一致：主进程同步给出 DSH 页的 host/port，只有本机 DSH 页才挂监听；
+// 主进程收到请求后仍会用 trust.isDshAppUrl 复核发送方，并校验"绝对本地路径 + 文件存在"。
+const FILE_OPEN = { ORIGIN: 'dshl:file-open:origin', OPEN: 'dsh:file-open' }
+// 与 file-open.js 的校验保持一致：盘符或 UNC（DSH 的 title 可能是 C:\ 或 C:/）
+const FILE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])/u
+
+/** 同步问主进程：本机 DSH 页的地址。拿不到就按"不启用"处理（fail-closed）。 */
+function readFileOpenOrigin() {
+  try {
+    const value = ipcRenderer.sendSync(FILE_OPEN.ORIGIN)
+    return value && typeof value === 'object' ? value : null
+  } catch {
+    return null
+  }
+}
+
+/** 只有本机 DSH 页才挂这个快捷方式：说明页（file://）、外部站点、其它标签页都不挂。 */
+function isFileOpenPage(origin) {
+  try {
+    const url = new URL(String(location.href || ''))
+    const port = origin.port === undefined || origin.port === null ? '' : String(origin.port)
+    return url.protocol === 'http:'
+      && url.hostname === origin.host
+      && String(url.port) === port
+  } catch {
+    return false
+  }
+}
+
+/** 从点击目标上找到 DSH 文件链接的绝对路径（没有就返回空串，让原行为继续）。 */
+function filePathFromClick(event) {
+  try {
+    const target = event.target
+    if (!target || typeof target.closest !== 'function') return ''
+    const button = target.closest('button[title]')
+    if (!button) return ''
+    const title = String(button.getAttribute('title') || '').trim()
+    return FILE_PATH_RE.test(title) ? title : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 捕获阶段拦截 Ctrl/Cmd+点击；返回是否拦截（测试/调试用）。 */
+function interceptFileOpenClick(event) {
+  try {
+    if (!event.ctrlKey && !event.metaKey) return false
+    const path = filePathFromClick(event)
+    if (!path) return false
+    try { event.preventDefault() } catch { /* noop */ }
+    try { event.stopImmediatePropagation() } catch { /* noop */ }
+    const mode = event.shiftKey ? 'reveal' : 'open'
+    const pending = ipcRenderer.invoke(FILE_OPEN.OPEN, { path, mode })
+    if (pending && typeof pending.catch === 'function') pending.catch(() => { /* 失败只留主进程日志 */ })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function installFileOpenShortcut(origin) {
+  if (!isFileOpenPage(origin)) return
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return
+  window.addEventListener('click', (event) => { interceptFileOpenClick(event) }, true)
+}
+
+const fileOpenOrigin = readFileOpenOrigin()
+if (fileOpenOrigin) installFileOpenShortcut(fileOpenOrigin)

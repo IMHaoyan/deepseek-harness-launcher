@@ -47,6 +47,8 @@ function runPreload(options = {}) {
     },
     process: { platform: 'win32', argv: ['electron'] },
     location: { href: options.href || 'http://127.0.0.1:3080/' },
+    // 文件链接的 Ctrl+点击捕获会在这里挂监听（见 file-open-preload.test.js）；本测试只关心桌面壳门控
+    window: { addEventListener: () => undefined },
     URL,
     console,
   }
