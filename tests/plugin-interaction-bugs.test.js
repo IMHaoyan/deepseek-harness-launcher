@@ -41,16 +41,11 @@ test('全局 profile 写锁：主进程下发，页面禁用所有插件写操�
   assert.match(app, /if \(p\.busy \|\| locked\) btn\.disabled = true/)
   // 卡片按钮/开关触发点也要有兜底拦截（防止 disabled 被未来样式或键盘绕过）
   assert.match(app, /if \(pluginOpBusyNow\(\)\) \{\s*\n\s*showConsoleToast\('另一个插件操作正在进行，请稍候'\)/)
-  assert.match(app, /installBtn\.disabled = running \|\| locked/)
+  // 一键更新也要进入「忙态即禁用」：别的操作占着 profile 时不能再点
+  assert.match(app, /} else if \(locked\) \{\s*\n\s*updateBtn\.disabled = true/)
 })
 
 test('批量按钮：没目标也不做死按钮，点一下给出可读解释', () => {
-  assert.match(app, /const pending = plugins\.filter\(\(p\) => p && p\.preset && !p\.installed\)/)
-  assert.match(app, /const installable = pending\.filter/)
-  assert.match(app, /if \(!targets\.length\) \{\s*\n\s*showConsoleToast/,
-    '一键安装的点按守卫必须存在（旧实现根本没有"全部已装"的提示）')
-  assert.match(app, /缺失的预装插件都需先授权：请在卡片上点「授权并安装」/)
-  assert.match(app, /所有预装插件都已安装/)
   // 一键更新不再按"没得更新"置灰：handler 里的 0 目标提示必须真的能被用户触发
   assert.match(app, /updateBtn\.disabled = false;\s*\n\s*updateBtn\.title = updatable\.length/)
 })

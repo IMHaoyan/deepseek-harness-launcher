@@ -154,7 +154,7 @@ test('profile 写锁：所有会改 profile 的入口都必须过锁', () => {
   const guarded = [
     ['marketInstall', /case 'marketInstall': return JSON\.stringify\(await withProfileOp\(/],
     ['marketUninstall', /case 'marketUninstall': return JSON\.stringify\(await withProfileOp\(/],
-    ['pluginAction', /case 'pluginAction':[\s\S]{0,400}?withProfileOp\(/],
+    ['pluginAction', /case 'pluginAction':[\s\S]{0,900}?withProfileOp\(/],
     ['pluginsInstallAll', /case 'pluginsInstallAll':[\s\S]{0,400}?profileOpBusy\(\)/],
     ['pluginsRetryEnvFailed', /case 'pluginsRetryEnvFailed': return JSON\.stringify\(await withProfileOp\(/],
     ['pluginsApplyRestart', /case 'pluginsApplyRestart': return JSON\.stringify\(await withProfileOp\(/],
@@ -256,4 +256,14 @@ test('回退结果里的"跳过了什么"必须被说出来（日志 + 通知）
   assert.match(auto, /describeRestoreExtras\(r\.extras\)/, '自动回退要转述 extras 结果')
   const manual = main.slice(main.indexOf('async function restoreCheckpoint'))
   assert.match(manual, /describeRestoreExtras\(r\.extras\)/, '手动回退要转述 extras 结果')
+})
+
+test('延迟模式（defer）不打断正在运行的服务：只有立即生效的安装/卸载才先停服务', () => {
+  const start = main.indexOf('const npmDef = MANAGED_NPM_PLUGINS.find')
+  const end = main.indexOf("if (act === 'enable' || act === 'disable') return runNpmPluginAction(npmDef", start)
+  assert.ok(start > 0 && end > start, '找不到 npm 插件动作分支')
+  const body = main.slice(start, end)
+  assert.match(body, /if \(!defer\) \{\n\s+const stop = await stopServiceForPluginChange\(\)/, 'defer 分支不得先停服务（与 DSH 内置插件市场一致）')
+  assert.match(body, /return runNpmPluginAction\(npmDef, act, \{ defer, grantExemption/, 'defer 必须透传给动作')
+  assert.match(body, /return runNpmPluginAction\(npmDef, act === 'grant-install' \? 'install' : 'update', \{ defer, grantExemption: true \}\)/, '授权动作同样透传 defer')
 })

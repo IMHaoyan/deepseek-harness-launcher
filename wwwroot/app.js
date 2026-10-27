@@ -1954,8 +1954,8 @@ $('btnApplyRestart').addEventListener('click', async () => {
 });
 
 /**
- * 插件页两个批量按钮的进度与可用态（共用主进程同一份 pluginInstallAll 状态）：
- * 跑的是哪一批由 kind 决定 —— 只有发起那批的按钮显示进度，另一个禁用但不假装在干活。
+ * 插件页「一键更新」的进度与可用态（复用主进程 pluginInstallAll 状态）：
+ * 只有 kind=update 显示进度；其它批量操作进行中时按钮禁用但不假装在干活。
  * 空闲时两个按钮都不按「当前没目标」置灰：点一下会得到可读的解释（disabled 的 title 不可靠，
  * 而且旧实现把「没有可更新的插件」那段提示永久关在 disabled 后面，用户只看到一个死按钮）。
  */
@@ -1980,27 +1980,6 @@ function renderInstallAll(info, list) {
   }
   if (running) window._batchSawRunning = true;
   else if (result) window._batchSawRunning = false;
-
-  const installBtn = $('btnPluginsInstallAll');
-  if (installBtn) {
-    const pending = plugins.filter((p) => p && p.preset && !p.installed);
-    const pendingGated = pending.filter((p) => p.gate && p.gate.state === 'gated');
-    const installable = pending.filter((p) => !(p.gate && p.gate.state === 'gated'));
-    installBtn.disabled = running || locked;
-    installBtn.textContent = running && kind !== 'update'
-      ? '安装中 (' + done + '/' + total + ')' + current + '…'
-      : '一键安装所有预装插件';
-    if (!running) {
-      installBtn.title = locked
-        ? '另一个插件操作正在进行，请稍候'
-        : installable.length
-          ? '依次安装 ' + installable.length + ' 个缺失的预装插件（装完点顶部「立即重启生效」）'
-            + (pendingGated.length ? '；另有 ' + pendingGated.length + ' 个需先授权：' + pendingGated.map((p) => p.name).join('、') : '')
-          : (pendingGated.length
-            ? '缺失的预装插件都需先授权（' + pendingGated.map((p) => p.name).join('、') + '）：请在卡片上点「授权并安装」'
-            : '所有预装插件都已安装');
-    }
-  }
 
   const updateBtn = $('btnPluginsUpdate');
   if (updateBtn) {
@@ -2224,6 +2203,10 @@ $('pluginCards').addEventListener('click', async (e) => {
     });
     if (!ok) return;
   }
+  // 更新/安装类动作默认「延迟生效」：只改 profile、不自动重启，和「一键更新 / 一键安装」一致 ——
+  // 这样用户可以连续更新多个插件，最后点一次顶部「立即重启生效」。卸载保持立即重启（应急恢复用）。
+  const defer = action === 'install' || action === 'update' || action === 'reinstall'
+    || action === 'grant-install' || action === 'grant-update';
   const old = btn.textContent;
   const name = pluginDisplayName(id);
   const verb = PLUGIN_ACTION_VERB[action] || '处理';
@@ -2231,9 +2214,11 @@ $('pluginCards').addEventListener('click', async (e) => {
   btn.textContent = '处理中…';
   const changeHint = (action === 'enable' || action === 'disable')
     ? '修改启用状态后，需要手动重启服务生效'
-    : '会停止并重启 DSH 服务，进行中的会话会中断，约 10~60 秒';
+    : defer
+      ? '会直接更新 profile，不打断正在运行的服务；改完点顶部「立即重启生效」一次性生效'
+      : '会停止并重启 DSH 服务，进行中的会话会中断，约 10~60 秒';
   setPluginCardFeedback(btn, `正在${verb}「${name}」…（${changeHint}）`);
-  const r = await cmd('pluginAction', { id, action });
+  const r = await cmd('pluginAction', { id, action, defer });
   if (!r || !r.ok) {
     const msg = (r && r.error) || '操作失败，请查看日志';
     setPluginCardFeedback(btn, '✕ ' + msg);
@@ -2242,7 +2227,8 @@ $('pluginCards').addEventListener('click', async (e) => {
     btn.textContent = old;
   } else {
     // 成功必须自己说一声：卡片重渲染只是"状态变了"，不解释"刚刚发生了什么"
-    showConsoleToast(r.restartPending
+    const needsRestart = defer || r.restartPending;
+    showConsoleToast(needsRestart
       ? `已${verb}「${name}」；点顶部「立即重启生效」后生效`
       : `已${verb}「${name}」，服务已重启生效`);
   }
@@ -2307,44 +2293,6 @@ $('btnPluginsRefresh').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = old;
-  }
-});
-
-// 一键安装所有预装插件：只装未安装的，进度由主进程 state 推送驱动
-$('btnPluginsInstallAll').addEventListener('click', async () => {
-  const btn = $('btnPluginsInstallAll');
-  if (pluginOpBusyNow()) {
-    showConsoleToast('另一个插件操作正在进行，请稍候');
-    return;
-  }
-  const pending = (window._plugins || []).filter((p) => p && p.preset && !p.installed);
-  const gated = pending.filter((p) => p.gate && p.gate.state === 'gated');
-  const targets = pending.filter((p) => !(p.gate && p.gate.state === 'gated'));
-  // 「全都装好了 / 缺的都需先授权」不该还弹一个"开始安装"然后什么也不发生：
-  // 直接说清当前没有可装项，以及需授权的去哪里点。
-  if (!targets.length) {
-    showConsoleToast(gated.length
-      ? '缺失的预装插件都需先授权：请在卡片上点「授权并安装」'
-      : '所有预装插件都已安装');
-    return;
-  }
-  const ok = await confirmDialog({
-    title: '一键安装所有预装插件？',
-    body: '会依次装好本页 ' + targets.length + ' 个尚未安装的预装插件（插件市场、手机连接与各推荐插件）。安装前会先停止 DSH 服务，进行中的会话会中断；中途不重启，装完后点顶部「立即重启生效」重新启动服务。'
-      + (gated.length
-        ? '\n\n另有 ' + gated.length + ' 个需先授权（' + gated.map((p) => p.name).join('、') + '），不在这批里：'
-          + '请在卡片上单独点「授权并安装」（授权是风险接受，只对这一对精确版本生效）。'
-        : ''),
-    confirmText: '开始安装',
-  });
-  if (!ok) return;
-  btn.disabled = true;
-  btn.textContent = '启动中…';
-  const r = await cmd('pluginsInstallAll');
-  if (!r || !r.ok) {
-    btn.textContent = (r && r.error) || '启动失败';
-    btn.disabled = false;
-    setTimeout(() => { btn.textContent = '一键安装所有预装插件'; }, 2500);
   }
 });
 

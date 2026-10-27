@@ -4252,6 +4252,8 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
 
 async function runManagedPluginAction(id, action, opts = {}) {
   const r = await dispatchManagedPluginAction(id, action, opts)
+  // 延迟模式（defer）：动作只改 profile、不重启，结论里要明确告诉调用方"还需一次重启才生效"。
+  if (r && r.ok && opts.defer) r.restartPending = true
   // 环境级失败（与「装哪个插件」无关的那些）只解释一次；成功的动作把自己从聚合里摘掉。
   if (r && r.ok) {
     clearPluginEnvFailure(id)
@@ -4308,16 +4310,21 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
   const npmDef = MANAGED_NPM_PLUGINS.find((d) => d.id === pid)
   if (npmDef) {
     if (act === 'install' || act === 'uninstall' || act === 'update' || act === 'reinstall') {
-      // pnpm 改写 profile 依赖树时不能有 dsh 进程占用；重启由 applyPluginChange 统一负责。
-      const stop = await stopServiceForPluginChange()
-      if (!stop.ok) return stop
+      // 延迟模式与 DSH 内置插件市场一致：直接改 profile、不打断正在运行的服务（新 bundle 在下次重启加载）；
+      // 只有「立即生效」（非 defer）的安装/卸载才需要先停服务。
+      if (!defer) {
+        const stop = await stopServiceForPluginChange()
+        if (!stop.ok) return stop
+      }
       return runNpmPluginAction(npmDef, act, { defer, grantExemption: !!opts.grantExemption })
     }
     // 「授权并安装 / 授权并更新」：动作本身还是 install/update，只是先落一次精确版本豁免。
     // 授权必须由用户在卡片上显式点（带风险确认），批量流程绝不静默授权。
     if (act === 'grant-install' || act === 'grant-update') {
-      const stop = await stopServiceForPluginChange()
-      if (!stop.ok) return stop
+      if (!defer) {
+        const stop = await stopServiceForPluginChange()
+        if (!stop.ok) return stop
+      }
       return runNpmPluginAction(npmDef, act === 'grant-install' ? 'install' : 'update', { defer, grantExemption: true })
     }
     if (act === 'enable' || act === 'disable') return runNpmPluginAction(npmDef, act, { defer })
@@ -7295,12 +7302,15 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'pluginAction': {
           const id = String((value && value.id) || '').slice(0, 80)
           const action = String((value && value.action) || '').slice(0, 40)
+          // 单卡片动作也支持「先改 profile、最后统一重启」：控制台更新/安装时传 defer，
+          // 与「一键更新/一键安装」同一套挂起机制，避免点一次更新就重启一次服务。
+          const defer = !!(value && value.defer)
           // 先让卡片进入忙态并立刻推给控制台：这段动作末尾还要重启服务（实测约 10 秒），
           // 只在 pnpm 期间显示忙态会留出一段"看着已经结束"的空档，用户会以为点了没反应。
           pluginActionBusy.set(id, action)
           broadcastState()
           try {
-            return JSON.stringify(await withProfileOp(`插件 ${action}`, () => runManagedPluginAction(id, action)))
+            return JSON.stringify(await withProfileOp(`插件 ${action}`, () => runManagedPluginAction(id, action, { defer })))
           } finally {
             pluginActionBusy.delete(id)
             broadcastState() // 忙态解除 + 结果（lastChange/error）一起推给控制台

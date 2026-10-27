@@ -5,11 +5,11 @@ const fs = require('node:fs')
 const path = require('node:path')
 const read = (name) => fs.readFileSync(path.join(__dirname, '..', name), 'utf8')
 const ui = read('ui-src/app.js')
-test('批量确认说明开始先停服、会话中断、最后手动启动，不承诺无打断', () => {
-  const body = ui.slice(ui.indexOf("title: '一键安装所有预装插件？'"), ui.indexOf("confirmText: '开始安装'"))
-  assert.match(body, /安装前会先停止 DSH 服务/)
+test('批量更新确认说明开始先停服、会话中断、最后自动重启，不承诺无打断', () => {
+  const body = ui.slice(ui.indexOf("title: '更新所有可更新的插件？'"), ui.indexOf("confirmText: '开始更新'"))
+  assert.match(body, /开始前会先停止 DSH 服务/)
   assert.match(body, /进行中的会话会中断/)
-  assert.match(body, /重新启动服务/)
+  assert.match(body, /自动重启一次 DSH 生效/)
   assert.doesNotMatch(read('README.md'), /变更不打断会话/)
 })
 test('npm 插件开关直接改 patch 层：不再有手机连接专用的安装/卸载确认', () => {
