@@ -29,6 +29,8 @@ const envInstallSrc = read('env-install.js')
 const fetchDistSrc = read('tools/fetch-node-dist.mjs')
 const appJs = read('ui-src/app.js')
 const builtAppJs = read('wwwroot/app.js')
+const indexHtml = read('ui-src/index.html')
+const builtIndexHtml = read('wwwroot/index.html')
 
 // 取 [startMarker, endMarker) 之间的源码。放在测试里调用：找不到边界时算测试失败，而不是整文件加载失败。
 function sliceBetween(src, startMarker, endMarker, label) {
@@ -329,4 +331,34 @@ test('env-detect.js：报告与 envSummary 都带 nodeUpgrade（链路第一段�
   assert.match(envDetectSrc, /nodeUpgrade,/, '报告要带 nodeUpgrade 字段')
   assert.match(envDetectSrc, /nodeUpgrade: report\.nodeUpgrade \|\| null/, 'envSummary 要透出 nodeUpgrade')
   assert.match(envDetectSrc, /decideNodeUpgrade,/, 'decideNodeUpgrade 要对外导出（可测试）')
+})
+
+// 首页（通用页）状态卡上的第二个入口：Node 22 用户不会主动进运行环境页，首页要有可见但不吵的入口。
+test('首页状态卡：Node.js 升级行只在有事实时出现，且与运行环境页共用同一个升级入口', () => {
+  for (const [name, html] of [['ui-src/index.html', indexHtml], ['wwwroot/index.html', builtIndexHtml]]) {
+    assert.match(html, /id="nodeUpgradeRow"/, `${name} 缺首页 Node.js 升级行容器`)
+    assert.match(html, /id="btnNodeUpgrade"/, `${name} 缺首页升级按钮`)
+    assert.match(html, /id="nodeUpgradeVersion"/, `${name} 缺首页当前版本展示`)
+    // 默认隐藏：没有可升级事实时不能占版面（不是常驻设置项）
+    assert.match(html, /class="row version-row hidden" id="nodeUpgradeRow"/, `${name} 的升级行必须默认隐藏`)
+    // 与状态卡其他版本行同一种形态（能复用既有样式，不新造警示卡）
+    assert.ok(html.includes('id="statusCard"'), `${name} 缺状态卡容器`)
+  }
+  assert.ok(!builtIndexHtml.includes('__WHALE_PATH__'), 'wwwroot/index.html 的鲸鱼路径占位符必须已被内联')
+
+  // 渲染：只在 nodeUpgrade 存在时去掉 hidden；按钮文案/提示跟 mode 走
+  assert.match(appJs, /const row = \$\('nodeUpgradeRow'\)/, '渲染层要更新首页升级行')
+  assert.match(appJs, /row\.classList\.(remove|add)\('hidden'\)/, '渲染层要切换首页行的显隐')
+  assert.match(appJs, /可升级到 Node\.js \$\{targetMajor\} LTS/, '首页提示要带上目标版本')
+  assert.match(appJs, /免管理员授权/, 'user 模式要说明免管理员授权')
+  // 共用入口：两张入口不能各写一套确认/payload（否则文案与行为会漂移）
+  assert.match(appJs, /async function startNodeUpgrade\(\)/, '升级入口要收敛成一个函数')
+  assert.match(appJs, /=== 'upgrade-node'[\s\S]{0,300}await startNodeUpgrade\(\)/, '运行环境页的升级卡应调用共用入口')
+  assert.match(appJs, /\$\('btnNodeUpgrade'\)\.addEventListener\('click', \(\) => void startNodeUpgrade\(\)\)/, '首页按钮要绑定同一个入口')
+  // 动作启动后要切到运行环境页看进度/日志/重试（首页没有任务视图，不能点了没反馈）
+  assert.match(sliceBetween(appJs, 'async function startNodeUpgrade() {', 'function renderEnvSummary(env)', 'startNodeUpgrade'),
+    /showPage\('env'\)/, '升级任务启动后要跳到运行环境页，保证有可见进度与结果')
+  // 安装进行中两个入口一起进忙态
+  assert.match(appJs, /const homeUpBtn = \$\('btnNodeUpgrade'\)/, '任务进行中首页按钮也要禁用')
+  assert.match(appJs, /homeUpBtn\.disabled = running/, '任务进行中首页按钮要进忙态')
 })
