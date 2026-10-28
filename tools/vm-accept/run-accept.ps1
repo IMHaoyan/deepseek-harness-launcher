@@ -3,9 +3,11 @@
 # 前置（一次性，需要管理员 + 重启）：
 #   Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All
 # 用法：
-#   pwsh -File tools\vm-accept\run-accept.ps1 [-TimeoutMinutes 20] [-KeepOpen]
+#   pwsh -File tools\vm-accept\run-accept.ps1 [-TimeoutMinutes 30] [-KeepOpen]
+# 说明：本轮起沙箱内会先跑一遍「安装 24.22.1 → 卸载」，再跑一遍「装 22.23.2 → 直接升级 24.22.1 →
+# 卸载」，比旧版多两轮 msiexec，默认等待时间相应放宽到 30 分钟。
 param(
-  [int]$TimeoutMinutes = 20,
+  [int]$TimeoutMinutes = 30,
   [switch]$KeepOpen
 )
 $ErrorActionPreference = 'Stop'

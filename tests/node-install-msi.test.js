@@ -2,8 +2,9 @@
 //
 // 为什么要有这些断言：
 //   1) "复用优先"是硬规则——已装用户升级 dshl 后不该被动过 Node（这是我们承诺过的）；
-//   2) "已装 MSI 但版本过旧"必须拒绝而不是再装一个：Node 的 MSI 是不同版本=不同产品码却默认装同一目录，
-//      两个产品争用同一目录会让卸载其一就删掉文件、留下另一个残缺；
+//   2) "已装 MSI 但版本过旧"走官方 MSI 的原生 major upgrade，不再拒绝让用户手工处理：
+//      Node 的 MSI 同 UpgradeCode + RemoveExistingProducts，装新版本会先移除旧产品（绝不并装两个产品）；
+//      只有"坏产品（注册表有、可执行文件不在）"与"版本管理器在场"才拒绝；
 //   3) 兜底路径（zip）必须与 MSI 语义一致：那 23 字节 npmrc 要按字节复刻，否则全局包又会跑回 Node 目录。
 'use strict'
 
@@ -37,7 +38,7 @@ function makeJob() {
   return { lines, job: { logLine: (l) => lines.push(l), opts: {} } }
 }
 
-// ---------- 决策：复用优先 / MSI / 兜底 / 拒绝 ----------
+// ---------- 决策：复用优先 / MSI / major upgrade / 兜底 / 拒绝 ----------
 
 test('decideNodeInstallPlan：已有可用 Node 一律复用（不装任何东西）', () => {
   assert.deepEqual(
@@ -46,16 +47,16 @@ test('decideNodeInstallPlan：已有可用 Node 一律复用（不装任何东�
   )
 })
 
-test('decideNodeInstallPlan：本机已有 Node.js MSI 产品时按其版本决定复用或拒绝', () => {
+test('decideNodeInstallPlan：本机已有 Node.js MSI 产品时按其版本决定复用或 major upgrade', () => {
   // 版本满足 → 复用（哪怕没走我们的安装流程）
   assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '22.23.2' } }).action, 'reuse')
   assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '24.16.0' } }).action, 'reuse')
-  // 版本过旧 → 拒绝，并带上可行动作所需的版本与范围（绝不并装第二个产品）
+  // 版本过旧 → 走官方 MSI 的原生 major upgrade（Windows Installer 先移除旧产品再装新版本），带上 from/targetMajor
   const old = envInstall.decideNodeInstallPlan({ installedMsi: { version: '18.20.0' } })
-  assert.equal(old.action, 'refuse')
+  assert.equal(old.action, 'upgrade-msi')
   assert.equal(old.reason, 'msi-too-old')
-  assert.equal(old.version, '18.20.0')
-  assert.equal(old.range, envDetect.DEFAULT_ENGINE_RANGE)
+  assert.equal(old.from, '18.20.0')
+  assert.equal(old.targetMajor, envDetect.DEFAULT_NODE_MAJOR)
 })
 
 test('decideNodeInstallPlan：注册了 MSI 但可执行文件不在 → 拒绝并请用户修复（不能复用也不能并装）', () => {
@@ -65,8 +66,8 @@ test('decideNodeInstallPlan：注册了 MSI 但可执行文件不在 → 拒绝�
   assert.equal(broken.action, 'refuse')
   assert.equal(broken.reason, 'msi-broken')
   assert.equal(broken.version, '24.16.0')
-  // 版本过旧优先于"文件不在"（先能升级才谈得上修复）
-  assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '18.20.0' }, msiUsable: false }).reason, 'msi-too-old')
+  // "文件不在"优先于版本判断：坏产品上不能叠加安装（先修复或卸载，升级也才有意义）
+  assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '18.20.0' }, msiUsable: false }).reason, 'msi-broken')
   // 文件在 → 照常复用；未提供该信息（旧调用方）→ 保持历史行为
   assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '24.16.0' }, msiUsable: true }).action, 'reuse')
   assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '24.16.0' } }).action, 'reuse')
@@ -84,9 +85,12 @@ test('decideNodeInstallPlan：默认官方 MSI；版本管理器在场或配置�
   assert.equal(envInstall.decideNodeInstallPlan({ installedMsi: { version: '22.23.2' }, versionManager: 'nvm' }).action, 'reuse')
 })
 
-test('decideNodeInstallPlan：mode=user 不能盖过"已有可用 MSI"（否则会出现两台 Node）', () => {
+test('decideNodeInstallPlan：mode=user 不能盖过"已有 MSI"（否则会出现两台 Node）', () => {
+  // 旧 MSI 在场时，回退用户级装了也会被机器 PATH 遮蔽 → 不装第二个，改走 MSI major upgrade
   const r = envInstall.decideNodeInstallPlan({ mode: 'user', installedMsi: { version: '18.20.0' } })
-  assert.equal(r.action, 'refuse', '旧 MSI 在场时，回退用户级装了也会被机器 PATH 遮蔽 → 必须拒绝并交代')
+  assert.equal(r.action, 'upgrade-msi', '已有 MSI 时 mode=user 也要走官方 major upgrade，不能并装用户级')
+  assert.equal(r.reason, 'msi-too-old')
+  assert.equal(r.from, '18.20.0')
 })
 
 // ---------- msiexec 结果与注册表解析 ----------

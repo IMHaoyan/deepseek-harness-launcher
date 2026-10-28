@@ -602,7 +602,33 @@ function renderEnvSummary(env) {
       ? (n.source === 'user' ? '用户级安装' : n.source === 'managed' ? '托管安装' : n.source === 'config' ? '手动指定' : '系统检测') + (n.path ? ` · ${n.path}` : '')
       : n.status === 'tooOld' ? `版本过低（需要 ${env.engineRange || '22.19+/24+'}）${n.path ? ' · ' + n.path : ''}`
       : n.path ? `配置的路径不可用：${n.path}` : '未检测到 Node.js';
-    cards.push({ badge, name: 'Node.js', version, detail, item: 'node', btnLabel: n.status === 'ok' ? '' : '安装 Node.js（用户级）' });
+    // 升级卡存在时 Node 卡不再给安装入口：真实动作会走官方 MSI major upgrade（需管理员授权），
+    // 文案若仍是「安装 Node.js（用户级）」就与真实动作不符；升级统一由下面的「Node.js 升级」卡承担。
+    cards.push({ badge, name: 'Node.js', version, detail, item: 'node', btnLabel: n.status === 'ok' || env.nodeUpgrade ? '' : '安装 Node.js（用户级）' });
+  }
+
+  // Node.js 升级（旧版 dshl 装的 Node 22 → 24 LTS）：是否存在由主进程探测后放在 env.nodeUpgrade 里，
+  // 渲染层只消费事实、不做版本判断。仅当存在时出现；点击后由主进程按 mode（msi / user）执行升级。
+  if (env.nodeUpgrade) {
+    const up = env.nodeUpgrade;
+    const targetMajor = esc(up.targetMajor);
+    const msi = up.mode === 'msi';
+    // 文案按安装方式区分：MSI 走 Windows Installer major upgrade（一次管理员授权，全局包在 %APPDATA%\npm 不受影响）；
+    // 用户级 zip 直接替换目录（免授权，其他全局包不迁移、旧目录保留备份）。
+    const detail = msi
+      ? `当前是官方 MSI 安装的 Node.js（${esc(up.dir)}）。升级到 Node.js ${targetMajor} LTS 需一次管理员授权；`
+        + 'Windows Installer 会先移除旧版本再安装（major upgrade）；升级前自动停止服务、完成后自动恢复；'
+        + '全局包在 %APPDATA%\\npm，不受影响。'
+      : `当前是用户级 zip 安装（${esc(up.dir)}）。升级到 Node.js ${targetMajor} LTS 无需管理员授权；`
+        + '下载官方发行包替换该目录；升级前自动停止服务、完成后自动恢复；'
+        + '其他全局包不会被迁移，旧目录会保留备份。';
+    cards.push({
+      badge: 'warn',
+      name: 'Node.js 升级',
+      version: `v${esc(up.from)}`,
+      detail,
+      actHtml: `<button class="btn sm" data-env-act="upgrade-node">升级到 Node.js ${targetMajor} LTS${msi ? '（需一次管理员授权）' : ''}</button>`,
+    });
   }
 
   {
@@ -688,9 +714,10 @@ function renderEnvJob(job) {
   $('btnEnvRetry').style.display = (job.status === 'failed' || job.status === 'cancelled') ? '' : 'none';
   const btn = $('btnEnvInstallAll');
   btn.disabled = running;
-  // 迁移入口（卡片由 renderEnvSummary 重建，可能不存在）：安装进行中一律禁用，避免并发第二个任务
-  const migrateBtn = document.querySelector('#envCards button[data-env-act="migrate-msi"]');
-  if (migrateBtn) migrateBtn.disabled = running;
+  // 迁移 / Node.js 升级入口（卡片由 renderEnvSummary 重建，可能不存在）：安装进行中一律禁用，
+  // 避免并发第二个安装任务。用 querySelectorAll：两张卡片可能同时存在。
+  document.querySelectorAll('#envCards button[data-env-act="migrate-msi"], #envCards button[data-env-act="upgrade-node"]')
+    .forEach((b) => { b.disabled = running; });
   // 提示文案只认"检测结果"（renderEnvSummary 负责），安装任务状态只显示在阶段文本里，
   // 避免"安装完成"与"检测未就绪"互相矛盾；安装进行中时给出进度提示。
   if (running) $('envInstallHint').textContent = '安装进行中…';
@@ -2340,13 +2367,36 @@ document.querySelectorAll('#pluginFilters [data-plugin-filter]').forEach((el) =>
   el.addEventListener('click', () => setPluginFilter(el.dataset.pluginFilter));
 });
 // 状态卡上的单项安装按钮（事件委托：卡片由 render 重建）
-$('envCards').addEventListener('click', (e) => {
+$('envCards').addEventListener('click', async (e) => {
   // 迁移到官方安装：重装 Node（官方 MSI）+ DSH 落到 %APPDATA%\npm + 旧残留由后端清理。
   // DSH 会在后端按"旧目录里有 DSH"自动补进安装项（nodeReplacePlan），这里只声明"要重装 Node"。
   const act = e.target.closest('button[data-env-act]');
   if (act) {
     if (act.getAttribute('data-env-act') === 'migrate-msi') {
       void cmd('envInstall', { items: ['node'], forceNodeInstall: true, nodeInstallMode: 'msi' });
+      return;
+    }
+    if (act.getAttribute('data-env-act') === 'upgrade-node') {
+      // Node.js 升级（Node 22 → 24 LTS）：先讲清代价（停服务、msi 需一次管理员授权、失败自动恢复服务），
+      // 确认后把"升级"作为事实交给主进程：mode（msi / user）由主进程探测，渲染层不重复判断。
+      const up = (window._envSummary && window._envSummary.nodeUpgrade) || {};
+      const targetMajor = up.targetMajor || 24;
+      const msi = up.mode === 'msi';
+      const ok = await confirmDialog({
+        title: `升级 Node.js 到 ${targetMajor} LTS？`,
+        body: '升级会先停止 DSH 服务（升级期间服务不可用），完成后自动恢复；若升级失败，也会尝试自动恢复服务。\n\n'
+          + (msi
+            ? `本次升级需要一次管理员授权（UAC 确认）：Windows Installer 会先移除旧版本再安装 Node.js ${targetMajor} LTS（major upgrade）；全局包在 %APPDATA%\\npm，不受影响。`
+            : `本次升级无需管理员授权：下载官方发行包替换当前安装目录${up.dir ? `（${up.dir}）` : ''}；其他全局包不会被迁移，旧目录会保留备份。`),
+        confirmText: '开始升级',
+        danger: true,
+      });
+      if (!ok) return;
+      const r = await cmd('envInstall', { items: ['node'], forceNodeInstall: true, nodeUpgrade: true });
+      if (!r || r.ok === false) {
+        showConsoleToast('✕ Node.js 升级启动失败：' + ((r && r.error) || '无响应，请查看日志'));
+      }
+      return;
     }
     return;
   }

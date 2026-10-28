@@ -1,4 +1,5 @@
 // fetch-node-dist.mjs — 发布构建前置：下载 Node 官方发行包到 assets/node-dist（安装包内置，首装免下载）
+// 默认版本 24.22.1 —— 与 env-detect.js 的 DEFAULT_NODE_MAJOR = 24 对齐（测试会校验大版本一致）。
 // 用法：node tools/fetch-node-dist.mjs [version] [--msi-only | --zip-only]
 //   默认两份都内置：
 //     · node-v<ver>-x64.msi      —— **官方 MSI，dshl 的默认安装路径**（与官网 .msi 完全一致）
@@ -18,7 +19,7 @@ const outDir = join(root, 'assets', 'node-dist')
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'))
 const msiOnly = process.argv.includes('--msi-only')
 const zipOnly = process.argv.includes('--zip-only')
-const version = args[0] || '22.23.2'
+const version = args[0] || '24.22.1'
 const BASES = ['https://npmmirror.com/dist', 'https://nodejs.org/dist']
 
 const MSI = `node-v${version}-x64.msi`

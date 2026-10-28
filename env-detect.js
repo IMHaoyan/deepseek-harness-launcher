@@ -15,6 +15,10 @@ const os = require('os')
 const semver = require('semver')
 const { execFile } = require('child_process')
 
+// DSHL 安装 Node 的目标大版本：24 = 当前 Active LTS（Krypton）。
+// 只决定"要装/要升级到哪个大版本"；"现有 Node 能不能复用"仍看 DEFAULT_ENGINE_RANGE ——
+// 22.x 依旧可复用，不会因为换了目标版本就逼已有用户重装环境。
+const DEFAULT_NODE_MAJOR = 24
 // DSH 仓库 engines：node ^22.19.0 || >=24.0.0；已安装的 DSH 包自带 engines.node 时以它为准
 const DEFAULT_ENGINE_RANGE = '^22.19.0 || >=24.0.0'
 const DEFAULT_PNPM_VERSION = '11.8.0'
@@ -26,7 +30,7 @@ let HOME = path.join(os.homedir(), '.dsh') // 始终为真实用户 HOME（安�
 // npmGlobalRoot：安装侧（env-install.resolveGlobalRoot）记账的"实际使用的 npm 前缀"。
 // 它是探测与安装之间唯一的事实源——不记账就只能靠 %APPDATA%\npm 这类默认值猜，一旦猜错就是
 // "安装完成却报未检测到 DSH"（zip 版 Node 的 npm 内建前缀 = node.exe 所在目录，见 globalPrefixes）。
-let Config = { harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, nodeMajor: 22, npmGlobalRoot: '' }
+let Config = { harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, nodeMajor: DEFAULT_NODE_MAJOR, npmGlobalRoot: '' }
 let logFn = () => {}
 let FRESH_TEST = false // DSHL_FRESH_TEST=1：模拟全新机器（无视系统级 node/源码仓库/全局/npx 缓存，只认托管安装）
 
@@ -286,6 +290,45 @@ async function msiNodeBin() {
   return msiNodeMemo
 }
 
+// ---------- 探测：官方 Node.js MSI 产品（HKLM\SOFTWARE\Node.js：InstallPath + Version） ----------
+// 官方 MSI 才会写这个键。只读不写；读失败与"没装"在这里等价（后续决策都按"没装"走 = 不会误判成已装）。
+async function readInstalledNodeMsi() {
+  if (!IS_WIN) return null
+  try {
+    const out = await runText('reg', ['query', 'HKLM\\SOFTWARE\\Node.js'], 10000)
+    return parseNodeJsRegQuery(out)
+  } catch { return null }
+}
+
+// reg query 输出解析（纯函数，便于测试）：键不存在时输出为空或错误文本 → 返回 null
+function parseNodeJsRegQuery(stdout) {
+  const text = String(stdout || '')
+  const pick = (name) => {
+    const m = new RegExp(`${name}\\s+REG_\\w+\\s+(.*)$`, 'm').exec(text)
+    return m ? m[1].trim() : ''
+  }
+  const installPath = pick('InstallPath')
+  const version = pick('Version')
+  if (!installPath && !version) return null
+  return { installPath, version }
+}
+
+// 版本管理器在场时不要去装机器级 MSI：那会和 nvm/volta/fnm 争 PATH，把用户"切版本"的行为打乱。
+function detectVersionManager(deps = {}) {
+  const exists = deps.exists || ((p) => { try { return fs.existsSync(p) } catch { return false } })
+  const env = deps.env || process.env
+  const home = deps.home || os.homedir()
+  const candidates = [
+    ['nvm', env.NVM_HOME, path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'nvm')],
+    ['volta', env.VOLTA_HOME, path.join(home, '.volta')],
+    ['fnm', env.FNM_DIR, path.join(home, '.fnm'), path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'fnm')],
+  ]
+  for (const [name, ...dirs] of candidates) {
+    if (dirs.some((d) => d && exists(d))) return name
+  }
+  return ''
+}
+
 function nodeCandidates(extra = []) {
   const list = []
   if (!FRESH_TEST && Config.nodePath) list.push({ path: Config.nodePath, source: 'config' })
@@ -347,6 +390,84 @@ async function detectNode(range) {
   if (firstMissingExplicit) return { status: 'missing', path: firstMissingExplicit, version: null, detail: '配置的 nodePath 不可用' }
   if (best) return { status: 'tooOld', path: best.path, version: best.version, source: best.source, detail: `需要 ${range}` }
   return { status: 'missing', path: null, version: null }
+}
+
+// 版本串 → 大版本号；拿不到返回 null（宁可少报，不猜）
+function nodeMajorOf(version) {
+  const m = /^v?(\d+)\./.exec(String(version || '').trim())
+  return m ? Number(m[1]) : null
+}
+
+// dshl 用户级 Node 目录（官方 zip 落位）里那份的真实版本。只读探测：不存在/拿不到版本都如实返回。
+async function readUserNodeForUpgrade() {
+  const dir = userNodeDir()
+  if (!dir) return null
+  const bin = path.join(dir, IS_WIN ? 'node.exe' : 'node')
+  if (!fs.existsSync(bin)) return { dir, exists: false, version: '' }
+  const v = await runNode(bin, ['-v'])
+  return { dir, exists: true, version: String(v || '').trim().replace(/^v/i, '') }
+}
+
+// 生效 Node 的真实路径：PATH 上的 `node` 在探测里是裸命令名，拿不到目录就无法证明
+// "用户级目录里那份就是当前生效的"。问 where.exe 一次，能解析就用来做路径比对（失败返回空，退回版本比对）。
+async function resolveActiveNodePath(node) {
+  const p = node && node.path
+  if (typeof p === 'string' && path.isAbsolute(p)) return p
+  try {
+    const list = await executableCandidates('node')
+    return list.find((x) => path.isAbsolute(x)) || ''
+  } catch { return '' }
+}
+
+// Windows 路径归一化（仅用于比较：大小写不敏感、去掉尾部斜杠）
+function sameWinDir(a, b) {
+  const norm = (p) => {
+    try { return path.win32.normalize(String(p)).replace(/[\\/]+$/, '').toLowerCase() } catch { return String(p).toLowerCase() }
+  }
+  return !!a && !!b && norm(a) === norm(b)
+}
+
+/**
+ * 旧版 Node 的升级建议（纯函数，便于测试）。只在"这份 Node 确实由 dshl 的安装方式管理"时给建议，
+ * 用户自装 / 版本管理器管理的 Node 一律不碰（保持"启动器不侵入被管理工具"的边界）：
+ *   - 当前生效 Node 的大版本已 >= 目标（如 26 用户）→ 不提示（不去动机器上残留的旧 MSI）
+ *   - 官方 MSI 产品大版本 < 目标 → mode 'msi'：官方 MSI 原生支持 major upgrade，
+ *     Upgrade 表（WIX_UPGRADE_DETECTED / RemoveExistingProducts）会先移除旧产品再装新版本
+ *   - 无 MSI、用户级目录里那份正是当前生效版本且大版本 < 目标 → mode 'user'：zip 目录替换
+ *   - 版本管理器在场 → 一律不提示（不去和 nvm/volta/fnm 争 PATH）
+ */
+function decideNodeUpgrade(input) {
+  const o = input || {}
+  const platform = o.platform || process.platform
+  if (platform !== 'win32') return null
+  if (o.versionManager) return null
+  const targetMajor = Number(o.targetMajor) || DEFAULT_NODE_MAJOR
+  const activeVersion = String((o.node && o.node.version) || '').trim().replace(/^v/i, '')
+  const activeMajor = nodeMajorOf(activeVersion)
+  if (activeMajor !== null && activeMajor >= targetMajor) return null
+  const msi = o.installedMsi
+  if (msi && msi.version) {
+    const m = nodeMajorOf(msi.version)
+    if (m !== null && m < targetMajor) {
+      return { mode: 'msi', from: String(msi.version), targetMajor, dir: String(msi.installPath || ''), reason: 'msi-older-major' }
+    }
+    return null
+  }
+  const u = o.userNode
+  if (u && u.exists && u.version) {
+    const userVersion = String(u.version).trim().replace(/^v/i, '')
+    const uv = nodeMajorOf(userVersion)
+    if (uv === null || uv >= targetMajor) return null
+    // 证明"用户级目录里那份就是当前生效的"：
+    //   ① 能拿到生效路径 → 必须与用户级目录同目录（最硬的证据）；
+    //   ② 拿不到路径（PATH 上是裸 node 且 where 也解析不了）→ 退回完整版本串相等。
+    const activePath = String(o.activePath || '')
+    const evidence = activePath ? sameWinDir(path.dirname(activePath), u.dir) : (activeVersion === '' || userVersion === activeVersion)
+    if (evidence) {
+      return { mode: 'user', from: userVersion, targetMajor, dir: String(u.dir || ''), reason: 'user-level-older-major' }
+    }
+  }
+  return null
 }
 
 // ---------- 探测：DSH（四种形态） ----------
@@ -575,6 +696,21 @@ async function buildReport() {
     issues.push(`检测到 ${dsh.kind === 'managed' ? '托管' : 'npx'} 形态的 DSH（v${dsh.version || '?'}），将自动迁移到全局 npm 安装（迁移失败不影响当前使用）`)
   }
 
+  // 旧版 Node 升级建议：只读取本机事实（注册表 / 用户级目录），这里不做任何修改。
+  // FRESH_TEST 模拟全新机器：不看宿主机上的 Node 产品，免得把"宿主机事实"当成客户端事实。
+  const installedMsi = FRESH_TEST ? null : await readInstalledNodeMsi()
+  const versionManager = FRESH_TEST ? '' : detectVersionManager()
+  const targetMajor = Number(Config.nodeMajor) || DEFAULT_NODE_MAJOR
+  const activeMajor = nodeMajorOf(node.version)
+  let userNode = null
+  let activePath = ''
+  if (!FRESH_TEST && !installedMsi && !versionManager && (activeMajor === null || activeMajor < targetMajor)) {
+    userNode = await readUserNodeForUpgrade()
+    if (userNode && userNode.exists) activePath = await resolveActiveNodePath(node)
+  }
+  // 用户显式配了 nodePath = 明确指定用哪份 Node：不提示改机器上那份 MSI（最小侵入，不猜用户意图）。
+  const nodeUpgrade = Config.nodePath ? null : decideNodeUpgrade({ platform: process.platform, installedMsi, node, userNode, versionManager, targetMajor, activePath })
+
   const plan = buildPlan(node, dsh)
   return {
     ready: !!plan,
@@ -599,6 +735,7 @@ async function buildReport() {
     issues,
     npmPrefix: npmPrefix || null, // 尾查问到的 npm 全局前缀（诊断线索；未触发尾查时为 null）
     legacyNode: legacyUserNodeLayout(), // 旧布局事实（用户级 Node 目录里还装着全局 DSH）→ 迁移入口的输入
+    nodeUpgrade, // 旧版 Node 升级建议（null = 无需/不该由 dshl 升）→ UI 升级卡片的唯一输入
     at: Date.now(),
   }
 }
@@ -645,6 +782,8 @@ function envSummary(report) {
     npmPrefix: report.npmPrefix || null,
     // 旧布局事实（用户级 Node 目录里还装着全局 DSH）：非 null 时 UI 应给出"迁移到官方安装"入口
     legacyNode: report.legacyNode || null,
+    // 旧版 Node 升级建议（null = 无）：非 null 时 UI 应给出"升级到 Node.js 24 LTS"入口
+    nodeUpgrade: report.nodeUpgrade || null,
   }
 }
 
@@ -654,6 +793,7 @@ function cachedReport() {
 }
 
 module.exports = {
+  DEFAULT_NODE_MAJOR,
   DEFAULT_ENGINE_RANGE,
   DEFAULT_PNPM_VERSION,
   initEnv,
@@ -666,7 +806,13 @@ module.exports = {
   globalPrefixes,
   npmPrefixOf,
   legacyUserNodeLayout,
+  nodeMajorOf,
+  decideNodeUpgrade,
+  readUserNodeForUpgrade,
   msiNodeBin,
+  readInstalledNodeMsi,
+  parseNodeJsRegQuery,
+  detectVersionManager,
   readNpmPrefix,
   normalizeNpmPrefix,
   runtimeBase,

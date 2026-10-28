@@ -6,7 +6,7 @@
 #
 # 用途：发布前断言"我们内置的官方安装包"确实是官方那一份（产品名/版本/升级族/ALLUSERS）、
 # 带上决定 npm 全局根的那份 23 字节 npmrc，以及 MSI 自己怎么写 PATH（Environment 表）。
-param([string]$Msi = "$PSScriptRoot\..\assets\node-dist\node-v22.23.2-x64.msi")
+param([string]$Msi = "$PSScriptRoot\..\assets\node-dist\node-v24.22.1-x64.msi")
 $ErrorActionPreference = 'Stop'
 $Msi = (Resolve-Path $Msi).Path
 Write-Host "只读检查：$Msi"

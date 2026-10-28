@@ -131,7 +131,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: 22, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -160,6 +160,8 @@ desktopShell.registerConfigChannel(ipcMain, {
 let envReport = null
 let envRefreshSeq = 0
 let envForceRefreshInFlight = false
+// 显式「升级 Node.js」任务是否停过服务：失败/取消后要负责把服务拉回来（成功路径由 onDone 自动启动）
+let nodeUpgradeRestartPending = false
 
 function initEnvRuntime() {
   envDetect.initEnv({ realHome: realHome, Config, log })
@@ -174,6 +176,7 @@ function initEnvRuntime() {
       // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
       // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动。
       // 静默任务（后台迁移）：只切换检测结果，不自动启动/重启服务（避免打断正在运行的会话）。
+      nodeUpgradeRestartPending = false // 成功路径统一由下面的 onDone 逻辑启动服务
       const snap = envInstall.getJob()
       const silent = !!(snap && snap.job && snap.job.silent)
       void (async () => {
@@ -196,6 +199,19 @@ function initEnvRuntime() {
         } else {
           startWhenReady = true
           log('environment not ready right after install, deferred start armed')
+        }
+      })()
+    },
+    onFail: () => {
+      // 显式升级任务在启动前停了服务：失败/取消后必须把服务拉回来
+      // （fail-closed：不能让用户环境停在"服务已停、升级也没成"的半截状态）。
+      if (!nodeUpgradeRestartPending) return
+      nodeUpgradeRestartPending = false
+      log('node upgrade job failed/cancelled, restarting service')
+      void (async () => {
+        try { await refreshEnv(true) } catch { /* 探测失败也照样尝试启动：handleStart 自己会报错 */ }
+        if (envReady() && !server.running()) {
+          try { await handleStart() } catch (err) { log('restart after failed node upgrade failed: ' + (err && err.message ? err.message : String(err))) }
         }
       })()
     },
@@ -227,6 +243,10 @@ async function refreshEnv(force = false) {
       // 旧布局（用户级 Node 目录里还装着全局 DSH）：官方 MSI 成为默认安装方式后，这类机器可迁移；只记事实，不静默改环境
       if (s.legacyNode) {
         log(`ENV-DIAG legacy-node: ${s.legacyNode.dir}（v${s.legacyNode.version || '?'}${s.legacyNode.otherGlobals.length ? `，另有 ${s.legacyNode.otherGlobals.length} 个全局包` : ''}）→ 可迁移到官方 MSI（只迁移 DSH）`)
+      }
+      // 旧版 Node 可升级：只记事实（界面据此给升级卡片），绝不静默升级（要 UAC / 要停服务，必须用户点）
+      if (s.nodeUpgrade) {
+        log(`ENV-DIAG node-upgrade: v${s.nodeUpgrade.from} → Node.js ${s.nodeUpgrade.targetMajor} LTS（方式：${s.nodeUpgrade.mode}${s.nodeUpgrade.dir ? ' · ' + s.nodeUpgrade.dir : ''}）`)
       }
       broadcastState()
     }
@@ -387,6 +407,10 @@ function log(message) {
 }
 
 // 逐字段应用配置（loadConfig 与"健康快照恢复后重载"共用，保证校验规则一致）
+// 说明：nodeMajor 的旧默认值（22）可能已经随 Config 落盘进每个用户的 config.json。
+// 目标升到 Node.js 24 LTS 后必须做一次显式迁移，否则老用户下次重装 Node 仍会装 22；
+// 迁移只发生在"值仍是旧默认 22 且没有迁移标记"时，迁移过或用户显式改成别的值都完全尊重配置。
+let configMigrationPending = false
 function applyConfigJson(cfg) {
   if (cfg.theme === 'light' || cfg.theme === 'dark' || cfg.theme === 'system') Config.theme = cfg.theme
   if (typeof cfg.notify === 'boolean') Config.notify = cfg.notify
@@ -435,6 +459,13 @@ function applyConfigJson(cfg) {
   // 上次真正成功的源（github / mirror / proxy:<host>）：auto 模式下下次优先用它，避免反复卡 GitHub。
   if (typeof cfg.launcherUpdateSourceOk === 'string') Config.launcherUpdateSourceOk = cfg.launcherUpdateSourceOk.slice(0, 120)
   if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
+  if (typeof cfg.nodeMajorMigratedTo === 'string' && cfg.nodeMajorMigratedTo) Config.nodeMajorMigratedTo = cfg.nodeMajorMigratedTo
+  // 旧默认值 22 → 新默认（Node.js 24 LTS）：只迁移一次并落标记；标记存在后用户的显式值不再被改
+  if (Number(cfg.nodeMajor) === 22 && !Config.nodeMajorMigratedTo) {
+    Config.nodeMajor = envDetect.DEFAULT_NODE_MAJOR
+    Config.nodeMajorMigratedTo = String(envDetect.DEFAULT_NODE_MAJOR)
+    configMigrationPending = true
+  }
   if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
   if (typeof cfg.npmRegistry === 'string') Config.npmRegistry = cfg.npmRegistry
   // 上次安装/更新实际使用的 npm 全局根（探测侧据此找回"装到哪儿"的 DSH）：
@@ -497,6 +528,11 @@ function loadConfig() {
   if (firstRun) return
   try {
     applyConfigJson(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+    if (configMigrationPending) {
+      configMigrationPending = false
+      saveConfig() // 立刻落盘迁移标记：避免下次启动又按旧默认值判断一遍
+      log(`config migrated: nodeMajor → ${Config.nodeMajor}（Node.js LTS）`)
+    }
   } catch { log('config parse failed, using defaults') }
 }
 
@@ -504,6 +540,10 @@ function loadConfig() {
 function mergeConfigFromDisk() {
   try {
     applyConfigJson(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+    if (configMigrationPending) {
+      configMigrationPending = false
+      saveConfig()
+    }
     log('config re-merged from disk after recovery')
   } catch (err) { log('config reload failed: ' + err.message) }
 }
@@ -7119,7 +7159,8 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           Config.launcherUpdateSourceOk = ''
           updater.onChannelChanged() // 渠道+源都回默认：作废已下载的旧渠道/旧源安装包
           updater.onSourceChanged()
-          Config.nodeMajor = 22
+          Config.nodeMajor = envDetect.DEFAULT_NODE_MAJOR
+          Config.nodeMajorMigratedTo = String(envDetect.DEFAULT_NODE_MAJOR)
           Config.nodeMirror = ''
           Config.npmRegistry = ''
           Config.dshUpdateCheckedAt = 0
@@ -7265,10 +7306,35 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           const items = value && Array.isArray(value.items) ? value.items : []
           const opts = value && typeof value === 'object' ? value : {}
           delete opts.items
+          // 「升级 Node.js」是唯一会动"已就绪环境"的安装动作：旧 node.exe 正被服务占用时，
+          // MSI 的 major upgrade 会因删不掉旧文件而失败（这次失败是整包回滚，不会留半截）。
+          // 所以先把服务停稳；停止无法确认就一个字节都不改（fail-closed）。
+          // 失败/取消后由 initInstaller 的 onFail 把服务拉回来。
+          if (opts.nodeUpgrade === true) {
+            const snap = envInstall.getJob()
+            if (snap && snap.job && snap.job.status === 'running') {
+              return JSON.stringify({ ok: false, error: '已有安装任务正在进行，请等它结束后再升级 Node.js' })
+            }
+            if (server.running()) {
+              log('node upgrade: stopping service before MSI major upgrade')
+              nodeUpgradeRestartPending = true
+              let stopped = false
+              try { stopped = (await stopServer()) === true } catch (err) { log('node upgrade: stop service failed: ' + (err && err.message ? err.message : String(err))) }
+              if (!stopped) {
+                nodeUpgradeRestartPending = false
+                return JSON.stringify({ ok: false, error: '服务未能确认停止，已暂停 Node.js 升级（请先停止服务后重试）' })
+              }
+            }
+          }
           try {
             envInstall.startInstall(items, opts)
             return JSON.stringify({ ok: true, state: envInstall.getJob() })
           } catch (err) {
+            // 服务已经停了但任务没能启动：立刻恢复，别把用户环境留在"服务已停"的状态
+            if (nodeUpgradeRestartPending) {
+              nodeUpgradeRestartPending = false
+              if (envReady() && !server.running()) void handleStart()
+            }
             return JSON.stringify({ ok: false, error: err.message || String(err) })
           }
         }

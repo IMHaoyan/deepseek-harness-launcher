@@ -25,11 +25,13 @@ const IS_WIN = process.platform === 'win32'
 const DEFAULT_PNPM_VERSION = '11.8.0'
 
 let HOME = path.join(os.homedir(), '.dsh')
-let Config = { nodeMajor: 22, dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, npmRegistry: '', npmGlobalRoot: '' }
+let Config = { nodeMajor: envDetect.DEFAULT_NODE_MAJOR, dshVersion: 'latest', pnpmVersion: DEFAULT_PNPM_VERSION, npmRegistry: '', npmGlobalRoot: '' }
 let ASSETS_DIR = ''
 let logFn = () => {}
 let onPushFn = () => {}
 let onDoneFn = () => {}
+// 失败/取消回调：显式升级任务会先停服务，失败后要能把服务拉回来（主力失败恢复由 main.js 决策）
+let onFailFn = () => {}
 let saveConfigFn = () => {}
 
 const INSTALL_LOG = 'dshl-logs/install.log' // 相对 HOME 的安装日志
@@ -41,6 +43,7 @@ function initInstaller(opts = {}) {
   if (opts.log) logFn = opts.log
   if (opts.onPush) onPushFn = opts.onPush
   if (opts.onDone) onDoneFn = opts.onDone
+  if (typeof opts.onFail === 'function') onFailFn = opts.onFail
   if (typeof opts.saveConfig === 'function') saveConfigFn = opts.saveConfig
 }
 
@@ -450,78 +453,74 @@ async function downloadText(url, abortRef) {
 // 「应用和功能」的修复/卸载）。这些必须管理员权限，也无法用"看起来像"的注册表项伪造。
 // 因此在"确实需要装 Node"时用官方 MSI；装不了（策略禁用/无管理员权限/版本管理器在场）才回退
 // 用户级 zip，并保证回退路径的语义与 MSI 一致（补 MSI 那份 npmrc → 全局包同样落在 %APPDATA%\npm）。
+//
+// 大版本切换（Node 22 → 24 LTS）走的是官方 MSI 自带的 major upgrade：更新版本 MSI 的 Upgrade 表
+// （WIX_UPGRADE_DETECTED + InstallExecuteSequence 的 RemoveExistingProducts）会先移除旧产品再装新版本，
+// 不需要（也不能）先手工卸载 —— 同一 UpgradeCode/同一目录，手工并装才会出现"两个产品争同一目录"。
 
-// 本机已装的 Node.js MSI 产品标记：官方 MSI 会写 HKLM\SOFTWARE\Node.js（InstallPath + Version）。
-// 只读，不写；读不到就当没有（读失败与"没装"在这里等价，后续决策都按"没装"走 = 不会误判成已装）。
+// 官方 MSI 产品读取/版本管理器识别只有一份实现（env-detect.js），这里只收口径：
+// 只有"读到了 Version"才算已装产品（历史行为；探测侧还要用 InstallPath 兜底 PATH，语义更宽）。
+const parseNodeJsRegQuery = envDetect.parseNodeJsRegQuery
 async function readInstalledNodeMsi() {
-  if (!IS_WIN) return null
-  try {
-    const r = await runExec('reg', ['query', 'HKLM\\SOFTWARE\\Node.js'], { timeout: 10000 })
-    const parsed = parseNodeJsRegQuery(r.stdout)
-    return parsed && parsed.version ? parsed : null
-  } catch { return null }
+  const msi = await envDetect.readInstalledNodeMsi()
+  return msi && msi.version ? msi : null
 }
-
-// reg query 输出解析（纯函数，便于测试）：键不存在会抛错，这里只处理"查到了"的情况
-function parseNodeJsRegQuery(stdout) {
-  const text = String(stdout || '')
-  const pick = (name) => {
-    const m = new RegExp(`${name}\\s+REG_\\w+\\s+(.*)$`, 'm').exec(text)
-    return m ? m[1].trim() : ''
-  }
-  const installPath = pick('InstallPath')
-  const version = pick('Version')
-  if (!installPath && !version) return null
-  return { installPath, version }
-}
-
-// 版本管理器在场时不要去装机器级 MSI：那会和 nvm/volta/fnm 争 PATH，把用户"切版本"的行为打乱。
-function detectVersionManager(deps = {}) {
-  const exists = deps.exists || ((p) => { try { return fs.existsSync(p) } catch { return false } })
-  const env = deps.env || process.env
-  const home = deps.home || os.homedir()
-  const candidates = [
-    ['nvm', env.NVM_HOME, path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'nvm')],
-    ['volta', env.VOLTA_HOME, path.join(home, '.volta')],
-    ['fnm', env.FNM_DIR, path.join(home, '.fnm'), path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'fnm')],
-  ]
-  for (const [name, ...dirs] of candidates) {
-    if (dirs.some((d) => d && exists(d))) return name
-  }
-  return ''
-}
+const detectVersionManager = envDetect.detectVersionManager
 
 /**
  * Node 安装方式决策（纯函数，便于测试；所有输入都来自探测/注册表，不在这里做 IO）。
  * 顺序即优先级，"复用优先"是硬规则——能复用用户现有的 Node 就绝不动它：
+ *   0) 显式升级请求（用户点了环境页「升级到 Node.js 24 LTS」）：旧 MSI → major upgrade；用户级 zip → 替换目录
  *   1) 探测到可用的 Node（满足 engines）→ 复用，什么都不装
- *   2) 本机已有 Node.js MSI 产品：版本满足且可执行文件在 → 复用；版本过旧 / 文件不在 → 拒绝（见下）
+ *   2) 本机已有 Node.js MSI 产品：版本满足且可执行文件在 → 复用；版本不在 engines 范围 → major upgrade
  *   3) 版本管理器在场 → 用户级 zip（不与版本管理器争 PATH）
  *   4) 显式配置成 user → 用户级 zip
  *   5) 其余 → 官方 MSI
  *
- * 为什么"已装 MSI 但版本过旧"要拒绝而不是再装一个：Node 的 MSI 是不同版本 = 不同产品码，却
- * 默认装到同一个 C:\Program Files\nodejs —— 两个产品共同宣称拥有同一目录，卸载其一会把文件删掉、
- * 留下另一个残缺。也不能回退用户级：Windows 的机器 PATH 先于用户 PATH，回退装出来的 Node 会被
- * 旧的那份遮蔽，装了等于没装。所以这里 fail-closed，把可行动作写清楚交给用户。
- *
- * msiUsable=false（注册表说装了、可执行文件却找不到）同样必须拒绝：既兑现不了"复用"，
- * 也不能再装一个产品去争同一目录 —— 只能请用户先在「应用和功能」里修复或卸载它。
+ * 版本过旧不再"拒绝让用户自己处理"：官方 Node MSI 自带 major upgrade（同 UpgradeCode +
+ * RemoveExistingProducts；20.20.2 / 22.23.2 / 24.22.1 三份包实测同一升级族），装新版本就会先移除旧产品。
+ * 这正是"旧 Node 用户升到 24 LTS"要走的路径，比让用户去「应用和功能」手工卸载更不易出错。
+ * 仍保留两种拒绝：
+ *   - 版本管理器在场（nvm/volta/fnm）：不去和用户切版本的工具争 PATH；
+ *   - msiUsable=false（注册表说装了、可执行文件却找不到）：先请用户修复/卸载，不在坏产品上叠加安装。
  */
 function decideNodeInstallPlan(input) {
   const o = input || {}
   const range = o.range || envDetect.DEFAULT_ENGINE_RANGE
+  const targetMajor = Number(o.targetMajor) || Number(Config.nodeMajor) || envDetect.DEFAULT_NODE_MAJOR
   const ok = (v) => {
     const clean = String(v || '').trim().replace(/^v/i, '')
     if (!clean) return false
     try { return semver.satisfies(clean, range, { includePrerelease: true }) } catch { return false }
   }
-  if (o.nodeOk) return { action: 'reuse', reason: 'node-ok', version: String(o.nodeVersion || '') }
   const msi = o.installedMsi
-  if (msi && msi.version) {
-    if (!ok(msi.version)) return { action: 'refuse', reason: 'msi-too-old', version: String(msi.version), range }
-    if (o.msiUsable === false) return { action: 'refuse', reason: 'msi-broken', version: String(msi.version), range }
-    return { action: 'reuse', reason: 'msi-ok', version: String(msi.version) }
+  const msiVersion = msi && msi.version ? String(msi.version) : ''
+  if (o.upgrade === true) {
+    // 显式升级：只升"由 dshl 的安装方式管理"的那份 Node，不做任何猜测式改动
+    if (o.versionManager) {
+      return { action: 'refuse', reason: 'upgrade-version-manager', version: msiVersion, versionManager: o.versionManager, range }
+    }
+    if (msiVersion) {
+      const m = envDetect.nodeMajorOf(msiVersion)
+      if (m !== null && m >= targetMajor) return { action: 'reuse', reason: 'already-target', version: msiVersion }
+      return { action: 'upgrade-msi', reason: 'upgrade-msi', from: msiVersion, targetMajor }
+    }
+    const userNode = o.userNode
+    if (userNode && userNode.exists && userNode.version) {
+      const uv = envDetect.nodeMajorOf(userNode.version)
+      if (uv !== null && uv >= targetMajor) return { action: 'reuse', reason: 'already-target', version: String(userNode.version) }
+      return { action: 'upgrade-user', reason: 'upgrade-user', from: String(userNode.version), targetMajor }
+    }
+    return { action: 'refuse', reason: 'no-managed-node', targetMajor }
+  }
+  if (o.nodeOk) return { action: 'reuse', reason: 'node-ok', version: String(o.nodeVersion || '') }
+  if (msiVersion) {
+    if (o.msiUsable === false) return { action: 'refuse', reason: 'msi-broken', version: msiVersion, range }
+    if (!ok(msiVersion)) {
+      if (o.versionManager) return { action: 'refuse', reason: 'msi-too-old', version: msiVersion, range }
+      return { action: 'upgrade-msi', reason: 'msi-too-old', from: msiVersion, targetMajor }
+    }
+    return { action: 'reuse', reason: 'msi-ok', version: msiVersion }
   }
   if (o.versionManager) return { action: 'install-user', reason: 'version-manager-' + o.versionManager }
   if (o.mode === 'user') return { action: 'install-user', reason: 'mode-user' }
@@ -577,7 +576,7 @@ function nodeBases() {
 
 async function resolveNodeVersion(job, base) {
   const index = JSON.parse(await downloadText(`${base}/index.json`, job.abortRef))
-  const major = Number(Config.nodeMajor) || 22
+  const major = Number(Config.nodeMajor) || envDetect.DEFAULT_NODE_MAJOR
   const entry = index.find((e) => typeof e.version === 'string' && e.version.startsWith(`v${major}.`))
   if (!entry) throw new Error(`Node.js v${major} 在 ${base} 中不存在`)
   return entry.version.replace(/^v/, '')
@@ -627,7 +626,7 @@ function nodeDistDirs() {
 
 // 内置的**官方 MSI**（默认安装路径）：与 zip 同一套"内置 + SHA256 侧车"逻辑
 function bundledNodeMsi() {
-  const major = Number(Config.nodeMajor) || 22
+  const major = Number(Config.nodeMajor) || envDetect.DEFAULT_NODE_MAJOR
   for (const dir of nodeDistDirs()) {
     try {
       const files = fs.readdirSync(dir).filter((f) => new RegExp(`^node-v${major}\\.\\d+\\.\\d+-x64\\.msi$`).test(f))
@@ -644,7 +643,7 @@ function bundledNodeMsi() {
 
 // 内置的 zip（**兜底路径**用；没有内置就联网下载）
 function bundledNodeDist() {
-  const major = Number(Config.nodeMajor) || 22
+  const major = Number(Config.nodeMajor) || envDetect.DEFAULT_NODE_MAJOR
   for (const dir of nodeDistDirs()) {
     try {
       const zips = fs.readdirSync(dir).filter((f) => new RegExp(`^node-v${major}\\.\\d+\\.\\d+-win-x64\\.zip$`).test(f))
@@ -717,7 +716,9 @@ async function acquireNodeMsi(job) {
 // 走官方 MSI 安装 Node（机器级，与官网 .msi 完全一致：Program Files 落位 + HKLM\SOFTWARE\Node.js +
 // 机器 PATH + 自己的 npmrc + 「应用和功能」注册）。返回 { ok, nodeBin, detail, cancelled, policy }。
 // 失败不抛错：调用方据此决定"回退用户级 zip"还是"明确报错"。
-async function installNodeViaMsi(job, onInstallStart) {
+// opts.upgradeFrom：版本升级（major upgrade）场景的已安装版本。官方 MSI 的 Upgrade 表会先移除旧产品，
+// 这里额外拦一道"新包必须严格更高"，避免把降级/同版本覆盖当成升级执行。
+async function installNodeViaMsi(job, onInstallStart, opts = {}) {
   if (!IS_WIN) return { ok: false, detail: '非 Windows 平台不支持官方 MSI', cancelled: false, policy: false }
   if (onInstallStart) onInstallStart()
   const logDir = path.join(HOME, 'dshl-logs')
@@ -728,6 +729,16 @@ async function installNodeViaMsi(job, onInstallStart) {
     acquired = await acquireNodeMsi(job)
   } catch (e) {
     return { ok: false, detail: '官方安装包获取失败：' + (e && e.message ? e.message : String(e)), cancelled: false, policy: false }
+  }
+  const upgradeFrom = opts.upgradeFrom ? String(opts.upgradeFrom).trim().replace(/^v/i, '') : ''
+  if (upgradeFrom) {
+    if (!semver.valid(upgradeFrom)) {
+      return { ok: false, detail: `无法确认已安装的 Node.js 版本（${opts.upgradeFrom}），已暂停升级`, cancelled: false, policy: false }
+    }
+    if (!semver.gt(acquired.ver, upgradeFrom)) {
+      return { ok: false, detail: `内置安装包 v${acquired.ver} 不高于已安装的 v${upgradeFrom}，已暂停（不做降级/同版本覆盖）`, cancelled: false, policy: false }
+    }
+    job.logLine(`官方 MSI major upgrade：v${upgradeFrom} → v${acquired.ver}（Windows Installer 会先移除旧产品再装新版本）`)
   }
   job.logLine('运行官方 Node.js 安装包（msiexec /qn，会弹出一次管理员授权）…')
   const r = await runElevatedMsi(acquired.msiPath, msiLog)
@@ -1608,6 +1619,16 @@ function detectVersionManagerSafe() {
   try { return detectVersionManager() } catch { return '' }
 }
 
+// 用户级 Node 目录（dshl 的 zip 落位）里那份的真实版本：升级决策的输入（只读探测，不写任何东西）。
+async function readUserNodeForUpgrade(job) {
+  const dir = userNodeDir()
+  if (!dir) return null
+  const bin = path.join(dir, IS_WIN ? 'node.exe' : 'node')
+  if (!fs.existsSync(bin)) return { dir, exists: false, version: '' }
+  const v = await probeUserNodeVersion(bin, job)
+  return { dir, exists: true, version: String(v || '').trim().replace(/^v/i, '') }
+}
+
 // 当前探测到的可用 Node（取最近一次探测结果；还没探过就现探一次）。复用决策以此为准，
 // 不轻信调用方传来的信息——界面上的按钮可能已经过期。
 async function readDetectedNode() {
@@ -1639,14 +1660,18 @@ async function findUsableNodeBin(job, installedMsi) {
 
 // 用户级 zip 安装（兜底路径）：落位 %LOCALAPPDATA%\Programs\nodejs，并让语义与官方 MSI 对齐
 // （复刻那份 npmrc → 全局包同样落在 %APPDATA%\npm），最后写入用户 PATH。
-async function installNodeUserLevel(job, stageIdx) {
+// opts.force=true：显式升级请求 —— 即使现有版本仍满足 engines 也不复用，直接替换成目标版本。
+// opts.keepBackupWithGlobals=true：升级路径的 data-safety 约定 —— 旧目录里有用户全局包时整目录保留为
+// 备份（不迁移、不删除）；只有"除发行版自带 npm/corepack 外没有全局包"时才清理备份。
+async function installNodeUserLevel(job, stageIdx, opts = {}) {
   const dest = userNodeDir()
   const existing = path.join(dest, IS_WIN ? 'node.exe' : 'node')
   const hasExisting = fs.existsSync(existing)
+  const force = opts.force === true
   const probeFn = typeof job.nodeVersionProbe === 'function' ? job.nodeVersionProbe
     : (job.opts && typeof job.opts.nodeVersionProbe === 'function' ? job.opts.nodeVersionProbe : null)
   const probed = hasExisting ? (probeFn ? await probeFn(existing) : await probeUserNodeVersion(existing, job)) : ''
-  const verdict = decideUserNodeReuse({ exists: hasExisting, version: probed })
+  const verdict = force ? { reuse: false, reason: 'force-upgrade' } : decideUserNodeReuse({ exists: hasExisting, version: probed })
   let nodeBin = null
   if (verdict.reuse) {
     job.logLine(`用户级 Node.js 已存在且版本可用（${probed}）：${dest}，跳过下载/解压`)
@@ -1655,7 +1680,8 @@ async function installNodeUserLevel(job, stageIdx) {
     job.enterStage(stageIdx('node-ex'))
     job.finishStage()
   } else {
-    if (verdict.reason === 'too-old') job.logLine(`用户级 Node.js ${probed} 不满足 ${envDetect.DEFAULT_ENGINE_RANGE}：忽略旧版本并重新安装`)
+    if (verdict.reason === 'force-upgrade') job.logLine(`按升级请求替换用户级 Node.js（当前 ${probed || '未知'} → Node.js ${Number(opts.targetMajor) || Number(Config.nodeMajor) || envDetect.DEFAULT_NODE_MAJOR} LTS）：${dest}`)
+    else if (verdict.reason === 'too-old') job.logLine(`用户级 Node.js ${probed} 不满足 ${envDetect.DEFAULT_ENGINE_RANGE}：忽略旧版本并重新安装`)
     else if (verdict.reason === 'unknown') job.logLine('用户级 Node.js 版本无法确认：不复用，重新安装')
     let backup = ''
     if (fs.existsSync(dest)) {
@@ -1672,7 +1698,14 @@ async function installNodeUserLevel(job, stageIdx) {
       if (backup) job.logLine('安装失败：旧目录保留在 ' + backup)
       throw e
     }
-    if (backup) { try { fs.rmSync(backup, { recursive: true, force: true }) } catch { /* noop */ } }
+    if (backup) {
+      const leftovers = opts.keepBackupWithGlobals ? nodeDirGlobalPackages(backup).filter((g) => !isDistributionPackage(g)) : []
+      if (leftovers.length) {
+        job.logLine(`旧 Node 目录已保留为备份（含 ${leftovers.length} 个全局包，未迁移、未删除）：${backup}；确认新版可用后可手动删除`)
+      } else {
+        try { fs.rmSync(backup, { recursive: true, force: true }) } catch { /* noop */ }
+      }
+    }
     job.finishStage()
   }
   writeMsiEquivalentNpmrc(job, dest)
@@ -1712,15 +1745,41 @@ async function runJob(job) {
         const msiUsable = installedMsi && installedMsi.installPath
           ? decideUserNodeReuse({ exists: fs.existsSync(path.join(installedMsi.installPath, IS_WIN ? 'node.exe' : 'node')), version: await probeUserNodeVersion(path.join(installedMsi.installPath, IS_WIN ? 'node.exe' : 'node'), null) }).reuse
           : undefined
-        const plan = decideNodeInstallPlan({
-          mode,
-          range: (job.opts && job.opts.engineRange) || envDetect.DEFAULT_ENGINE_RANGE,
-          nodeOk,
-          nodeVersion,
-          installedMsi,
-          msiUsable,
-          versionManager: detectVersionManagerSafe(),
-        })
+        const targetMajor = Number((job.opts && job.opts.targetNodeMajor) || Config.nodeMajor) || envDetect.DEFAULT_NODE_MAJOR
+        const versionManager = detectVersionManagerSafe()
+        const upgradeRequested = !!(job.opts && job.opts.nodeUpgrade)
+        let plan
+        if (upgradeRequested) {
+          // 显式升级（用户在环境页点了「升级到 Node.js 24 LTS」）：事实一律现读（界面可能已过期），
+          // 只升"由 dshl 安装方式管理"的那份 Node —— 与探测侧 decideNodeUpgrade 同一套判据。
+          const userNode = installedMsi ? null : await readUserNodeForUpgrade(job)
+          const up = envDetect.decideNodeUpgrade({
+            platform: process.platform,
+            installedMsi,
+            node: { status: nodeOk ? 'ok' : (detectedNode ? 'tooOld' : 'missing'), version: nodeVersion, path: detectedNode ? detectedNode.path : null },
+            userNode,
+            versionManager,
+            targetMajor,
+          })
+          if (!up) {
+            throw new Error(`未检测到可升级的 Node.js 安装（可能已经是 Node.js ${targetMajor} LTS，或不是 dshl 管理的安装）；请刷新环境页后重试`)
+          }
+          plan = up.mode === 'msi'
+            ? { action: 'upgrade-msi', reason: up.reason, from: up.from, targetMajor: up.targetMajor }
+            : { action: 'upgrade-user', reason: up.reason, from: up.from, targetMajor: up.targetMajor }
+          job.logLine(`收到升级请求：Node.js v${up.from} → ${up.targetMajor} LTS（${up.mode === 'msi' ? '官方 MSI major upgrade，需一次管理员授权' : '用户级 zip 目录替换，免管理员授权'}）`)
+        } else {
+          plan = decideNodeInstallPlan({
+            mode,
+            range: (job.opts && job.opts.engineRange) || envDetect.DEFAULT_ENGINE_RANGE,
+            targetMajor,
+            nodeOk,
+            nodeVersion,
+            installedMsi,
+            msiUsable,
+            versionManager,
+          })
+        }
         job.logLine(`Node 安装方式决策：${plan.action}（${plan.reason}${msiUsable === false ? '：注册表登记的 Node 找不到可执行文件' : ''}）`)
         if (job.nodePlan && job.nodePlan.dshInNodeDir) {
           job.logLine(`检测到全局 DSH 就在用户级 Node 目录里（${job.nodePlan.nodeDir}）：本次会自动带上 DSH，并在新版装好、校验通过后清理旧残留`)
@@ -1730,11 +1789,18 @@ async function runJob(job) {
           job.logLine(`该目录下另有 ${list.length} 个全局包（不迁移：跨 Node 大版本时原生模块 ABI 会变）：${list.slice(0, 8).join('、')}${list.length > 8 ? ' 等' : ''}`)
         }
         if (plan.action === 'refuse') {
-          throw new Error(plan.reason === 'msi-broken'
-            ? `本机注册了官方 Node.js v${plan.version}，但找不到它的可执行文件（安装可能被破坏或文件被删除）；`
-              + '请在「应用和功能」里对 Node.js 执行「修复」或先卸载，然后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）'
-            : `本机已通过官方 MSI 安装 Node.js v${plan.version}，不满足 DSH 要求 ${plan.range}；`
-              + '请在「应用和功能」里升级 Node.js 后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）')
+          if (plan.reason === 'msi-broken') {
+            throw new Error(`本机注册了官方 Node.js v${plan.version}，但找不到它的可执行文件（安装可能被破坏或文件被删除）；`
+              + '请在「应用和功能」里对 Node.js 执行「修复」或先卸载，然后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）')
+          }
+          if (plan.reason === 'upgrade-version-manager') {
+            throw new Error(`检测到版本管理器 ${plan.versionManager || ''}：dshl 不会与它争 PATH，请用它把 Node.js 升级到 ${plan.targetMajor || targetMajor} LTS 后重试`)
+          }
+          if (plan.reason === 'no-managed-node') {
+            throw new Error('没有找到由 dshl 安装方式管理的 Node.js（可能已经升级，或这份 Node 不是 dshl 安装的）；请刷新环境页后重试')
+          }
+          throw new Error(`本机已通过官方 MSI 安装 Node.js v${plan.version}，不满足 DSH 要求 ${plan.range}；`
+            + '请在「应用和功能」里升级 Node.js 后重试（不会同时装第二个版本：那会让两个安装程序争用同一目录）')
         }
         if (plan.action === 'reuse') {
           // 复用已有 Node：什么都不装（"不影响已装用户"的关键路径）
@@ -1748,18 +1814,34 @@ async function runJob(job) {
           job.finishStage()
           job.enterStage(stageIdx('node-ex'))
           job.finishStage()
-        } else if (plan.action === 'install-msi') {
+        } else if (plan.action === 'install-msi' || plan.action === 'upgrade-msi') {
+          const isUpgrade = plan.action === 'upgrade-msi'
           const r = await installNodeViaMsi(job, () => {
             job.finishStage()
             job.enterStage(stageIdx('node-ex'))
-          })
+          }, isUpgrade ? { upgradeFrom: plan.from } : {})
           if (r.ok) {
             nodeBin = r.nodeBin
             job.nodeInstallMode = 'msi'
             job.finishStage()
-            job.logLine('官方安装包已注册到「应用和功能」（与官网 .msi 一致，可修复/卸载）')
+            if (isUpgrade) {
+              // 升级的验收判据：注册表里的版本已经换成目标大版本（不轻信 msiexec 的退出码）
+              const after = await readInstalledNodeMsi()
+              const afterVersion = (after && after.version) || r.version || ''
+              if (envDetect.nodeMajorOf(afterVersion) !== plan.targetMajor) {
+                throw new Error(`Node.js 升级后版本校验失败：注册表版本 ${afterVersion || '(未知)'}，预期 ${plan.targetMajor}.x LTS；详细日志见 ${path.join(HOME, 'dshl-logs', 'msi-node.log')}`)
+              }
+              job.logLine(`Node.js 升级完成：v${plan.from} → v${afterVersion}（官方 MSI major upgrade）`)
+            } else {
+              job.logLine('官方安装包已注册到「应用和功能」（与官网 .msi 一致，可修复/卸载）')
+            }
             // 机器 PATH 由 MSI 负责；用户 PATH 里的 %APPDATA%\npm（全局命令靠它才调得动）幂等确认一次
             await addToUserPath(job, [npmGlobalRoot()], { prepend: true })
+          } else if (isUpgrade) {
+            // 升级失败 = 旧版本仍在原位、环境未被改动。绝不回退用户级 zip：
+            // 机器 PATH 上旧 MSI 会遮蔽用户级 Node，装了等于没装（这正是"拒绝并装第二个版本"的原因）。
+            throw new Error(`Node.js 升级失败（${r.detail}）：旧版本 v${plan.from} 仍在原位，环境未被改动。`
+              + '请重试并允许管理员授权；或先在「应用和功能」里升级/卸载 Node.js 后重试')
           } else {
             // 2) 兜底：官方 MSI 用不了（策略禁止 / 用户取消授权 / 报错）→ 用户级 zip。
             //    语义保持一致（复刻 MSI 那份 npmrc → 全局包同样落在 %APPDATA%\npm），只少机器级注册。
@@ -1767,6 +1849,16 @@ async function runJob(job) {
             nodeBin = await installNodeUserLevel(job, stageIdx)
             job.nodeInstallMode = 'zip-user'
           }
+        } else if (plan.action === 'upgrade-user') {
+          // 用户级 zip 的升级：同目录替换（先改名备份 → 装目标版本 → 旧目录保留或不保留见 installNodeUserLevel）
+          nodeBin = await installNodeUserLevel(job, stageIdx, { force: true, targetMajor: plan.targetMajor, keepBackupWithGlobals: true })
+          job.nodeInstallMode = 'zip-user'
+          const afterRaw = await probeUserNodeVersion(nodeBin, job)
+          const afterVersion = String(afterRaw || '').trim().replace(/^v/i, '')
+          if (envDetect.nodeMajorOf(afterVersion) !== plan.targetMajor) {
+            throw new Error(`用户级 Node.js 升级后版本校验失败：${afterVersion || '(未知)'}，预期 ${plan.targetMajor}.x LTS`)
+          }
+          job.logLine(`Node.js 升级完成：v${plan.from} → v${afterVersion}（用户级 zip）`)
         } else {
           // install-user：版本管理器在场（不与它争 PATH）或显式配置成用户级
           job.logLine(plan.reason.startsWith('version-manager-')
@@ -1878,6 +1970,8 @@ async function runJob(job) {
     job.stageText = job.status === 'cancelled' ? '安装已取消' : '安装失败'
     pushJob(job)
     flushPending()
+    // 显式升级会先停服务：失败/取消时必须通知上层把服务恢复（普通安装任务由 main.js 侧判断是否需要）
+    try { onFailFn(job) } catch { /* noop */ }
   } finally {
     try { job.abortRef.onAbort = null } catch { /* noop */ }
     job.child = null
