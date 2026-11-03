@@ -17,6 +17,7 @@
 const fs = require('fs')
 const path = require('path')
 const { spawn } = require('child_process')
+const { ensureProfileBundle } = require('./profile-bundle')
 
 const PLUGIN_NAME = 'dshmarket'
 const PROFILE_NAME = 'web'
@@ -392,6 +393,16 @@ function classifyEnvFailure(output) {
   // 一个点了还会同样失败的「重试」按钮。
   const gate = parseVersionGate(text)
   if (gate) return versionGateFailure(gate)
+  if (/ERR_PNPM_IGNORED_BUILDS|Ignored build scripts:/u.test(text)) {
+    return {
+      kind: 'build-approval',
+      title: '插件依赖的安装脚本等待批准',
+      reason: 'pnpm 已阻止尚未批准的依赖构建脚本；请在 ' + profileDir()
+        + ' 目录运行 pnpm approve-builds，仅批准你信任的依赖，然后回到这里重试安装。'
+        + '详情见日志中的 Ignored build scripts 列表。普通重试不会自动批准脚本。',
+      entries: [], recoversAt: '', recoverable: false,
+    }
+  }
   if (releaseAgeViolation(text)) {
     const entries = parseReleaseAgeEntries(text)
     return {
@@ -481,6 +492,7 @@ async function runCliOnce(args) {
       const output = chunks.join('').trimEnd()
       if (code === 0) resolve({ code, output })
       else {
+        log('dsh plugin 失败输出（最多保留 64 KiB）：\n' + output)
         // ★ 头部必须留着：错误码在最前面，只留尾部会切出 `TCHING_VERSION]` 这种残骸
         //   （2026-10-12 真实截图）。省略策略见 release-age.js 的 quoteForError。
         const err = new Error('dsh plugin 退出码 ' + code + (output ? '：' + releaseAge.quoteForError(output) : ''))
@@ -572,6 +584,7 @@ async function installByName(name, opts = {}) {
     // 新版本 pnpm 拒绝在 workspace 根加依赖，除非显式 -w/--workspace-root。
     // 24h 观察期由 runCli 统一处理：先按策略默认跑，被整体拒绝时才一次性放行重试。
     const cli = await runCli(['add', pkg + '@' + verified.version, '-w'])
+    ensureProfileBundle(profileDir(), pkg)
     const after = pluginStateOf(readProfileManifest(), pkg)
     if (!after.installed || !after.bundle) {
       throw new Error('安装后 profile 未正确记录该插件（dependencies/bundles 缺一）')

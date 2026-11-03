@@ -11,6 +11,7 @@
 // DSH applies the change through its own watcher. This is the same durable
 // mechanism dshmarket / dsh-plugin-hub use, not a DSHL-only state file.
 'use strict'
+const { ensureProfileBundle } = require('./profile-bundle')
 
 const fs = require('fs')
 const path = require('path')
@@ -349,6 +350,10 @@ function setEnabled(packageName, enabled) {
   const rows = rowIdsForPackage(packageName)
   const carriers = carrierDisableIds(packageName)
   if (!rows.length && !carriers.length) return { ok: false, error: '无法识别该插件的加载项，未写入补丁层' }
+  if (enabled) {
+    try { ensureProfileBundle(path.dirname(profileManifestPath()), packageName) }
+    catch (error) { return { ok: false, error: '无法登记插件 bundle：' + error.message } }
+  }
   // 先记 durable 选择，再写 patch：中途崩溃时下次 reconcile 会按选择补全。
   persistDisabled(packageName, !enabled)
   const patchPath = defaultPatchPath()

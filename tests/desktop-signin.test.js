@@ -12,6 +12,33 @@ const root = path.resolve(__dirname, '..')
 const PAYLOAD = path.join(root, 'assets', 'dshl-desktop-signin')
 const PKG = signin.PKG_NAME
 
+test('ensure repairs an already materialized helper after an earlier failed install', async (t) => {
+  const home = tempHome(t)
+  const dir = path.join(home, 'profiles', 'web')
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, 'package.json')
+  fs.writeFileSync(file, JSON.stringify({ dependencies: {}, dsh: { profile: { bundles: ['base'] } } }))
+  signin.init({ home, payloadRoot: PAYLOAD, log: () => {} })
+  const cli = require('../dsh-cli')
+  t.mock.method(cli, 'runCli', async (args) => {
+    assert.equal(args[0], 'add')
+    assert.equal(args.at(-1), '-w')
+    const target = args[1].slice('link:'.length)
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
+    manifest.dependencies[PKG] = args[1]
+    fs.writeFileSync(file, JSON.stringify(manifest))
+    fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true })
+    fs.symlinkSync(target, path.join(dir, 'node_modules', PKG), process.platform === 'win32' ? 'junction' : 'dir')
+    return { code: 0, output: 'Already up to date' }
+  })
+  const result = await signin.ensure()
+  assert.equal(result.ok, true)
+  assert.equal(signin.getState().installed, true)
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).dsh.profile.bundles, ['base', PKG])
+  assert.equal((await signin.ensure()).ok, true)
+  assert.equal(cli.runCli.mock.callCount(), 1, 'a repaired helper must not be reinstalled on every launch')
+})
+
 function tempHome(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-signin-'))
   t.after(() => { try { fs.rmSync(home, { recursive: true, force: true }) } catch { /* noop */ } })

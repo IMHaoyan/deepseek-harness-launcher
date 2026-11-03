@@ -69,7 +69,8 @@ function capture(child, label) {
         resolve({ code, output })
         return
       }
-      const error = new Error(label + ' 退出码 ' + code + (output ? '：' + output.slice(-400) : ''))
+      log(label + ' 失败输出（最多保留 64 KiB）：\n' + output)
+      const error = new Error(label + ' 退出码 ' + code + (output ? '：' + releaseAge.quoteForError(output) : ''))
       error.exitCode = code
       error.output = output // 完整输出：24h 观察期判定与条目提取都靠它
       reject(error)

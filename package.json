@@ -54,6 +54,7 @@
       "feedback-pack.js",
       "start-progress.js",
       "market.js",
+      "profile-bundle.js",
       "plugin-switch.js",
       "plugin-inventory.js",
       "plugin-activation.js",
