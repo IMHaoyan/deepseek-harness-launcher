@@ -7931,7 +7931,11 @@ async function runSelfTest() {
       const deadPid3 = server.child.pid
       await killPid(deadPid3, true)
       const scheduled = await waitUntil(() => restartRetryPending(), 6000)
-      const revived3 = await waitUntil(() => servicePhase() === 'ready' && server.running() && server.displayPid() !== deadPid3, 25000, 500)
+      // 等待"补偿定时器到期 → 重启成功"要覆盖：剩余冷却（≤RESTART_COOLDOWN_MS=10s）
+      // + maybeAutoRestart 里的等端口 sleep(3000) + DSH 真实启动耗时（实测 13~15s）。
+      // 25s 在 DSH 0.2.2-alpha.3 上只剩 1~2s 余量：启动完成的瞬间被判负，随后被本测试杀掉
+      // （2026-11-03 alpha.4 自检实测 revived=false、exit 紧跟在窗口到期后）。45s 留足余量。
+      const revived3 = await waitUntil(() => servicePhase() === 'ready' && server.running() && server.displayPid() !== deadPid3, 45000, 500)
       // 用户主动停止必须取消待触的延后重启
       server.expectCrash = true
       lastRestartAt = Date.now()
