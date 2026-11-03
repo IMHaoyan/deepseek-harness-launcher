@@ -14,6 +14,17 @@ const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\
 const main = read('main.js')
 const market = require('../market')
 
+test('pending build approval is actionable and is not offered a blind retry', () => {
+  const info = market.classifyEnvFailure('[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: @dataiku/uv@0.12.0\n'
+    + '[WARN] GET uv.tgz error (UND_ERR_DESTROYED)')
+  assert.equal(info.kind, 'build-approval')
+  assert.equal(info.recoverable, false)
+  assert.match(info.reason, /pnpm approve-builds/)
+  const agg = loadAggregator()
+  agg.notePluginEnvFailure('usage-billing', 'install', info)
+  assert.deepEqual(agg.issue().retry, [])
+})
+
 const AGE_OUTPUT = '[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries failed verification:\n'
   + '  @michengai/dsh-codex-ui@1.1.8 was published at 2026-09-15T09:53:00.584Z, within the minimumReleaseAge cutoff (x)\n'
   + '  dsh-chat-import@0.17.0 was published at 2026-09-15T15:39:20.245Z, within the minimumReleaseAge cutoff (x)\n'

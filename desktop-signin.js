@@ -16,6 +16,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const dshCli = require('./dsh-cli')
+const { ensureProfileBundle } = require('./profile-bundle')
 
 const PKG_NAME = 'dshl-desktop-signin'
 const PROFILE_NAME = 'web'
@@ -280,7 +281,8 @@ async function ensure() {
     if (typeof dshCli.runCli !== 'function') throw new Error('dshCli.runCli 不可用（dsh-cli 未初始化）')
     const target = materialize()
     log('安装到 profile：link:' + target)
-    await dshCli.runCli(['add', 'link:' + target.replace(/\\/gu, '/')])
+    await dshCli.runCli(['add', 'link:' + target.replace(/\\/gu, '/'), '-w'])
+    ensureProfileBundle(path.join(HOME, 'profiles', PROFILE_NAME), PKG_NAME)
     const after = readProfileManifest()
     if (!pluginSatisfied({ manifest: after, spec, version: payload.version, materializedPackage: materializedPackageInfo() })) {
       throw new Error('安装后校验失败（profile dependencies / bundles / node_modules 不一致）')

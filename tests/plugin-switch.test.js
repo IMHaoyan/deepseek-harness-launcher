@@ -8,6 +8,18 @@ const path = require('node:path')
 
 const pluginSwitch = require('../plugin-switch')
 
+test('explicit enable registers a retained dependency before writing toggle state', (t) => {
+  const { home, profile } = makeHome()
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
+  const file = path.join(profile, 'package.json')
+  fs.writeFileSync(file, JSON.stringify({ dependencies: { pkg: '1.0.0', other: '1.0.0' }, dsh: { profile: { bundles: [] } } }))
+  pluginSwitch.initPluginSwitch({ home })
+  assert.equal(pluginSwitch.isDisabled('pkg'), true)
+  assert.equal(pluginSwitch.setEnabled('pkg', true).ok, true)
+  assert.equal(pluginSwitch.isDisabled('pkg'), false)
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).dsh.profile.bundles, ['pkg'])
+})
+
 function makeHome(packageName = 'pkg', bundlePatch = "- insert:\n    - id: mine\n      name: 'pkg'\n") {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-plugin-switch-'))
   const profile = path.join(home, 'profiles', 'web')
