@@ -240,14 +240,19 @@ test('没有事务文件 / 非 start 阶段：一律不动作（原有语义不�
   assert.deepEqual(await dshUpdater.recoverInterruptedUpdate(), { recovered: false, reason: 'no-pending' })
 })
 
-// ---------- 4) 源选择：--prefer-offline 只能加给"钉死版本的安装"，不能加给 npm view ----------
+// ---------- 4) 源选择：npm view 必须走网络；安装不得用 --prefer-offline ----------
 
-test('--prefer-offline 只用于钉死版本的安装：npm view 必须走网络（否则检测永远读到旧的最新版）', () => {
+test('npm view 必须走网络；钉死版本的安装也不得带 --prefer-offline（过期元数据会让新版本解析失败）', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'dsh-update.js'), 'utf8')
   const viewArgs = /const args = \['view'[^\]]*\]/.exec(src)
   assert.ok(viewArgs, '应能找到 npm view 的参数构造')
   assert.ok(!/prefer-offline/.test(viewArgs[0]), 'npm view 不能带 --prefer-offline')
-  const installArgs = /const args = \['install', '-g', '--prefix', globalRoot[^\]]*\]/.exec(src)
-  assert.ok(installArgs, '应能找到全局安装的参数构造')
-  assert.match(installArgs[0], /--prefer-offline/, '全局安装应带 --prefer-offline')
+  // 全局安装 / 预装 / 缓存预热三条 install 命令：都不许带 --prefer-offline
+  const installArgLines = src.split('\n').filter((line) => /const args = \['install'/.test(line))
+  assert.ok(installArgLines.length >= 2, '应能找到安装命令的参数构造')
+  for (const line of installArgLines) {
+    assert.ok(!/prefer-offline/.test(line), '安装不能带 --prefer-offline：npm 会直接复用过期 packument（force-cache）')
+  }
+  // 缺版本号失败的重试必须是"强制重新校验元数据"，而不是再读一次同一条缓存
+  assert.ok(src.includes("spawnNpm([...args, '--prefer-online'], opts)"), 'ETARGET 后要用 --prefer-online 重试一次')
 })

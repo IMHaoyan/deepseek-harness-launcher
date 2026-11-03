@@ -473,9 +473,30 @@ function logNpmFailure(args, error, stderr) {
   log(`dsh-update: npm ${args.slice(0, 4).join(' ')} 失败（${error}）：${redact(tail(stderr)) || '(stderr 为空)'}`)
 }
 
+/** 安装失败是否属于"缺版本号"（npm ETARGET / notarget）。纯函数，供测试。 */
+function isMissingVersionFailure(result) {
+  if (!result || result.ok !== false) return false
+  const text = String(result.stderr || '') + '\n' + String(result.error || '')
+  return /(?:ETARGET|No matching version found)/i.test(text)
+}
+
+/** 从失败输出里抠出缺的是哪个"包@版本"（诊断/日志用）；抠不到给空串。纯函数，供测试。 */
+function missingVersionSpec(result) {
+  const text = String((result && result.stderr) || '') + '\n' + String((result && result.error) || '')
+  const m = /No matching version found for (\S+)/i.exec(text)
+  return m ? m[1].replace(/[.,;:)\]]+$/, '') : ''
+}
+
 /**
  * 跑一次 npm。会写盘的调用（安装 / 预装 / 预热）必须带 `mutation: true`：
  * 它运行期间所有只读调用（npm view）立刻返回 busy，不与安装争抢同一份共享缓存。
+ *
+ * 安装还多一条：命中"缺版本号"（ETARGET/notarget）时强制重新校验元数据再试一次。
+ * 原因有二：① registry 的 packument 带 max-age 缓存，刚发布的依赖版本可能还没进客户端
+ * 手里那份"新鲜但落后"的缓存；默认缓存模式只重新校验过期条目。② 半发布期间依赖确实可能
+ * 还没上齐。前者能被 --prefer-online（无条件校验）救回来，后者重试一次也很快失败并如实上报
+ * —— 解析阶段就失败，不会写盘。只重试一次，避免把每次检查拖长。
+ *
  * @param {string[]} args npm 参数（自动前置 --no-update-notifier）
  * @param {{nodeBin?:string, timeoutMs?:number, mutation?:boolean}} opts 调用选项
  * @returns {Promise<{ok:boolean, error:string, stdout:string, stderr:string, busy?:boolean}>} 结果；busy=true 表示被让路，不是失败
@@ -487,7 +508,12 @@ async function runNpm(args, opts = {}) {
   }
   if (mutation) npmMutations += 1
   try {
-    return await spawnNpm(args, opts)
+    const first = await spawnNpm(args, opts)
+    if (!mutation || first.ok || args.includes('--prefer-online') || !isMissingVersionFailure(first)) return first
+    log(`dsh-update: 安装报缺版本（${missingVersionSpec(first) || '未知包'}），强制重新校验元数据后重试一次`)
+    const retried = await spawnNpm([...args, '--prefer-online'], opts)
+    if (retried.ok) log('dsh-update: 强制重新校验后安装成功（首次失败是本地元数据缓存落后）')
+    return retried
   } finally {
     if (mutation) npmMutations -= 1
   }
@@ -642,11 +668,13 @@ function parseDistTags(stdout) {
 // 全局 npm 更新：npm i -g --prefix <全局根> @deepseek-ai/dsh@<版本>（npmmirror 优先、官方回退）
 // 用 install + 显式版本（而非 npm update）：幂等且指定精确目标版本，失败重试不会留下"半套"文件；
 // 超时给足 25 分钟（慢速网络全量依赖树约 13 分钟，90s 默认超时会永远杀不掉大下载）。
-// --prefer-offline：目标版本是显式钉死的，缓存命中时省掉元数据往返；注意**不能**加给 `npm view`
-// （那会把"最新版"读成缓存里的旧值，检测直接失效）。
+// 安装**不能**加 --prefer-offline：npm 把它映射成 cache:force-cache，过期 packument 也直接复用。
+// 目标版本虽钉死，但它的依赖元数据必须是新的 —— 新版本刚发布时缓存里还是上一版的依赖列表，
+// npm 会在解析阶段报 ETARGET/notarget（2026-10 的 rc.4 / alpha.2 就是这样"显示有更新但装不上"）。
+// 这类缺版本号失败由 runNpm 强制重新校验元数据后重试一次；仍失败则如实上报，交给下一轮检查。
 async function runGlobalUpdate(nodeBin, globalRoot, version) {
   for (const registry of registries()) {
-    const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund', '--prefer-offline']
+    const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund']
     if (registry) args.push('--registry', registry)
     // 用当前环境 npm（用户级/系统均可）并显式指定全局根，确保落在与 npm i -g 相同的目录
     const r = await runNpm(args, { nodeBin, timeoutMs: 25 * 60 * 1000, mutation: true })
@@ -815,7 +843,9 @@ async function stageLatest(version, nodeBin, kind, installDir) {
   cleanupStage(paths.stageRoot, version) // 其他版本的暂存已过期
   let last = { ok: false, error: '未执行' }
   for (const registry of registries()) {
-    const args = ['install', '-g', '--prefix', paths.stagePrefix, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund', '--prefer-offline']
+    // 同样不加 --prefer-offline（理由见 runGlobalUpdate 上方注释）：预装的就是"刚发布的新版本"，
+    // 依赖元数据必须重新校验，否则会拿上一版的依赖列表在解析阶段报 notarget。
+    const args = ['install', '-g', '--prefix', paths.stagePrefix, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund']
     if (registry) args.push('--registry', registry)
     last = await runNpm(args, { nodeBin, timeoutMs: STAGE_TIMEOUT_MS, mutation: true })
     if (last.ok) { noteRegistryOk(registry); break }
@@ -1449,6 +1479,9 @@ module.exports = {
   tagForDisplay,
   parseDistTags,
   tail,
+  // 安装失败的"缺版本号"识别与重试依据（纯函数，供测试验证）
+  isMissingVersionFailure,
+  missingVersionSpec,
   // 预装/改名切换（纯函数，供测试直接验证判定逻辑）
   npmPrefixOf,
   stageRootOf,

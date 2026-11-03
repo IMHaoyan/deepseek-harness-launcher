@@ -46,3 +46,27 @@ test('Defender 排除项要覆盖 npm 共享缓存目录', () => {
   assert.ok(mainSrc.includes("'npm-cache'"), '缓存目录没排除时，实时扫描会让安装即刻失败')
   assert.match(mainSrc, /path\.join\(os\.homedir\(\), '\.npm'\)/, 'HOME 下的另一种默认缓存位置也要覆盖')
 })
+
+test('缺版本号（ETARGET/notarget）的失败能被识别，并抠出缺的"包@版本"', () => {
+  const etarget = {
+    ok: false,
+    stderr: 'npm error code ETARGET\nnpm error notarget No matching version found for @deepseek-ai/dsh-client-ui-settings-account@0.2.1-rc.4.\nnpm error notarget In most cases...',
+    error: 'npm 退出码 1',
+  }
+  assert.equal(dshUpdater.isMissingVersionFailure(etarget), true, 'ETARGET/notarget 要能识别')
+  assert.equal(dshUpdater.missingVersionSpec(etarget), '@deepseek-ai/dsh-client-ui-settings-account@0.2.1-rc.4', '日志要能说清缺的是哪个包')
+  // 其他失败一律不当作"缺版本号"，不触发重试
+  assert.equal(dshUpdater.isMissingVersionFailure({ ok: false, stderr: 'npm error code ECONNRESET', error: '' }), false)
+  assert.equal(dshUpdater.isMissingVersionFailure({ ok: false, stdout: '', stderr: '', error: 'npm 退出码 1' }), false)
+  assert.equal(dshUpdater.isMissingVersionFailure({ ok: true, stderr: 'No matching version found for x@1' }), false, '成功的调用不重试')
+  assert.equal(dshUpdater.isMissingVersionFailure(null), false)
+  assert.equal(dshUpdater.missingVersionSpec({ ok: false, stderr: 'boom', error: '' }), '')
+})
+
+test('缺版本号的安装失败会强制重新校验元数据重试一次（不会直接放弃）', () => {
+  assert.ok(src.includes('isMissingVersionFailure(first)'), 'runNpm 要识别缺版本号失败')
+  // 重试是"同一条命令 + --prefer-online"的一次性重调用（spawnNpm 直接调，不再进 runNpm，不会循环）
+  assert.ok(src.includes("const retried = await spawnNpm([...args, '--prefer-online'], opts)"), '重试要带 --prefer-online（无条件重新校验）')
+  assert.ok(src.includes('if (retried.ok) log('), '重试成功要留一条可解释日志')
+  assert.ok(src.includes("args.includes('--prefer-online')"), '已带该参数时不重复重试')
+})
