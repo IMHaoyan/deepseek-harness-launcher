@@ -229,7 +229,8 @@ function showPage(name) {
   document.querySelectorAll('#consoleNav .console-nav-item').forEach((el) => {
     el.classList.toggle('active', el.id === activeNav);
   });
-  document.title = 'DSHL 控制台 · ' + (CONSOLE_PAGE_LABELS[name] || '通用');
+  document.title = 'DSHL 控制台 · ' + (name === 'wizard' && window._pluginSetupEditing
+    ? '预装插件选择' : (CONSOLE_PAGE_LABELS[name] || '通用'));
   const content = $('consoleContent');
   if (content) content.scrollTop = 0;
   $('pageGeneral').classList.toggle('hidden', name !== 'general');
@@ -255,7 +256,7 @@ function showPage(name) {
     void cmd('envDetect');
   }
   if (name === 'wizard') {
-    // 进入向导：环境已就绪 → 完成屏；有安装任务 → 按任务状态显示；否则欢迎屏
+    // 插件选择始终先于环境流程；环境快照不能覆盖 pending / 插件批次。
     void cmd('envGetState').then((s) => {
       if (!s) return;
       if (s.job) {
@@ -264,12 +265,8 @@ function showPage(name) {
       }
       if (Array.isArray(s.log)) appendWizardLog(s.log.map((e) => (typeof e === 'object' && e.line != null ? e.line : String(e))));
     });
-    if (window._envSummary && window._envSummary.ready) {
-      showWizardScreen('done');
-      ensureWizardStart();
-      if (window._running) finishWizardStart();
-    } else if (window._envJob) renderWizardJob(window._envJob);
-    else showWizardScreen('welcome');
+    window._wizardActive = true;
+    routeWizard();
   }
 }
 
@@ -278,6 +275,8 @@ function render(state) {
   window._lastState = state;
   window._running = !!state.running;
   window._firstRun = !!state.firstRun;
+  window._pluginOpBusy = !!(state.pluginOp && state.pluginOp.busy);
+  renderPluginSetup(state.pluginSetup, state.pluginSetupPlugins);
 
   // 最低端版本行：启动器版本 / DSH 版本（DSH 优先取环境探测的已安装版本，回退更新器记录；点击打开对应的 GitHub Release）
   const lvEl = $('launcherVersion');
@@ -465,16 +464,8 @@ function render(state) {
   // DSH 新版本卡片（检测自动、更新手动）
   renderDshUpdate(state.dshUpdate);
 
-  // 新手向导：安装完成且环境已就绪 → 启动进度屏（进度条走完自动回主页；DSH 窗口由主进程弹出）
-  if (window._wizardActive && window._envJob && window._envJob.status === 'done' && state.env && state.env.ready) {
-    showWizardScreen('done');
-    ensureWizardStart();
-    if (state.running) {
-      finishWizardStart();
-    } else if (wizardStartState && !wizardStartState.finished && Date.now() - wizardStartState.t0 > 90000) {
-      finishWizardStart(); // 兜底：90 秒仍未就绪也回主页（主页会显示真实状态，用户可手动处理）
-    }
-  }
+  // 只按真实环境、服务与插件批次状态推进，不用等待时长冒充成功。
+  if (window._wizardActive) routeWizard();
 
   // 插件页：卡片完全由 state.plugins 驱动；新增插件不需要改这里
   // 插件操作锁（profile 写锁）：主进程同一时刻只允许一个流程改 profile。页面必须让
@@ -798,7 +789,220 @@ const WIZARD_STAGE_ACTION = {
   'plugin': '正在安装桌面通知组件…',
 };
 
+function pluginSetupPending() {
+  return !window._pluginSetup || window._pluginSetup.choice === 'pending';
+}
+
+function pluginSetupSelecting() {
+  return pluginSetupPending() || !!window._pluginSetupEditing;
+}
+
+function pluginSetupEntryBusy() {
+  return !!(window._pluginSetupOpening || window._pluginSetupSubmitting || window._pluginOpBusy
+    || (window._pluginSetup && window._pluginSetup.running));
+}
+
+function pluginSetupBlocksFinish() {
+  const setup = window._pluginSetup;
+  return window._pluginSetupSubmitting || pluginSetupSelecting() || setup.running || !!setup.error
+    || (setup.choice === 'install' && setup.completed !== true);
+}
+
+function pluginSetupSelectedIds() {
+  return (window._pluginSetupPlugins || []).filter((p) => window._pluginSetupDraft && window._pluginSetupDraft.has(p.id)).map((p) => p.id);
+}
+
+function pluginSetupCanEdit() {
+  return !!window._pluginSetup && pluginSetupSelecting() && !pluginSetupEntryBusy();
+}
+
+function resetPluginSetupDraft() {
+  const setup = window._pluginSetup || {};
+  const saved = setup.selectedIds;
+  window._pluginSetupDraft = new Set(Array.isArray(saved) ? saved
+    : setup.choice === 'skip' ? [] : (window._pluginSetupPlugins || []).map((p) => p.id));
+}
+
+async function openPluginSetup() {
+  if (pluginSetupEntryBusy()) return;
+  window._pluginSetupOpening = true;
+  renderPluginSetup();
+  const latest = await cmd('getState');
+  window._pluginSetupOpening = false;
+  if (!latest || !latest.pluginSetup) {
+    renderPluginSetup();
+    showConsoleToast('无法读取预装选择，请刷新后重试');
+    return;
+  }
+  if (latest.pluginSetup.running || (latest.pluginOp && latest.pluginOp.busy) || pluginSetupEntryBusy()) {
+    window._pluginOpBusy = !!(latest.pluginOp && latest.pluginOp.busy);
+    renderPluginSetup(latest.pluginSetup, latest.pluginSetupPlugins);
+    showConsoleToast('插件操作正在进行，请完成后再修改预装选择');
+    return;
+  }
+  // 只打开本地编辑态，不能把真实 choice 改成 pending，更不能在入口写配置。
+  window._pluginSetupEditing = latest.pluginSetup.choice !== 'pending';
+  window._wizardActive = true;
+  window._pluginSetupChoiceError = '';
+  wizardStartState = null;
+  clearTimeout(window._wizardDoneTimer);
+  window._wizardDoneTimer = null;
+  render(latest);
+  resetPluginSetupDraft();
+  renderPluginSetup();
+  showPage('wizard');
+}
+
+function cancelPluginSetupEditing() {
+  if (!window._pluginSetupEditing || window._pluginSetupSubmitting) return;
+  window._pluginSetupEditing = false;
+  window._pluginSetupChoiceError = '';
+  resetPluginSetupDraft();
+  window._wizardActive = false;
+  stopWizardTimer();
+  renderPluginSetup();
+  showPage('plugins');
+}
+
+function selectPluginSetupAll(all) {
+  if (!pluginSetupCanEdit()) return;
+  window._pluginSetupDraft = new Set(all ? (window._pluginSetupPlugins || []).map((p) => p.id) : []);
+  renderPluginSetup();
+}
+
+function renderPluginSetup(setup, plugins) {
+  if (setup) window._pluginSetup = setup;
+  if (Array.isArray(plugins)) window._pluginSetupPlugins = plugins;
+  const list = window._pluginSetupPlugins || [];
+  // 草稿只初始化一次：pending 的状态广播与离开/重开向导都不能抹掉用户勾选。
+  if (!window._pluginSetupDraft && list.length) {
+    const saved = window._pluginSetup && window._pluginSetup.selectedIds;
+    window._pluginSetupDraft = new Set(Array.isArray(saved) ? saved : list.map((p) => p.id));
+  }
+  const listJson = JSON.stringify(list);
+  if (window._pluginSetupListJson !== listJson) {
+    window._pluginSetupListJson = listJson;
+    $('wizardPluginList').innerHTML = list.length ? list.map((p) => `<li class="wizard-plugin-item">
+      <label class="wizard-plugin-option">
+        <input type="checkbox" data-plugin-setup-id="${esc(p.id)}" aria-label="${esc(p.name || p.id)}">
+        <span class="wizard-plugin-copy"><span class="wizard-plugin-name">${esc(p.name || p.id)}</span>
+          <span class="wizard-plugin-description">${esc(p.description)}</span>
+          ${p.npm ? `<span class="wizard-plugin-package">${esc(p.npm)}</span>` : ''}
+        </span>
+      </label>
+    </li>`).join('') : '<li class="wizard-plugin-item muted">正在读取预装插件清单…</li>';
+  }
+  const s = window._pluginSetup || {};
+  const pending = pluginSetupPending();
+  const selecting = pluginSetupSelecting();
+  const editing = !!window._pluginSetupEditing;
+  const submitting = !!window._pluginSetupSubmitting;
+  $('btnPluginsSetup').disabled = pluginSetupEntryBusy();
+  $('wizardPluginKicker').textContent = editing ? '插件管理 · 可选插件' : '首次设置 · 可选插件';
+  $('wizardPluginTitle').textContent = editing ? '预装插件选择' : '为 DSH 添加常用功能';
+  $('wizardPluginExplanation').textContent = editing
+    ? '取消勾选不卸载已安装插件，只影响自动补装；点击安装只补缺失项。未勾选项以后不会自动补装，仍可手动安装。'
+    : '跳过不会影响 DSH 使用。未勾选的插件以后不会自动补装，可在「插件管理」手动安装。选中项联网安装，批次末尾统一重启一次生效。';
+  $('btnWizardPluginsBack').classList.toggle('hidden', !editing);
+  $('btnWizardPluginsBack').disabled = submitting;
+  $('btnWizardPluginsMain').classList.toggle('hidden', editing);
+  $('wizardPluginExitNote').classList.toggle('hidden', editing);
+  const selectedIds = pluginSetupSelectedIds();
+  const editable = pluginSetupCanEdit();
+  $('wizardPluginList').querySelectorAll('input[data-plugin-setup-id]').forEach((input) => {
+    input.checked = selectedIds.includes(input.dataset.pluginSetupId);
+    input.disabled = !editable;
+  });
+  $('wizardPluginSelection').classList.toggle('hidden', !selecting);
+  $('btnWizardPluginsAll').disabled = !editable || !list.length;
+  $('btnWizardPluginsClear').disabled = !editable || !list.length;
+  $('wizardPluginSelectedCount').textContent = `已选 ${selectedIds.length}/${list.length}`;
+  $('wizardPluginChoices').classList.toggle('hidden', !selecting);
+  $('btnWizardPluginsInstall').disabled = !editable || selectedIds.length === 0;
+  $('btnWizardPluginsSkip').disabled = !editable;
+  $('btnWizardPluginsInstall').textContent = submitting ? '正在保存选择…' : `安装选中的 ${selectedIds.length} 个插件`;
+  const current = list.find((p) => p.id === s.current || p.npm === s.current);
+  const done = Math.max(0, Number(s.done) || 0);
+  const total = Math.max(0, Number(s.total) || 0);
+  $('wizardPluginStatus').textContent = window._pluginSetupChoiceError || s.error
+    ? (window._pluginSetupChoiceError ? '选择未保存：' + window._pluginSetupChoiceError : '插件安装没有全部完成：' + s.error)
+    : selecting ? (submitting ? '正在保存选择，请稍候…' : editing ? '勾选后保存，或返回插件页放弃本次修改。' : '请先选择是否安装预装插件。')
+      : s.running ? `正在安装：${current ? current.name || current.id : s.current || '准备批次…'} · ${done}/${total}`
+        : s.choice === 'install' ? `等待安装流程确认 · ${done}/${total}` : '已跳过插件安装';
+  $('wizardPluginStatus').classList.toggle('error', !!(window._pluginSetupChoiceError || s.error));
+  $('wizardPluginProgress').classList.toggle('hidden', selecting || (!s.running && !s.error));
+  $('wizardPluginBar').style.width = (total > 0 ? Math.min(100, done / total * 100) : 0) + '%';
+  // pending 首次出现必须提示；用户仍可主动去主页排障，后续广播不反复抢页面。
+  if (pending && !window._pluginSetupPromptShown) {
+    window._pluginSetupPromptShown = true;
+    window._wizardActive = true;
+    showPage('wizard');
+  }
+}
+
+function routeWizard() {
+  const setup = window._pluginSetup;
+  if (pluginSetupSelecting() || window._pluginSetupSubmitting || setup.running || setup.error) {
+    stopWizardTimer();
+    showWizardScreen('plugins');
+    return;
+  }
+  if (window._envJob && window._envJob.status === 'running') { renderWizardJob(window._envJob); return; }
+  if (window._envSummary && window._envSummary.ready) {
+    if (pluginSetupBlocksFinish()) { stopWizardTimer(); showWizardScreen('plugins'); return; }
+    showWizardScreen('done');
+    ensureWizardStart();
+    if (window._running) finishWizardStart();
+  } else if (window._envJob && window._envJob.status !== 'done') {
+    renderWizardJob(window._envJob);
+  } else showWizardScreen('welcome');
+}
+
+async function choosePluginSetup(choice) {
+  if (!pluginSetupCanEdit()) return;
+  const wasEditing = !!window._pluginSetupEditing;
+  const selectedIds = choice === 'skip' ? [] : pluginSetupSelectedIds();
+  if (choice === 'install' && selectedIds.length === 0) return;
+  window._pluginSetupSubmitting = true;
+  window._pluginSetupChoiceError = '';
+  renderPluginSetup();
+  const result = await cmd('pluginsSetSetupChoice', { choice, selectedIds });
+  if (!result || result.ok !== true) {
+    window._pluginSetupSubmitting = false;
+    window._pluginSetupChoiceError = (result && result.error) || '无响应，请重试或查看日志';
+    renderPluginSetup();
+    showWizardScreen('plugins');
+    return;
+  }
+  // IPC 的 ok 是持久化证据；不在发起请求时乐观放行。随后回读完整状态确认批次。
+  const latest = await cmd('getState');
+  if (latest) render(latest);
+  window._pluginSetupSubmitting = false;
+  const savedIds = Array.isArray(result.selectedIds) ? result.selectedIds : selectedIds;
+  window._pluginSetupDraft = new Set(savedIds);
+  const savedChoice = result.choice || choice;
+  const current = window._pluginSetup || {};
+  const sameSavedBatch = current.choice === savedChoice
+    && JSON.stringify(current.selectedIds) === JSON.stringify(savedIds);
+  // 回读失败/旧广播错位时不能把上一次 completed 沿用为新批次的成功证据。
+  window._pluginSetup = { ...current, ...(savedChoice === 'install' && !sameSavedBatch
+    ? { completed: false, running: false, current: '', done: 0, total: 0, error: '' } : {}), choice: savedChoice, selectedIds: savedIds };
+  window._pluginSetupEditing = false;
+  wizardStartState = null;
+  renderPluginSetup();
+  if (wasEditing && window._pluginSetup.choice === 'skip') {
+    window._wizardActive = false;
+    stopWizardTimer();
+    showPage('plugins');
+  } else routeWizard();
+}
+
 function showWizardScreen(name) {
+  // 防住异步 envGetState / 环境 job done 等所有旧入口，不能盖掉尚未保存的选择。
+  if (name !== 'plugins' && (pluginSetupSelecting() || window._pluginSetupSubmitting
+    || window._pluginSetup.running || window._pluginSetup.error)) name = 'plugins';
+  if (name === 'done' && pluginSetupBlocksFinish()) name = 'plugins';
+  $('wizardPlugins').classList.toggle('hidden', name !== 'plugins');
   $('wizardWelcome').classList.toggle('hidden', name !== 'welcome');
   $('wizardProgress').classList.toggle('hidden', name !== 'progress');
   $('wizardDone').classList.toggle('hidden', name !== 'done');
@@ -810,21 +1014,24 @@ let wizardStartState = null; // 启动进度屏状态 { t0, finished }
 
 // 启动进度条：10 秒线性走到 90%（首次启动初始化），服务就绪后跳到 100% 并回主页
 function ensureWizardStart() {
-  if (wizardStartState && !wizardStartState.finished) return;
+  if (pluginSetupBlocksFinish() || wizardStartState) return;
   wizardStartState = { t0: Date.now(), finished: false };
   const bar = $('wizardStartBar');
   const note = $('wizardStartNote');
   bar.style.transition = 'none';
   bar.style.width = '0%';
-  note.textContent = '首次启动需要初始化（约 10 秒），完成后会自动打开 DeepSeek Harness';
+  note.textContent = window._pluginSetup && window._pluginSetup.choice === 'skip'
+    ? '已跳过插件安装。正在等待服务就绪，完成后自动打开 DeepSeek Harness。'
+    : '插件批次已结束。正在等待服务就绪，完成后自动打开 DeepSeek Harness。';
   requestAnimationFrame(() => {
+    if (wizardStartState.finished || pluginSetupBlocksFinish()) return;
     bar.style.transition = 'width 10s linear';
     bar.style.width = '90%';
   });
 }
 
 function finishWizardStart() {
-  if (!wizardStartState || wizardStartState.finished) return;
+  if (pluginSetupBlocksFinish() || !window._running || !wizardStartState || wizardStartState.finished) return;
   wizardStartState.finished = true;
   const bar = $('wizardStartBar');
   bar.style.transition = 'width 400ms ease-out';
@@ -833,7 +1040,7 @@ function finishWizardStart() {
   if (window._wizardDoneTimer) clearTimeout(window._wizardDoneTimer);
   window._wizardDoneTimer = setTimeout(() => {
     window._wizardDoneTimer = null;
-    if (!$('pageWizard').classList.contains('hidden')) {
+    if (!pluginSetupBlocksFinish() && window._running && !$('pageWizard').classList.contains('hidden')) {
       window._wizardActive = false;
       showPage('main');
     }
@@ -926,6 +1133,11 @@ function renderWizardJob(job) {
   if (!job) return;
   window._envJob = job;
   window._lastInstallItems = job.items || [];
+  if (pluginSetupSelecting() || window._pluginSetupSubmitting || window._pluginSetup.running || window._pluginSetup.error) {
+    stopWizardTimer();
+    showWizardScreen('plugins');
+    return;
+  }
   if (job.status === 'running') {
     // 新任务：重置计时；阶段切换：记录本阶段开始时刻（速率型 ETA 的基准）
     if (window._wizardJobId !== job.id) {
@@ -966,7 +1178,7 @@ function renderWizardJob(job) {
     startWizardTimer();
   } else if (job.status === 'done') {
     stopWizardTimer();
-    if (window._envSummary && window._envSummary.ready) showWizardScreen('done');
+    if (window._envSummary && window._envSummary.ready) routeWizard();
     else { showWizardScreen('progress'); $('wizardStepText').textContent = '完成检查…'; }
   } else if (job.status === 'failed' || job.status === 'cancelled') {
     stopWizardTimer();
@@ -985,13 +1197,37 @@ function appendWizardLog(lines) {
   if (!$('wizardLog').classList.contains('hidden')) el.scrollTop = el.scrollHeight;
 }
 
+$('btnPluginsSetup').addEventListener('click', () => openPluginSetup());
+$('btnWizardPluginsBack').addEventListener('click', cancelPluginSetupEditing);
+$('wizardPluginList').addEventListener('change', (event) => {
+  const input = event.target.closest('input[data-plugin-setup-id]');
+  if (!input || !$('wizardPluginList').contains(input) || !pluginSetupCanEdit()) return;
+  const id = input.dataset.pluginSetupId;
+  if (!(window._pluginSetupPlugins || []).some((p) => p.id === id)) return;
+  if (input.checked) window._pluginSetupDraft.add(id);
+  else window._pluginSetupDraft.delete(id);
+  renderPluginSetup();
+});
+$('btnWizardPluginsAll').addEventListener('click', () => selectPluginSetupAll(true));
+$('btnWizardPluginsClear').addEventListener('click', () => selectPluginSetupAll(false));
+$('btnWizardPluginsInstall').addEventListener('click', () => void choosePluginSetup('install'));
+$('btnWizardPluginsSkip').addEventListener('click', () => void choosePluginSetup('skip'));
+for (const id of ['btnWizardPluginsMain', 'btnWizardStartMain']) {
+  $(id).addEventListener('click', () => {
+    window._wizardActive = false;
+    stopWizardTimer();
+    showPage('main'); // 只离开向导，不改选择、不取消批次，也不报告成功。
+  });
+}
 $('btnWizardStart').addEventListener('click', () => {
   window._wizardActive = true;
+  if (pluginSetupSelecting() || window._pluginSetupSubmitting) { showWizardScreen('plugins'); return; }
   const items = missingEnvItems(window._envSummary);
   if (items.length) void cmd('envInstall', { items });
-  else if (window._envSummary && window._envSummary.ready) showWizardScreen('done');
+  else routeWizard();
 });
 $('btnWizardSkip').addEventListener('click', async () => {
+  if (pluginSetupSelecting() || window._pluginSetupSubmitting) { showWizardScreen('plugins'); return; }
   const ok = await confirmDialog({
     title: '跳过向导？',
     body: '跳过向导需要你手动安装 Node / npm / pnpm / DSH；建议先试自动安装（约 3-5 分钟，已装好的组件会自动跳过）。',
@@ -1010,6 +1246,7 @@ $('btnWizardCancel').addEventListener('click', () => {
 });
 $('btnWizardRetry').addEventListener('click', () => {
   window._wizardActive = true;
+  if (pluginSetupSelecting() || window._pluginSetupSubmitting) { showWizardScreen('plugins'); return; }
   const items = window._lastInstallItems || [];
   if (items.length) void cmd('envInstall', { items });
   else showWizardScreen('welcome');

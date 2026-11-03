@@ -241,8 +241,30 @@
     </div>
   </div>
 
-  <!-- 新手安装向导（首装引导：欢迎 → 极简进度 → 完成/失败；高级用户可跳过进"运行环境"页） -->
+  <!-- 首装引导：插件选择 → 环境欢迎/进度 → 批次确认 → 服务就绪；仍在同一控制台内 -->
   <div id="pageWizard" class="page hidden">
+    <div id="wizardPlugins" class="hidden">
+      <div class="wizard-setup-kicker" id="wizardPluginKicker">首次设置 · 可选插件</div>
+      <div class="wizard-title" id="wizardPluginTitle">为 DSH 添加常用功能</div>
+      <div class="wizard-sub">勾选需要的预装插件，也可以只使用 DSH。</div>
+      <div id="wizardPluginSelection" class="wizard-plugin-selection">
+        <span id="wizardPluginSelectedCount">已选 0/6</span>
+        <button class="btn sm" id="btnWizardPluginsAll" disabled>全选</button>
+        <button class="btn sm" id="btnWizardPluginsClear" disabled>清空</button>
+      </div>
+      <ul id="wizardPluginList" class="wizard-plugin-list" aria-label="预装插件清单"></ul>
+      <div class="wizard-plugin-explanation" id="wizardPluginExplanation">跳过不会影响 DSH 使用。未勾选的插件以后不会自动补装，可在「插件管理」手动安装。选中项联网安装，批次末尾统一重启一次生效。</div>
+      <div id="wizardPluginChoices" class="wizard-plugin-choices">
+        <button class="btn primary wizard-main-btn" id="btnWizardPluginsInstall" disabled>安装选中的 6 个插件</button>
+        <button class="btn wizard-main-btn" id="btnWizardPluginsSkip" disabled>跳过插件安装</button>
+      </div>
+      <div id="wizardPluginProgress" class="progress hidden"><div id="wizardPluginBar" class="progress-bar"></div></div>
+      <div id="wizardPluginStatus" class="wizard-plugin-status" role="status" aria-live="polite">正在读取首次设置状态…</div>
+      <button class="btn sm wizard-skip" id="btnWizardPluginsMain">先去通用页查看状态</button>
+      <button class="btn sm wizard-skip hidden" id="btnWizardPluginsBack">取消修改，返回插件页</button>
+      <div class="wizard-note" id="wizardPluginExitNote">此入口仅离开向导，不会保存选择或取消正在安装的批次。</div>
+    </div>
+
     <div id="wizardWelcome">
       <div class="wizard-hero" aria-hidden="true"><svg viewBox="0 0 50 50"><use href="#dshWhale"/></svg></div>
       <div class="wizard-title">欢迎使用 DeepSeek Harness Launcher</div>
@@ -250,7 +272,7 @@
       <div class="wizard-points">
         <div class="wizard-point"><span class="wizard-point-icon">✓</span>全自动，无需任何技术操作</div>
         <div class="wizard-point"><span class="wizard-point-icon">✓</span>约 3–5 分钟，需要联网（下载约 100MB）</div>
-        <div class="wizard-point"><span class="wizard-point-icon">✓</span>不修改系统设置，可随时卸载</div>
+        <div class="wizard-point"><span class="wizard-point-icon">✓</span>已安装组件会复用；必要时弹管理员授权</div>
       </div>
       <button class="btn primary wizard-main-btn" id="btnWizardStart">开始，自动完成</button>
       <div class="wizard-note">已装好的组件会自动跳过，不会重复下载</div>
@@ -272,11 +294,12 @@
     </div>
 
     <div id="wizardDone" class="hidden">
-      <div class="wizard-done-icon">✓</div>
-      <div class="wizard-title">安装完成！</div>
-      <div class="wizard-sub">正在启动 DeepSeek Harness…</div>
+      <div class="wizard-done-icon" aria-hidden="true">·</div>
+      <div class="wizard-title">运行环境已就绪</div>
+      <div class="wizard-sub">正在确认 DeepSeek Harness 服务状态…</div>
       <div class="progress wizard-start-bar"><div class="progress-bar" id="wizardStartBar"></div></div>
-      <div class="wizard-note" id="wizardStartNote">首次启动需要初始化（约 10 秒），完成后会自动打开 DeepSeek Harness</div>
+      <div class="wizard-note" id="wizardStartNote">正在等待服务就绪，完成后自动打开 DeepSeek Harness。</div>
+      <button class="btn sm wizard-skip" id="btnWizardStartMain">查看通用页 / 启动状态</button>
     </div>
 
     <div id="wizardFail" class="hidden">
@@ -380,6 +403,7 @@
       </div>
       <!-- 第一行：筛选按钮（左）+ 操作按钮（贴右）；搜索框独占第二行（见 console.css 的 flex 契约） -->
       <div class="plugin-toolbar-actions">
+        <button class="btn" id="btnPluginsSetup" title="修改预装插件的自动补装范围；不会卸载已安装插件">预装插件选择</button>
         <button class="btn" id="btnPluginsRefresh" title="重新读取插件状态并检查更新">刷新</button>
         <button class="btn primary" id="btnPluginsUpdate" title="把本页所有可更新的插件更新一遍；全部完成后自动重启一次 DSH 生效">一键更新</button>
       </div>

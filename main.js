@@ -131,7 +131,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '' }
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -183,16 +183,15 @@ function initEnvRuntime() {
         await refreshEnv(true)
         if (silent) {
           log('silent install done, detection switched (service left as-is)')
-          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallPluginMarket(); void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
+          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
           return
         }
         if (envReady()) {
           log('environment ready after install, starting service')
           await handleStart()
-          void maybeAutoInstallPluginMarket() // 首次安装环境完成后：默认装上插件市场
-          void maybeAutoInstallRecommendedPlugins() // 以及默认代装的推荐插件（含手机连接）
+          await maybeAutoInstallRecommendedPlugins() // 插件市场与全部预装插件同批，最后仅重启一次
           void maybeRemoveRetiredPlugins() // 以及自动卸掉已从注册表摘除的退役插件（老用户升级后生效）
-          if (server.running()) {
+          if (server.running() && Config.pluginSetupChoice !== 'pending' && !pluginSetup.error) {
             await sleep(400)
             openWebUi({ hideConsole: true }) // 新手完成感：服务就绪后自动回到 DeepSeek Harness
           }
@@ -273,9 +272,7 @@ function maybeStartDeferred() {
   if (startWhenReady && envReady() && !server.running()) {
     startWhenReady = false
     log('environment became ready, starting deferred service')
-    void handleStart()
-    void maybeAutoInstallPluginMarket() // 环境/服务刚就绪：补上插件市场默认安装
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（手机连接 / 用量与计费 / 技能管理 / 对话回退）同样补装
+    void handleStart().then((ok) => { if (ok) return maybeAutoInstallRecommendedPlugins() }) // 基础服务启动完成后，同批补装全部预装插件
     void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）同样补卸
   }
 }
@@ -491,6 +488,14 @@ function applyConfigJson(cfg) {
   // 插件市场（dshmarket）自动安装记账：每个启动器版本只自动尝试一次
   if (typeof cfg.pluginMarketAutoTryVersion === 'string') Config.pluginMarketAutoTryVersion = cfg.pluginMarketAutoTryVersion
   if (typeof cfg.pluginMarketDeclined === 'boolean') Config.pluginMarketDeclined = cfg.pluginMarketDeclined
+  // 老用户没有首装选择字段：保留既有默认代装；新用户 pending 必须显式选择。
+  Config.pluginSetupChoice = ['pending', 'install', 'skip'].includes(cfg.pluginSetupChoice)
+    ? cfg.pluginSetupChoice : (cfg.pluginSetupChoice === undefined ? 'install' : 'pending')
+  // 缺字段/null 是旧版默认全装；显式清单按首装时所选保存，升级不能扩大选择。
+  try {
+    Config.pluginSetupSelectedIds = cfg.pluginSetupSelectedIds == null ? null
+      : normalizePluginSetupSelection(cfg.pluginSetupSelectedIds)
+  } catch { Config.pluginSetupSelectedIds = [] } // 坏配置不得悄悄回退全选
   // 推荐插件（npm 分发）默认自动安装记账：每个启动器版本只自动尝试一次；
   // pluginAutoDeclined 记「用户手动卸载过」的插件 id，卸载过的以后不再自动装回来（手动装回来会清除）。
   if (typeof cfg.pluginAutoInstallTriedVersion === 'string') Config.pluginAutoInstallTriedVersion = cfg.pluginAutoInstallTriedVersion
@@ -552,7 +557,8 @@ function saveConfig() {
   try {
     fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true })
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(Config, null, 2))
-  } catch (err) { log('failed to save config: ' + err.message) }
+    return true
+  } catch (err) { log('failed to save config: ' + err.message); return false }
 }
 
 function defaultHarnessRoot() {
@@ -2843,6 +2849,9 @@ let profileOp = null // { label, at }；null = 空闲
 /** 尝试占用 profile 写锁。成功返回 release()，失败返回 null。 */
 function tryBeginProfileOp(label) {
   if (profileOp !== null) return null
+  // 重新选择后的基础启动/安装排队也是 profile 操作的一部分；其它写入口不能插队。
+  // 只有统一预装驱动可把该队列接管为真实写锁（标签由主进程固定，不来自 IPC）。
+  if (typeof pluginSetup !== 'undefined' && pluginSetup.running && label !== '自动安装预装插件') return null
   // ★ 拿到写锁之后、动 profile **之前**先落一个回退点。放在这里是因为它是所有改 profile 的
   //   统一入口（一键安装/一键更新/单个装卸启停都从这里进），一处插入覆盖全部 —— 不用在
   //   每个写入口各补一次（那种补法必然会漏掉一个）。落点失败不阻断。
@@ -2858,7 +2867,7 @@ function tryBeginProfileOp(label) {
 }
 
 function profileOpBusy() {
-  return profileOp !== null
+  return profileOp !== null || (typeof pluginSetup !== 'undefined' && pluginSetup.running)
 }
 
 function profileBusyError() {
@@ -3005,7 +3014,6 @@ function clearPendingPluginRestart() {
 //   - 每个启动器版本最多真正尝试一次（pluginMarketAutoTryVersion 记账）；
 //   - 环境一直不就绪（首次安装还没装完）时不记账、不重试安装，等下次触发点再来；
 //   - 用户主动卸载过（pluginMarketDeclined）就不再自动装回来。
-let marketAutoInstalling = false
 let pnpmRepairTried = false
 
 // pnpm 缺失/版本不匹配时，后台自动对齐一次（Corepack 优先，失败回退 npm 全局）。
@@ -3025,49 +3033,7 @@ async function maybeRepairPnpm() {
   }
 }
 
-async function maybeAutoInstallPluginMarket() {
-  if (SELF_TEST) return
-  if (marketAutoInstalling) return
-  if (Config.pluginMarketDeclined) return
-  if (market.installed().installed) return
-  const ver = app.getVersion()
-  if (Config.pluginMarketAutoTryVersion === ver) return // 本版本已尝试过（失败也不反复打扰）
-  if (!envReady()) {
-    // 环境还没装好：不记账（留给环境装好后的触发点），直接返回
-    log('market: 环境未就绪，暂不自动安装插件市场')
-    return
-  }
-  if (!envReport || !envReport.pnpm || envReport.pnpm.status !== 'ok') {
-    // pnpm 未就绪时不记账：修复环境后仍可在本版本自动安装 dshmarket
-    const detail = envReport && envReport.pnpm ? (envReport.pnpm.detail || '未就绪') : '未检测到 pnpm'
-    log('market: pnpm 未就绪，暂不自动安装插件市场（' + detail + '）')
-    return
-  }
-  marketAutoInstalling = true
-  // 拿不到 profile 写锁就整次跳过，且**不记账**（记账会让"本版本已尝试过"成真，自动补装再也不发生）
-  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装插件市场')
-  if (!releaseProfileOp) { marketAutoInstalling = false; return }
-  try {
-    Config.pluginMarketAutoTryVersion = ver
-    try { saveConfig() } catch { /* noop */ }
-    log(`market: 自动安装 ${market.PLUGIN_NAME} …`)
-    // 等服务就绪后再动：安装要停服务（pnpm 改写 profile 依赖树时不能有进程占用）。
-    // 首次安装环境后服务刚拉起，最多等 3 分钟。
-    const deadline = Date.now() + 180 * 1000
-    while (Date.now() < deadline && !server.running()) await sleep(1000)
-    const r = await market.install()
-    if (r.ok) {
-      await applyPluginChange('install', r.version || market.getState().version)
-    } else {
-      log('market: 自动安装失败：' + (r.error || '未知原因'))
-      notify('DeepSeek Harness Launcher', '插件市场自动安装失败（可在插件页手动重试）：' + String(r.error || '').slice(0, 120), undefined, 'recovery')
-    }
-    broadcastState()
-  } finally {
-    marketAutoInstalling = false
-    releaseProfileOp()
-  }
-}
+// 插件市场不再有独立安装/重启流程：由 maybeAutoInstallRecommendedPlugins 同批处理。
 
 // ---------- 桌面壳登录辅助 bundle ----------
 function resolveDesktopSigninPayloadRoot() {
@@ -3296,7 +3262,7 @@ function cleanInstalledVersion(spec) {
 // 卡片渲染 / 安装 / 卸载 / 更新检查都是通用的（统一走 market.installByName / uninstallByName）。
 // autoInstall: true 表示「默认代装」：首次运行或升级到本版本时由启动器自动补装一次
 //（见 maybeAutoInstallRecommendedPlugins）；用户手动卸载过就不再自动装回来。
-// 当前默认代装集合：用量与计费 / 技能管理 / 对话回退。
+// 当前默认代装集合：手机连接 / MCP 连接器 / 用量与计费 / 技能管理 / 对话回退（另含插件市场）。
 // 不代装的（卡片不显示预装标签，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、
 // 会话导入、上下文洞察。
 // 从本版本起摘出注册表的两个（会话归档 / MCP Lens）只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
@@ -3337,6 +3303,18 @@ const MANAGED_NPM_PLUGINS = [
     icon: '🎨',
     category: '界面增强',
     repo: 'https://github.com/MichengAI/dsh-codex-ui',
+  },
+  {
+    id: 'mcp-connector',
+    order: 38,
+    npm: 'dsh-mcp-connector',
+    name: 'MCP 连接器',
+    autoInstall: true,
+    subtitle: 'dsh-mcp-connector',
+    description: '浏览 MCP 连接器市场，管理连接授权、搜索工具与排查连接问题；支持 OAuth、API Key 和 HTTP/stdio。安装插件不会自动授权或连接外部服务。',
+    icon: '🔌',
+    category: '工具连接',
+    repo: 'https://github.com/duhu2000/dsh-mcp-connector',
   },
   {
     id: 'usage-billing',
@@ -3923,6 +3901,83 @@ async function updateAllManagedPlugins() {
 //   - 用户手动卸载过（pluginAutoDeclined）就不再自动装回来；
 //   - 一次装完只重启一次服务，不逐个重启。
 let recommendedAutoInstalling = false
+let autoPluginPromise = null
+const pluginSetup = { running: false, completed: false, current: '', done: 0, total: 0, error: '' }
+
+function pluginSetupPlugins() {
+  return [{ id: 'dshmarket', name: '插件市场', npm: market.PLUGIN_NAME, description: '发现与管理更多 DSH 插件。' },
+    ...MANAGED_NPM_PLUGINS.filter((d) => d.autoInstall)]
+    .map(({ id, name, npm, description }) => ({ id, name, npm, description }))
+}
+
+function normalizePluginSetupSelection(selectedIds) {
+  const presets = pluginSetupPlugins().map((p) => p.id)
+  if (!Array.isArray(selectedIds) || selectedIds.length > 100
+    || selectedIds.some((id) => typeof id !== 'string' || !presets.includes(id))) {
+    throw new Error('预装插件选择无效，请刷新清单后重试')
+  }
+  // 按权威清单排序并去重，不接受渲染进程指定包名或任意安装目标。
+  return presets.filter((id) => selectedIds.includes(id))
+}
+
+function pluginSetupSelected(id) {
+  return Config.pluginSetupSelectedIds == null
+    || (Array.isArray(Config.pluginSetupSelectedIds) && Config.pluginSetupSelectedIds.includes(id))
+}
+
+function setPluginSetupChoice(choice, selectedIds) {
+  if (!['install', 'skip'].includes(choice)) return { ok: false, error: '无效的插件安装选择' }
+  if (pluginSetup.running || recommendedAutoInstalling || autoPluginPromise || profileOpBusy()) return profileBusyError()
+  let selection
+  try {
+    selection = choice === 'skip' ? [] : normalizePluginSetupSelection(selectedIds === undefined
+      ? pluginSetupPlugins().map((p) => p.id) : selectedIds)
+  } catch (error) { return { ok: false, error: error.message } }
+  if (choice === 'install' && !selection.length) return { ok: false, error: '请至少选择一个插件，或点击跳过插件安装' }
+  const previous = Config.pluginSetupChoice
+  const previousSelectedIds = Config.pluginSetupSelectedIds
+  const previousAutoVersion = Config.pluginAutoInstallTriedVersion
+  const previousMarketVersion = Config.pluginMarketAutoTryVersion
+  const previousDeclined = Config.pluginAutoDeclined
+  const previousMarketDeclined = Config.pluginMarketDeclined
+  Config.pluginSetupChoice = choice
+  Config.pluginSetupSelectedIds = selection
+  if (choice === 'install') {
+    // 这是显式安装请求：同版本也重查缺失项，而不是被后台“一版本一次”记账挡住。
+    Config.pluginAutoInstallTriedVersion = ''
+    Config.pluginMarketAutoTryVersion = ''
+    Config.pluginAutoDeclined = Object.fromEntries(Object.entries(previousDeclined || {})
+      .filter(([id]) => !selection.includes(id)))
+    if (selection.includes('dshmarket')) Config.pluginMarketDeclined = false
+  }
+  // 所有相关设置一起保存；失败恢复原引用/值，打开界面本身不会触发任何安装。
+  if (!saveConfig()) {
+    Config.pluginSetupChoice = previous
+    Config.pluginSetupSelectedIds = previousSelectedIds
+    Config.pluginAutoInstallTriedVersion = previousAutoVersion
+    Config.pluginMarketAutoTryVersion = previousMarketVersion
+    Config.pluginAutoDeclined = previousDeclined
+    Config.pluginMarketDeclined = previousMarketDeclined
+    return { ok: false, error: '无法保存插件安装选择，请检查日志后重试' }
+  }
+  Object.assign(pluginSetup, { completed: false, current: '', done: 0, total: 0, error: '' })
+  // 首装跳过仍继续基础启动；管理页再次跳过只保存设置，不意外启动已停止的服务。
+  if (envReady() && (choice === 'install' || previous === 'pending')) {
+    pluginSetup.running = true // 响应前给出排队事实，避免 UI 在异步启动空档抢先完成
+    void (async () => {
+      try {
+        if (!server.running() && !await handleStart()) {
+          pluginSetup.error = 'DSH 服务尚未就绪，请在控制台处理启动问题'
+          return
+        }
+        await maybeAutoInstallRecommendedPlugins()
+      } catch (error) { pluginSetup.error = error.message || String(error); log('plugins: 首装流程异常：' + pluginSetup.error) }
+      finally { pluginSetup.running = false; broadcastState() }
+    })()
+  }
+  broadcastState()
+  return { ok: true, choice, selectedIds: [...selection] }
+}
 
 /** 用户是否手动卸载过该推荐插件（卸载过就不再自动装回来；手动装回来会清除该标记）。 */
 function pluginAutoDeclined(id) {
@@ -3943,7 +3998,7 @@ function notePluginAutoDeclined(id, declined) {
 function pendingAutoInstallPlugins() {
   const out = []
   for (const d of MANAGED_NPM_PLUGINS) {
-    if (!d.autoInstall) continue
+    if (!d.autoInstall || !pluginSetupSelected(d.id)) continue
     if (pluginAutoDeclined(d.id)) continue
     if (market.getState(d.npm).installed) continue
     out.push(d)
@@ -3991,107 +4046,156 @@ function ackPluginGateNotice() {
  *   - 其它安装流程（插件市场/远程连接自动安装、一键安装所有预装插件）在跑时不插队。
  */
 async function maybeAutoInstallRecommendedPlugins() {
-  if (SELF_TEST) return
-  if (recommendedAutoInstalling) return
+  if (autoPluginPromise) return autoPluginPromise
+  autoPluginPromise = runAutoInstallPlugins()
+  try { return await autoPluginPromise }
+  finally { autoPluginPromise = null }
+}
+
+async function runAutoInstallPlugins() {
+  if (SELF_TEST || Config.pluginSetupChoice === 'pending' || Config.pluginSetupChoice === 'skip') return
+  if (recommendedAutoInstalling || pluginInstallAllRunning) return
   const ver = app.getVersion()
-  if (Config.pluginAutoInstallTriedVersion === ver) return
-  if (marketAutoInstalling || pluginInstallAllRunning) return
-  const targets = pendingAutoInstallPlugins()
+  const marketPending = Config.pluginMarketAutoTryVersion !== ver && !Config.pluginMarketDeclined && pluginSetupSelected('dshmarket')
+    && !market.getState(market.PLUGIN_NAME).installed
+  const targets = Config.pluginAutoInstallTriedVersion === ver ? [] : pendingAutoInstallPlugins()
+  if (marketPending) targets.unshift({ id: 'dshmarket', name: '插件市场', npm: market.PLUGIN_NAME })
   if (!targets.length) {
-    // 没什么可装的也记账：省掉之后每个 tick 都去读 profile 判断
+    if (pluginSetup.completed) return // 本代批次已确认，tick 不重复写配置/推送
+    // 没有缺失插件也是一个可验证的完成结果，不必停服。
     Config.pluginAutoInstallTriedVersion = ver
+    Object.assign(pluginSetup, { completed: true, done: 0, total: 0 })
     try { saveConfig() } catch { /* noop */ }
+    broadcastState()
     return
   }
   if (!envReady()) return
   if (!envReport || !envReport.pnpm || envReport.pnpm.status !== 'ok') {
     const detail = envReport && envReport.pnpm ? (envReport.pnpm.detail || '未就绪') : '未检测到 pnpm'
+    pluginSetup.error = 'pnpm 未就绪，尚未安装预装插件：' + detail
+    broadcastState()
     log('plugins: pnpm 未就绪，暂不自动安装推荐插件（' + detail + '）')
     return
   }
-  // 目标版本的 manifest 先补齐（就是 installByName 稍后要拉的那一份）：门禁预判要用它，
-  // 顺带把 npm 侧版本喂给卡片 —— 代装跳过时卡片能直接写「需授权后安装 vX」。
-  await Promise.all(targets.map((d) => resolveNpmVersion(d.npm)))
-  const gated = []
-  const todo = []
-  for (const d of targets) {
-    const version = (npmVersionCache.get(d.npm) || {}).version || ''
-    const gate = pluginGateVerdict(d.npm, version)
-    if (gate.state === 'gated') gated.push({ id: d.id, npm: d.npm, name: d.name, version, gate })
-    else todo.push(d)
-  }
-  // 与「一键安装」同口径：**不替用户授权**（风险接受只能由本人拍板），只把事实摆到提示条上。
-  // 为什么要预判而不是硬装一次：装下去必然被门禁整条拒绝，白停一次服务、白跑一次 pnpm。
-  if (gated.length) {
-    log('plugins: 默认代装跳过 ' + gated.length + ' 个需先授权的插件：' + gated.map((x) => x.name).join('、'))
-    for (const x of gated) {
-      notePluginEnvFailure(x.id, 'install', market.versionGateFailure({
-        packageName: x.npm,
-        version: x.version,
-        dshVersion: x.gate.dshVersion,
-      }))
-    }
-    // 光有插件页的提示条不够：首次安装的用户可能根本不会打开那一页。
-    // 记一条待确认的弹窗提醒，把人引导到「插件管理」页手动点「授权并安装」。
-    setPluginGateNotice(gated.map((x) => ({
-      id: x.id,
-      name: x.name,
-      npm: x.npm,
-      version: x.version,
-      dshVersion: x.gate.dshVersion,
-    })))
-    // 控制台没开着就只能靠系统通知指路（不主动抢焦点/弹窗口）；开着的话弹窗会直接出现
-    if (!consoleIsOpen()) {
-      notify('DeepSeek Harness Launcher',
-        gated.length + ' 个预装插件需要你手动安装：打开启动器控制台「插件管理」页，点对应卡片的「授权并安装」',
-        undefined, 'recovery')
-    }
-  }
-  if (!todo.length) {
-    // 全是需授权的：一个都不装 → 不停服务、不重启，提示条与卡片已经写明下一步（授权并安装）
-    Config.pluginAutoInstallTriedVersion = ver
-    try { saveConfig() } catch { /* noop */ }
+  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装预装插件')
+  if (!releaseProfileOp) {
+    pluginSetup.error = PROFILE_BUSY_ERROR
     broadcastState()
-    return
+    return // 拿不到锁不记账，下次触发再试
   }
   recommendedAutoInstalling = true
-  const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装推荐插件')
-  if (!releaseProfileOp) { recommendedAutoInstalling = false; return }
+  Object.assign(pluginSetup, { running: true, completed: false, current: '检查插件兼容性', done: 0, total: targets.length, error: '' })
+  broadcastState()
+  let stopped = false
+  const failed = []
   try {
-    Config.pluginAutoInstallTriedVersion = ver
-    try { saveConfig() } catch { /* noop */ }
-    log('plugins: 自动安装推荐插件（' + todo.map((d) => d.name).join('、') + '）…')
-    // 安装要停服务（pnpm 改写 profile 依赖树时不能有 dsh 进程在跑）：先等服务起来再动，最多等 3 分钟
-    const deadline = Date.now() + 180 * 1000
-    while (Date.now() < deadline && !server.running()) await sleep(1000)
-    const stop = await stopServiceForPluginChange()
-    if (!stop.ok) {
-      log('plugins: 自动安装推荐插件中止：' + stop.error)
+    // 目标版本的 manifest 先补齐（就是 installByName 稍后要拉的那一份）：门禁预判要用它，
+    // 顺带把 npm 侧版本喂给卡片 —— 代装跳过时卡片能直接写「需授权后安装 vX」。
+    await Promise.all(targets.map((d) => resolveNpmVersion(d.npm)))
+    const gated = []
+    const todo = []
+    for (const d of targets) {
+      const version = (npmVersionCache.get(d.npm) || {}).version || ''
+      const gate = pluginGateVerdict(d.npm, version)
+      if (gate.state === 'gated') gated.push({ id: d.id, npm: d.npm, name: d.name, version, gate })
+      else todo.push(d)
+    }
+    // 与「一键安装」同口径：**不替用户授权**（风险接受只能由本人拍板），只把事实摆到提示条上。
+    // 为什么要预判而不是硬装一次：装下去必然被门禁整条拒绝，白停一次服务、白跑一次 pnpm。
+    if (gated.length) {
+      pluginSetup.error = gated.map((x) => x.name).join('、') + '需要兼容性授权，尚未安装；请到插件管理查看'
+      log('plugins: 默认代装跳过 ' + gated.length + ' 个需先授权的插件：' + gated.map((x) => x.name).join('、'))
+      for (const x of gated) {
+        notePluginEnvFailure(x.id, 'install', market.versionGateFailure({
+          packageName: x.npm,
+          version: x.version,
+          dshVersion: x.gate.dshVersion,
+        }))
+      }
+      // 光有插件页的提示条不够：首次安装的用户可能根本不会打开那一页。
+      // 记一条待确认的弹窗提醒，把人引导到「插件管理」页手动点「授权并安装」。
+      setPluginGateNotice(gated.map((x) => ({
+        id: x.id,
+        name: x.name,
+        npm: x.npm,
+        version: x.version,
+        dshVersion: x.gate.dshVersion,
+      })))
+      // 控制台没开着就只能靠系统通知指路（不主动抢焦点/弹窗口）；开着的话弹窗会直接出现
+      if (!consoleIsOpen()) {
+        notify('DeepSeek Harness Launcher',
+          gated.length + ' 个预装插件需要你手动安装：打开启动器控制台「插件管理」页，点对应卡片的「授权并安装」',
+          undefined, 'recovery')
+      }
+    }
+    if (!todo.length) {
+      // 全是需授权的：一个都不装，不停服务、不重启。
+      pluginSetup.error = '预装插件需要兼容性授权，尚未安装；请到插件管理查看'
+      if (marketPending) Config.pluginMarketAutoTryVersion = ver
+      Config.pluginAutoInstallTriedVersion = ver
+      try { saveConfig() } catch { /* noop */ }
+      broadcastState()
       return
     }
+    log('plugins: 自动安装预装插件（' + todo.map((d) => d.name).join('、') + '）…')
+    const stop = await stopServiceForPluginChange()
+    if (!stop.ok) {
+      pluginSetup.error = stop.error || '服务未完全停止，未安装任何插件'
+      log('plugins: 自动安装中止：' + pluginSetup.error)
+      return // 尚未改盘，不记本版本尝试
+    }
+    stopped = true
+    Config.pluginAutoInstallTriedVersion = ver
+    if (marketPending) Config.pluginMarketAutoTryVersion = ver
+    try { saveConfig() } catch { /* noop */ }
+    pluginSetup.total = todo.length
+    pluginSetup.done = 0
     const installed = []
-    const failed = []
     for (const d of todo) {
-      const r = await market.installByName(d.npm)
+      pluginSetup.current = d.name
+      broadcastState()
+      let r
+      try { r = await market.installByName(d.npm) }
+      catch (error) { r = { ok: false, error: error.message || String(error) } }
       if (r && r.ok) {
         installed.push(d.name + (r.version ? '@' + r.version : ''))
+        clearPluginEnvFailure(d.id)
         notePluginReleaseAgeRetry(r.releaseAge)
       } else {
         failed.push(d.name + '：' + ((r && r.error) || '未知原因'))
         notePluginEnvFailure(d.id, 'install', (r && r.env) || market.classifyEnvFailure(String((r && r.error) || '')))
       }
+      pluginSetup.done++
+      broadcastState()
     }
-    if (installed.length) {
-      // 一次装完再重启一次（失败项留给插件页手动重试）
-      await applyPluginChange('install', '', { name: installed.join('、'), profile: market.PROFILE_NAME, logTag: 'plugins', label: '推荐插件' })
-    }
+    pluginSetup.current = '启动 DSH，使插件生效'
+    broadcastState()
+    // 同一批只在这里启动一次。即使全失败，pnpm 也可能改了依赖；不能把服务留在停止状态。
+    stopped = false // applyPluginChange 自己负责一次启动；不能因失败再重复启动
+    const started = installed.length
+      ? await applyPluginChange('install', '', { name: installed.join('、'), profile: market.PROFILE_NAME, logTag: 'plugins', label: '已装好的预装插件' })
+      : await handleStart() // 全失败只恢复基础服务，绝不发“插件已安装”的通知
+    if (!started) failed.push('插件安装已结束，但 DSH 启动失败，请查看控制台日志')
     if (failed.length) {
       log('plugins: 自动安装失败 ' + failed.join('；'))
       notify('DeepSeek Harness Launcher', '推荐插件自动安装失败（可在插件页手动重试）：' + failed.join('；').slice(0, 160), undefined, 'recovery')
     }
+  } catch (error) {
+    failed.push(error.message || String(error))
+    log('plugins: 自动安装异常：' + (error.message || String(error)))
   } finally {
+    // 停服后的任何异常都必须收尾；预判/拿锁失败则不动服务。
+    if (stopped) {
+      try { if (!await handleStart()) failed.push('DSH 服务恢复失败，请查看日志') }
+      catch (error) { failed.push('DSH 服务恢复失败：' + (error.message || String(error))) }
+    }
+    if (failed.length) pluginSetup.error = failed.join('；')
+    pluginSetup.running = false
+    pluginSetup.completed = true
+    pluginSetup.current = ''
     recommendedAutoInstalling = false
     releaseProfileOp()
+    invalidatePluginInventory()
     broadcastState()
   }
 }
@@ -4137,7 +4241,7 @@ async function maybeRemoveRetiredPlugins() {
   if (retiredPluginCleanupRunning) return
   const ver = app.getVersion()
   if (Config.pluginRetiredCleanupVersion === ver) return
-  if (marketAutoInstalling || recommendedAutoInstalling || pluginInstallAllRunning) return
+  if (recommendedAutoInstalling || pluginInstallAllRunning) return
   const targets = pendingRetiredPlugins()
   if (!targets.length) {
     Config.pluginRetiredCleanupVersion = ver
@@ -4603,7 +4707,7 @@ function buildPluginCatalog(marketState, notes) {
       grantBody: gated ? pluginGateConfirmBody(d.name, latest, gate) : '',
     })
     // 自动安装是否仍然生效（用户手动卸载过就不再自动装回）：卡片字段与标签文案共用这一份判断
-    const autoOn = !!(d.autoInstall && !pluginAutoDeclined(d.id))
+    const autoOn = !!(d.autoInstall && !pluginAutoDeclined(d.id) && pluginSetupSelected(d.id) && Config.pluginSetupChoice !== 'skip' && Config.pluginSetupChoice !== 'pending')
     return {
       note: noteOf(d.id),
       id: d.id,
@@ -4667,11 +4771,11 @@ function buildPluginCatalog(marketState, notes) {
       error: m.error || '',
       activation: activationText(market.PLUGIN_NAME),
       lastChange: pluginReceiptText(m),
-      autoInstall: !Config.pluginMarketDeclined,
+      autoInstall: (!Config.pluginMarketDeclined && pluginSetupSelected('dshmarket') && Config.pluginSetupChoice !== 'skip' && Config.pluginSetupChoice !== 'pending'),
       tags: pluginTagsOf({
         preset: true, // 随启动器代装
         official: true, // Deepseek 官方推荐
-        autoInstall: !Config.pluginMarketDeclined,
+        autoInstall: (!Config.pluginMarketDeclined && pluginSetupSelected('dshmarket') && Config.pluginSetupChoice !== 'skip' && Config.pluginSetupChoice !== 'pending'),
         offLabel: '不自动安装',
       }),
       toggleAction: marketToggle ? 'toggle' : '',
@@ -6399,6 +6503,8 @@ function stateJson() {
     bootFailure: bootFailureState(),
     version: app.getVersion(),
     firstRun: firstRun,
+    pluginSetup: { ...pluginSetup, choice: Config.pluginSetupChoice, selectedIds: Config.pluginSetupSelectedIds },
+    pluginSetupPlugins: pluginSetupPlugins(),
     autostart: autostartEnabled(),
     notify: Config.notify,
     autoRestart: Config.autoRestart,
@@ -7373,6 +7479,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         // ---------- 通用插件注册表（控制台「插件」页） ----------
         // 凡是会改 profile 的入口一律走 profile 写锁：并发改写同一份依赖树是
         // "装完插件 DSH 就起不来" 的直接来源（详见 PROFILE_BUSY_ERROR 上方的说明）。
+        case 'pluginsSetSetupChoice': return JSON.stringify(setPluginSetupChoice(value && value.choice, value && value.selectedIds))
         case 'pluginsGetState': return JSON.stringify(buildPluginCatalog(market.getState(), Config.pluginNotes))
         case 'pluginCheckUpdates': return JSON.stringify(await checkManagedPluginUpdates())
         case 'pluginSetNote': return JSON.stringify(setManagedPluginNote(value && value.id, value && value.text))
@@ -8407,16 +8514,12 @@ function init() {
       if (!SELF_TEST) void refreshWebUiPhase()
       return
     }
-    void maybeAutoInstallPluginMarket() // 插件市场默认安装（每个版本只自动尝试一次）
-    void maybeAutoInstallRecommendedPlugins() // 默认代装插件（手机连接 / 用量与计费 / 技能管理 / 对话回退）
-    void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）老用户升级后自动卸载
-    if (args.console) {
-      showConsolePage('main')
-      await handleStart()
-      return
-    }
-    // 默认：窗口已先出现，服务异步就绪后自动进入真实页面。
-    await handleStart()
+    if (Config.pluginSetupChoice === 'pending') showConsolePage('wizard')
+    if (args.console && Config.pluginSetupChoice !== 'pending') showConsolePage('main')
+    // 先完成基础服务启动，避免启动准备与 pnpm 改 profile 交叉。
+    const started = await handleStart()
+    if (started) await maybeAutoInstallRecommendedPlugins()
+    void maybeRemoveRetiredPlugins() // 退役清理与新装不同，不改变用户的插件安装选择
     if (!server.running() && !SELF_TEST) void refreshWebUiPhase() // 启动失败：说明页切换为对应状态（未启动/卡住等）
   })()
   setInterval(onTick, TRACK_WATCHDOG_MS)

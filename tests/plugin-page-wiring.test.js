@@ -411,10 +411,12 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
   assert.deepEqual(deferCalls, [], '停不下来就一个都别装')
 })
 
-test('推荐插件注册表：八个 npm 插件 + 通用动作/更新检查', () => {
+test('推荐插件注册表：十个 npm 插件 + 通用动作/更新检查', () => {
   assert.match(main, /const MANAGED_NPM_PLUGINS = \[/, '主进程应有推荐插件注册表')
   for (const npm of [
+    '@agents-anywhere/dsh-bridge-next',
     'dsh-better-sidebar',
+    'dsh-mcp-connector',
     '@michengai/dsh-codex-ui',
     '@kenz1117/dsh-ui-usage-billing',
     'dsh-chat-import',
@@ -447,7 +449,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const marketRepo = marketRepoMatch[1]
 
   // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
-  assert.equal(registry.length, 9, '推荐插件（npm 分发）应为 9 个（含手机连接；会话归档 / MCP Lens 已摘出）')
+  assert.equal(registry.length, 10, '推荐插件（npm 分发）应为 10 个（含手机连接与 MCP 连接器；会话归档 / MCP Lens 已摘出）')
   assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
   assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
   for (const d of registry) {
@@ -477,6 +479,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     sliceFn('function pluginReceiptText(raw) {', '\n}\n'),
     sliceFn('function pluginRepoOf(id) {', '\n}\n'),
     sliceFn('function pluginTagsOf(opts) {', '\n}\n'),
+    sliceFn('function pluginSetupSelected(id) {', '\n}\n'),
     sliceFn('function buildPluginCatalog(marketState, notes) {', '\n}\n'),
   ].join('\n')
   const installed = new Set(registry.map((d) => d.npm))
@@ -485,7 +488,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     PLUGIN_MARKET_REPO: marketRepo,
     pluginRepo,
     LAST_CHANGE_TTL_MS: 60 * 1000,
-    Config: { pluginMarketDeclined: false, pluginNotes: {} },
+    Config: { pluginSetupChoice: 'install', pluginSetupSelectedIds: null, pluginMarketDeclined: false, pluginNotes: {} },
     pluginActionBusy: new Map(),
     // 门禁预判：这里只关心卡片渲染（状态/按钮/顺序），判定本身在 tests/plugin-version-gate.test.js 里钉死。
     // 默认 unknown = 界面按"未能确认"处理，不改变按钮语义。
@@ -535,6 +538,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.deepEqual(catalog.map((c) => c.id), [
     'dshmarket',
     'bridge-next',
+    'mcp-connector',
     'usage-billing',
     'skills-manager',
     'rewind',
@@ -606,6 +610,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.deepEqual(mixed.map((c) => c.id), [
     'dshmarket',
     'bridge-next',
+    'mcp-connector',
     'usage-billing',
     'skills-manager',
     'rewind',
@@ -616,7 +621,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'sidebar-qa',
   ], '已安装的在前；已安装组内「预装 → 手动」，未安装组内同样')
   const installedCount = mixed.filter((c) => c.installed).length
-  assert.equal(installedCount, 7, '这组夹具里应有 7 个已安装')
+  assert.equal(installedCount, 8, '这组夹具里应有 8 个已安装（含 MCP 连接器）')
   assert.equal(mixed.findIndex((c) => !c.installed), installedCount,
     '已安装卡片必须全部连续排在未安装之前（不与未安装项交错）')
 
@@ -647,20 +652,23 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const autoIds = registry.filter((d) => d.autoInstall).map((d) => d.id)
   assert.deepEqual(autoIds, [
     'bridge-next',
+    'mcp-connector',
     'usage-billing',
     'skills-manager',
     'rewind',
-  ], '默认代装集合应保持稳定（手机连接 + 用量与计费 / 技能管理 / 对话回退）')
+  ], '默认代装集合应保持稳定（手机连接 + MCP 连接器 + 用量与计费 / 技能管理 / 对话回退）')
   for (const d of registry.filter((x) => x.autoInstall)) {
     const card = catalog.find((c) => c.id === d.id)
     assert.deepEqual(card.tags.map((t) => t.label), ['DSHL预装'], d.id + ' 卡片应标「DSHL预装」')
     assert.match(card.status.label, /已启用|已安装/, d.id + ' 已装时状态应为已启用/已安装')
   }
 
-  const pendSrc = sliceFn('function pendingAutoInstallPlugins() {', '\n}\n')
+  const pendSrc = sliceFn('function pluginSetupSelected(id) {', '\n}\n') +
+    sliceFn('function pendingAutoInstallPlugins() {', '\n}\n')
   // 缺失集合里故意混入手动安装项（划线提问 / Codex 风格界面）：它们不得进入代装队列
   const missing = new Set(['dsh-sidebar-qa', '@michengai/dsh-codex-ui', 'dsh-rewind-plugin'])
   const pendCtx = {
+    Config: ctx.Config,
     MANAGED_NPM_PLUGINS: registry,
     pluginAutoDeclined: () => false,
     market: { getState: (npm) => ({ installed: !missing.has(npm) }) },
@@ -672,6 +680,17 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const declinedCtx = { ...pendCtx, pluginAutoDeclined: (id) => id === 'rewind' }
   const declinedPending = new Function(...pendNames, pendSrc + '\nreturn pendingAutoInstallPlugins')(...pendNames.map((k) => declinedCtx[k]))
   assert.deepEqual(declinedPending().map((d) => d.id), [], '手动卸载过的插件不应再自动补装')
+
+  ctx.Config.pluginSetupSelectedIds = ['mcp-connector']
+  assert.deepEqual(pending(), [], '未选的回退插件缺失也不能加入补装队列')
+  const selectedCatalog = build(marketArg, {})
+  assert.equal(selectedCatalog.find((c) => c.id === 'mcp-connector').autoInstall, true)
+  for (const id of ['dshmarket', 'bridge-next', 'usage-billing', 'skills-manager', 'rewind']) {
+    const card = selectedCatalog.find((c) => c.id === id)
+    assert.equal(card.autoInstall, false, id + ' 未勾选不能显示自动安装开启')
+    assert.equal(card.preset, true, id + ' 仍保留预装归属')
+  }
+  ctx.Config.pluginSetupSelectedIds = null
 })
 
 test('点插件标题 → 系统默认浏览器打开它的 GitHub 发布页（渲染层只发 id，地址在主进程拼）', () => {
@@ -898,13 +917,13 @@ test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器�
   assert.doesNotMatch(main, /npm: '@michengai\/dsh-codex-ui',\n    name: 'Codex 风格界面',\n    autoInstall: true,/, 'Codex 风格界面默认不安装（只进插件页）')
   assert.doesNotMatch(main, /npm: 'dsh-context',\n    name: '上下文洞察',\n    autoInstall: true,/, '上下文洞察保持手动安装')
 
-  const triggers = main.match(/void maybeAutoInstallRecommendedPlugins\(\)/g) || []
+  const triggers = main.match(/(?:void|await|return) maybeAutoInstallRecommendedPlugins\(\)/g) || []
   assert.ok(triggers.length >= 3, '应在启动 / 环境装好 / 服务就绪等触发点补装（实际 ' + triggers.length + ' 处）')
   assert.match(main, /if \(envReady\(\) && server\.running\(\)\) void maybeAutoInstallRecommendedPlugins\(\)/, 'onTick 服务就绪时应补装')
 
   assert.match(main, /notePluginAutoDeclined\(descriptor\.id, false\)/, '手动装回应清除「不再自动安装」')
   assert.match(main, /notePluginAutoDeclined\(descriptor\.id, true\)/, '手动卸载应记下「不再自动安装」')
-  assert.match(main, /const autoOn = !!\(d\.autoInstall && !pluginAutoDeclined\(d\.id\)\)/, '卡片状态应反映自动安装语义')
+  assert.match(main, /const autoOn = !!\(d\.autoInstall && !pluginAutoDeclined\(d\.id\) && pluginSetupSelected\(d\.id\) && Config\.pluginSetupChoice !== 'skip' && Config\.pluginSetupChoice !== 'pending'\)/, '卡片状态应反映首装选择、勾选集合与逐插件自动安装语义')
   assert.match(app, /p\.tags/, '插件卡片应渲染归属标签')
 })
 
@@ -913,13 +932,13 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
   assert.ok(start > 0, '找不到默认代装流程')
   const driver = main.indexOf('async function maybeAutoInstallRecommendedPlugins()', start)
   assert.ok(driver > start, '找不到 maybeAutoInstallRecommendedPlugins')
-  const end = main.indexOf('\n}\n', main.indexOf('broadcastState()', driver)) + 2
-  assert.ok(end > driver, '找不到函数结尾')
+  const end = main.indexOf('// ---------- 退役插件：', driver)
+  assert.ok(end > driver, '找不到默认代装 block 结尾')
   const fnSrc = main.slice(start, end)
 
   const calls = { installs: [], stops: 0, applied: [], notified: 0, resolved: [], envFailures: [], consoleOpen: true }
-  const installed = new Set(['dsh-chat-import']) // 会话导入已装（且非默认代装）
-  const Config = { pluginAutoInstallTriedVersion: '', pluginAutoDeclined: { 'usage-billing': true } }
+  const installed = new Set(['dshmarket', 'dsh-chat-import']) // 市场已装；此用例专测推荐插件门禁
+  const Config = { pluginSetupChoice: 'install', pluginMarketAutoTryVersion: '', pluginAutoInstallTriedVersion: '', pluginAutoDeclined: { 'usage-billing': true } }
   // 门禁预判的注入点：默认全部放行，④ 里再单独把某个插件标成"会被门禁拒绝"
   const gatePlan = {}
   const npmVersionCache = new Map()
@@ -936,6 +955,7 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
       { id: 'chat-import', name: '会话导入', npm: 'dsh-chat-import' },
     ],
     market: {
+      PLUGIN_NAME: 'dshmarket',
       PROFILE_NAME: 'web',
       getState: (npm) => ({ installed: installed.has(npm) }),
       installByName: async (npm) => { calls.installs.push(npm); installed.add(npm); return { ok: true, version: '9.9.9' } },
@@ -958,7 +978,10 @@ test('默认代装：只装缺失且未被卸载的，一次装完全部只重�
     applyPluginChange: async (verb, version, spec) => { calls.applied.push(spec && spec.name); return true },
     notify: () => { calls.notified++ },
     log: () => {},
-    saveConfig: () => {},
+    saveConfig: () => true,
+    clearPluginEnvFailure: () => {},
+    invalidatePluginInventory: () => {},
+    handleStart: async () => true,
     notePluginEnvFailure: (id, action, info) => { calls.envFailures.push({ id, action, kind: info && info.kind, version: info && info.gate && info.gate.version }) },
     notePluginReleaseAgeRetry: () => {},
     broadcastState: () => {},

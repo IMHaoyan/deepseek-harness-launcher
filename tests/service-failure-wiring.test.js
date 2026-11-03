@@ -165,11 +165,31 @@ test('profile 写锁：所有会改 profile 的入口都必须过锁', () => {
 })
 
 test('后台自动流程也要占锁，拿不到就跳过且不记账', () => {
-  for (const label of ['自动安装插件市场', '自动安装推荐插件']) {
-    assert.match(main, new RegExp(`tryBeginBackgroundProfileOp\\('${label}'\\)`), `${label} 必须占锁`)
-  }
-  // 一行式：拿不到锁就把单飞标志复位并返回（不能把"已尝试过"记账写下去）
-  assert.match(main, /if \(!releaseProfileOp\) \{ (marketAutoInstalling|recommendedAutoInstalling) = false; return \}/, '拿不到锁必须复位标志并返回')
+  assert.match(main, /tryBeginBackgroundProfileOp\('自动安装预装插件'\)/, '市场与推荐插件必须同批占锁')
+  assert.doesNotMatch(main, /async function maybeAutoInstallPluginMarket\(/, '不得恢复单独市场安装/重启流程')
+  const start = main.indexOf("const releaseProfileOp = tryBeginBackgroundProfileOp('自动安装预装插件')")
+  const running = main.indexOf('recommendedAutoInstalling = true', start)
+  const guard = main.slice(start, running)
+  assert.match(guard, /if \(!releaseProfileOp\)[\s\S]*return/, '拿不到锁必须在单飞标志/记账之前返回')
+  assert.doesNotMatch(guard, /pluginAutoInstallTriedVersion =|pluginMarketAutoTryVersion =/, '锁失败不得记尝试账')
+})
+
+test('重新选择的启动排队空档也属于忙态，只有统一预装驱动可以接管写锁', () => {
+  const start = main.indexOf('const PROFILE_BUSY_ERROR')
+  const end = main.indexOf('\n}\n', main.indexOf('function tryBeginBackgroundProfileOp')) + 3
+  const setup = { running: true }
+  const factory = new Function('pluginSetup', 'capturePreWriteSnapshot', 'log',
+    main.slice(start, end) + '\nreturn { profileOpBusy, tryBeginProfileOp }')
+  const api = factory(setup, () => {}, () => {})
+  assert.equal(api.profileOpBusy(), true)
+  assert.equal(api.tryBeginProfileOp('插件 install'), null, '手动插件改写不得插入基础启动空档')
+  assert.equal(api.tryBeginProfileOp('移除退役插件'), null)
+  const release = api.tryBeginProfileOp('自动安装预装插件')
+  assert.equal(typeof release, 'function', '真实统一批次必须可接管排队状态')
+  release()
+  assert.equal(api.profileOpBusy(), true, '写锁释放但队列未结束仍是忙态')
+  setup.running = false
+  assert.equal(api.profileOpBusy(), false)
 })
 
 test('锁是 fail-fast：后来者立刻拿到可读的拒绝，不排队', () => {
