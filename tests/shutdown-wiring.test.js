@@ -66,6 +66,8 @@ function stopHarness({ fail = false, external = false, busy = false } = {}) {
     setDesktopShellGate: () => {},
     stopPidVerified: async (pid) => { calls.push(pid); if (fail) throw new Error('still alive') },
     clearClaimed: () => { server.claimedPid = 0; server.claimedAlive = false }, lastServiceError: '', waitForCompletion,
+    PORT: 3080, portOpen: async () => false,
+    findListener: async () => ({ status: 'absent', pid: 0 }),
   }
   vm.createContext(ctx)
   const begin = source.indexOf('let serviceStopPromise = null')
@@ -109,6 +111,25 @@ test('停止过程中旧 child 退出并产生同签名后继，必须再次停�
   assert.equal(await h.stop(), true)
   assert.deepEqual(h.calls, [42, 43])
   assert.equal(h.server.claimedPid, 0)
+})
+test('认领后继停止后端口仍有应答：不报"已停止"，保留责任 PID', async () => {
+  const h = stopHarness()
+  h.server.claimedPid = 99
+  h.server.claimedAlive = true
+  h.ctx.portOpen = async () => true
+  await assert.rejects(h.stop(), /停止后端口 3080 仍有应答/u)
+  assert.equal(h.server.claimedPid, 99, '未确认停止时必须保留责任 PID 供重试')
+  assert.match(h.ctx.lastServiceError, /仍有应答/u)
+})
+test('停止后端口仍有人应答但监听者无法核实：拒绝报告已停止', async () => {
+  const h = stopHarness()
+  h.server.launchSig = { script: 'mock', args: [] }
+  h.ctx.findListenPid = async () => 0
+  h.ctx.matchSuccessorPid = async () => 0
+  h.ctx.portOpen = async () => true
+  h.ctx.findListener = async () => ({ status: 'unknown', pid: 0 })
+  await assert.rejects(h.stop(), /监听者无法核实/u)
+  assert.match(h.ctx.lastServiceError, /监听者无法核实/u)
 })
 test('启动准备顺序：先迁移旧 payload → 再打运行时补丁 → 最后才 spawn', () => {
   const body = source.slice(source.indexOf('async function maybeMigrateBridgePayloadInstall('), source.indexOf('function killPid('))

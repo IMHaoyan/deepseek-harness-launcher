@@ -68,11 +68,21 @@ function matchLaunchSig(cmdline, sig) {
   return { ok: true, matched: tail }
 }
 
+// .NET ticks（100ns since 0001-01-01）→ epoch ms；用于判断后继候选是否本世代创建。
+// 拿不到/非法一律返回 0（调用方按"创建时间未知"处理，不据此剔除候选）。
+function dotNetTicksToEpochMs(ticks) {
+  const n = Number(ticks)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  const ms = Math.round(n / 10000) - 62135596800000
+  return ms > 0 ? ms : 0
+}
+
 /**
  * child 退出后的交接裁决。
- * @param {{listenerPid:number, matchedPid?:number, elapsedMs:number,
- *          settleMs:number, maxMs:number}} state
- * @returns {'self-restart'|'external'|'pending'|'crash'}
+ * @param {{listenerPid:number, listenerStatus?:'found'|'absent'|'unknown', portOpen?:boolean,
+ *          matchedPid?:number, matchedAlive?:boolean, matchedCurrentGen?:boolean,
+ *          elapsedMs:number, settleMs:number, maxMs:number}} state
+ * @returns {'self-restart'|'external'|'pending'|'crash'|'occupied-unverified'}
  */
 function classifyHandover(state) {
   const listenerPid = Number(state.listenerPid) || 0
@@ -81,9 +91,21 @@ function classifyHandover(state) {
     // 只有"端口持有者 == 命令行逐参数匹配的那个进程"才认领；读不到命令行一律当外部实例
     return matchedPid > 0 && matchedPid === listenerPid ? 'self-restart' : 'external'
   }
-  // 端口暂时没人监听：后继可能还在启动（bind 实测 3.5~4.5s）。有匹配候选就多等，没有就短等。
-  const budget = matchedPid > 0 ? state.maxMs : state.settleMs
-  return Number(state.elapsedMs) < budget ? 'pending' : 'crash'
+  // 端口暂时没人监听：后继可能还在启动（bind 实测 3.5~4.5s，有负载时可达 20s 上下）。
+  // 只有"候选仍可信"（活着的、且是本世代创建的）才值得等长窗口；
+  // 候选已退出或明显是上一代遗留时回到短窗口 —— 真崩溃不该被长窗口拖住，
+  // 而晚 bind 的自家后继仍能等到。两个布尔值都缺省时维持旧语义（matchedPid>0 即长窗口）。
+  const candidateTrusted = matchedPid > 0 && state.matchedAlive !== false && state.matchedCurrentGen !== false
+  const budget = candidateTrusted ? state.maxMs : state.settleMs
+  const elapsed = Number(state.elapsedMs) || 0
+  const listenerStatus = state.listenerStatus || 'absent'
+  // 取证失败 + 端口仍有人应答：既不能认领（没有可管理的 PID），也不能判 crash
+  // （会误闪崩溃/自动重启，进而与真正的占有者抢端口）。等到预算后收敛为 occupied-unverified，
+  // 由调用方按"未核实占用"处理：不认领、不重启、不换端口，交给用户处理。
+  if (listenerStatus === 'unknown' && state.portOpen === true) {
+    return elapsed < budget ? 'pending' : 'occupied-unverified'
+  }
+  return elapsed < budget ? 'pending' : 'crash'
 }
 
 /**
@@ -93,19 +115,26 @@ function classifyHandover(state) {
  * 只看指纹就会得出"端口被其他程序占用"，进而误换端口、起出第二个实例（实测：3080 上并存两个 dsh）。
  *
  * 判据优先级：命令行签名（进程一创建就能读到，最可靠）→ HTTP 指纹 → 等待（端口有人但没应答）→ 冲突。
- * @param {{hasListener:boolean, sigMatched:boolean, probeOk:boolean, probeReason:string,
+ * 重要：hasListener=false + portOpen=true 是"端口有人应答但查不到 PID"（取证失败），
+ * 绝不能当"端口又空了"去 retry-start —— 那正是 2026-11 事故里误报"端口空闲"的直接原因。
+ * 预算必须先行：这个状态等到 budget 后收敛为 conflict，而不是无限 wait。
+ * @param {{hasListener:boolean, portOpen?:boolean, sigMatched:boolean, probeOk:boolean, probeReason:string,
  *          waitedMs:number, budgetMs:number}} state
  * @returns {'retry-start'|'adopt'|'wait'|'conflict'}
  */
 function classifyOccupant(state) {
   const s = state || {}
-  if (s.hasListener !== true) return 'retry-start' // 端口又空了：交给启动器自己拉起
+  const waited = Number(s.waitedMs) || 0
+  const budget = Number(s.budgetMs) || 0
+  const expired = waited >= budget
+  if (s.hasListener !== true) {
+    if (s.portOpen === true) return expired ? 'conflict' : 'wait'
+    return 'retry-start' // 端口确实空了：交给启动器自己拉起
+  }
   if (s.sigMatched === true) return 'adopt' // 命令行逐参数一致 = 我们的后继
   if (s.probeOk === true) return 'adopt' // 指纹命中 = 已在运行的 DSH（外部实例）
   if (s.probeReason === 'fingerprint') return 'conflict' // 明确回了非 DSH 内容：确实是别人的程序
-  const waited = Number(s.waitedMs) || 0
-  const budget = Number(s.budgetMs) || 0
-  return waited >= budget ? 'conflict' : 'wait'
+  return expired ? 'conflict' : 'wait'
 }
 
 /**
@@ -153,6 +182,7 @@ function parseDshWebLine(line, opts) {
 module.exports = {
   splitCmdline,
   matchLaunchSig,
+  dotNetTicksToEpochMs,
   classifyHandover,
   classifyOccupant,
   classifyReadiness,

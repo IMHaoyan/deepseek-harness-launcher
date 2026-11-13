@@ -1,0 +1,14 @@
+# stats/wrangler.toml — 部署前把 database_id 换成 `wrangler d1 create dshl-stats` 返回的值。
+name = "dshl-stats"
+main = "worker.mjs"
+compatibility_date = "2026-11-01"
+# 只通过 workers.dev 暴露；后台与上报共用这个域名。
+workers_dev = true
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dshl-stats"
+database_id = "79288244-3a09-482b-832d-ed0b721cbf21"
+
+# 管理 Token 用 `wrangler secret put ADMIN_TOKEN` 写入，不要写进本文件。

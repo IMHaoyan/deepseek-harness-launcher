@@ -79,6 +79,47 @@ test('classifyHandover：端口空档期先等；无匹配候选短等，有候�
   assert.equal(handover.classifyHandover({ listenerPid: 0, matchedPid: 0, elapsedMs: 3100, settleMs: 3000, maxMs: 8000 }), 'crash')
 })
 
+// 2026-11 本机日志实测：64 次交接 p95 18.4s、max 19.8s，另有 2 次 20.6s/20.4s 的误判。
+// 修复把 maxMs 提到 45s，但只对"存活且本世代创建的候选"生效；候选没了就回短窗口，真崩溃不被拖住。
+test('classifyHandover：候选存活且本世代 → 长窗口等它 bind（覆盖 20s 晚绑定）', () => {
+  const base = { listenerPid: 0, matchedPid: 72044, matchedAlive: true, matchedCurrentGen: true, settleMs: 3000, maxMs: 45000 }
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 30000 }), 'pending')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 44999 }), 'pending')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 45000 }), 'crash')
+})
+
+test('classifyHandover：候选已退出/上一代遗留 → 回短窗口，真崩溃不拖长', () => {
+  const base = { listenerPid: 0, matchedPid: 72044, settleMs: 3000, maxMs: 45000 }
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 2999, matchedAlive: false }), 'pending')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 3000, matchedAlive: false }), 'crash')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 3000, matchedAlive: true, matchedCurrentGen: false }), 'crash')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 3000, matchedAlive: true, matchedCurrentGen: true }), 'pending')
+})
+
+test('dotNetTicksToEpochMs：.NET ticks → epoch ms；非法值回 0（未知，不据此剔候选）', () => {
+  const ms = 1767225600000 // 2026-01-01T00:00:00Z
+  const ticks = String((ms + 62135596800000) * 10000)
+  assert.equal(handover.dotNetTicksToEpochMs(ticks), ms)
+  for (const v of [0, null, undefined, '', 'abc', -1]) assert.equal(handover.dotNetTicksToEpochMs(v), 0)
+})
+
+test('classifyHandover：监听取证 unknown 且端口有人应答 → 不判 crash，预算后 occupied-unverified', () => {
+  const base = { listenerPid: 0, listenerStatus: 'unknown', portOpen: true, matchedPid: 0, settleMs: 3000, maxMs: 45000 }
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 1000 }), 'pending')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 3000 }), 'occupied-unverified')
+  // 有本世代存活候选时按长窗口等它 bind，到期同样是"未核实占用"而不是 crash
+  const cand = { ...base, matchedPid: 72044, matchedAlive: true, matchedCurrentGen: true }
+  assert.equal(handover.classifyHandover({ ...cand, elapsedMs: 30000 }), 'pending')
+  assert.equal(handover.classifyHandover({ ...cand, elapsedMs: 45000 }), 'occupied-unverified')
+})
+
+test('classifyHandover：unknown 但端口已经关闭 → 仍按短窗口判 crash（取证失败不能导致永不重启）', () => {
+  const base = { listenerPid: 0, listenerStatus: 'unknown', portOpen: false, matchedPid: 0, settleMs: 3000, maxMs: 45000 }
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 2999 }), 'pending')
+  assert.equal(handover.classifyHandover({ ...base, elapsedMs: 3000 }), 'crash')
+  assert.equal(handover.classifyHandover({ ...base, matchedPid: 72044, matchedAlive: true, matchedCurrentGen: true, elapsedMs: 30000 }), 'pending')
+})
+
 test('classifyReadiness：只有监听者等于我们的 child 才算就绪', () => {
   assert.equal(handover.classifyReadiness({ listenerPid: 86680, childPid: 86680, sigMatched: false }), 'ready')
 })
@@ -141,6 +182,15 @@ test('classifyOccupant：明确回了非 DSH 内容 → 立刻判冲突，不白
   assert.equal(handover.classifyOccupant({
     hasListener: true, sigMatched: false, probeOk: false, probeReason: 'fingerprint', waitedMs: 100, budgetMs: 8000,
   }), 'conflict')
+})
+
+test('classifyOccupant：端口有人应答但查不到 PID → wait，到期 conflict，绝不 retry-start', () => {
+  const base = { hasListener: false, portOpen: true, sigMatched: false, probeOk: false, probeReason: 'timeout', budgetMs: 8000 }
+  assert.equal(handover.classifyOccupant({ ...base, waitedMs: 0 }), 'wait')
+  assert.equal(handover.classifyOccupant({ ...base, waitedMs: 7999 }), 'wait')
+  assert.equal(handover.classifyOccupant({ ...base, waitedMs: 8000 }), 'conflict')
+  // 端口确实空了才允许 retry-start（旧的"hasListener=false 即空闲"语义）
+  assert.equal(handover.classifyOccupant({ ...base, portOpen: false }), 'retry-start')
 })
 
 test('classifyOccupant：端口有人但没应答 → 等到预算用完才判冲突（这就是误报的修法）', () => {

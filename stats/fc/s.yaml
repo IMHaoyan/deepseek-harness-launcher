@@ -1,0 +1,31 @@
+edition: 3.0.0
+name: dshl-stats-fc
+access: default
+
+resources:
+  dshl_stats:
+    component: fc3
+    props:
+      region: cn-hangzhou
+      functionName: dshl-stats
+      description: DSHL usage statistics (5 version fields only)
+      runtime: nodejs20
+      code: ./
+      handler: index.handler
+      memorySize: 128
+      timeout: 30
+      environmentVariables:
+        OTS_ENDPOINT: ${env(OTS_ENDPOINT)}
+        OTS_INSTANCE: ${env(OTS_INSTANCE)}
+        OTS_TABLE: ${env(OTS_TABLE)}
+        OTS_AK_ID: ${env(OTS_AK_ID)}
+        OTS_AK_SECRET: ${env(OTS_AK_SECRET)}
+        ADMIN_TOKEN: ${env(ADMIN_TOKEN)}
+      triggers:
+        - triggerName: http
+          triggerType: http
+          triggerConfig:
+            authType: anonymous
+            methods:
+              - GET
+              - POST

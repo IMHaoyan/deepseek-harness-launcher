@@ -28,3 +28,6 @@ assets/node-dist/
 
 # alpha 预发布记录：只做本地存盘（不发公告、也不进公开仓库），转正式版时才把内容汇总成正式版公告
 .alpha-notes/
+
+# 统计后台管理 Token（本地部署用，不进仓库）
+stats/.admin-token

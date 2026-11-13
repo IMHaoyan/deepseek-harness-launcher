@@ -33,6 +33,7 @@ const pluginCompat = require('./dsh-plugin-compat')
 const stopGuard = require('./service-stop-guard')
 const { probePid, terminateProcess, waitForCompletion } = require('./service-termination')
 const handover = require('./service-handover')
+const listenerProbe = require('./service-listener')
 const trust = require('./trust')
 const fileOpen = require('./file-open')
 const workspaceMapModule = require('./workspace-map')
@@ -40,6 +41,7 @@ const { createConsoleSurface } = require('./console-surface')
 const { createUpdateWindow } = require('./update-window')
 const changelog = require('./changelog')
 const notifyPolicy = require('./notify-policy')
+const usageStats = require('./usage-stats')
 const crashNote = require('./crash-note')
 const startProgress = require('./start-progress')
 const bridgePatch = require('./bridge-patch')
@@ -82,6 +84,10 @@ const READY_TIMEOUT_SEC = 60
 // 启动器安装包的发布页：自动更新失败（尤其 GitHub 不可达）时，界面用「手动下载」打开它。
 // 主进程/更新窗口共用一处，避免两个渠道各写一个 URL 后悄悄分叉。
 const LAUNCHER_RELEASES_URL = 'https://github.com/IMHaoyan/deepseek-harness-launcher/releases'
+// 使用量统计接收端（Cloudflare Worker，部署步骤见 stats/README.md）。
+// 留空 = 不发起任何网络请求：功能开关照常展示，但不会拿未部署的地址反复失败。
+// 部署完成后把 Worker 的自定义域名填在这里（必须 https），随下一次发版生效。
+const USAGE_STATS_URL = 'https://dshl-stats.dshl-stats-8ba81e.workers.dev/v1/report'
 
 // 按当前配置重算运行端口（配置缺失/非法一律回退默认 3080）。
 // seed=true（仅启动时）：命令行 --port 优先，作为本次会话的种子；运行时（设置页/一键换端口）一律以 Config.port 为准，
@@ -131,7 +137,9 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '' }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
+// 默认接收端在配置对象之外赋值：Config 这一行会被测试按源码片段求值，不能引用外部常量。
+Config.usageStatsUrl = USAGE_STATS_URL
 let firstRun = false
 let harnessRoot = ''
 let consoleZoomLoaded = false // 控制台缩放是否来自用户持久化设置
@@ -403,6 +411,17 @@ function log(message) {
   } catch { /* 日志失败不致命 */ }
 }
 
+// 节流日志：监听 PID / 进程表的取证在轮询里每 300~600ms 跑一次，失败信息不能每次都刷屏，
+// 但也不能像旧实现那样把 execFile 的 err 直接吞掉 —— 那正是"查不到监听者"被误当"端口空闲"的起点。
+const throttledLogAt = new Map()
+function logThrottled(key, message, everyMs = 60000) {
+  const now = Date.now()
+  const last = throttledLogAt.get(key) || 0
+  if (now - last < everyMs) return
+  throttledLogAt.set(key, now)
+  log(message)
+}
+
 // 逐字段应用配置（loadConfig 与"健康快照恢复后重载"共用，保证校验规则一致）
 // 说明：nodeMajor 的旧默认值（22）可能已经随 Config 落盘进每个用户的 config.json。
 // 目标升到 Node.js 24 LTS 后必须做一次显式迁移，否则老用户下次重装 Node 仍会装 22；
@@ -430,6 +449,13 @@ function applyConfigJson(cfg) {
   }
   if (typeof cfg.desktopShellAutoEnabledFor === 'string') Config.desktopShellAutoEnabledFor = cfg.desktopShellAutoEnabledFor
   if (Number.isInteger(cfg.port) && cfg.port >= 1024 && cfg.port <= 65535) Config.port = cfg.port
+  if (typeof cfg.usageStats === 'boolean') Config.usageStats = cfg.usageStats
+  // 接收端地址只认合法 https（回环 http 仅本地联调）；读坏/为空时保留默认，不拿垃圾地址发请求。
+  if (typeof cfg.usageStatsUrl === 'string') {
+    const endpoint = usageStats.normalizeEndpoint(cfg.usageStatsUrl)
+    if (endpoint) Config.usageStatsUrl = endpoint
+  }
+  if (Number.isFinite(cfg.usageStatsAt) && cfg.usageStatsAt > 0) Config.usageStatsAt = cfg.usageStatsAt
   if (typeof cfg.feedbackWebhook === 'string') Config.feedbackWebhook = cfg.feedbackWebhook
   // 反馈分片上限（字符）：界面无入口，作者按飞书实测截断点调；0/缺失 = 用默认值
   if (Number.isFinite(cfg.feedbackChunkChars) && cfg.feedbackChunkChars > 0) Config.feedbackChunkChars = Math.floor(cfg.feedbackChunkChars)
@@ -637,8 +663,11 @@ const HANDOVER_POLL_MS = 300
 const HANDOVER_SETTLE_MS = 3000
 // 后继已被命令行签名认出来、但还没绑上端口的等待上限。
 // 空载冷启动实测 3.5~4.5s；自检在机器有负载时实测到 11~12s（AV/多实例/磁盘冷读），
-// 8s 会在这种时候误判"服务消失"→ 去抢端口（双实例事故的第二种成因），故留到 20s。
-const HANDOVER_MAX_MS = 20000
+// 8s 会在这种时候误判"服务消失"→ 去抢端口（双实例事故的第二种成因）。
+// 2026-11 实测：本机 64 次成功交接 p95 18.4s、max 19.8s，另有 2 次 20.6s/20.4s 的 crash 误判
+// （后继其实活着、只是还没 bind）；dshmarket 的 restart helper 对同一冷启动等 45s+8s。故上限提到 45s。
+// 注意：只有"本世代创建、仍存活的签名候选"存在时才等满上限；候选退出/属于上一代则回到短窗口（见 runHandover）。
+const HANDOVER_MAX_MS = 45000
 const HANDOVER_SCAN_MS = 600 // 进程表取证节流（PowerShell 单次约 0.7~1s，不能进每轮的轮询）
 const CMDLINE_TIMEOUT_MS = 6000 // PowerShell 冷启动 + AV 扫描实测可到 3~4s，超时会让识别退化成"外部实例"
 const TOKEN_TAIL_MS = 15000 // child 退出后继续读它的 stdout 多久：克隆体可能继承同一根管道
@@ -655,6 +684,7 @@ const server = {
   claimedPid: 0, // DSH 自重启后继：命令行与本轮启动签名一致，已认领
   claimedAlive: false,
   launchSig: null, // { script, args }，与实际 spawn argv 同源（认领的唯一判据）
+  genStartedAt: 0, // 本世代 spawn 时刻（ms）：用于把"上一代遗留的同签名进程"从后继候选中剔掉
   authPending: false, // 服务在跑但没拿到本轮访问凭据（token），页面需要一次由启动器发起的重启
   tokenPending: false, // 认领后的 stdout 尾读窗口内，token 有无尚未定案
   tailGen: -1, // 尾读窗口所属世代
@@ -828,30 +858,41 @@ async function findBindablePort(preferred) {
   return 0
 }
 
-function findListenPid() {
-  return new Promise((resolve) => {
-    if (IS_WIN) {
-      execFile('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true, timeout: 8000 }, (err, stdout) => {
-        if (err) return resolve(0)
-        for (const line of String(stdout).split(/\r?\n/)) {
-          if (!line.includes('LISTENING')) continue
-          const parts = line.trim().split(/\s+/)
-          if (parts.length >= 5 && (parts[1] || '').endsWith(':' + PORT)) {
-            const pid = parseInt(parts[parts.length - 1], 10)
-            return resolve(Number.isInteger(pid) ? pid : 0)
-          }
-        }
-        resolve(0)
-      })
-    } else {
-      execFile('lsof', ['-nP', '-iTCP:' + PORT, '-sTCP:LISTEN', '-t'], { timeout: 8000 }, (err, stdout) => {
-        if (err) return resolve(0)
-        const first = String(stdout || '').trim().split(/\r?\n/)[0]
-        const pid = parseInt(first, 10)
-        resolve(Number.isInteger(pid) ? pid : 0)
-      })
+// 监听 PID 的取证在 service-listener.js（纯解析 + 可注入 IO）：netstat 为主；
+// 端口确实有人应答、netstat 却没给出 PID 时，用 Get-NetTCPConnection 兜底（带缓存，单次 1.6~2.3s）。
+// 失败/查不到一律回 0 供旧调用点维持原语义，但 unknown/兜底证据会写进日志 —— 不再像旧实现那样静默。
+const listenerResolver = listenerProbe.createListenerResolver({
+  isWin: IS_WIN,
+  host: HOST,
+  execFileImpl: execFile,
+  runPwshImpl: runPwsh,
+})
+
+// 监听取证的三态结果（found / absent / unknown）。unknown 的判决语义是"不可判定"，
+// 绝不能当成"没有监听者" —— 交接/占位裁决用它来避开"取证失败→误判崩溃/误换端口"。
+// 旧调用点继续用 findListenPid()（只取 PID，0 兼容旧语义）。
+async function findListener() {
+  try {
+    const r = await listenerResolver.resolve(PORT, { probePortOpen: portOpen })
+    const d = r.diag || {}
+    if (r.status === 'unknown') {
+      const primary = d.primary || d
+      const fallback = d.primary ? `；Get-NetTCPConnection 兜底 code=${d.code || 'n/a'}${d.stderr ? ' ' + d.stderr : ''}` : ''
+      logThrottled('listener-unknown-' + (primary.code || 'n/a'),
+        `端口 ${PORT} 监听者无法核实：netstat code=${primary.code || 'n/a'} killed=${!!primary.killed}${primary.signal ? ' signal=' + primary.signal : ''} 耗时=${primary.ms || '?'}ms 字节=${primary.bytes || 0}${fallback}（总耗时 ${r.totalMs}ms）`)
+    } else if (r.via === 'net-tcp') {
+      logThrottled('listener-fallback-hit', `端口 ${PORT} 监听者经 Get-NetTCPConnection 兜底识别（PID ${r.pid}${r.ambiguous ? '，多候选歧义' : ''}）`)
     }
-  })
+    return r
+  } catch (err) {
+    logThrottled('listener-resolve-error', '监听者取证异常：' + ((err && err.message) || String(err)))
+    return { status: 'unknown', pid: 0, via: 'none', ambiguous: false, diag: {}, cached: false, totalMs: 0 }
+  }
+}
+
+async function findListenPid() {
+  const r = await findListener()
+  return r.status === 'found' ? r.pid : 0
 }
 
 // 读某 PID 的完整命令行。拿不到一律返回 ''：调用方按"不可判定"处理，绝不凭猜测认领别人的进程。
@@ -870,16 +911,25 @@ async function readCmdline(pid) {
 
 // 可能是"我们这一轮 DSH 的后继"的进程：命令行里出现启动脚本的 node 进程。
 // needle 只用来缩小 POSIX 侧的扫描范围；真正的判定在 matchLaunchSig（逐参数比对）。
+// Windows 分支额外带回进程创建时间（.NET ticks）：用来剔除上一代遗留的同签名进程，
+// 避免历史孤儿被当成"本次自重启的后继"而把真崩溃拖进长等待窗口。
 async function dshSuccessorCandidates(needle) {
   const out = []
   if (IS_WIN) {
-    const r = await runPwsh('Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.ProcessId);$($_.CommandLine)" }', { timeoutMs: CMDLINE_TIMEOUT_MS })
-    if (!r.ok) return out
+    const r = await runPwsh('Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.ProcessId);$($_.CreationDate.ToUniversalTime().Ticks);$($_.CommandLine)" }', { timeoutMs: CMDLINE_TIMEOUT_MS })
+    if (!r.ok) {
+      logThrottled('successor-scan-failed', `后继进程扫描失败（PowerShell code=${r.code || 'n/a'}）：${(r.stderr || '').trim().slice(0, 200) || '无 stderr'}`)
+      return out
+    }
     for (const line of r.stdout.split(/\r?\n/)) {
       const sep = line.indexOf(';')
       if (sep < 0) continue
+      const sep2 = line.indexOf(';', sep + 1)
+      if (sep2 < 0) continue
       const pid = parseInt(line.slice(0, sep), 10)
-      if (Number.isInteger(pid)) out.push({ pid, cmdline: line.slice(sep + 1) })
+      if (!Number.isInteger(pid)) continue
+      const createdAt = handover.dotNetTicksToEpochMs(line.slice(sep + 1, sep2))
+      out.push({ pid, createdAt, cmdline: line.slice(sep2 + 1) })
     }
     return out
   }
@@ -890,7 +940,7 @@ async function dshSuccessorCandidates(needle) {
     const m = line.match(/^\s*(\d+)\s+([\s\S]*)$/)
     if (!m) continue
     if (needle && !m[2].includes(needle)) continue
-    out.push({ pid: parseInt(m[1], 10), cmdline: m[2] })
+    out.push({ pid: parseInt(m[1], 10), createdAt: 0, cmdline: m[2] })
   }
   return out
 }
@@ -961,8 +1011,9 @@ function probeDsh() {
   })
 }
 
-// 端口被占时的"占有者确认"预算：DSH 冷启动实测 3.5~4.5s，自重启后继还要先 bind 再开始应答；
-// 与 HANDOVER_MAX_MS 同量级。窗口内不下"换端口/拒绝接管"的结论 —— 那正是双实例事故的来源。
+// 端口被占时的"占有者确认"预算：DSH 冷启动实测 3.5~4.5s，自重启后继还要先 bind 再开始应答。
+// 注意它和交接窗口 HANDOVER_MAX_MS(45s) 是两档：这里发生在"已经决定重来/启动"之后，
+// 只用于确认占有者身份；窗口内不下"换端口/拒绝接管"的结论 —— 那正是双实例事故的来源。
 const PORT_OCCUPANT_BUDGET_MS = 8000
 const PORT_OCCUPANT_POLL_MS = 500
 
@@ -971,22 +1022,32 @@ const PORT_OCCUPANT_POLL_MS = 500
 // 判定规则在 service-handover.classifyOccupant（纯函数、可单测）：命令行签名 → HTTP 指纹 → 等待 → 冲突。
 async function handlePortOccupied(source, retryDepth = 0) {
   const started = Date.now()
+  const gen = server.gen
   let pid = 0
   let probe = { ok: false, reason: 'connect' }
+  let lastOpen = false
   while (true) {
+    // 被停止/新启动/退出打断：别在 while(true) 里空转（旧实现没有这层兜底）。
+    if (serviceStopping() || reallyExit || server.gen !== gen) return false
     pid = await findListenPid()
     const matched = pid ? await matchSuccessorPid(pid) : 0
-    probe = pid ? await probeDsh() : { ok: false, reason: 'connect' }
+    // pid=0 时也要探指纹：端口有人应答时它能区分"没应答/别人/DSH"。
+    // 旧实现把 probeDsh 和 pid 绑在一起，等于在取证失败时把唯一的旁证也丢了。
+    lastOpen = pid > 0 ? true : await portOpen()
+    probe = (pid > 0 || lastOpen) ? await probeDsh() : { ok: false, reason: 'connect' }
     const waitedMs = Date.now() - started
     const verdict = handover.classifyOccupant({
       hasListener: pid > 0,
+      portOpen: lastOpen,
       sigMatched: matched > 0 && matched === pid,
-      probeOk: probe.ok,
+      // 指纹命中但 PID 未知时不能据此"接管"：没有可管理/可终止的 PID，接管只会写出假状态。
+      probeOk: probe.ok && pid > 0,
       probeReason: probe.reason,
       waitedMs,
       budgetMs: PORT_OCCUPANT_BUDGET_MS,
     })
     if (verdict === 'adopt') {
+      if (!(pid > 0)) break // 双保险：没有 PID 不接管（classifyOccupant 已不会走到这里）
       if (matched > 0 && matched === pid) {
         // 自家后继（DSH 内部重启）：按认领处理 —— 不算崩溃、不发通知、保留页面 cookie 会话
         log(`端口 ${PORT} 的新进程（PID ${pid}）与本轮启动签名一致：按 DSH 自重启后继认领（确认耗时 ${waitedMs}ms）`)
@@ -1023,12 +1084,17 @@ async function handlePortOccupied(source, retryDepth = 0) {
   pid = await findListenPid()
   server.adoptedPid = 0
   server.adoptedAlive = false
+  // 指纹确认是 DSH、但监听 PID 取证失败：不能"接管"一个没有 PID 的服务，也不能建议换端口了事。
+  const dshUnverified = pid === 0 && probe.ok === true
+  const occupant = dshUnverified
+    ? '上的服务确认是 DSH，但进程 PID 无法核实（监听取证失败）'
+    : `被其他程序占用（PID ${pid || '未知'}）`
   // 自动找下一个空闲端口作为建议，控制台提供"换到该端口并启动"一键入口
   const suggested = await findFreePort(PORT + 1)
   server.suggestedPort = suggested
   server.blockedReason = suggested
-    ? `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；建议切换到空闲端口 ${suggested}（DSHL 控制台可一键切换），或关闭占用程序`
-    : `端口 ${PORT} 被其他程序占用（PID ${pid || '未知'}），已拒绝接管；附近端口均被占用，请关闭占用程序后重试`
+    ? `端口 ${PORT} ${occupant}，已拒绝接管；建议切换到空闲端口 ${suggested}（DSHL 控制台可一键切换），或重启启动器后重试`
+    : `端口 ${PORT} ${occupant}，已拒绝接管；附近端口均被占用，请关闭占用程序后重试`
   log(server.blockedReason)
   lifecycle.emit('service.blocked', { port: PORT, reason: 'port-conflict' })
   return false
@@ -1203,6 +1269,7 @@ async function startServerInner(occupantRetry = 0) {
   server.errTail = [] // 上一代的 stderr 不能当成本代的失败原因
   resetActivationEvidence() // 插件"没生效"的证据同样随世代清空（含滑动窗口；见 resetActivationEvidence 注释）
   server.launchSig = { script: spawnArgs[0], args: spawnArgs.slice(1) } // 与实际 argv 同源，认领判据不会漂
+  server.genStartedAt = Date.now() // 本世代起点：后继候选的创建时间必须不早于它（见 matchSuccessorCandidate）
   let child
   try {
     child = spawn(nodeCmd, spawnArgs, {
@@ -1563,6 +1630,22 @@ async function matchSuccessorPid(listenerPid, sig = server.launchSig) {
   return hit ? hit.pid : 0
 }
 
+// runHandover 专用：全表扫描后继候选，并带回"创建时间是否属于本世代"。
+// 不要求候选当前存活（存活由调用方每轮 probePid 判定）；total/currentGen 只用于取证日志。
+// 拿不到创建时间时（POSIX/旧 PowerShell）不据此剔人，保持既有行为。
+async function matchSuccessorCandidate(sig = server.launchSig) {
+  const empty = { pid: 0, createdAt: 0, total: 0, currentGen: 0 }
+  if (!sig || !sig.script) return empty
+  const cands = await dshSuccessorCandidates(path.basename(sig.script))
+  const hits = cands.filter((c) => handover.matchLaunchSig(c.cmdline, sig).ok)
+  if (!hits.length) return empty
+  const genStart = Number(server.genStartedAt) || 0
+  const fresh = genStart > 0 ? hits.filter((c) => !c.createdAt || c.createdAt >= genStart - 2000) : hits
+  const pool = fresh.length ? fresh : hits
+  pool.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) // 多候选取最新；歧义数仍由 total 记录
+  return { pid: pool[0].pid, createdAt: pool[0].createdAt || 0, total: hits.length, currentGen: fresh.length }
+}
+
 function markReady(child, ownerVerdict) {
   child.__starting = false
   markLoadingProgress('load') // 说明页步骤：载入界面（随后 refreshWebUiOnReady 换页）
@@ -1628,25 +1711,66 @@ async function runHandover(fromPid, code, signal) {
   const gen = server.gen
   const started = Date.now()
   let listener = 0
+  let listenerStatus = 'absent'
   let matched = 0
+  let matchedCreatedAt = 0
+  let candidateCount = 0
+  let currentGenCandidates = 0
   let lastScan = 0
   let verdict = 'pending'
+  let diag = null
   server.settling = true
   server.settlingServing = await portOpen()
   while (true) {
-    listener = await findListenPid()
+    const lr = await findListener()
+    listenerStatus = lr.status
+    listener = lr.status === 'found' ? lr.pid : 0
     if (Date.now() - lastScan >= HANDOVER_SCAN_MS) {
       lastScan = Date.now()
-      matched = await matchSuccessorPid(listener)
+      if (listener > 0) {
+        matched = await matchSuccessorPid(listener)
+        matchedCreatedAt = 0
+        candidateCount = 0
+        currentGenCandidates = 0
+      } else {
+        const cand = await matchSuccessorCandidate()
+        matched = cand.pid
+        matchedCreatedAt = cand.createdAt
+        candidateCount = cand.total
+        currentGenCandidates = cand.currentGen
+      }
+    }
+    const matchedAlive = matched > 0 ? probePid(matched) !== false : false
+    // 创建时间未知（POSIX/旧 PowerShell）时按"本世代"处理，保持既有行为；
+    // Windows 上只有本世代创建的候选才允许把窗口拖满 HANDOVER_MAX_MS（见 service-handover.classifyHandover）。
+    const matchedCurrentGen = matched > 0 && (!matchedCreatedAt || !server.genStartedAt || matchedCreatedAt >= server.genStartedAt - 2000)
+    const serving = listener > 0 ? true : await portOpen()
+    diag = {
+      listenerStatus,
+      listenerPid: listener,
+      listenerVia: lr.via || '',
+      listenerAmbiguous: lr.ambiguous === true,
+      matchedPid: matched,
+      matchedAlive: matched > 0 ? matchedAlive : null,
+      matchedCurrentGen: matched > 0 ? matchedCurrentGen : null,
+      matchedCreatedAt: matchedCreatedAt || 0,
+      candidateCount,
+      currentGenCandidates,
+      portOpen: serving,
+      elapsedMs: Date.now() - started,
     }
     verdict = handover.classifyHandover({
       listenerPid: listener,
+      listenerStatus,
+      portOpen: serving,
       matchedPid: matched,
-      elapsedMs: Date.now() - started,
+      matchedAlive,
+      matchedCurrentGen,
+      elapsedMs: diag.elapsedMs,
       settleMs: HANDOVER_SETTLE_MS,
       maxMs: HANDOVER_MAX_MS,
     })
-    server.settlingServing = listener > 0 ? true : await portOpen()
+    server.settlingServing = serving
     // 被停止/新启动/退出打断：裁决作废，交由打断方收尾
     if (server.gen !== gen || reallyExit || serviceStopping()) { endSettling(); return }
     broadcastState() // 控制台在裁决期也要看到真实状态（不能停在"已停止"）
@@ -1665,20 +1789,40 @@ async function runHandover(fromPid, code, signal) {
     broadcastState()
     return
   }
-  handleUnexpectedExit(fromPid, code, signal, elapsedMs)
+  if (verdict === 'occupied-unverified') {
+    // 端口有人应答、但两条监听取证都失败：不 crash（会误报并自动重启）、不认领（没有可管理 PID）、
+    // 也不建议换端口（那会与真正的占有者并存）。交给用户在控制台处理。
+    const reason = `端口 ${PORT} 上的服务无法核实进程归属（netstat/Get-NetTCPConnection 取证失败，但端口仍有人应答），已暂停自动重启与换端口；请检查占用程序，或重启启动器后重试`
+    server.blockedReason = reason
+    server.suggestedPort = 0
+    server.adoptedPid = 0
+    server.adoptedAlive = false
+    if (diag) diag.elapsedMs = elapsedMs
+    log(`交接取证：${JSON.stringify(diag)}`)
+    log(reason)
+    lifecycle.emit('service.blocked', { port: PORT, reason: 'listener-unverified' })
+    broadcastState()
+    if (!SELF_TEST) showConsolePage('main')
+    return
+  }
+  if (diag) diag.elapsedMs = elapsedMs
+  handleUnexpectedExit(fromPid, code, signal, elapsedMs, 'handover', diag)
 }
 
 // 真崩溃路径：语义与改动前保持一致（标故障、切说明页、通知+闪烁、交给看护）
-function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source) {
+function handleUnexpectedExit(fromPid, code, signal, elapsedMs, source, evidence) {
   const verdictSource = source || 'handover'
+  const detail = evidence && typeof evidence === 'object' ? { ...evidence } : null
   markHealthFault()
   noteServiceFailure(verdictSource) // 崩因进内存证据：通知与控制台都据此写清原因
   // 就绪后很快又崩 = 崩溃循环特征：计入硬止损计数（与计数窗口独立）
   if (readySince && Date.now() - readySince < RESTART_STABLE_MS) fastCrashStreak += 1
   else fastCrashStreak = 0
+  // 交接取证：下次再遇到"误判崩溃"的报告，日志里能直接看到当时 listener/matched/portOpen 是什么。
+  if (detail) log('交接取证：' + JSON.stringify(detail))
   log(`DSH exited unexpectedly (code ${code === null || code === undefined ? '未知' : code}${signal ? ', signal ' + signal : ''})`)
-  server.handover = { at: new Date().toISOString(), fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, elapsedMs: elapsedMs || 0 }
-  lifecycle.emit('service.handover', { fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, port: PORT, elapsedMs: elapsedMs || 0 })
+  server.handover = { at: new Date().toISOString(), fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, elapsedMs: elapsedMs || 0, ...(detail ? { evidence: detail } : {}) }
+  lifecycle.emit('service.handover', { fromPid: fromPid || 0, toPid: 0, verdict: 'crash', source: verdictSource, port: PORT, elapsedMs: elapsedMs || 0, ...(detail ? { evidence: detail } : {}) })
   // 页面立即切到"服务正在自动重启…"说明页（文字说明 + 刷新按钮；就绪后由 refreshWebUiOnReady 自动切回）
   if (!SELF_TEST) {
     const reason = autoRestartStopped ? 'offline' : (Config.autoRestart ? 'restart' : 'offline')
@@ -1761,6 +1905,11 @@ async function stopServerInner({ managedOnly = false, force = false } = {}) {
       const pid = server.claimedPid
       cancelRestartRetry()
       await stopPidVerified(pid, null, force)
+      // 进程没了 ≠ 端口已经释放：若端口仍有应答，说明中途又出现了同端口实例，
+      // 此时报告"已停止"会让更新/重启在残留实例上继续跑。fail-closed，保留责任进程状态等重试。
+      if (await portOpen()) {
+        throw new Error(`停止后端口 ${PORT} 仍有应答（原 PID ${pid}），无法确认已停止；已保留责任进程状态，请重试`)
+      }
       clearClaimed()
       server.launchUrl = null
       server.launchSig = null
@@ -1792,6 +1941,14 @@ async function stopServerInner({ managedOnly = false, force = false } = {}) {
         clearClaimed()
         log(`停止期间出现的 DSH 后继已停止 (PID ${matched})`)
       }
+    }
+    // 停止后端口仍有应答、监听者却无法核实：不能静默放行（更新/重启可能在残留实例上继续跑）。
+    // managedOnly（只停自管服务、不动外部实例）保持旧语义，不在此拦截。
+    if (!managedOnly && launchSig && await portOpen()) {
+      const lr = await findListener()
+      throw new Error(lr.status === 'found'
+        ? `停止后端口 ${PORT} 仍被 PID ${lr.pid} 持有，已暂停更新/重启`
+        : `停止后端口 ${PORT} 仍有人应答，但监听者无法核实（${lr.status}），已暂停更新/重启`)
     }
     server.launchSig = null
     return true
@@ -3267,7 +3424,7 @@ function cleanInstalledVersion(spec) {
 // 会话导入、上下文洞察。
 // 从本版本起摘出注册表的两个（会话归档 / MCP Lens）只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
 // 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
-// tests/plugin-page-wiring.test.js 的默认代装断言与 README「插件管理」小节。
+// tests/plugin-page-wiring.test.js 的默认代装断言与 docs/internals.md 的预装清单。
 const MANAGED_NPM_PLUGINS = [
   {
     id: 'bridge-next',
@@ -6553,6 +6710,12 @@ function stateJson() {
     recoveredAt: lastRecoveryAt || '',
     autoRestartStopped: autoRestartStopped,
     notifyCategories: Config.notifyCategories,
+    // 使用量统计：只暴露"是否开启/是否已配置接收端/上次成功时间"，不把接收地址下发给页面
+    usageStats: {
+      enabled: Config.usageStats !== false,
+      endpointConfigured: !!Config.usageStatsUrl,
+      lastAt: Number(Config.usageStatsAt) || 0,
+    },
     // 恢复页数据：健康检查点 + 最近回退 + 崩溃提示（控制台只读）
     // 回退动作走两阶段：previewHealthRestore 签发一次性凭据 → healthRestore 核销执行
     recovery: {
@@ -6719,9 +6882,56 @@ async function watchTrackedService() {
   broadcastState()
 }
 
+// ---------- 使用量统计（可关闭；不阻塞启动，失败静默） ----------
+// 启动后先让服务与页面就绪，再发首条统计：15s 后再看，避免和 DSH 初始化抢磁盘/CPU。
+const USAGE_STATS_FIRST_DELAY_MS = 15000
+const USAGE_STATS_RETRY_MS = 30 * 60 * 1000
+let usageStatsFirstAt = Date.now() + USAGE_STATS_FIRST_DELAY_MS
+let usageStatsRetryAt = 0
+let usageStatsInFlight = null
+
+function maybeSendUsageStats() {
+  if (SELF_TEST || !Config.usageStats || !Config.usageStatsUrl) return
+  if (usageStatsInFlight) return
+  if (!envReady() || !envReport || !envReport.plan) return
+  const now = Date.now()
+  if (now < usageStatsFirstAt || now < usageStatsRetryAt) return
+  if (!usageStats.shouldReport({ enabled: true, lastAt: Config.usageStatsAt, now, intervalMs: usageStats.REPORT_INTERVAL_MS })) return
+  const payload = usageStats.buildPayload({
+    launcherVersion: app.getVersion(),
+    launcherChannel: Config.launcherChannel,
+    dshVersion: envReport.plan.dshVersion,
+    dshChannel: Config.dshChannel,
+    platform: process.platform,
+    release: os.release(),
+  })
+  if (!payload) {
+    // 版本信息还不完整（环境探测尚未给出实际 DSH 版本）：1 分钟后再看，不报假数据
+    usageStatsRetryAt = now + 60 * 1000
+    return
+  }
+  usageStatsInFlight = usageStats.sendReport({ endpoint: Config.usageStatsUrl, payload })
+    .then((result) => {
+      if (result.ok) {
+        Config.usageStatsAt = Date.now()
+        try { saveConfig() } catch { /* noop */ }
+        log('usage-stats: 已上报本日使用量样本（不含任何设备标识）')
+      } else {
+        usageStatsRetryAt = Date.now() + USAGE_STATS_RETRY_MS
+        logThrottled('usage-stats-failed', 'usage-stats: 上报失败（不影响使用，30 分钟后再试）：' + (result.error || ''))
+      }
+    })
+    .catch((error) => {
+      usageStatsRetryAt = Date.now() + USAGE_STATS_RETRY_MS
+      logThrottled('usage-stats-failed', 'usage-stats: 上报异常（不影响使用）：' + ((error && error.message) || String(error)))
+    })
+    .finally(() => { usageStatsInFlight = null })
+}
+
 function onTick() {
   // 环境未就绪时周期性重测（缓存 30s 节流），用户在外部装好 Node/DSH 后自动就绪
   if (!envReady()) void refreshEnv(false)
+  maybeSendUsageStats()
   expirePluginReceipts() // 动作回执超时兜底：不重启的机器上也要自己退场
   maybeStartDeferred() // 安装完成/启动请求时环境未就绪 → 就绪后自动补启动
   if (envReady()) void maybeRepairPnpm() // pnpm 缺失/版本不匹配时后台对齐一次
@@ -7133,6 +7343,12 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
             return JSON.stringify({ ok: !err, error: err || '' })
           } catch (e) { return JSON.stringify({ ok: false, error: e && e.message ? e.message : String(e) }) }
         }
+        case 'setUsageStats': {
+          Config.usageStats = !!value
+          saveConfig()
+          broadcastState()
+          return JSON.stringify({ ok: true, usageStats: { enabled: Config.usageStats } })
+        }
         case 'setNotifyCategory': {
           const key = value && value.key
           if (notifyPolicy.CATEGORIES.includes(key)) {
@@ -7279,6 +7495,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           Config.crashStreak = 0
           Config.lastCrashReportedAt = ''
           Config.notifyCategories = notifyPolicy.defaultCategories()
+          Config.usageStats = true // 使用量统计回默认（开启）
           Config.desktopShell = true // 桌面快捷键模式也回默认（开启）；下次启动生效
           Config.desktopShellAutoEnabledFor = ''
           Config.notifiedLauncherVersion = ''
