@@ -292,7 +292,7 @@ test('新用户默认 pending，旧配置缺字段迁移 install，显式 choice
 
 test('首装 IPC 转交 choice 和 selectedIds，state 下发真实选择与安装进度', () => {
   assert.match(main, /case 'pluginsSetSetupChoice': return JSON\.stringify\(setPluginSetupChoice\(value && value\.choice, value && value\.selectedIds\)\)/)
-  assert.match(main, /pluginSetup: \{ \.\.\.pluginSetup, choice: Config\.pluginSetupChoice, selectedIds: Config\.pluginSetupSelectedIds \}/)
+  assert.match(main, /pluginSetup: \{ \.\.\.pluginSetup, choice: Config\.pluginSetupChoice, selectedIds: Config\.pluginSetupSelectedIds, declined: pluginSetupDeclinedIds\(\) \}/)
 })
 
 for (const [ids, expected] of [

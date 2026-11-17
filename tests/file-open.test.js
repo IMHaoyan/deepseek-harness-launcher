@@ -24,8 +24,10 @@ test('Windows 绝对路径：盘符 + 正/反斜杠都接受', () => {
   }
 })
 
-test('UNC 路径接受；相对路径/裸文件名/空值拒绝', () => {
-  assert.equal(fileOpen.classifyOpenRequest({ path: '\\\\server\\share\\a.txt' }, 'win32').ok, true)
+test('UNC 路径拒绝（防远程 SMB 认证）；相对路径/裸文件名/空值拒绝', () => {
+  const unc = fileOpen.classifyOpenRequest({ path: '\\\\server\\share\\a.txt' }, 'win32')
+  assert.equal(unc.ok, false)
+  assert.match(unc.error, /UNC/)
   for (const path of ['dist\\dshl.exe', 'dshl.exe', '', '   ', '..\\a.txt', '/tmp/a.txt']) {
     const request = fileOpen.classifyOpenRequest({ path }, 'win32')
     assert.equal(request.ok, false, JSON.stringify(path))

@@ -816,11 +816,22 @@ function pluginSetupCanEdit() {
   return !!window._pluginSetup && pluginSetupSelecting() && !pluginSetupEntryBusy();
 }
 
-function resetPluginSetupDraft() {
+/**
+ * 预装选择的默认草稿：已保存的选择优先；没有保存过就是清单全选。
+ * 但用户亲手卸载过的插件（declined）默认不勾 —— 否则「卸载过就不再自动装回」会被
+ * “打开预装选择 → 直接点安装”悄悄推翻（并且顺手清掉 declined 记忆）。
+ */
+function pluginSetupDefaultIds() {
   const setup = window._pluginSetup || {};
-  const saved = setup.selectedIds;
-  window._pluginSetupDraft = new Set(Array.isArray(saved) ? saved
-    : setup.choice === 'skip' ? [] : (window._pluginSetupPlugins || []).map((p) => p.id));
+  const declined = new Set(Array.isArray(setup.declined) ? setup.declined : []);
+  const all = (window._pluginSetupPlugins || []).map((p) => p.id);
+  const base = Array.isArray(setup.selectedIds) ? setup.selectedIds
+    : setup.choice === 'skip' ? [] : all;
+  return base.filter((id) => !declined.has(id));
+}
+
+function resetPluginSetupDraft() {
+  window._pluginSetupDraft = new Set(pluginSetupDefaultIds());
 }
 
 async function openPluginSetup() {
@@ -876,8 +887,7 @@ function renderPluginSetup(setup, plugins) {
   const list = window._pluginSetupPlugins || [];
   // 草稿只初始化一次：pending 的状态广播与离开/重开向导都不能抹掉用户勾选。
   if (!window._pluginSetupDraft && list.length) {
-    const saved = window._pluginSetup && window._pluginSetup.selectedIds;
-    window._pluginSetupDraft = new Set(Array.isArray(saved) ? saved : list.map((p) => p.id));
+    window._pluginSetupDraft = new Set(pluginSetupDefaultIds());
   }
   const listJson = JSON.stringify(list);
   if (window._pluginSetupListJson !== listJson) {

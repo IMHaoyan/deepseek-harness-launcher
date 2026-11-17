@@ -390,6 +390,9 @@ function openAbsolutePath(path, event) {
 /** 捕获阶段拦截 Ctrl/Cmd+点击；返回是否拦截（测试/调试用）。 */
 function interceptFileOpenClick(event) {
   try {
+    // 只认真实用户手势：页面脚本 dispatchEvent 造出来的事件 isTrusted=false，
+    // 否则任何页面内 JS（含第三方插件前端）都能零交互借这条桥打开/执行本地文件。
+    if (event.isTrusted !== true) return false
     if (!event.ctrlKey && !event.metaKey) return false
     const button = clickButton(event.target)
     if (button === null) return false

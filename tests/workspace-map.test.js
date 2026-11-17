@@ -82,6 +82,25 @@ test('filePathInWorkspace：相对路径拼成绝对路径；非法输入空串'
   assert.equal(workspaceMap.filePathInWorkspace(cwd, 'a\u0000b.js'), '')
 })
 
+test('filePathInWorkspace：.. 不能穿出工作区（防页面借相对链接枚举工作区外文件）', () => {
+  const cwd = 'C:\\Users\\gonghaoyan\\Desktop\\dshl'
+  for (const rel of [
+    '..\\..\\Users\\gonghaoyan\\.ssh\\id_rsa',
+    '..\\sibling.txt',
+    'a/../../outside.txt',
+    'D:\\other\\x.txt',
+    '\\\\server\\share\\x.txt',
+    '.',
+  ]) {
+    assert.equal(workspaceMap.filePathInWorkspace(cwd, rel), '', rel)
+  }
+  // 工作区内的 .. 只要能归一化回内部就仍可用
+  assert.equal(
+    workspaceMap.filePathInWorkspace(cwd, 'tests/../browser-preload.js'),
+    path.resolve(cwd, 'browser-preload.js'),
+  )
+})
+
 test('createWorkspaceMap：首次读取后按 mtime+size 缓存，文件更新后重新读取，reset 放弃缓存', () => {
   const dir = tempDir()
   const file = writeIndex(dir, INDEX)

@@ -68,7 +68,12 @@ function filePathInWorkspace(cwd, relativePath) {
   const relative = relativePath.trim()
   if (relative === '' || /[\u0000-\u001f\u007f]/u.test(relative)) return ''
   try {
-    return path.resolve(cwd.trim(), relative.replace(/\//gu, path.sep))
+    const root = path.resolve(cwd.trim())
+    const resolved = path.resolve(root, relative.replace(/\//gu, path.sep))
+    // 必须留在工作区内：相对路径里的 .. 不能拿来枚举/打开工作区外的文件（会话渲染内容可写任意链接文本）
+    const inside = path.relative(root, resolved)
+    if (inside === '' || inside === '..' || inside.startsWith('..' + path.sep) || path.isAbsolute(inside)) return ''
+    return resolved
   } catch {
     return ''
   }

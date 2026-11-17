@@ -596,9 +596,17 @@ async function installByName(name, opts = {}) {
   } catch (e) {
     s.error = (e && e.message) || String(e)
     s.busy = ''
+    // 失败也要回读 profile：DSH 存在"依赖已写入、bundle 被门禁拒绝（exit 1）"的路径，
+    // 不回读的话卡片只会说「操作失败」，用户看不出这是半装状态、下一步该干什么。
+    let partial = false
+    try {
+      const after = pluginStateOf(readProfileManifest(), pkg)
+      partial = after.installed && !after.bundle
+      if (partial) s.error += '（依赖已写入 profile 但 bundle 未激活：请卸载后重试，或检查该插件的 bundle 声明）'
+    } catch { /* 回读失败不改变原错误 */ }
     log('install failed: ' + pkg + '：' + s.error)
     const env = classifyEnvFailure((e && e.output) || s.error)
-    return { ok: false, error: s.error, env: env.kind ? env : null }
+    return { ok: false, error: s.error, env: env.kind ? env : null, partial }
   }
 }
 

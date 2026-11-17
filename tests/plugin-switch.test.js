@@ -172,3 +172,50 @@ test('hasClientPart：带 dsh.client 的插件需要页面刷新，纯 host 插�
   fs.writeFileSync(pkgPath, JSON.stringify(pkg))
   assert.equal(pluginSwitch.hasClientPart('pkg'), true)
 })
+
+test('readPatchState：带兄弟键（name/config）的禁用行也能读出来；config 深层的 disabled 不算', () => {
+  const { home, profile } = makeHome()
+  fs.writeFileSync(path.join(profile, 'cordis.patch.yml'), [
+    '- id: foreign-a',
+    "  name: '@deepseek-ai/dsh-mcp-client'",
+    '  disabled: true',
+    '- id: forced-b',
+    '  name: pkg',
+    '  disabled: false',
+    '- insert:',
+    '    - id: mine',
+    '      name: pkg',
+    '      config:',
+    '        disabled: true',
+  ].join('\n'))
+  pluginSwitch.initPluginSwitch({ home })
+  const state = pluginSwitch.readPatchState(path.join(profile, 'cordis.patch.yml'))
+  assert.deepEqual(state.disables, ['foreign-a'], '三行形态的禁用必须读出来')
+  assert.deepEqual(state.forced, ['forced-b'])
+  assert.deepEqual(state.inserts, ['mine'])
+})
+
+test('写补丁层：原子替换并留 .bak-dshl 备份，不留临时文件', () => {
+  const { home, profile } = makeHome()
+  pluginSwitch.initPluginSwitch({ home })
+  const patchPath = path.join(profile, 'cordis.patch.yml')
+  fs.writeFileSync(patchPath, '- id: old\n  disabled: true\n')
+  assert.equal(pluginSwitch.setEnabled('pkg', false).ok, true)
+  const files = fs.readdirSync(profile)
+  assert.ok(files.some((name) => name.startsWith('cordis.patch.yml.bak-dshl-')), '写前应留备份')
+  assert.deepEqual(files.filter((name) => name.includes('.tmp-')), [], '不应留下临时文件')
+})
+
+test('市场状态文件损坏：fail-closed，拒绝写入且不覆盖原文件', () => {
+  const { home, profile } = makeHome()
+  pluginSwitch.initPluginSwitch({ home })
+  const stateDir = path.join(profile, '.dsh-market')
+  fs.mkdirSync(stateDir, { recursive: true })
+  const statePath = path.join(stateDir, 'state.json')
+  fs.writeFileSync(statePath, '{ broken json')
+  const before = fs.readFileSync(statePath, 'utf8')
+  const result = pluginSwitch.setEnabled('pkg', false)
+  assert.equal(result.ok, false)
+  assert.match(result.error, /状态文件/)
+  assert.equal(fs.readFileSync(statePath, 'utf8'), before, '损坏文件不能被"重建小形状"覆盖')
+})

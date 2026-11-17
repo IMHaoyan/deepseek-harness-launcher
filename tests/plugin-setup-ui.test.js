@@ -347,6 +347,21 @@ test('explicit saved subset initializes checkboxes, legacy null initializes all'
   assert.ok(old.inputs().every((input) => input.checked && input.disabled))
 })
 
+test('用户卸载过的插件默认不勾选（全选默认与已保存选择都排除），显式勾选才恢复', () => {
+  const fresh = harness({ setup: { ...baseSetup, declined: ['mcp'] } })
+  assert.equal(fresh.inputs().find((input) => input.dataset.pluginSetupId === 'mcp').checked, false,
+    '全选默认不能把卸载过的插件又勾回来')
+  assert.equal(fresh.context.pluginSetupSelectedIds().length, 5)
+
+  const saved = harness({ setup: { ...baseSetup, selectedIds: ['market', 'mcp'], declined: ['mcp'] } })
+  assert.deepEqual(Array.from(saved.context.pluginSetupSelectedIds()), ['market'],
+    '已保存选择里也要扣掉用户后来卸载过的')
+
+  saved.check('mcp', true)
+  assert.deepEqual(Array.from(saved.context.pluginSetupSelectedIds()), ['market', 'mcp'],
+    '显式勾选可以恢复；保存时后端会清掉 declined')
+})
+
 test('empty install sends no IPC, but skip persists an empty selectedIds array', async () => {
   const h = harness({ ready: false })
   h.$('btnWizardPluginsClear').click()

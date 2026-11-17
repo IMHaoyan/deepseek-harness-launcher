@@ -128,11 +128,29 @@ function emitLifecycle(event, detail) {
 
 // 更新事务状态：写入/清空（best-effort，仅用于诊断与回滚依据）
 // 返回值表示"是否真的落盘"：改名切换前的那次写入必须成功，否则崩溃在两次改名之间就没有修复凭据。
+// 原子写：断电/被杀时不能留下半截 JSON —— 那会被 readUpdateState 当成"没有事务"。
+function writeFileAtomicSync(file, text) {
+  const temp = `${file}.tmp-${process.pid}-${Date.now()}`
+  let fd
+  try {
+    fd = fs.openSync(temp, 'w', 0o600)
+    fs.writeFileSync(fd, text)
+    try { fs.fsyncSync(fd) } catch { /* 文件系统不支持也不影响 rename 的原子性 */ }
+    fs.closeSync(fd)
+    fd = undefined
+    fs.renameSync(temp, file)
+  } catch (err) {
+    try { if (fd !== undefined) fs.closeSync(fd) } catch { /* noop */ }
+    try { fs.unlinkSync(temp) } catch { /* noop */ }
+    throw err
+  }
+}
+
 function writeUpdateState(value) {
   if (!statePath) return false
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true })
-    fs.writeFileSync(statePath, JSON.stringify(Object.assign({ updatedAt: new Date().toISOString() }, value), null, 2))
+    writeFileAtomicSync(statePath, JSON.stringify(Object.assign({ updatedAt: new Date().toISOString() }, value), null, 2))
     return true
   } catch (e) { log('dsh-update: state write failed: ' + (e && e.message ? e.message : String(e))); return false }
 }
@@ -144,10 +162,17 @@ function clearUpdateState() {
 
 function readUpdateState() {
   if (!statePath) return null
+  if (!fs.existsSync(statePath)) return null
   try {
     const v = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-    return v && typeof v === 'object' ? v : null
-  } catch { return null }
+    if (v && typeof v === 'object') return v
+    log('dsh-update: 事务状态不是对象，按无事务处理（文件保留供取证）')
+    return null
+  } catch (e) {
+    // 文件存在但读不出来 ≠ 没有事务：这是"修复凭据损坏"，必须留下可检索的证据。
+    log('dsh-update: 事务状态文件损坏，无法自动恢复（文件保留供取证）：' + (e && e.message ? e.message : String(e)))
+    return null
+  }
 }
 
 /**
@@ -173,15 +198,16 @@ async function recoverSwapTransaction(st, nodeBin, ctx) {
     probeVersion: probe,
   })
   const stageRoot = stageRootOf(installDir)
-  const finish = (payload) => {
+  const finish = (payload, keepExtra = []) => {
     try { clearUpdateState() } catch { /* noop */ }
-    if (!warming) cleanupStage(stageRoot, '')
+    if (!warming) cleanupStage(stageRoot, '', keepExtra)
     return payload
   }
   if (decided.action === 'done') {
-    log('dsh-update: 上次的改名切换其实已完成，只清理事务与暂存残留')
+    log(`dsh-update: 上次的改名切换其实已完成，只清理事务与暂存残留；旧树备份保留在 ${backupDir}`)
     emitLifecycle('update.dsh', { step: 'interrupted-swap-done', from: ctx.from, to: target })
-    return finish({ recovered: true, to: target, mode: 'swap-done' })
+    // 「切换完成」只代表目录换好了：本次启动还没验证新版本能跑，旧树备份必须留着当退路。
+    return finish({ recovered: true, to: target, mode: 'swap-done' }, [path.basename(backupDir)])
   }
   if (decided.action === 'intact') {
     // 切换还没开始，安装目录完好（旧版可用）：不动它，也不谎称"已修复"
@@ -554,7 +580,7 @@ async function spawnNpm(args, opts = {}) {
     }
     let stdout = ''
     let stderr = ''
-    const t = setTimeout(() => { try { child.kill() } catch { /* noop */ } }, timeoutMs)
+    const t = setTimeout(() => { try { killProcessTree(child) } catch { /* noop */ } }, timeoutMs)
     child.stdout.on('data', (d) => { stdout += String(d) })
     child.stderr.on('data', (d) => { stderr += String(d) })
     child.on('error', (err) => {
@@ -569,6 +595,18 @@ async function spawnNpm(args, opts = {}) {
       resolve({ ok: code === 0, error, stdout, stderr })
     })
   })
+}
+
+/** 结束 npm 及其子树：只 kill 本体时 cmd.exe / node 生命周期脚本会变成孤儿继续写磁盘。 */
+function killProcessTree(child) {
+  if (!child || child.killed) return
+  try {
+    if (process.platform === 'win32' && child.pid) {
+      spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      return
+    }
+  } catch { /* 退回 child.kill */ }
+  try { child.kill() } catch { /* noop */ }
 }
 
 function registries() {
@@ -815,15 +853,36 @@ function probeDshVersion(nodeBin, binPath) {
 }
 
 /** 清理暂存目录：删掉 keep 之外的版本目录与 old-/rejected- 备份，返回删掉的名字。 */
-function cleanupStage(stageRoot, keep) {
+function cleanupStage(stageRoot, keep, keepExtra = []) {
   if (!stageRoot) return []
   let names = []
   try { names = fs.readdirSync(stageRoot) } catch { return [] }
   const removed = []
-  for (const name of staleStageEntries(names, keep)) {
+  const keepSet = new Set([String(keep || ''), ...(Array.isArray(keepExtra) ? keepExtra : []).map(String)].filter(Boolean))
+  for (const name of staleStageEntries(names, '')) {
+    if (keepSet.has(name)) continue // 事务/回退凭据不能当过期物删掉
     try { fs.rmSync(path.join(stageRoot, name), { recursive: true, force: true }); removed.push(name) } catch { /* 删不掉下次再删 */ }
   }
   return removed
+}
+
+/** 未完成事务里记着的暂存/备份目录名：清理时必须保留（否则人工退路被自己删掉）。 */
+function transactionKeepNames() {
+  try {
+    const st = readUpdateState()
+    if (!st) return []
+    const names = []
+    const backupDir = String(st.backupDir || '')
+    if (backupDir) names.push(path.basename(backupDir))
+    const installDir = String(st.installDir || '')
+    const stagePkg = String(st.stagePkg || '')
+    const stageRoot = installDir ? stageRootOf(installDir) : ''
+    if (stageRoot && stagePkg) {
+      const first = path.relative(stageRoot, stagePkg).split(path.sep)[0]
+      if (first && first !== '..' && !first.startsWith('..' + path.sep)) names.push(first)
+    }
+    return names
+  } catch { return [] }
 }
 
 /** 后台预装：把目标版本完整装进暂存 prefix 并探测确认可用。只为全局形态服务。 */
@@ -969,6 +1028,9 @@ async function restoreSwap(state, nodeBin) {
     fs.renameSync(backupDir, installDir)
   } catch (err) { return { ok: false, error: (err && err.message) || String(err) } }
   const probed = await probeDshVersion(nodeBin || 'node', path.join(installDir, 'lib', 'bin.js'))
+  // 改名成功 ≠ 恢复出来的树能跑：探测不出来就如实失败，让调用方保留事务、下次启动再处理，
+  // 绝不把"空版本"当成回滚成功去发通知。
+  if (!probed) return { ok: false, error: '恢复出来的旧树不可用（版本探测失败）', version: '', rejected }
   return { ok: true, version: probed, rejected }
 }
 
@@ -1180,8 +1242,8 @@ async function checkOnce(reason, force) {
       log(`dsh-update: v${current} 已是最新（latest v${latest.version}）`)
       setState({ status: 'up-to-date' })
       // 已是最新：暂存目录里剩下的都是过期物（含切换失败留下的 rejected-*），顺手清掉。
-      // 正在预装时不动（那份还在写盘，删了只会让本次预装白跑）。
-      if (!warming) cleanupStage(stageRootOf(installDir), '')
+      // 正在预装时不动（那份还在写盘，删了只会让本次预装白跑）；未完成事务记着的树必须保留。
+      if (!warming) cleanupStage(stageRootOf(installDir), '', transactionKeepNames())
     }
   } catch (err) {
     if (timedOut) return
@@ -1368,18 +1430,24 @@ async function updateNow() {
           : await runGlobalUpdate(plan.nodeCmd, globalRootForRollback, fromVersion)
         if (rb.ok) {
           try { await refreshEnv(true) } catch { /* noop */ }
+          let restarted = true
           if (wasRunning) {
-            const ok2 = (await startService()) !== false
+            restarted = (await startService()) !== false
             if (reloadWebTabs) reloadWebTabs()
-            log(`dsh-update: rollback restart ${ok2 ? 'ok' : 'failed'}`)
+            log(`dsh-update: rollback restart ${restarted ? 'ok' : 'failed'}`)
           }
           Config.dshVersion = fromVersion
           Config.dshUpdateCheckedAt = Date.now()
           try { saveConfig() } catch { /* noop */ }
-          notify('DeepSeek Harness', `新版本 v${latest} 启动失败，已自动回滚到 v${fromVersion}（原配置不受影响；如仍异常请查看控制台日志）`)
-          log(`dsh-update: rolled back to v${fromVersion}`)
-          emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest })
-          setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}` })
+          if (restarted) {
+            notify('DeepSeek Harness', `新版本 v${latest} 启动失败，已自动回滚到 v${fromVersion}（原配置不受影响；如仍异常请查看控制台日志）`)
+            setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}` })
+          } else {
+            notify('DeepSeek Harness', `已回滚到 v${fromVersion}，但服务未能重新启动：请打开控制台「恢复」页处理`, undefined, 'recovery')
+            setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}，但服务未恢复` })
+          }
+          log(`dsh-update: rolled back to v${fromVersion}${restarted ? '' : '（服务未恢复）'}`)
+          emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest, restarted })
           try { clearUpdateState() } catch { /* noop */ }
           return
         }
@@ -1419,15 +1487,21 @@ async function updateNow() {
         const rb = await restoreSwap(swapState, plan.nodeCmd)
         if (rb.ok) {
           try { await refreshEnv(true) } catch { /* noop */ }
+          let restarted = true
           if (wasRunning) {
-            try { await startService() } catch { /* noop */ }
+            restarted = (await startService()) !== false
             if (reloadWebTabs) reloadWebTabs()
           }
           const backVersion = rb.version || fromVersion || '旧版本'
-          log(`dsh-update: restored previous tree (v${backVersion})`)
-          emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest, mode: 'swap' })
-          notify('DeepSeek Harness', `DSH v${latest} 未能确认更新成功（${outcome.reason}），已恢复原来的 v${backVersion}`)
-          setState({ status: 'error', error: `v${latest} 未生效，已恢复 v${backVersion}` })
+          log(`dsh-update: restored previous tree (v${backVersion})${restarted ? '' : '（服务未恢复）'}`)
+          emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest, mode: 'swap', restarted })
+          if (restarted) {
+            notify('DeepSeek Harness', `DSH v${latest} 未能确认更新成功（${outcome.reason}），已恢复原来的 v${backVersion}`)
+            setState({ status: 'error', error: `v${latest} 未生效，已恢复 v${backVersion}` })
+          } else {
+            notify('DeepSeek Harness', `已恢复原来的 v${backVersion}，但服务未能重新启动：请打开控制台「恢复」页处理`, undefined, 'recovery')
+            setState({ status: 'error', error: `v${latest} 未生效，已恢复 v${backVersion}，但服务未恢复` })
+          }
           try { clearUpdateState() } catch { /* noop */ }
           return
         }
@@ -1492,6 +1566,10 @@ module.exports = {
   // 切换动作本身也导出：测试用真实目录演练"顶上 / 退回"，而不是只测判定
   swapStagedInto,
   restoreSwap,
+  cleanupStage,
+  transactionKeepNames,
+  writeUpdateState,
+  readUpdateState,
   noteChannelChange,
   recoverInterruptedUpdate,
 }

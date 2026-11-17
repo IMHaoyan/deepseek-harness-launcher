@@ -16,6 +16,9 @@ function exitHarness(stop, install = async () => false) {
     lifecycle: { emit: (_name, detail) => events.push(detail.serviceStopped ? 'stopped' : 'unconfirmed') },
     tray: null, app: { quit: () => events.push('quit') },
     updater: { installOnExit: async () => { events.push('install'); return install() } },
+    envInstall: { getJob: () => ({ job: { status: 'idle' } }), cancelInstall: () => events.push('cancel-install') },
+    dshUpdater: { getState: () => ({ status: 'idle' }) },
+    notify: () => events.push('notify'),
     log: () => {}, redact: (text) => text,
   }
   vm.createContext(ctx)
@@ -49,6 +52,16 @@ test('已成功交接给安装器时不抢先再次 app.quit', async () => {
   const h = exitHarness(async () => true, async () => true)
   await h.request()
   assert.deepEqual(h.events, ['stop', 'clean', 'stopped', 'install'])
+})
+
+test('退出时取消正在运行的安装任务；DSH 更新中给出提示但不阻断退出', async () => {
+  const h = exitHarness(async () => true)
+  h.ctx.envInstall = { getJob: () => ({ job: { status: 'running' } }), cancelInstall: () => h.events.push('cancel-install') }
+  h.ctx.dshUpdater = { getState: () => ({ status: 'updating' }) }
+  await h.request()
+  assert.ok(h.events.includes('cancel-install'), '应结束自己拉起的安装子进程树')
+  assert.ok(h.events.includes('notify'), '更新未完成要留下可见提示')
+  assert.ok(h.events.includes('quit'), '提示不阻断退出')
 })
 
 function stopHarness({ fail = false, external = false, busy = false } = {}) {

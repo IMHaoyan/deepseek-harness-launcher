@@ -126,11 +126,11 @@ function clickHandler(run) {
 /**
  * 造一次点击事件。
  * @param {{ctrlKey?: boolean, metaKey?: boolean, shiftKey?: boolean, title?: string, text?: string,
- *          button?: boolean, session?: string}} options
+ *          button?: boolean, session?: string, isTrusted?: boolean}} options
  *   title 省略 = 按钮没有 title（图片链接）；button:false = 点的不是按钮；
- *   session 省略 = 按钮不在任何会话正文里。
+ *   session 省略 = 按钮不在任何会话正文里；isTrusted 默认 true（真实用户手势）。
  */
-function clickEvent({ ctrlKey = true, metaKey = false, shiftKey = false, title, text = '', button = true, session } = {}) {
+function clickEvent({ ctrlKey = true, metaKey = false, shiftKey = false, title, text = '', button = true, session, isTrusted = true } = {}) {
   const element = button
     ? {
         getAttribute: (name) => (name === 'title' && title !== undefined ? title : null),
@@ -144,6 +144,7 @@ function clickEvent({ ctrlKey = true, metaKey = false, shiftKey = false, title, 
     },
   }
   return {
+    isTrusted,
     ctrlKey,
     metaKey,
     shiftKey,
@@ -327,6 +328,22 @@ test('点了一个不打开预览的按钮（tooltip 文本不是文件）：不
   run.fireMutations()
   assert.equal(event.defaultPrevented, false)
   assert.deepEqual(run.calls, [])
+})
+
+test('合成事件（isTrusted=false）：页面脚本伪造 ctrl+click 也不能打开任何文件', () => {
+  const run = runPreload({ documentSession: 'session-x' })
+  const handler = clickHandler(run)
+  const synthetic = clickEvent({ isTrusted: false, title: 'C:\\Windows\\System32\\cmd.exe', session: 'session-x' })
+  handler(synthetic)
+  assert.equal(synthetic.defaultPrevented, false, '不能拦截，也不能触发打开')
+  assert.deepEqual(run.calls, [])
+  assert.deepEqual(run.syncCalls, [])
+
+  // 同样不能借"相对路径 + 会话"那条路
+  const syntheticRelative = clickEvent({ isTrusted: false, title: 'a.js', text: 'a.js', session: 'session-x' })
+  handler(syntheticRelative)
+  assert.equal(syntheticRelative.defaultPrevented, false)
+  assert.deepEqual(run.syncCalls, [])
 })
 
 test('非本机 DSH 页（file:// / 其它端口）：不挂监听', () => {

@@ -411,7 +411,7 @@ test('批量安装：停服务失败时中止，绝不在别人占着依赖树�
   assert.deepEqual(deferCalls, [], '停不下来就一个都别装')
 })
 
-test('推荐插件注册表：十个 npm 插件 + 通用动作/更新检查', () => {
+test('推荐插件注册表：十三个 npm 插件 + 通用动作/更新检查', () => {
   assert.match(main, /const MANAGED_NPM_PLUGINS = \[/, '主进程应有推荐插件注册表')
   for (const npm of [
     '@agents-anywhere/dsh-bridge-next',
@@ -449,7 +449,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const marketRepo = marketRepoMatch[1]
 
   // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
-  assert.equal(registry.length, 10, '推荐插件（npm 分发）应为 10 个（含手机连接与 MCP 连接器；会话归档 / MCP Lens 已摘出）')
+  assert.equal(registry.length, 13, '推荐插件（npm 分发）应为 13 个（含手机连接、MCP 连接器与 8 个手动项；MCP Lens 已摘出）')
   assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
   assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
   for (const d of registry) {
@@ -544,12 +544,15 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'rewind',
     'better-sidebar',
     'codex-ui',
+    'image-gen',
     'chat-import',
+    'computer-use-win',
     'sidebar-qa',
+    'archive-manager',
     'context',
   ], '卡片顺序应为「预装在前、手动在后」，各组内按 order')
   assert.deepEqual(catalog.filter((c) => !c.preset).map((c) => c.id), [
-    'better-sidebar', 'codex-ui', 'chat-import', 'sidebar-qa', 'context',
+    'better-sidebar', 'codex-ui', 'image-gen', 'chat-import', 'computer-use-win', 'sidebar-qa', 'archive-manager', 'context',
   ], 'preset=false 的应恰好是手动安装的那批')
   assert.equal(catalog.findIndex((c) => !c.preset), catalog.filter((c) => c.preset).length,
     '预装卡片必须全部连续排在前面（不与手动项交错）')
@@ -615,13 +618,16 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'skills-manager',
     'rewind',
     'better-sidebar',
+    'image-gen',
+    'computer-use-win',
+    'archive-manager',
     'context', // 手动安装但已装上 → 排在未安装的三张之前（这就是「已安装优先」要的效果）
     'codex-ui',
     'chat-import',
     'sidebar-qa',
   ], '已安装的在前；已安装组内「预装 → 手动」，未安装组内同样')
   const installedCount = mixed.filter((c) => c.installed).length
-  assert.equal(installedCount, 8, '这组夹具里应有 8 个已安装（含 MCP 连接器）')
+  assert.equal(installedCount, 11, '这组夹具里应有 11 个已安装（含 MCP 连接器）')
   assert.equal(mixed.findIndex((c) => !c.installed), installedCount,
     '已安装卡片必须全部连续排在未安装之前（不与未安装项交错）')
 
@@ -632,7 +638,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.deepEqual(tagKeys('usage-billing'), ['preinstall'])
   assert.deepEqual(tagKeys('better-sidebar'), ['official'], '增强侧边栏是手动安装项，只挂官方推荐')
   assert.deepEqual(tagKeys('context'), ['official'], '上下文洞察同上')
-  for (const id of ['codex-ui', 'chat-import', 'sidebar-qa']) {
+  for (const id of ['codex-ui', 'chat-import', 'sidebar-qa', 'image-gen', 'computer-use-win', 'archive-manager']) {
     assert.deepEqual(tagKeys(id), [], id + '：两枚标签都不带（落进「其他」）')
   }
   for (const card of catalog) {
@@ -896,7 +902,7 @@ test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
   assert.doesNotMatch(html, /id="btnRemoteConnect"/, '设置页不应再保留远程连接行')
   assert.doesNotMatch(html, /id="btnRecoveryMarket"/, '恢复页不应再保留插件修复行')
 })
-test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装，界面类与上下文洞察保持手动；会话归档与 MCP Lens 已摘出注册表', () => {
+test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装；界面类、会话导入、上下文洞察、图像生成、电脑操作、会话归档保持手动；MCP Lens 已摘出注册表', () => {
   assert.match(main, /pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: \{\}/, '配置应有自动安装与退役清理记账字段')
   assert.match(main, /function pluginAutoDeclined\(id\)/, '应有「用户卸载过」记忆查询')
   assert.match(main, /function notePluginAutoDeclined\(id, declined\)/, '应有「用户卸载过」记账写入')
@@ -906,13 +912,17 @@ test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器�
   assert.doesNotMatch(main, /npm: 'dsh-better-sidebar',\n    name: '增强侧边栏',\n    autoInstall: true,/, '增强侧边栏改为手动安装')
   assert.match(main, /npm: '@kenz1117\/dsh-ui-usage-billing',\n    name: '用量与计费',\n    autoInstall: true,/, '用量与计费应默认代装')
   assert.match(main, /npm: '@michengai\/dsh-skills-manager',\n    name: '技能管理',\n    autoInstall: true,/, '技能管理应默认代装')
-  // 会话归档 / MCP Lens：从注册表摘掉（页面不再有卡片），残留实例交给 RETIRED_NPM_PLUGINS 自动卸载
+  // 会话归档 / 图像生成 / 电脑操作：进注册表但保持手动；MCP Lens 仍退役（页面无卡片，残留自动卸载）
   const regOnly = main.slice(main.indexOf('const MANAGED_NPM_PLUGINS = ['), main.indexOf('\n]\n', main.indexOf('const MANAGED_NPM_PLUGINS = [')) + 3)
-  assert.doesNotMatch(regOnly, /dsh-archive-manager/, '会话归档不应再留在推荐插件注册表里')
-  assert.doesNotMatch(regOnly, /dsh-mcp-lens/, 'MCP Lens 不应再留在推荐插件注册表里')
+  assert.doesNotMatch(regOnly, /dsh-mcp-lens/, 'MCP Lens 已退役，不应再留在推荐插件注册表里')
+  assert.match(regOnly, /npm: 'dsh-image-gen',\n    name: '图像生成',/, '图像生成应进注册表')
+  assert.doesNotMatch(regOnly, /npm: 'dsh-image-gen',\n    name: '图像生成',\n    autoInstall: true,/, '图像生成应保持手动安装')
+  assert.match(regOnly, /npm: 'dsh-computer-use-win',\n    name: '电脑操作',/, '电脑操作应进注册表')
+  assert.doesNotMatch(regOnly, /npm: 'dsh-computer-use-win',\n    name: '电脑操作',\n    autoInstall: true,/, '电脑操作应保持手动安装')
+  assert.match(regOnly, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',/, '会话归档应重新进注册表')
+  assert.doesNotMatch(regOnly, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',\n    autoInstall: true,/, '会话归档应保持手动安装')
   assert.doesNotMatch(main, /npm: 'dsh-sidebar-qa',\n    name: '划线提问',\n    autoInstall: true,/, '划线提问改为手动安装（依赖增强侧边栏）')
   assert.match(main, /npm: 'dsh-rewind-plugin',\n    name: '对话回退',\n    autoInstall: true,/, '对话回退应默认代装')
-  assert.doesNotMatch(main, /npm: 'dsh-mcp-lens',\n    name: 'MCP Lens',\n    autoInstall: true,/, 'MCP Lens 改为手动安装（上游 npm 只有预发布版，稳定版校验会拒绝）')
   assert.doesNotMatch(main, /npm: 'dsh-chat-import',\n    name: '会话导入',\n    autoInstall: true,/, '会话导入保持手动安装')
   assert.doesNotMatch(main, /npm: '@michengai\/dsh-codex-ui',\n    name: 'Codex 风格界面',\n    autoInstall: true,/, 'Codex 风格界面默认不安装（只进插件页）')
   assert.doesNotMatch(main, /npm: 'dsh-context',\n    name: '上下文洞察',\n    autoInstall: true,/, '上下文洞察保持手动安装')
@@ -1089,19 +1099,21 @@ test('挂起变更统一走重启：任何插件变更都只提供「立即重�
   assert.equal(calls.restart, 2, '批量变更一次重启统一生效')
 })
 test('退役插件：注册表摘掉的同时，老用户机器上残留的实例会被自动卸载（注入桩执行真实流程）', async () => {
-  // 1) 注册表里不许再有这两个包（页面上的卡片来自注册表，摘掉即不再展示、不再代装）
+  // 1) 注册表里不许再有 MCP Lens（页面上的卡片来自注册表，摘掉即不再展示、不再代装）；
+  //    会话归档已改回手动项，必须留在注册表里，不能继续被当作"退役残留"自动卸掉
   const regStart = main.indexOf('const MANAGED_NPM_PLUGINS = [')
   const regText = main.slice(regStart, main.indexOf('\n]\n', regStart) + 3)
-  assert.doesNotMatch(regText, /dsh-archive-manager|dsh-mcp-lens/, '两个退役包都不应再出现在预装插件注册表里')
+  assert.doesNotMatch(regText, /dsh-mcp-lens/, 'MCP Lens 不应再出现在预装插件注册表里')
+  assert.match(regText, /@michengai\/dsh-archive-manager/, '会话归档已改为手动项，应留在注册表里')
 
-  // 2) 退役清单必须点名这两个包（老用户的 profile 里已经装过它们，摘卡片不等于卸载）
+  // 2) 退役清单必须点名 MCP Lens（老用户的 profile 里已经装过它，摘卡片不等于卸载）
   const start = main.indexOf('// ---------- 退役插件：')
   assert.ok(start > 0, '找不到退役插件清理块')
   const retiredStart = main.indexOf('const RETIRED_NPM_PLUGINS = [', start)
   const retiredEnd = main.indexOf('\n]\n', retiredStart) + 3
   assert.ok(retiredStart > start && retiredEnd > retiredStart, '找不到 RETIRED_NPM_PLUGINS 字面量')
   const retired = new Function(main.slice(retiredStart, retiredEnd) + '; return RETIRED_NPM_PLUGINS')()
-  assert.deepEqual(retired.map((d) => d.npm), ['@michengai/dsh-archive-manager', 'dsh-mcp-lens'], '退役清单应包含会话归档与 MCP Lens')
+  assert.deepEqual(retired.map((d) => d.npm), ['dsh-mcp-lens'], '退役清单应只包含 MCP Lens')
   for (const d of retired) assert.ok(d.id && d.name, '退役项要带 id/name（日志与提示要说人话）')
 
   // 3) 触发点与默认代装同一批：启动 / 环境装好 / 服务就绪（onTick）
@@ -1144,9 +1156,9 @@ test('退役插件：注册表摘掉的同时，老用户机器上残留的实�
   const names = Object.keys(ctx)
   const api = new Function(...names, fnSrc + '\nreturn { maybeRemoveRetiredPlugins, pendingRetiredPlugins }')(...names.map((k) => ctx[k]))
 
-  assert.deepEqual(api.pendingRetiredPlugins().map((d) => d.npm), ['@michengai/dsh-archive-manager', 'dsh-mcp-lens'], '两个包都在时应都进清理队列')
+  assert.deepEqual(api.pendingRetiredPlugins().map((d) => d.npm), ['dsh-mcp-lens'], '只有仍在退役清单里的包进清理队列（会话归档已改为手动项，不再被自动卸）')
   await api.maybeRemoveRetiredPlugins()
-  assert.deepEqual(calls.uninstalls, ['@michengai/dsh-archive-manager', 'dsh-mcp-lens'], '应把残留的两个都卸掉（无关插件不碰）')
+  assert.deepEqual(calls.uninstalls, ['dsh-mcp-lens'], '只卸 MCP Lens；会话归档和其它已装插件都不碰')
   assert.equal(calls.applied.length, 1, '卸完只重启一次服务')
   assert.equal(Config.pluginRetiredCleanupVersion, '1.4.6', '清理成功应记账')
   assert.equal('mcp-lens' in Config.pluginAutoDeclined, false, '退役插件的「不再自动安装」死键应清掉')

@@ -98,33 +98,47 @@ function parsePatchRows(text) {
   return { names, ids, insertedIds, foreignDisables: foreignDisables.filter((id) => !insertedIds.includes(id)) }
 }
 
-/** Line-wise scan of the user patch layer; enough to read DSHL toggle rows. */
+/**
+ * 行级扫描用户补丁层：按"顶层条目"读，而不是假设 `- id: X` 紧接 `disabled:`。
+ * 真实会遇到兄弟键（dsh-mcp-panel / dshmarket 写的是 `- id: X` / `name: …` / `disabled: true`），
+ * 只认两行相邻的话，别的工具写的禁用态会被读成"已启用"，随后开关再追加一条重复行。
+ * 仍然只做行级扫描（不引 YAML 依赖）：条目内 2 空格缩进的 `disabled:` 才是这条目的开关值，
+ * `config:` 下的更深缩进不会被误读。
+ */
 function readPatchState(patchPath = defaultPatchPath()) {
   const disables = []
   const forced = []
   const inserts = []
-  let text = ''
-  try { text = fs.readFileSync(patchPath, 'utf8') } catch { /* no patch file */ }
-  const lines = text.split(/\r?\n/u)
+  let lines = []
+  try { lines = fs.readFileSync(patchPath, 'utf8').split(/\r?\n/u) } catch { return { disables, forced, inserts } }
+  let entry = null // { id, disabled: boolean|null }
   let inInsert = false
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? ''
-    if (/^- insert:\s*$/u.test(line)) {
-      inInsert = true
+  const flush = () => {
+    if (!entry) return
+    if (entry.disabled === true) disables.push(entry.id)
+    else if (entry.disabled === false) forced.push(entry.id)
+    entry = null
+  }
+  for (const line of lines) {
+    if (/^- insert:\s*$/u.test(line)) { flush(); inInsert = true; continue }
+    if (/^- /u.test(line)) {
+      inInsert = false
+      flush()
+      const row = /^- id: ['"]?([A-Za-z0-9_.-]+)['"]?\s*$/u.exec(line)
+      if (row !== null) entry = { id: row[1], disabled: null }
       continue
     }
-    if (/^- /u.test(line)) inInsert = false
     if (inInsert) {
       const insertRow = /^ {4}- id: ([A-Za-z0-9_.-]+)/u.exec(line)
       if (insertRow !== null) inserts.push(insertRow[1])
       continue
     }
-    const disableRow = /^- id: ['"]?([A-Za-z0-9_.-]+)['"]?\s*$/u.exec(line)
-    if (disableRow === null) continue
-    const next = lines[index + 1] ?? ''
-    if (/^ {2}disabled: true\s*$/u.test(next)) disables.push(disableRow[1])
-    else if (/^ {2}disabled: false\s*$/u.test(next)) forced.push(disableRow[1])
+    if (entry) {
+      const value = /^ {2}disabled:\s*(true|false)\s*$/u.exec(line) // 恰好 2 空格：条目自己的键
+      if (value !== null) entry.disabled = value[1] === 'true'
+    }
   }
+  flush()
   return { disables, forced, inserts }
 }
 
@@ -220,6 +234,45 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 }
 
+/** 原子落盘：同目录临时文件 → rename；失败抛错（调用方决定语义）。 */
+function writeFileAtomicSync(file, text) {
+  const dir = path.dirname(file)
+  const temp = `${file}.tmp-${process.pid}-${Date.now()}`
+  let fd
+  try {
+    fd = fs.openSync(temp, 'w', 0o600)
+    fs.writeFileSync(fd, text)
+    try { fs.fsyncSync(fd) } catch { /* 文件系统不支持也不影响 rename 的原子性 */ }
+    fs.closeSync(fd)
+    fd = undefined
+    fs.renameSync(temp, file)
+  } catch (err) {
+    try { if (fd !== undefined) fs.closeSync(fd) } catch { /* noop */ }
+    try { fs.unlinkSync(temp) } catch { /* noop */ }
+    throw err
+  }
+}
+
+const PATCH_BACKUP_KEEP = 3
+/**
+ * 写 profile 补丁层：先留一份时间戳备份再原子替换。
+ * 这个文件被 DSH 在启动时**抛错式**解析（坏一个字符就整站起不来），改坏必须能退回去。
+ */
+function writePatchAtomic(file, text) {
+  if (fs.existsSync(file)) {
+    const backup = `${file}.bak-dshl-${new Date().toISOString().replace(/[:.]/gu, '-')}`
+    try { fs.copyFileSync(file, backup) } catch { /* 备份失败不阻断写入，但会缺少回滚点 */ }
+    try {
+      const dir = path.dirname(file)
+      const base = path.basename(file) + '.bak-dshl-'
+      const names = fs.readdirSync(dir).filter((n) => n.startsWith(base)).sort()
+      while (names.length > PATCH_BACKUP_KEEP) { try { fs.unlinkSync(path.join(dir, names.shift())) } catch { /* noop */ } }
+    } catch { /* noop */ }
+  }
+  writeFileAtomicSync(file, text)
+}
+
+/** 该行属于本工具写入的两行形态（`- id: X` 紧接 2 空格缩进），才允许 strip。 */
 function rowBlock(rowId, disabled) {
   return `- id: ${rowId}\n  disabled: ${disabled ? 'true' : 'false'}\n`
 }
@@ -242,19 +295,19 @@ function appendPatchEntry(patchPath, block) {
   try { text = fs.readFileSync(patchPath, 'utf8') } catch { /* created below */ }
   const core = text.trim()
   if (core === '') {
-    fs.writeFileSync(patchPath, block)
+    writePatchAtomic(patchPath, block)
     return { ok: true, error: '' }
   }
   const withoutComments = text.replace(/^[ \t]*#.*$/gmu, '').trim()
   if (withoutComments === '') {
     const next = text.endsWith('\n') ? text : `${text}\n`
-    fs.writeFileSync(patchPath, `${next}${block}`)
+    writePatchAtomic(patchPath, `${next}${block}`)
     return { ok: true, error: '' }
   }
   if (withoutComments === '[]' || withoutComments === '[ ]') {
     const commented = text.replace(/^[ \t]*\[[ \t]*\][ \t]*(?:#.*)?(?:\r?\n|$)/mu, '# []\n')
     const next = commented.endsWith('\n') ? commented : `${commented}\n`
-    fs.writeFileSync(patchPath, `${next}${block}`)
+    writePatchAtomic(patchPath, `${next}${block}`)
     return { ok: true, error: '' }
   }
   const contentLines = text.split(/\r?\n/u)
@@ -269,7 +322,7 @@ function appendPatchEntry(patchPath, block) {
     return { ok: false, error: 'cordis.patch.yml 不是合法的顶层条目列表，拒绝自动追加' }
   }
   const next = text.endsWith('\n') ? text : `${text}\n`
-  fs.writeFileSync(patchPath, `${next}${block}`)
+  writePatchAtomic(patchPath, `${next}${block}`)
   return { ok: true, error: '' }
 }
 
@@ -278,7 +331,7 @@ function stripRows(patchPath, rowId) {
   try { text = fs.readFileSync(patchPath, 'utf8') } catch { return }
   const blockRe = new RegExp(`^- id: ['"]?${escapeRegExp(rowId)}['"]?\\s*\\r?\\n[ \\t]+disabled: (?:true|false)\\s*\\r?\\n?`, 'mgu')
   const next = text.replace(blockRe, '')
-  if (next !== text) fs.writeFileSync(patchPath, withPlaceholderRestored(next))
+  if (next !== text) writePatchAtomic(patchPath, withPlaceholderRestored(next))
 }
 
 function stripForceRows(patchPath, rowId) {
@@ -286,7 +339,7 @@ function stripForceRows(patchPath, rowId) {
   try { text = fs.readFileSync(patchPath, 'utf8') } catch { return { ok: true, error: '' } }
   const blockRe = new RegExp(`^- id: ['"]?${escapeRegExp(rowId)}['"]?\\s*\\r?\\n[ \\t]+disabled: false\\s*\\r?\\n?`, 'mgu')
   const next = text.replace(blockRe, '')
-  if (next !== text) fs.writeFileSync(patchPath, withPlaceholderRestored(next))
+  if (next !== text) writePatchAtomic(patchPath, withPlaceholderRestored(next))
   return { ok: true, error: '' }
 }
 
@@ -330,42 +383,65 @@ function persistDisabled(packageName, disabled) {
   const statePath = marketStatePath()
   const stateDir = path.dirname(statePath)
   const marketInstalled = fs.existsSync(path.join(profileDir(), 'node_modules', 'dshmarket', 'package.json'))
-  if (!marketInstalled && !fs.existsSync(stateDir)) return
+  if (!marketInstalled && !fs.existsSync(stateDir)) return { ok: true, skipped: true }
   let state = {}
-  try {
-    const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'))
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) state = parsed
-  } catch { /* missing or malformed state: recreate the small shape below */ }
+  if (fs.existsSync(statePath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('状态不是对象')
+      state = parsed
+    } catch (err) {
+      // fail-closed：这是 dshmarket 的多键状态文件（分组/区域/安装时间都在里面），
+      // 解析失败时"重建小形状"会把用户的市场设置整份抹掉。
+      log(`market state 不可读，拒绝写入：${(err && err.message) || String(err)}`)
+      return { ok: false, error: '市场状态文件不可读，本次启停未保存' }
+    }
+  }
   const list = Array.isArray(state.disabled) ? state.disabled.filter((item) => typeof item === 'string') : []
   const next = disabled
     ? (list.includes(packageName) ? list : [...list, packageName])
     : list.filter((item) => item !== packageName)
   state.disabled = next
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  fs.writeFileSync(statePath, JSON.stringify(state))
+  try {
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    if (fs.existsSync(statePath)) { try { fs.copyFileSync(statePath, statePath + '.bak-dshl') } catch { /* noop */ } }
+    writeFileAtomicSync(statePath, JSON.stringify(state))
+  } catch (err) {
+    const message = (err && err.message) || String(err)
+    log('market state 写入失败：' + message)
+    return { ok: false, error: '市场状态写入失败：' + message }
+  }
+  return { ok: true }
 }
 
 /** Turn one installed bundle plugin on/off through the user patch layer. */
 function setEnabled(packageName, enabled) {
-  const rows = rowIdsForPackage(packageName)
-  const carriers = carrierDisableIds(packageName)
-  if (!rows.length && !carriers.length) return { ok: false, error: '无法识别该插件的加载项，未写入补丁层' }
-  if (enabled) {
-    try { ensureProfileBundle(path.dirname(profileManifestPath()), packageName) }
-    catch (error) { return { ok: false, error: '无法登记插件 bundle：' + error.message } }
+  try {
+    const rows = rowIdsForPackage(packageName)
+    const carriers = carrierDisableIds(packageName)
+    if (!rows.length && !carriers.length) return { ok: false, error: '无法识别该插件的加载项，未写入补丁层' }
+    if (enabled) {
+      try { ensureProfileBundle(path.dirname(profileManifestPath()), packageName) }
+      catch (error) { return { ok: false, error: '无法登记插件 bundle：' + error.message } }
+    }
+    // 先记 durable 选择，再写 patch：中途崩溃时下次 reconcile 会按选择补全。
+    const persisted = persistDisabled(packageName, !enabled)
+    if (persisted && persisted.ok === false) return { ok: false, error: persisted.error || '无法保存启停状态' }
+    const patchPath = defaultPatchPath()
+    for (const rowId of rows) {
+      const result = enabled ? enableRow(patchPath, rowId) : disableRow(patchPath, rowId)
+      if (!result.ok) return result
+    }
+    for (const rowId of carriers) {
+      const result = enabled ? stripForceRows(patchPath, rowId) : forceEnableRow(patchPath, rowId)
+      if (!result.ok) return result
+    }
+    return { ok: true, rows, carriers }
+  } catch (err) {
+    const message = (err && err.message) || String(err)
+    log('补丁层写入失败：' + message)
+    return { ok: false, error: '补丁层写入失败：' + message }
   }
-  // 先记 durable 选择，再写 patch：中途崩溃时下次 reconcile 会按选择补全。
-  persistDisabled(packageName, !enabled)
-  const patchPath = defaultPatchPath()
-  for (const rowId of rows) {
-    const result = enabled ? enableRow(patchPath, rowId) : disableRow(patchPath, rowId)
-    if (!result.ok) return result
-  }
-  for (const rowId of carriers) {
-    const result = enabled ? stripForceRows(patchPath, rowId) : forceEnableRow(patchPath, rowId)
-    if (!result.ok) return result
-  }
-  return { ok: true, rows, carriers }
 }
 
 /** Persist DSH market's enabled/disabled choices onto the patch layer for managed plugins. */
@@ -412,32 +488,45 @@ function reconcileDisabledPackages(packageNames = []) {
 /** Remove only stale carrier force-enable rows after a version change. */
 function pruneCarrierForces(rowIds = []) {
   const rows = [...new Set((Array.isArray(rowIds) ? rowIds : []).filter((id) => ROW_ID_RE.test(id)))]
+  let error = ''
   if (rows.length) {
-    const patchPath = defaultPatchPath()
-    for (const rowId of rows) stripForceRows(patchPath, rowId)
+    try {
+      const patchPath = defaultPatchPath()
+      for (const rowId of rows) stripForceRows(patchPath, rowId)
+    } catch (err) { error = (err && err.message) || String(err) }
   }
-  return { ok: true, rows }
+  if (error) log('补丁层清理失败（force 行）：' + error)
+  return error ? { ok: false, error, rows } : { ok: true, rows }
 }
 
 /** Remove exactly the supplied toggle rows (stale row ids after an update). */
 function pruneRows(rowIds = []) {
   const rows = [...new Set((Array.isArray(rowIds) ? rowIds : []).filter((id) => ROW_ID_RE.test(id)))]
+  let error = ''
   if (rows.length) {
-    const patchPath = defaultPatchPath()
-    for (const rowId of rows) stripRows(patchPath, rowId)
+    try {
+      const patchPath = defaultPatchPath()
+      for (const rowId of rows) stripRows(patchPath, rowId)
+    } catch (err) { error = (err && err.message) || String(err) }
   }
-  return { ok: true, rows }
+  if (error) log('补丁层清理失败：' + error)
+  return error ? { ok: false, error, rows } : { ok: true, rows }
 }
 
-/** Remove all toggle rows for a package (uninstall / stale-id cleanup). */
+/** Remove all toggle rows for a package (uninstall / stale-id cleanup). 不抛错：调用方按 ok 处理。 */
 function removeRows(packageName, previousRows = [], previousCarriers = []) {
   const rows = new Set([...(Array.isArray(previousRows) ? previousRows : []), ...rowIdsForPackage(packageName)])
   const carriers = new Set([...(Array.isArray(previousCarriers) ? previousCarriers : []), ...carrierDisableIds(packageName)])
-  const patchPath = defaultPatchPath()
-  for (const rowId of rows) stripRows(patchPath, rowId)
-  for (const rowId of carriers) stripForceRows(patchPath, rowId)
-  persistDisabled(packageName, false)
-  return { ok: true, rows: [...rows], carriers: [...carriers] }
+  let error = ''
+  try {
+    const patchPath = defaultPatchPath()
+    for (const rowId of rows) stripRows(patchPath, rowId)
+    for (const rowId of carriers) stripForceRows(patchPath, rowId)
+  } catch (err) { error = (err && err.message) || String(err) }
+  const persisted = persistDisabled(packageName, false)
+  if (!error && persisted && persisted.ok === false) error = persisted.error
+  if (error) log('补丁层清理失败：' + error)
+  return error ? { ok: false, error, rows: [...rows], carriers: [...carriers] } : { ok: true, rows: [...rows], carriers: [...carriers] }
 }
 
 module.exports = {

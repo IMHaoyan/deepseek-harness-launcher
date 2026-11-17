@@ -5,7 +5,8 @@
 // 页面里的按钮 title 可能是 DSH 解析后的原文（含 `#L24` 已被上游剥掉、含前斜杠的 Windows 路径等），
 // 这里统一成一个可直接交给 shell.openPath / shell.showItemInFolder 的路径，并把拒绝理由说清楚。
 //
-// 触发面只有浏览器视图 preload 的 Ctrl/Cmd+点击（页面脚本拿不到 IPC），本模块不是通用文件打开 API。
+// 触发面只有浏览器视图 preload 的 Ctrl/Cmd+点击（preload 只认 isTrusted 的真实用户手势；
+// 页面脚本拿不到 IPC），本模块不是通用文件打开 API。UNC 路径一律拒绝：打开它会触发远程 SMB 认证。
 'use strict'
 
 const MAX_PATH_LENGTH = 4096
@@ -13,8 +14,6 @@ const MODES = new Set(['open', 'reveal'])
 
 /** Windows 本地绝对路径：盘符（C:/ 或 C:\）。 */
 const DRIVE_PATH = /^[A-Za-z]:[\\/]/u
-/** UNC 路径：\\server\share\...（两个反斜杠开头且 server 非空）。 */
-const UNC_PATH = /^\\\\[^\\/]+[\\/][^\\/]/u
 
 /**
  * 把 `file:///C:/a/b.exe` 还原成 `C:/a/b.exe`；不是 file: 原样返回；无法解析返回空串。
@@ -50,7 +49,8 @@ function classifyOpenRequest(payload, platform = process.platform) {
   if (/[\u0000-\u001f\u007f]/u.test(raw)) return { ok: false, mode, path: '', error: '路径包含控制字符' }
   const decoded = decodeFileUrl(raw)
   if (!decoded) return { ok: false, mode, path: '', error: '无法解析 file: 地址' }
-  const windowsAbsolute = DRIVE_PATH.test(decoded) || UNC_PATH.test(decoded)
+  if (decoded.startsWith('\\\\')) return { ok: false, mode, path: '', error: '不接受 UNC 路径' }
+  const windowsAbsolute = DRIVE_PATH.test(decoded)
   const posixAbsolute = platform !== 'win32' && decoded.startsWith('/') && !decoded.startsWith('//')
   if (!windowsAbsolute && !posixAbsolute) return { ok: false, mode, path: '', error: '只接受本地绝对路径' }
   return { ok: true, mode, path: decoded }

@@ -4,7 +4,7 @@
 //                          DshServer.cs（服务生命周期） TcpPid.cs（端口→PID） Bridge.cs（命令桥）
 'use strict'
 
-const { app, BrowserWindow, WebContentsView, Tray, Menu, Notification, shell, ipcMain, nativeImage, nativeTheme, clipboard, screen, dialog } = require('electron')
+const { app, BrowserWindow, WebContentsView, Tray, Menu, Notification, shell, ipcMain, nativeImage, nativeTheme, clipboard, screen, dialog, session } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
@@ -281,7 +281,7 @@ function maybeStartDeferred() {
     startWhenReady = false
     log('environment became ready, starting deferred service')
     void handleStart().then((ok) => { if (ok) return maybeAutoInstallRecommendedPlugins() }) // 基础服务启动完成后，同批补装全部预装插件
-    void maybeRemoveRetiredPlugins() // 退役插件（会话归档 / MCP Lens）同样补卸
+    void maybeRemoveRetiredPlugins() // 退役插件（MCP Lens）同样补卸
   }
 }
 
@@ -525,7 +525,7 @@ function applyConfigJson(cfg) {
   // 推荐插件（npm 分发）默认自动安装记账：每个启动器版本只自动尝试一次；
   // pluginAutoDeclined 记「用户手动卸载过」的插件 id，卸载过的以后不再自动装回来（手动装回来会清除）。
   if (typeof cfg.pluginAutoInstallTriedVersion === 'string') Config.pluginAutoInstallTriedVersion = cfg.pluginAutoInstallTriedVersion
-  // 退役插件（已从注册表摘掉的会话归档 / MCP Lens）自动卸载记账：清理成功才写，失败下次启动再补
+  // 退役插件（已从注册表摘掉的 MCP Lens）自动卸载记账：清理成功才写，失败下次启动再补
   if (typeof cfg.pluginRetiredCleanupVersion === 'string') Config.pluginRetiredCleanupVersion = cfg.pluginRetiredCleanupVersion
   if (cfg.pluginAutoDeclined && typeof cfg.pluginAutoDeclined === 'object' && !Array.isArray(cfg.pluginAutoDeclined)) {
     for (const [id, val] of Object.entries(cfg.pluginAutoDeclined)) {
@@ -554,17 +554,63 @@ function applyConfigJson(cfg) {
   if (typeof cfg.notifiedDshVersion === 'string') Config.notifiedDshVersion = cfg.notifiedDshVersion
 }
 
+/** 原子落盘：同目录临时文件 → fsync → rename。失败抛错，由调用方决定语义。 */
+function writeFileAtomicSync(file, text, mode) {
+  const dir = path.dirname(file)
+  fs.mkdirSync(dir, { recursive: true })
+  const temp = `${file}.tmp-${process.pid}-${Date.now()}`
+  let fd
+  try {
+    fd = fs.openSync(temp, 'w', mode === undefined ? 0o600 : mode)
+    fs.writeFileSync(fd, text)
+    try { fs.fsyncSync(fd) } catch { /* 某些文件系统不支持 fsync：rename 仍是原子的 */ }
+    fs.closeSync(fd)
+    fd = undefined
+    fs.renameSync(temp, file)
+  } catch (err) {
+    try { if (fd !== undefined) fs.closeSync(fd) } catch { /* noop */ }
+    try { fs.unlinkSync(temp) } catch { /* noop */ }
+    throw err
+  }
+}
+
 function loadConfig() {
   firstRun = !fs.existsSync(CONFIG_PATH)
   if (firstRun) return
+  let text = ''
   try {
-    applyConfigJson(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+    text = fs.readFileSync(CONFIG_PATH, 'utf8')
+  } catch (err) {
+    // 读失败不是"配置坏了"：可能是权限/占用，别动文件，也别把默认值写回去。
+    log('config read failed, using defaults: ' + ((err && err.message) || String(err)))
+    return
+  }
+  try {
+    applyConfigJson(JSON.parse(text))
     if (configMigrationPending) {
       configMigrationPending = false
       saveConfig() // 立刻落盘迁移标记：避免下次启动又按旧默认值判断一遍
       log(`config migrated: nodeMajor → ${Config.nodeMajor}（Node.js LTS）`)
     }
-  } catch { log('config parse failed, using defaults') }
+  } catch (err) {
+    // JSON 语法错误才是真的损坏：留一份备份、用默认值重建一份可用配置，并让用户知道。
+    // 其他异常（applyConfigJson 内部）只记日志，不覆盖原文件。
+    const corrupt = err instanceof SyntaxError
+    let backup = ''
+    if (corrupt) {
+      backup = `${CONFIG_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/gu, '-')}`
+      try { fs.copyFileSync(CONFIG_PATH, backup) } catch { backup = '' }
+      try { writeFileAtomicSync(CONFIG_PATH, JSON.stringify(Config, null, 2)) } catch { /* noop */ }
+    }
+    log('config parse failed, using defaults' + (backup ? '（已备份为 ' + path.basename(backup) + '）' : '') + '：' + ((err && err.message) || String(err)))
+    if (corrupt && !SELF_TEST) {
+      notify('DeepSeek Harness Launcher',
+        backup
+          ? `配置文件损坏，已备份为 ${path.basename(backup)}，本次以默认设置运行`
+          : '配置文件损坏，本次以默认设置运行',
+        undefined, 'recovery')
+    }
+  }
 }
 
 // 健康快照恢复后：从磁盘重新加载配置到内存 Config（避免"文件已回退、内存还是旧值"的错位）
@@ -579,12 +625,24 @@ function mergeConfigFromDisk() {
   } catch (err) { log('config reload failed: ' + err.message) }
 }
 
+let configSaveWarned = false
+function warnConfigSaveFailure(message) {
+  if (configSaveWarned || SELF_TEST) return
+  configSaveWarned = true
+  notify('DeepSeek Harness Launcher',
+    `设置未能保存到磁盘（${String(message).slice(0, 80)}）：本次修改只在当前运行有效`, undefined, 'recovery')
+}
+
 function saveConfig() {
   try {
-    fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true })
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(Config, null, 2))
+    writeFileAtomicSync(CONFIG_PATH, JSON.stringify(Config, null, 2))
     return true
-  } catch (err) { log('failed to save config: ' + err.message); return false }
+  } catch (err) {
+    const message = (err && err.message) || String(err)
+    log('failed to save config: ' + message)
+    warnConfigSaveFailure(message)
+    return false
+  }
 }
 
 function defaultHarnessRoot() {
@@ -1221,37 +1279,51 @@ async function startServerInner(occupantRetry = 0) {
   }
   // 「手机连接」旧版随包 payload → 一次性迁移到 npm 版本；再给已装的 npm 版打运行时补丁
   // （设置左栏入口 / 直接铺开面板 / 嵌套弹层关闭 / 进程查询修复）。任何一步失败都不阻断启动。
-  try {
-    await maybeMigrateBridgePayloadInstall()
-  } catch (err) {
-    log('bridge: 迁移检查异常（不阻断启动）：' + ((err && err.message) || String(err)))
-  }
-  try {
-    bridgePatch.apply({ profileDir: DSH_PROFILE_DIR, log })
-  } catch (err) {
-    log('bridge: 运行时补丁异常（不阻断启动）：' + ((err && err.message) || String(err)))
-  }
-  // 桌面快捷键模式（Config.desktopShell）：连接快捷键持久化桥 + 安装 Host 侧登录辅助 bundle。
-  // 必须在 spawn 之前完成：preload 的同步配置只认"桥就绪 + 登录辅助已被本代服务加载"，
-  // 且 profile 改写不能有 dsh 进程占用。任何一步失败都 fail-closed → 本次按 web runtime 运行
-  // （登录行为不变，绝不出现"桌面快捷键可用但登录退化"的半套状态）。
-  if (Config.desktopShell && !SELF_TEST) {
-    const prepared = await ensureDesktopShellPrepared()
-    if (!prepared.ok) {
-      setDesktopShellGate(false, 'bridge-not-ready', 'start')
-      log('desktop-shell: 桥未就绪，本次按 web runtime 运行：' + (prepared.error || '未知原因'))
-    } else {
-      const signin = await ensureDesktopSigninInstalled()
-      if (signin.ok) {
-        setDesktopShellGate(true, 'managed-service', 'start')
-        log('desktop-shell: 已启用（自管服务 + 登录辅助 v' + (signin.version || '?') + '）')
-      } else {
-        setDesktopShellGate(false, 'signin-install-failed', 'start')
-        log('desktop-shell: 登录辅助未安装，本次按 web runtime 运行（登录保持网页模式）')
+  //
+  // 这些写入必须在 profile 写锁内：控制台可能正好在装/卸插件（pnpm 正在改写同一棵树），
+  // 两路并发写 profile 正是"装完插件 DSH 就起不来"的来源。拿不到锁就跳过本次辅助写入，
+  // 绝不并发；下次启动会再补。
+  const releaseProfileWrite = tryBeginProfileOp('启动前 profile 写入', { skipSnapshot: true })
+  if (!releaseProfileWrite) {
+    log('启动前 profile 写入跳过：另一个插件操作正在改写 profile（下次启动再补）')
+    if (!SELF_TEST) setDesktopShellGate(false, Config.desktopShell ? 'profile-busy' : 'disabled', 'start')
+  } else {
+    try {
+      try {
+        await maybeMigrateBridgePayloadInstall()
+      } catch (err) {
+        log('bridge: 迁移检查异常（不阻断启动）：' + ((err && err.message) || String(err)))
       }
+      try {
+        bridgePatch.apply({ profileDir: DSH_PROFILE_DIR, log })
+      } catch (err) {
+        log('bridge: 运行时补丁异常（不阻断启动）：' + ((err && err.message) || String(err)))
+      }
+      // 桌面快捷键模式（Config.desktopShell）：连接快捷键持久化桥 + 安装 Host 侧登录辅助 bundle。
+      // 必须在 spawn 之前完成：preload 的同步配置只认"桥就绪 + 登录辅助已被本代服务加载"，
+      // 且 profile 改写不能有 dsh 进程占用。任何一步失败都 fail-closed → 本次按 web runtime 运行
+      // （登录行为不变，绝不出现"桌面快捷键可用但登录退化"的半套状态）。
+      if (Config.desktopShell && !SELF_TEST) {
+        const prepared = await ensureDesktopShellPrepared()
+        if (!prepared.ok) {
+          setDesktopShellGate(false, 'bridge-not-ready', 'start')
+          log('desktop-shell: 桥未就绪，本次按 web runtime 运行：' + (prepared.error || '未知原因'))
+        } else {
+          const signin = await ensureDesktopSigninInstalled()
+          if (signin.ok) {
+            setDesktopShellGate(true, 'managed-service', 'start')
+            log('desktop-shell: 已启用（自管服务 + 登录辅助 v' + (signin.version || '?') + '）')
+          } else {
+            setDesktopShellGate(false, 'signin-install-failed', 'start')
+            log('desktop-shell: 登录辅助未安装，本次按 web runtime 运行（登录保持网页模式）')
+          }
+        }
+      } else if (!SELF_TEST) {
+        setDesktopShellGate(false, 'disabled', 'start')
+      }
+    } finally {
+      try { releaseProfileWrite() } catch { /* noop */ }
     }
-  } else if (!SELF_TEST) {
-    setDesktopShellGate(false, 'disabled', 'start')
   }
   // 环境/插件准备期间也可能收到退出或停止，不能晚到再启动一个无人收尾的孩子。
   if (reallyExit || serviceStopping() || server.gen !== startGeneration) return false
@@ -2517,7 +2589,8 @@ async function executeRepair(previewId) {
         const beforeCarriers = pluginSwitch.carrierDisableIds(name)
         const r = await market.uninstallByName(name)
         if (!r || !r.ok) { failed.push(name); continue }
-        pluginSwitch.removeRows(name, beforeRows, beforeCarriers)
+        const cleaned = pluginSwitch.removeRows(name, beforeRows, beforeCarriers)
+        if (cleaned && cleaned.ok === false) log('recovery: 补丁层清理失败（不影响卸载结果）：' + cleaned.error)
         done.push(name)
       }
       if (!done.length) return { ok: false, error: '这些插件都没能卸载成功；请查看日志' }
@@ -2645,6 +2718,10 @@ async function maybeAutoRestart() {
     notify('DeepSeek Harness', '服务已自动重启', WEB_URL, 'recovery')
   } else {
     log('auto-restart failed')
+    // 这一次自己也没起来：不能停在"既不重启、也不声明停止"的僵尸态。
+    // 还有额度就按冷却重试；额度用尽走显式终态（haltAutoRestart 会通知并让托盘显示"自动恢复已停止"）。
+    if (restartAttemptsInWindow() >= RESTART_MAX) haltAutoRestart()
+    else scheduleRestartRetry(5000, 'auto-restart failed')
     broadcastState()
     void refreshWebUiPhase() // 重启失败：说明页切到"服务未启动"状态
   }
@@ -3003,8 +3080,9 @@ function saveCrashDiagnostics() {
 const PROFILE_BUSY_ERROR = '另一个插件操作正在进行，请等它结束后再试'
 let profileOp = null // { label, at }；null = 空闲
 
-/** 尝试占用 profile 写锁。成功返回 release()，失败返回 null。 */
-function tryBeginProfileOp(label) {
+/** 尝试占用 profile 写锁。成功返回 release()，失败返回 null。
+ *  opts.skipSnapshot：启动前那批辅助写入用（此刻服务还没起来，落点本来也不存在）。 */
+function tryBeginProfileOp(label, opts = {}) {
   if (profileOp !== null) return null
   // 重新选择后的基础启动/安装排队也是 profile 操作的一部分；其它写入口不能插队。
   // 只有统一预装驱动可把该队列接管为真实写锁（标签由主进程固定，不来自 IPC）。
@@ -3012,7 +3090,7 @@ function tryBeginProfileOp(label) {
   // ★ 拿到写锁之后、动 profile **之前**先落一个回退点。放在这里是因为它是所有改 profile 的
   //   统一入口（一键安装/一键更新/单个装卸启停都从这里进），一处插入覆盖全部 —— 不用在
   //   每个写入口各补一次（那种补法必然会漏掉一个）。落点失败不阻断。
-  capturePreWriteSnapshot(String(label || '插件操作'))
+  if (opts.skipSnapshot !== true) capturePreWriteSnapshot(String(label || '插件操作'))
   const token = { label: String(label || '插件操作'), at: Date.now() }
   profileOp = token
   let released = false
@@ -3370,9 +3448,18 @@ async function installManagedMarket(opts = {}) {
     const afterCarriers = pluginSwitch.carrierDisableIds(market.PLUGIN_NAME)
     const staleRows = beforeRows.filter((rowId) => !afterRows.includes(rowId))
     const staleCarriers = beforeCarriers.filter((rowId) => !afterCarriers.includes(rowId))
-    if (staleRows.length) pluginSwitch.pruneRows(staleRows)
-    if (staleCarriers.length) pluginSwitch.pruneCarrierForces(staleCarriers)
-    if (wasDisabled) pluginSwitch.setEnabled(market.PLUGIN_NAME, false)
+    if (staleRows.length) {
+      const cleaned = pluginSwitch.pruneRows(staleRows)
+      if (cleaned && cleaned.ok === false) log('plugins: 清理市场旧开关行失败：' + cleaned.error)
+    }
+    if (staleCarriers.length) {
+      const cleaned = pluginSwitch.pruneCarrierForces(staleCarriers)
+      if (cleaned && cleaned.ok === false) log('plugins: 清理市场载体行失败：' + cleaned.error)
+    }
+    if (wasDisabled) {
+      const restored = pluginSwitch.setEnabled(market.PLUGIN_NAME, false)
+      if (restored && restored.ok === false) log('plugins: 恢复插件市场禁用状态失败：' + restored.error)
+    }
     Config.pluginMarketDeclined = false
     try { saveConfig() } catch { /* noop */ }
   }
@@ -3395,7 +3482,8 @@ async function uninstallManagedMarket(opts = {}) {
   const beforeCarriers = pluginSwitch.carrierDisableIds(market.PLUGIN_NAME)
   const r = await market.uninstall()
   if (r.ok) {
-    pluginSwitch.removeRows(market.PLUGIN_NAME, beforeRows, beforeCarriers)
+    const cleaned = pluginSwitch.removeRows(market.PLUGIN_NAME, beforeRows, beforeCarriers)
+    if (cleaned && cleaned.ok === false) log('plugins: 插件市场补丁层清理失败：' + cleaned.error)
     Config.pluginMarketDeclined = true
     try { saveConfig() } catch { /* noop */ }
   }
@@ -3421,8 +3509,8 @@ function cleanInstalledVersion(spec) {
 //（见 maybeAutoInstallRecommendedPlugins）；用户手动卸载过就不再自动装回来。
 // 当前默认代装集合：手机连接 / MCP 连接器 / 用量与计费 / 技能管理 / 对话回退（另含插件市场）。
 // 不代装的（卡片不显示预装标签，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、
-// 会话导入、上下文洞察。
-// 从本版本起摘出注册表的两个（会话归档 / MCP Lens）只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
+// 会话导入、上下文洞察、图像生成、电脑操作、会话归档。
+// MCP Lens 已摘出注册表，只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
 // 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
 // tests/plugin-page-wiring.test.js 的默认代装断言与 docs/internals.md 的预装清单。
 const MANAGED_NPM_PLUGINS = [
@@ -3486,6 +3574,17 @@ const MANAGED_NPM_PLUGINS = [
     repo: 'https://github.com/kenz1117/dsh-ui-usage-billing',
   },
   {
+    id: 'image-gen',
+    order: 45,
+    npm: 'dsh-image-gen',
+    name: '图像生成',
+    subtitle: 'dsh-image-gen',
+    description: '把 ChatGPT 式的图片生成带进 DSH：Gemini、OpenAI、Seedream、DashScope 与本地 ComfyUI，可接自定义渠道。',
+    icon: '🖼️',
+    category: '图像生成',
+    repo: 'https://github.com/shanliuling/dsh-image-gen',
+  },
+  {
     id: 'chat-import',
     order: 50,
     npm: 'dsh-chat-import',
@@ -3509,6 +3608,17 @@ const MANAGED_NPM_PLUGINS = [
     repo: 'https://github.com/MichengAI/dsh-skills-manager',
   },
   {
+    id: 'computer-use-win',
+    order: 60,
+    npm: 'dsh-computer-use-win',
+    name: '电脑操作',
+    subtitle: 'dsh-computer-use-win',
+    description: '在 Windows 上读写真实桌面应用：UI Automation 树、截图、输入、OCR 与窗口管理，经 MCP 桥接进 DSH。',
+    icon: '🖱️',
+    category: '桌面自动化',
+    repo: 'https://github.com/Yu-tao-Li/dsh-computer-use-win',
+  },
+  {
     id: 'sidebar-qa',
     order: 65,
     npm: 'dsh-sidebar-qa',
@@ -3530,6 +3640,17 @@ const MANAGED_NPM_PLUGINS = [
     icon: '⏪',
     category: '会话管理',
     repo: 'https://github.com/SiriLee/dsh-rewind',
+  },
+  {
+    id: 'archive-manager',
+    order: 75,
+    npm: '@michengai/dsh-archive-manager',
+    name: '会话归档',
+    subtitle: '@michengai/dsh-archive-manager',
+    description: '归档、恢复、收藏和永久删除会话，并诊断损坏的会话日志。',
+    icon: '🗄️',
+    category: '会话管理',
+    repo: 'https://github.com/MichengAI/dsh-archive-manager',
   },
   {
     id: 'context',
@@ -4067,6 +4188,14 @@ function pluginSetupPlugins() {
     .map(({ id, name, npm, description }) => ({ id, name, npm, description }))
 }
 
+/** 用户亲手卸载过、因此不该在预装选择里默认勾上的 id（只算预装清单里的）。 */
+function pluginSetupDeclinedIds() {
+  const presets = new Set(pluginSetupPlugins().map((p) => p.id))
+  try {
+    return Object.keys(Config.pluginAutoDeclined || {}).filter((id) => presets.has(id))
+  } catch { return [] }
+}
+
 function normalizePluginSetupSelection(selectedIds) {
   const presets = pluginSetupPlugins().map((p) => p.id)
   if (!Array.isArray(selectedIds) || selectedIds.length > 100
@@ -4361,8 +4490,9 @@ async function runAutoInstallPlugins() {
 // 为什么不能只删注册表条目：注册表只决定「页面上有没有这张卡片」，老用户的 profile 里已经装过它们，
 // 不卸载就会继续被 DSH 加载（白占工具位与上下文）。触发点与默认代装完全一致；
 // 失败不记账、下次启动再补；停不下服务时整次跳过且不记账（否则"本版本已试过"会让老插件永远卸不掉）。
+// 会话归档已重新纳入注册表（手动安装项），不能再留在这里 —— 否则新版本启动会把它自动卸掉，
+// 与卡片提供的安装/启停语义直接打架。
 const RETIRED_NPM_PLUGINS = [
-  { id: 'archive-manager', npm: '@michengai/dsh-archive-manager', name: '会话归档' },
   { id: 'mcp-lens', npm: 'dsh-mcp-lens', name: 'MCP Lens' },
 ]
 let retiredPluginCleanupRunning = false
@@ -4435,7 +4565,8 @@ async function maybeRemoveRetiredPlugins() {
       const r = await market.uninstallByName(d.npm)
       if (r && r.ok) {
         // 行/载体强制项跟着一起清：否则残留在 patch 层，以后重装同包会被这些死行影响
-        pluginSwitch.removeRows(d.npm, beforeRows, beforeCarriers)
+        const cleaned = pluginSwitch.removeRows(d.npm, beforeRows, beforeCarriers)
+        if (cleaned && cleaned.ok === false) log('plugins: 退役插件补丁层清理失败：' + cleaned.error)
         removed.push(d.name)
       } else {
         failed.push(d.name + '：' + ((r && r.error) || '未知原因'))
@@ -4519,10 +4650,19 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
     const afterCarriers = pluginSwitch.carrierDisableIds(descriptor.npm)
     const staleRows = beforeRows.filter((rowId) => !afterRows.includes(rowId))
     const staleCarriers = beforeCarriers.filter((rowId) => !afterCarriers.includes(rowId))
-    if (staleRows.length) pluginSwitch.pruneRows(staleRows)
-    if (staleCarriers.length) pluginSwitch.pruneCarrierForces(staleCarriers)
+    if (staleRows.length) {
+      const cleaned = pluginSwitch.pruneRows(staleRows)
+      if (cleaned && cleaned.ok === false) log('plugins: 清理旧开关行失败（下次启动可再清）：' + cleaned.error)
+    }
+    if (staleCarriers.length) {
+      const cleaned = pluginSwitch.pruneCarrierForces(staleCarriers)
+      if (cleaned && cleaned.ok === false) log('plugins: 清理载体覆盖行失败（下次启动可再清）：' + cleaned.error)
+    }
     // 装/更新不能把用户关掉的开关悄悄打开；禁用状态继续压在新版本上。
-    if (wasDisabled) pluginSwitch.setEnabled(descriptor.npm, false)
+    if (wasDisabled) {
+      const restored = pluginSwitch.setEnabled(descriptor.npm, false)
+      if (restored && restored.ok === false) log('plugins: 恢复禁用状态失败：' + restored.error)
+    }
     notePluginAutoDeclined(descriptor.id, false) // 手动装回来 → 以后继续自动维护
     // 「手机连接」装/更新成功后立刻打运行时补丁（设置左栏入口 / 页面形态 / 进程查询修复）；
     // 其它插件不受影响（bridge-patch 只认这一个包）。补丁失败不影响安装结果。
@@ -4534,8 +4674,11 @@ async function runNpmPluginAction(descriptor, action, opts = {}) {
   if (action === 'uninstall') {
     const r = await market.uninstallByName(descriptor.npm)
     if (!r.ok) return r
-    pluginSwitch.removeRows(descriptor.npm, beforeRows, beforeCarriers)
-    notePluginAutoDeclined(descriptor.id, true) // 用户明确卸载 → 以后不再自动装回来
+    // 先记「用户明确卸载」再清理补丁层：补丁层写失败不能把这次卸载降级成失败，
+    // 更不能让下一次启动把它当成"缺失的预装插件"装回来。
+    notePluginAutoDeclined(descriptor.id, true)
+    const cleaned = pluginSwitch.removeRows(descriptor.npm, beforeRows, beforeCarriers)
+    if (cleaned && cleaned.ok === false) log('plugins: 补丁层清理失败（不影响卸载回执，下次启动可再清）：' + cleaned.error)
     if (opts.defer) deferPluginChange('uninstall', descriptor.npm, descriptor.name)
     else await applyPluginChange('uninstall', '', { name: descriptor.npm, profile: market.PROFILE_NAME, logTag: 'plugins', label: descriptor.name })
     return { ok: true }
@@ -4604,7 +4747,8 @@ async function dispatchManagedPluginAction(id, action, opts = {}) {
       if (!stop.ok) return stop
       const r = await market.uninstallByName(npm)
       if (!r || !r.ok) return r || { ok: false, error: '卸载失败' }
-      pluginSwitch.removeRows(npm, beforeRows, beforeCarriers)
+      const cleaned = pluginSwitch.removeRows(npm, beforeRows, beforeCarriers)
+      if (cleaned && cleaned.ok === false) log('plugins: 补丁层清理失败（不影响卸载回执）：' + cleaned.error)
       if (defer) deferPluginChange('uninstall', npm, label)
       else await applyPluginChange('uninstall', '', { name: npm, profile: market.PROFILE_NAME, logTag: 'plugins', label })
       return { ok: true }
@@ -6440,6 +6584,7 @@ function openWebUi(opts = {}) {
   // session-end 只派发到窗口上（App 没有这个事件）：关机/注销时靠它清掉 active-run 标记。
   // 主窗口常驻，所以这一个挂点覆盖了"关掉窗口只剩托盘"的情形；处理体见文件末尾的 onSessionEnd。
   webWin.on('session-end', onSessionEnd)
+  guardChromeNavigation(webWin.webContents, 'shell')
   // 控制台视图与窗口同生命周期：窗口创建后即可懒加载 index.html，但只有 showConsole 时才挂到标题栏下方。
   consoleSurfaceHandle = createConsoleSurface({
     ownerWindow: webWin,
@@ -6449,6 +6594,7 @@ function openWebUi(opts = {}) {
     onError: (err) => log('console surface: ' + (err && err.message ? err.message : String(err))),
     onWebContents: (wc) => {
       attachContextMenu(wc, true) // 控制台保留旧面板的右键编辑/刷新/DevTools
+      guardChromeNavigation(wc, 'console')
       wc.on('before-input-event', (e, input) => {
         if (input.type === 'keyDown' && input.key === 'F12') {
           e.preventDefault()
@@ -6660,7 +6806,7 @@ function stateJson() {
     bootFailure: bootFailureState(),
     version: app.getVersion(),
     firstRun: firstRun,
-    pluginSetup: { ...pluginSetup, choice: Config.pluginSetupChoice, selectedIds: Config.pluginSetupSelectedIds },
+    pluginSetup: { ...pluginSetup, choice: Config.pluginSetupChoice, selectedIds: Config.pluginSetupSelectedIds, declined: pluginSetupDeclinedIds() },
     pluginSetupPlugins: pluginSetupPlugins(),
     autostart: autostartEnabled(),
     notify: Config.notify,
@@ -7082,18 +7228,58 @@ function buildFeedbackPack(text, contact, includeLogs) {
 // 唯一例外：说明页（loading.html）挂在标签视图里，webContents 不等于控制台/窗口壳，它自己那几条
 // 按钮要能用——按"必须是本机 loading.html 且只放行白名单命令"放行（trust.js 的 LOADING_PAGE_COMMANDS）。
 const LOADING_PAGE_URL = pathToFileURL(path.join(WWWROOT, 'loading.html')).href
+// 控制台/窗口壳只允许停留本机 wwwroot 页面（senderOf 与导航守卫共用这一份判据）。
+const WWWROOT_URL = pathToFileURL(WWWROOT).href
+function isLocalWwwrootUrl(url) {
+  const value = String(url || '')
+  return value === WWWROOT_URL || value.startsWith(WWWROOT_URL + '/')
+}
+
+/**
+ * 受信任的本地页面（控制台 / 窗口壳）一律禁止导航到外部内容：
+ * 它们的 webContents 身份等于"自己人"，一旦被导航到网页，preload 桥会跟着新文档重装，
+ * 外部页面就能调 `dsh:cmd`。命中外部 http(s) 时改交系统浏览器，行为不比原来差。
+ */
+function guardChromeNavigation(wc, label) {
+  if (!wc || typeof wc.on !== 'function') return
+  const block = (event, url) => {
+    const target = String(url || '')
+    try { event.preventDefault() } catch { /* noop */ }
+    log(`${label}: 拦截页面导航到 ${target.slice(0, 200)}`)
+    if (/^https?:\/\//iu.test(target)) { try { void shell.openExternal(target) } catch { /* noop */ } }
+  }
+  const check = (event, url) => { if (!isLocalWwwrootUrl(url)) block(event, url) }
+  try { wc.on('will-navigate', check) } catch { /* noop */ }
+  try { wc.on('will-redirect', check) } catch { /* noop */ }
+}
+
+// 页面不需要摄像头/麦克风/屏幕共享/定位/串口……这些默认策略会直接授予；这里只放行确实用得到的几项。
+const ALLOWED_PERMISSIONS = new Set(['notifications', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen', 'pointerLock'])
+function installPermissionPolicy() {
+  try {
+    const ses = session.defaultSession
+    ses.setPermissionRequestHandler((_wc, permission, callback) => {
+      try { callback(ALLOWED_PERMISSIONS.has(String(permission))) } catch { /* noop */ }
+    })
+    ses.setPermissionCheckHandler((_wc, permission) => ALLOWED_PERMISSIONS.has(String(permission)))
+  } catch (err) { log('permission policy init failed: ' + ((err && err.message) || String(err))) }
+}
 
 function senderOf(event) {
   try {
     const wc = event.sender
     if (!wc || wc.isDestroyed()) return { kind: 'none' } // 销毁中的发送方一律按不可信处理
-    if (consoleSurfaceHandle && consoleSurfaceHandle.view() && wc === consoleSurfaceHandle.view().webContents) return { kind: 'console' }
-    if (webWin && !webWin.isDestroyed() && wc === webWin.webContents) return { kind: 'shell' }
-    if (webTabs.some((t) => t.view && t.view.webContents === wc)) {
-      let url = ''
-      try { url = wc.getURL() || '' } catch { /* 取不到 URL → 按"不是说明页"处理 */ }
-      return { kind: 'tab', url }
+    let url = ''
+    try { url = wc.getURL() || '' } catch { /* 取不到 URL → 按不可信处理 */ }
+    // 身份 + 内容双重判定：控制台/窗口壳只在自己那份本地页面上才算"自己人"。
+    // 只看 webContents 身份的话，页面被导航到外部站点后，新文档会继承 preload 桥却仍被当成自己人。
+    if (consoleSurfaceHandle && consoleSurfaceHandle.view() && wc === consoleSurfaceHandle.view().webContents) {
+      return { kind: isLocalWwwrootUrl(url) ? 'console' : 'none', url }
     }
+    if (webWin && !webWin.isDestroyed() && wc === webWin.webContents) {
+      return { kind: isLocalWwwrootUrl(url) ? 'shell' : 'none', url }
+    }
+    if (webTabs.some((t) => t.view && t.view.webContents === wc)) return { kind: 'tab', url }
     return { kind: 'none' }
   } catch { return { kind: 'none' } }
 }
@@ -7177,7 +7363,14 @@ function registerIpc() {
   // 并与 file-open.js 一起把路径收成"存在的本地绝对路径"——失败只回执原因并记日志。
   ipcMain.on('dshl:file-open:origin', (event) => {
     try {
-      event.returnValue = { host: HOST, port: String(PORT) }
+      // 只回答我们自己创建的视图（preload 在文档加载早期同步问这一句，此时 URL 还不保证已提交，
+      // 所以这里按 webContents 身份判定；即便被外部页面读到，也只有它自己的 host/port）。
+      const wc = event && event.sender
+      const known = !!wc && !wc.isDestroyed() && (
+        webTabs.some((tab) => tab && tab.view && tab.view.webContents === wc)
+        || (webWin && !webWin.isDestroyed() && wc === webWin.webContents)
+        || (consoleSurfaceHandle && consoleSurfaceHandle.view() && wc === consoleSurfaceHandle.view().webContents))
+      event.returnValue = known ? { host: HOST, port: String(PORT) } : null
     } catch {
       event.returnValue = null
     }
@@ -7264,6 +7457,8 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'browser:paneToTab': webPaneToTab(value && value.id); return '{}'
         case 'browser:fixPane': await webReloadPane(value && value.id); return '{}'
         case 'browser:restartDsh': {
+          // 插件操作正在改写 profile 时不允许重启：启动路径会补写 profile，两路并发正是起不来的来源。
+          if (profileOpBusy()) return JSON.stringify(profileBusyError())
           // 独立窗口标题栏的「重启 DSH」：与控制台同一入口（停 → 起 → 刷新窗口）
           const r = await restartDshForConsole()
           // 环境未就绪 / 端口被占用：说明页给不出下一步动作，直接打开控制台对应页面
@@ -7298,8 +7493,12 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           return '{}'
         }
         case 'browser:winClose': if (webWin && !webWin.isDestroyed()) { try { webWin.hide() } catch { /* noop */ } } return '{}'
-        case 'start': return JSON.stringify(await startForConsole())
-        case 'restartDsh': return JSON.stringify(await restartDshForConsole())
+        case 'start':
+          if (profileOpBusy()) return JSON.stringify(profileBusyError())
+          return JSON.stringify(await startForConsole())
+        case 'restartDsh':
+          if (profileOpBusy()) return JSON.stringify(profileBusyError())
+          return JSON.stringify(await restartDshForConsole())
         case 'stop': {
           // 停止中重复点击：直接返回，不再重复 taskkill / 重复弹"服务已停止"通知
           if (serviceStopping()) {
@@ -7805,6 +8004,19 @@ function requestExit(reason = 'tray') {
     try {
       stopFlash()
       saveWebWindowState()
+      // 退出前先认领并结束自己拉起的安装子进程：否则 npm/pnpm 会带着它的子树继续写全局目录，
+      // 与下次启动的自动修复并发改写同一棵树。
+      try {
+        const job = envInstall.getJob()
+        if (job && job.job && job.job.status === 'running') {
+          log('退出收尾：取消正在运行的安装任务')
+          try { envInstall.cancelInstall() } catch (err) { log('退出收尾：取消安装任务失败：' + ((err && err.message) || String(err))) }
+        }
+      } catch { /* 读不到任务状态不阻断退出 */ }
+      if (dshUpdater.getState().status === 'updating') {
+        log('退出收尾：DSH 更新尚未完成 —— 更新事务已落盘，下次启动会按事务状态自愈')
+        notify('DeepSeek Harness', 'DSH 更新尚未完成，退出后下次启动会自动修复', undefined, 'recovery')
+      }
       await stopServerFast() // 包括正在启动/交接的世代；外部接管服务保持不动
       stopped = true
     } catch (err) {
@@ -8546,6 +8758,7 @@ function init() {
   health.initHealth({ configPath: CONFIG_PATH, snapshotDir: HEALTH_SNAPSHOT_DIR, extraFiles: healthExtraFiles(), log })
   diagnostics.initDiagnostics({ dir: DIAG_DIR, log })
   registerIpc()
+  installPermissionPolicy()
   // 桌面壳桥（desktop-shell.js）：给 DSH 页面提供 data-platform + dshDesktop.keyboard/shortcuts。
   // ipc handler 必须早于任何窗口创建；真正的连接在环境就绪后由 ensureDesktopShellPrepared() 完成，
   // 失败则页面按 web runtime 加载（fail-closed）。
