@@ -575,31 +575,50 @@ function verifyUpgradedNode(input) {
 async function runElevatedMsi(msiPath, logPath, opts = {}) {
   const ps = (p) => String(p).replace(/'/g, "''")
   const resultFile = path.join(os.tmpdir(), `dshl-msi-${process.pid}-${Date.now()}.txt`)
-  const inner = [
+  // 内层脚本在**提权进程**里执行：msiexec 与 Corepack 残留清理都在同一个管理员会话中完成。
+  // 不能写成 "Start-Process msiexec -Verb RunAs" 之后在非提权父进程里删文件 —— 那样只有
+  // msiexec 是管理员，清理仍会因 Program Files 权限失败（本地管理员环境测不出来）。
+  const elevatedScript = [
     `$r = '${ps(resultFile)}'`,
     'try {',
-    `  $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i','${ps(msiPath)}','/qn','/norestart','/l*v','${ps(logPath)}') -Verb RunAs -Wait -PassThru`,
-    // 与 MSI 共用同一次管理员授权清理旧版 Corepack 的 pnpm shim：
-    // Node 25/26 不再内置 Corepack，升级后这些 shim 指向已删除的目标，却排在 PATH 前面遮蔽全局 pnpm。
-    // 放在这里而不是安装后再删：Program Files 需要管理员权限，单独再弹一次 UAC 对用户是额外打扰。
+    `  $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i','${ps(msiPath)}','/qn','/norestart','/l*v','${ps(logPath)}') -Wait -PassThru`,
+    // Node 25/26 不再内置 Corepack：MSI major upgrade 会留下旧版 shim（内容指向 node_modules/corepack/dist/pnpm.js），
+    // 它们排在 PATH 前面遮蔽全局 pnpm。判据必须同时是"标准 shim 形状 + 目标确实不存在 + 小文件"。
     '  if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {',
     '    $dir = $null',
     `    try { $dir = (Get-ItemProperty 'HKLM:\\SOFTWARE\\Node.js' -ErrorAction Stop).InstallPath } catch {}`,
     `    if (-not $dir) { $dir = Join-Path $env:ProgramFiles 'nodejs' }`,
     `    if ($dir -and -not (Test-Path (Join-Path $dir 'node_modules\\corepack\\dist\\pnpm.js'))) {`,
+    '      $removed = @()',
     `      foreach ($n in @('pnpm','pnpm.cmd','pnpm.ps1')) {`,
     '        $f = Join-Path $dir $n',
-    `        if (Test-Path -LiteralPath $f) {`,
-    `          $t = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue`,
-    `          if ($t -match 'corepack') { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }`,
+    '        if (Test-Path -LiteralPath $f) {',
+    `          $fi = Get-Item -LiteralPath $f -ErrorAction SilentlyContinue`,
+    '          if ($fi -and $fi.Length -le 4096) {',
+    `            $t = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue`,
+    `            if ($t -match 'node_modules[\\\\/]+corepack[\\\\/]+dist[\\\\/]+pnpm\\.(js|cjs|mjs)') {`,
+    `              Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue`,
+    '              if (-not (Test-Path -LiteralPath $f)) { $removed += $n }',
+    '            }',
+    '          }',
     '        }',
     '      }',
+    `      ('CLEANUP=' + ($removed -join ',')) | Out-File -FilePath $r -Encoding utf8`,
     '    }',
     '  }',
-    `  'CODE=' + $p.ExitCode | Out-File -FilePath $r -Encoding utf8`,
+    `  ('CODE=' + $p.ExitCode) | Out-File -FilePath $r -Encoding utf8 -Append`,
     `} catch { 'CANCELLED=' + $_.Exception.Message | Out-File -FilePath $r -Encoding utf8 }`,
   ].join('; ')
-  const b64 = Buffer.from(inner, 'utf16le').toString('base64')
+  const elevatedB64 = Buffer.from(elevatedScript, 'utf16le').toString('base64')
+  const outer = [
+    `$r = '${ps(resultFile)}'`,
+    'try {',
+    // 整段脚本一次提权：只有一个 UAC 提示，且清理确实在管理员上下文里。
+    `  $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','${elevatedB64}') -Verb RunAs -Wait -PassThru`,
+    `  if (-not (Test-Path -LiteralPath $r)) { 'CANCELLED=提权进程未返回结果' | Out-File -FilePath $r -Encoding utf8 }`,
+    `} catch { 'CANCELLED=' + $_.Exception.Message | Out-File -FilePath $r -Encoding utf8 }`,
+  ].join('; ')
+  const b64 = Buffer.from(outer, 'utf16le').toString('base64')
   try {
     await runExec('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', b64], { timeout: opts.timeoutMs || 30 * 60 * 1000 })
   } catch { /* 超时/被杀：仍去读结果文件，读不到按"结果不可读"处理 */ }
@@ -607,8 +626,12 @@ async function runElevatedMsi(msiPath, logPath, opts = {}) {
   try { text = fs.readFileSync(resultFile, 'utf8').trim() } catch { /* 无结果文件 */ }
   try { fs.unlinkSync(resultFile) } catch { /* noop */ }
   const codeMatch = /CODE=(-?\d+)/.exec(text)
+  const cleanupMatch = /CLEANUP=([^\r\n]*)/.exec(text)
   const cancelledByUser = /CANCELLED=/.test(text)
-  return interpretMsiResult(codeMatch ? codeMatch[1] : NaN, cancelledByUser)
+  const result = interpretMsiResult(codeMatch ? codeMatch[1] : NaN, cancelledByUser)
+  result.cleanup = cleanupMatch ? cleanupMatch[1].split(',').map((s) => s.trim()).filter(Boolean) : []
+  result.cleanupKnown = !!cleanupMatch
+  return result
 }
 
 // ---------- 各阶段实现 ----------
@@ -820,6 +843,10 @@ async function installNodeViaMsi(job, onInstallStart, opts = {}) {
   const r = await runElevatedMsi(acquired.msiPath, msiLog)
   if (acquired.temp) { try { fs.unlinkSync(acquired.msiPath) } catch { /* noop */ } }
   job.logLine(`官方安装包结果：${r.detail}（详细日志：${msiLog}）`)
+  // 清理是在提权进程里做的；只把"确实删掉了什么"如实写进日志（没发现就不占版面）。
+  if (r.cleanupKnown && r.cleanup && r.cleanup.length) {
+    job.logLine(`已清理旧版 Corepack 遗留的 pnpm 命令：${r.cleanup.join('、')}（新版 Node 不再内置 Corepack，PATH 将回落到全局 pnpm）`)
+  }
   if (!r.ok) return { ok: false, detail: r.detail, cancelled: r.cancelled, policy: r.policy }
   // 落位以注册表为准（MSI 自己写的 InstallPath），回退默认目录
   const msi = await readInstalledNodeMsi()
@@ -842,23 +869,32 @@ async function installNodeViaMsi(job, onInstallStart, opts = {}) {
 }
 
 // 清理旧版 Corepack 留下的 pnpm 三件套（仅在 Windows 官方 MSI 安装目录内）。
-// 判据必须同时成立：① 文件内容确实是 corepack shim；② 它引用的 corepack 目标文件已不存在。
-// 任一不成立就不动 —— 既能修好 Node 25/26 升级后的死 shim，也不碰用户自己装的 pnpm / nvm shim。
+// 判据必须同时成立：① 它是标准 corepack shim（内容精确引用 node_modules/<corepack>/dist/pnpm.js；
+// 只出现 "corepack" 字样的自定义脚本不算）；② 引用的目标文件已不存在；③ 是小文件（标准 shim < 4KB）。
+// 任一不成立或不满足（读不到、不是普通文件）就不动 —— 修死 shim，也绝不碰用户自己的 pnpm / nvm shim。
 const COREPACK_PNPM_SHIMS = ['pnpm', 'pnpm.cmd', 'pnpm.ps1']
+const COREPACK_PNPM_REF = /node_modules[\\/]+corepack[\\/]+dist[\\/]+pnpm\.(?:js|cjs|mjs)\b/i
+const COREPACK_SHIM_MAX_BYTES = 4096
 function cleanupStaleCorepackPnpmShims(job, nodeDir) {
   const dir = String(nodeDir || '')
   if (!IS_WIN || !dir) return []
   const corepackTarget = path.join(dir, 'node_modules', 'corepack', 'dist', 'pnpm.js')
-  if (fs.existsSync(corepackTarget)) return [] // Corepack 仍在：shim 有效，不动
+  try {
+    if (fs.existsSync(corepackTarget)) return [] // Corepack 仍在：shim 有效，不动
+  } catch { return [] } // 存在性都判不了 → fail-closed，不动任何文件
   const removed = []
   for (const name of COREPACK_PNPM_SHIMS) {
     const file = path.join(dir, name)
     let text = ''
-    try { text = fs.readFileSync(file, 'utf8') } catch { continue }
-    if (!/corepack/i.test(text)) continue // 不是 corepack 生成的 shim（例如 npm 全局安装）→ 不动
+    try {
+      const st = fs.statSync(file)
+      if (!st.isFile() || st.size > COREPACK_SHIM_MAX_BYTES) continue
+      text = fs.readFileSync(file, 'utf8')
+    } catch { continue } // 读不到/不是普通文件 → 不动
+    if (!COREPACK_PNPM_REF.test(text)) continue // 不是标准 corepack shim → 不动
     try {
       fs.rmSync(file, { force: true })
-      removed.push(name)
+      if (!fs.existsSync(file)) removed.push(name)
     } catch (e) {
       job.logLine(`清理旧版 Corepack 的 ${name} 失败（pnpm 可能仍被它遮蔽）：${(e && e.message) || String(e)}`)
     }

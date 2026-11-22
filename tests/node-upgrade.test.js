@@ -504,6 +504,11 @@ test('更新窗口：被 Node 拦下时有直达运行环境页的出口（只�
   assert.match(updateCmd, /showConsolePage\('env'\)/, '只打开运行环境页，不接受任意页面参数')
   assert.match(mainJs, /nodeUpgradeAvailable: !!\(envReport && envReport\.nodeUpgrade\)/,
     '快照要把"环境页是否有 Node 升级入口"如实带给渲染层')
+  // 两条真实数据链都必须带：更新窗口走 updateStateSnapshot，控制台走 stateJson().dshUpdate。
+  // 只加其中一处时，另一处的按钮会退化成「重试」或干脆不出现。
+  const consoleState = sliceBetween(mainJs, 'dshUpdate: Object.assign({}, dshUpdater.getState(), {', 'launcherChannel:', 'stateJson dshUpdate')
+  assert.match(consoleState, /nodeUpgradeAvailable: !!\(envReport && envReport\.nodeUpgrade\)/,
+    '控制台的 dshUpdate 也必须有 nodeUpgradeAvailable（否则主页面拿不到入口）')
 })
 
 test('env-install.js：MSI 升级带 upgradeFrom，并按实探版本 + engines 验收（不轻信退出码）', () => {
@@ -613,9 +618,9 @@ test('env-install：清理旧版 Corepack 的 pnpm shim（只删 corepack 且目
   const job = { logLine: (m) => logLines.push(String(m)) }
   try {
     const shim = (name) => path.join(dir, name)
-    fs.writeFileSync(shim('pnpm.cmd'), '@IF EXIST "%~dp0\node.exe" (\r\n  "%~dp0\node.exe"  "%~dp0\node_modules\corepack\dist\pnpm.js" %*\r\n)\r\n')
+    fs.writeFileSync(shim('pnpm.cmd'), '@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"  "%~dp0\\node_modules\\corepack\\dist\\pnpm.js" %*\r\n)\r\n')
     fs.writeFileSync(shim('pnpm'), '#!/bin/sh\nexec node "$basedir/node_modules/corepack/dist/pnpm.js" "$@"\n')
-    fs.writeFileSync(shim('pnpm.ps1'), '# corepack shim\n')
+    fs.writeFileSync(shim('pnpm.ps1'), '& "$basedir/node.exe" "$basedir/node_modules/corepack/dist/pnpm.js" $args\n')
     // 非 corepack 的 shim（例如 npm 全局安装的同名命令）不能被误删
     fs.writeFileSync(shim('yarn.cmd'), '@echo off\r\nyarn %*\r\n')
     const removed = envInstall.cleanupStaleCorepackPnpmShims(job, dir)
@@ -638,21 +643,36 @@ test('env-install：Corepack 仍在时保留 shim；非 corepack 的同名命令
     assert.deepEqual(removed, [], 'Corepack 目标存在时不能删 shim')
 
     fs.rmSync(path.join(dir, 'node_modules'), { recursive: true, force: true })
-    fs.writeFileSync(path.join(dir, 'pnpm.cmd'), '@echo off\r\npnpm-real %*\r\n')
+    // 只在注释里提到 corepack 的自定义脚本：不是标准 shim，不能删
+    fs.writeFileSync(path.join(dir, 'pnpm.cmd'), '@echo off\r\nrem migrated from corepack\r\npnpm-real %*\r\n')
     removed = envInstall.cleanupStaleCorepackPnpmShims({ logLine: () => {} }, dir)
-    assert.deepEqual(removed, [], '内容不是 corepack 的 pnpm 命令不能删')
+    assert.deepEqual(removed, [], '只提到 corepack 字样的自定义脚本不能删')
+    assert.equal(fs.existsSync(path.join(dir, 'pnpm.cmd')), true)
+
+    // 大文件（例如用户自己的包装脚本）即使包含标准引用也不删
+    fs.writeFileSync(path.join(dir, 'pnpm.cmd'), '"%~dp0\\node.exe" "%~dp0\\node_modules\\corepack\\dist\\pnpm.js" %*\r\n' + 'x'.repeat(5000))
+    removed = envInstall.cleanupStaleCorepackPnpmShims({ logLine: () => {} }, dir)
+    assert.deepEqual(removed, [], '超过 4KB 的非标准文件不能删')
     assert.equal(fs.existsSync(path.join(dir, 'pnpm.cmd')), true)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('env-install：MSI 安装脚本在同一次提权里清理旧 Corepack 的 pnpm shim', () => {
+test('env-install：MSI 安装脚本在提权进程内清理旧 Corepack 的 pnpm shim', () => {
   const body = sliceBetween(envInstallSrc, 'async function runElevatedMsi', '// ---------- 各阶段实现', 'runElevatedMsi')
   assert.match(body, /node_modules.+corepack.+dist.+pnpm\.js/, '要先判断 corepack 目标是否真的不存在')
+  assert.match(body, /fi\.Length -le 4096/, '只认小文件（标准 shim），不能误删自定义脚本')
+  assert.match(body, /corepack/, '清理判据必须基于 corepack 引用，而不是只看文件名')
+  assert.match(body, /js\|cjs\|mjs/, '标准 shim 的引用形状要覆盖 js/cjs/mjs')
   assert.match(body, /Remove-Item -LiteralPath \$f/, '在提权进程内删除残留 shim（Program Files 需要管理员）')
   assert.match(body, /ExitCode -eq 0 -or \$p\.ExitCode -eq 3010/, 'MSI 成功（含需重启）才清理')
-  assert.match(body, /-match 'corepack'/, '只删内容确实是 corepack shim 的文件')
+  // 关键：msiexec 与清理必须在同一个提权进程里。外层只提权一次 PowerShell，内层 msiexec 不再 RunAs。
+  assert.match(body, /Start-Process -FilePath 'powershell\.exe'.+-Verb RunAs/, '要提权运行包含清理的 PowerShell 脚本')
+  assert.doesNotMatch(body, /Start-Process -FilePath 'msiexec\.exe'.+-Verb RunAs/, '不能再只提升 msiexec（父进程仍是非管理员）')
+  assert.match(body, /CLEANUP=/, '清理结果要回传，不能静默丢失')
+  assert.match(body, /CODE=' \+ \$p\.ExitCode\) \| Out-File -FilePath \$r -Encoding utf8 -Append/, 'CODE 要追加写入，不能覆盖 CLEANUP')
   const msiBody = sliceBetween(envInstallSrc, 'async function installNodeViaMsi', '// 清理旧版 Corepack', 'installNodeViaMsi')
   assert.match(msiBody, /cleanupStaleCorepackPnpmShims\(job, dir\)/, '安装流程也要在非提权场景下幂等清理一次')
+  assert.match(msiBody, /r\.cleanupKnown && r\.cleanup/, '提权进程报告清理结果时要写进安装日志')
 })

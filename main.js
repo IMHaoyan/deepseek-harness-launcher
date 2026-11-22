@@ -6899,7 +6899,12 @@ function stateJson() {
     theme: Config.theme,
     env: envDetect.envSummary(envReport),
     // 升级代价预判（只读）：目标版本下哪些插件会被 DSH 门禁拒绝；没有待升级版本时为 null
-    dshUpdate: Object.assign({}, dshUpdater.getState(), { pluginCompat: dshPluginCompat() }),
+    // nodeUpgradeAvailable：控制台据此决定「打开运行环境」按钮是否真的能落到升级入口上
+    // （与更新窗口的 updateStateSnapshot 同源，两条数据链都必须带）。
+    dshUpdate: Object.assign({}, dshUpdater.getState(), {
+      pluginCompat: dshPluginCompat(),
+      nodeUpgradeAvailable: !!(envReport && envReport.nodeUpgrade),
+    }),
     launcherChannel: Config.launcherChannel,
     launcherUpdateSource: Config.launcherUpdateSource,
     log: logTail,
