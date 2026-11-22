@@ -78,7 +78,7 @@ tools/                构建、开发、发布与校验脚本
 | `port` | 服务端口，`0` = 默认 3080 |
 | `dshVersion` | 一键安装锁定的 DSH 版本，默认 `latest` |
 | `pnpmVersion` | 安装/对齐的 pnpm 版本，默认 `11.8.0` |
-| `nodeMajor` | 安装的 Node 主版本，默认 24（目标 Node.js 24 LTS；能复用的现有 Node 22 不会被重装） |
+| `nodeMajor` | 安装的 Node 主版本，默认 26（目标 Node.js 26 LTS；能复用的现有 Node 22 不会被重装） |
 | `nodePath` / `harnessRoot` | 手动指定 Node 路径 / DSH 源码仓库根目录 |
 | `nodeMirror` / `npmRegistry` | 下载源与 npm 源覆盖（默认镜像优先、失败回退官方） |
 | `dshChannel` | DSH 更新渠道：`latest`（默认）/ `alpha` |

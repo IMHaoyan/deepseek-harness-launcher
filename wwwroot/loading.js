@@ -56,7 +56,7 @@ const TEXTS = {
   },
   update: {
     title: '正在更新 DeepSeek Harness…',
-    sub: '正在下载并安装新版本（约 1~3 分钟，npmmirror 源）。升级完成后自动进入新版页面。',
+    sub: '正在安装新版本；完成后会自动重启服务并进入新版页面。预装就绪时约十几秒，未预装时约 1~2 分钟。',
     btn: '重新加载',
   },
   offline: {

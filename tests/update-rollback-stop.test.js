@@ -17,7 +17,16 @@ for (const branch of ['verification', 'outcome']) {
         // 预装探测的"坏目标"结论（模块级状态）：本用例关心的是停服/回滚顺序，显式置空
         stageBlock: null,
         warming: null,
-        Config: {}, saveConfig: () => {}, log: () => {}, notify: () => {},
+        staging: null,
+        // 目标版本 Node 预检：本组用例只关心回滚顺序，显式放行
+        Config: { nodeMajor: 26 },
+        readStagedEngines: () => '',
+        fetchTargetEngines: async () => '',
+        targetNodeBlockOf: () => null,
+        rememberTargetRequirement: () => {},
+        clearTargetRequirement: () => {},
+        setUpdatePhase: () => {},
+        saveConfig: () => {}, log: () => {}, notify: () => {},
         channelOf: () => 'latest', decideUpdateTarget: () => ({ action: 'install' }),
         envDetect: { detectEnv: async () => ({ plan: { kind: 'global', dshVersion: '0.1.0', nodeCmd: 'mock' }, dsh: { dir: 'mock' } }) },
         getServerState: () => ({ running: true }),

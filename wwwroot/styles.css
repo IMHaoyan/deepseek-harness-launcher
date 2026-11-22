@@ -1306,3 +1306,30 @@ select, input[type="checkbox"], input[type="radio"], input[type="range"] {
   padding: 0;
   justify-content: flex-end;
 }
+
+/* ---------- DSH 更新进度 / 失败详情 ----------
+   更新中显示"第几步 / 共几步 + 已用时间 + 当前动作"；安装阶段不伪造百分比（npm 没有可靠进度）。
+   失败时把原因完整展示出来（行内提示只放状态词，长文案会撑破版本行）。 */
+.dsh-upd-progress .upd-p-head { display: flex; align-items: baseline; gap: 10px; }
+.dsh-upd-progress .upd-p-phase { font-size: 13px; font-weight: 600; color: var(--text-primary); line-height: 20px; }
+.dsh-upd-progress .upd-p-elapsed { margin-left: auto; font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.dsh-upd-progress .upd-p-steps { display: flex; gap: 6px; margin: 10px 0 8px; }
+.dsh-upd-progress .upd-p-step { flex: 1; height: 4px; border-radius: 999px; background: var(--inset); position: relative; overflow: hidden; }
+.dsh-upd-progress .upd-p-step.done,
+.dsh-upd-progress .upd-p-step.current { background: var(--brand); }
+.dsh-upd-progress .upd-p-step.current::after {
+  content: "";
+  position: absolute; inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
+  animation: upd-step-shimmer 1.2s linear infinite;
+}
+@keyframes upd-step-shimmer { to { transform: translateX(100%); } }
+.dsh-upd-progress .upd-p-detail { font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+.dsh-upd-progress .upd-p-error { font-size: 12px; line-height: 1.6; color: var(--danger-text); white-space: pre-wrap; word-break: break-word; }
+.dsh-upd-progress .upd-p-actions { margin-top: 8px; display: flex; gap: 8px; }
+/* 更新窗口内嵌在卡片里：去掉独立卡片的外边距，用发丝线与上面的版本行分隔 */
+.upd-card .dsh-upd-progress { margin: 0; padding: 12px 16px 4px; border-top: 1px solid var(--border-soft); }
+@media (prefers-reduced-motion: reduce) {
+  .dsh-upd-progress .upd-p-step.current::after { animation: none; }
+}

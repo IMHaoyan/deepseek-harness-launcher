@@ -445,7 +445,94 @@ function noteChannelChange() {
   userSwitchedChannel = channelOf()
   staging = null // 旧渠道的预装树作废（暂存目录名是版本号，下次检查会自己清场）
   stageBlock = null // "目标版本不可用"的结论同样绑定版本号，换渠道后不再成立
+  clearTargetRequirement() // 目标要求也绑定渠道/版本，换渠道后不再成立
   setState({ status: 'idle', error: '', latest: '', latestChannel: '', prewarmed: false, staged: false, stageVersion: '' })
+}
+
+// ---------- 目标版本的 Node 要求（停服前预检） ----------
+// 为什么必须预检：更新流程是"停服 → 装目标版本 → 重新探测环境 → 起不来 → 回滚"。
+// 如果目标 DSH 要求更晚的 Node，而环境页只看**已安装的旧 DSH**，用户会陷入
+// "点更新 → 装上 → 起不来 → 回滚" 的死循环，且永远看不到 Node 升级入口
+// （2026-11-22 家里机器：Node 24.14.1、目标 alpha.2 要 ^24.22.3，实测）。
+// 这里在停服前拿到目标版本的 engines，逐条比对当前 Node；不满足就直接拒绝更新。
+
+/** 读预装树里的 engines（本地、零网络）；预装未就绪时返回空串 */
+function readStagedEngines(version) {
+  if (!staging || !version || staging.version !== version) return ''
+  const pkg = readPkgAt(staging.stagePkg)
+  return (pkg && pkg.engines) || ''
+}
+
+/** 联网取目标版本的 engines.node（预装未就绪时的兜底；失败返回空串 = 不据此拦截） */
+async function fetchTargetEngines(version, nodeBin) {
+  if (!version || !semver.valid(version)) return ''
+  for (const registry of registries()) {
+    const args = ['view', `@deepseek-ai/dsh@${version}`, 'engines.node', '--json']
+    if (registry) args.push('--registry', registry)
+    const r = await runNpm(args, { nodeBin, timeoutMs: 30000 })
+    if (!r.ok) continue
+    const text = String(r.stdout || '').trim()
+    if (!text) continue
+    try {
+      const v = JSON.parse(text)
+      if (typeof v === 'string' && v.trim()) return v.trim()
+      if (v && typeof v.node === 'string' && v.node.trim()) return v.node.trim()
+    } catch {
+      if (semver.validRange(text)) return text // 非 JSON 但本身就是合法 range
+    }
+  }
+  return ''
+}
+
+/**
+ * 当前 Node 是否满足"目标版本 + 目标大版本"（纯函数，供测试）。
+ * 两道判据：
+ *   1) 大版本 >= Config.nodeMajor（产品策略：目标跟最新 LTS 走，旧大版本一律先升级）；
+ *   2) 满足目标 DSH 的 engines（大版本达标但补丁不够也要拦，如 26.10 < 26.13.1）。
+ * @returns {{reason:string, nodeVersion:string, targetMajor?:number, engines?:string}|null}
+ */
+function targetNodeBlockOf(input) {
+  const o = input || {}
+  const nodeVersion = String(o.nodeVersion || '').trim().replace(/^v/i, '')
+  if (!nodeVersion || !semver.valid(nodeVersion)) return { reason: 'node-version-unknown', nodeVersion }
+  const targetMajor = Number(o.targetMajor) || 0
+  const major = Number(nodeVersion.split('.')[0])
+  if (targetMajor > 0 && major < targetMajor) return { reason: 'major-below-target', nodeVersion, targetMajor }
+  const engines = String(o.engines || '')
+  if (engines) {
+    try {
+      if (!semver.satisfies(nodeVersion, engines, { includePrerelease: true })) {
+        return { reason: 'engines-unsatisfied', nodeVersion, engines }
+      }
+    } catch { /* 非法 range：交给上一道大版本判定，不误拦 */ }
+  }
+  return null
+}
+
+/** 把目标要求记进 Config（环境页据此出现 Node 升级入口）；失败不影响本次拦截 */
+function rememberTargetRequirement(version, range) {
+  if (!Config || !version || !range) return
+  const prev = Config.dshTargetEngines
+  if (prev && prev.version === version && prev.range === range) return
+  Config.dshTargetEngines = { version, range }
+  try { saveConfig() } catch { /* noop */ }
+  try { if (typeof refreshEnv === 'function') void refreshEnv(true) } catch { /* noop */ }
+}
+
+function clearTargetRequirement() {
+  if (!Config || !Config.dshTargetEngines) return
+  Config.dshTargetEngines = null
+  try { saveConfig() } catch { /* noop */ }
+}
+
+/** 检查阶段的最佳努力：拿到就记下，拿不到等点击更新时再判 */
+async function recordTargetRequirementFrom(version, nodeBin) {
+  if (Config && Config.dshTargetEngines && Config.dshTargetEngines.version === version) return
+  try {
+    const engines = readStagedEngines(version) || await fetchTargetEngines(version, nodeBin)
+    if (!engines) return
+    if (!state.latest || state.latest === version) rememberTargetRequirement(version, engines)
+  } catch { /* 预取失败不影响检查 */ }
 }
 
 function pushState() {
@@ -466,6 +553,19 @@ function readPageCredential() {
 function setState(patch) {
   Object.assign(state, patch)
   pushState()
+}
+
+// 更新阶段：进度反馈的唯一事实源。UI 只画"第几步 / 共几步 + 已用时间"，
+// 不在安装阶段伪造百分比（npm 没有可靠进度；假的百分比比没有更糟）。
+const UPDATE_PHASES = ['准备更新', '停止服务', '安装新版本', '启动服务', '校验版本']
+function setUpdatePhase(index, detail) {
+  const i = Math.max(0, Math.min(UPDATE_PHASES.length - 1, Number(index) || 0))
+  setState({
+    phase: UPDATE_PHASES[i],
+    phaseIndex: i,
+    phaseCount: UPDATE_PHASES.length,
+    phaseDetail: String(detail || ''),
+  })
 }
 
 // 解析 npm CLI：托管/发行版 Node 自带 <dir>/node_modules/npm/bin/npm-cli.js（与 env-install 同策略）
@@ -848,7 +948,8 @@ function readPkgAt(dir) {
     const binLayout = typeof bin === 'string'
       ? 'string:' + bin
       : (bin && typeof bin === 'object' ? Object.keys(bin).sort().map((k) => k + '=' + String(bin[k])).join(',') : '')
-    return { version: String(pkg.version || ''), binLayout }
+    const engines = pkg.engines && typeof pkg.engines.node === 'string' ? pkg.engines.node : ''
+    return { version: String(pkg.version || ''), binLayout, engines }
   } catch { return null }
 }
 
@@ -1274,14 +1375,14 @@ async function checkOnce(reason, force) {
     if (timedOut) return
     if (!report || !report.plan) {
       log('dsh-update: environment not ready, check skipped')
-      setState(force ? { status: 'error', error: '运行环境未就绪，无法检查 DSH 更新' } : { status: 'idle' })
+      setState(force ? { status: 'error', error: '运行环境未就绪，无法检查 DSH 更新', nodeBlocked: false } : { status: 'idle' })
       return
     }
     const plan = report.plan
     const current = plan.dshVersion || ''
     if (!current) {
       log('dsh-update: installed version unknown, check skipped')
-      setState(force ? { status: 'error', error: '已安装的 DSH 版本未知，无法检查' } : { status: 'idle' })
+      setState(force ? { status: 'error', error: '已安装的 DSH 版本未知，无法检查', nodeBlocked: false } : { status: 'idle' })
       return
     }
     const latest = await fetchLatest(plan.nodeCmd)
@@ -1299,7 +1400,7 @@ async function checkOnce(reason, force) {
         return
       }
       log('dsh-update: fetch latest failed, check aborted')
-      setState(force ? { status: 'error', error: '检查失败：' + (lastFetchError || '无法获取最新版本（网络错误）') } : { status: 'idle' })
+      setState(force ? { status: 'error', error: '检查失败：' + (lastFetchError || '无法获取最新版本（网络错误）'), nodeBlocked: false } : { status: 'idle' })
       return
     }
     // prevLatest 必须在 setState 之前取：setState 之后 state.latest 已经是新版本，
@@ -1312,8 +1413,11 @@ async function checkOnce(reason, force) {
       const newVersionSeen = prevLatest !== latest.version
       // 换了目标版本：上一版的预装树作废（暂存目录名就是版本号，stageLatest 会自己清场），
       // "目标版本自身不可用"的结论也只对旧版本成立，必须一起清掉。
-      if (newVersionSeen) { staging = null; stageBlock = null }
-      setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false, staged: false, stageVersion: '' } : {}))
+      if (newVersionSeen) { staging = null; stageBlock = null; clearTargetRequirement() }
+      setState(Object.assign({ status: 'available', nodeBlocked: false }, newVersionSeen ? { prewarmed: false, staged: false, stageVersion: '' } : {}))
+      // 目标版本的 Node 要求：后台取一次（预装就绪后优先读本地包），供环境页提前显示 Node 升级入口。
+      // 不阻塞检查本身；失败就等用户点更新时再判（预检仍会兜底）。
+      void recordTargetRequirementFrom(latest.version, plan.nodeCmd)
       // 后台就绪（不阻塞检测）：全局形态预装一整套可切换的安装树，点击"立即更新"时只剩改名 + 重启服务。
       // 仅缓存预热过（prewarmed 但没 staged）时也再试一次预装——预装失败过不该永久放弃。
       if (!state.prewarmed || (plan.kind === 'global' && installDir && !state.staged)) {
@@ -1332,7 +1436,8 @@ async function checkOnce(reason, force) {
       }
     } else {
       log(`dsh-update: v${current} 已是最新（latest v${latest.version}）`)
-      setState({ status: 'up-to-date' })
+      clearTargetRequirement()
+      setState({ status: 'up-to-date', nodeBlocked: false })
       // 已是最新：暂存目录里剩下的都是过期物（含切换失败留下的 rejected-*），顺手清掉。
       // 正在预装时不动（那份还在写盘，删了只会让本次预装白跑）；未完成事务记着的树必须保留。
       if (!warming) cleanupStage(stageRootOf(installDir), '', transactionKeepNames())
@@ -1340,7 +1445,7 @@ async function checkOnce(reason, force) {
   } catch (err) {
     if (timedOut) return
     log('dsh-update: check failed: ' + (err && err.message ? err.message : String(err)))
-    setState(force ? { status: 'error', error: err && err.message ? err.message : String(err) } : { status: 'idle' })
+    setState(force ? { status: 'error', error: err && err.message ? err.message : String(err), nodeBlocked: false } : { status: 'idle' })
   } finally {
     if (!timedOut) finishCheck()
   }
@@ -1359,7 +1464,8 @@ async function updateNow() {
   let txInfo = null // 事务信息（catch 里写终态用：区分"失败"与"被中断"）
   let swapState = null // catch 同样需要判断是否已经切换目录
   let brokenDetail = '' // 完整安装后探测到"这棵树自身跑不起来"的证据（有值时跳过启动，直接走回滚）
-  setState({ status: 'updating', error: '' })
+  setState({ status: 'updating', error: '', nodeBlocked: false, startedAt: Date.now() })
+  setUpdatePhase(0, '正在检查目标版本与运行环境…')
   try {
     const report = await envDetect.detectEnv(false)
     if (!report || !report.plan) throw new Error('运行环境未就绪，无法更新')
@@ -1388,6 +1494,7 @@ async function updateNow() {
     // 直接走完整安装会白装一遍（预装马上会给出同一棵坏树的结论），还会先把服务停掉。
     if (warming) {
       log('dsh-update: 等待在途预装完成后再决定更新路径')
+      setUpdatePhase(0, '正在等待后台预装完成…')
       try { await warming } catch { /* warmLatest 自己吞错，这里只等它收场 */ }
     }
     // 预装探测已证明目标版本的安装树自身跑不起来（确定性证据）：完整安装装出来的还是同一棵树。
@@ -1399,7 +1506,7 @@ async function updateNow() {
         + `已取消升级，${fromVersion ? `当前 v${fromVersion} 未改动` : '当前版本未改动'}；可稍后重试检查更新。`
       log('dsh-update: update blocked (target-broken): ' + reason)
       emitLifecycle('update.dsh', { step: 'blocked', reason: 'target-broken', from: fromVersion, to: latest })
-      setState({ status: 'error', error: reason })
+      setState({ status: 'error', error: reason, nodeBlocked: false })
       return
     }
     // 在任何更新事务/包文件写入前完成停服；失败保持旧版，不留下待修复事务。
@@ -1408,8 +1515,33 @@ async function updateNow() {
         ? '源码安装请手动更新：git pull && pnpm run build（启动器不自动修改源码仓库）'
         : `当前安装形态（${plan.kind}）不支持更新`)
     }
+    // 目标版本对 Node 的要求：必须在停服/安装前判。
+    // 不满足就不制造一次"停服 → 装上 → 起不来 → 回滚"的循环；同时把要求记下来，
+    // 让环境页出现对应的 Node 升级入口（回滚后只看旧 DSH 的话，这个入口永远不会出现）。
+    const targetEngines = readStagedEngines(latest) || await fetchTargetEngines(latest, plan.nodeCmd)
+    const nodeVersion = (report.node && report.node.version) || ''
+    const nodeBlock = targetNodeBlockOf({
+      nodeVersion,
+      // 目标大版本策略只约束"升级"；用户显式切渠道降级/重装时，不应被 Node 26 策略挡住。
+      targetMajor: nonUpgrade ? 0 : (Config && Config.nodeMajor),
+      engines: targetEngines,
+    })
+    if (nodeBlock) {
+      if (targetEngines) rememberTargetRequirement(latest, targetEngines)
+      const need = nodeBlock.reason === 'major-below-target'
+        ? `Node.js ${Config.nodeMajor} LTS`
+        : (targetEngines ? `Node.js ${targetEngines}` : '更新版本的 Node.js')
+      const reason = `新版本 v${latest} 要求 ${need}，本机是 v${nodeBlock.nodeVersion || '未知'}。`
+        + `已取消升级，${fromVersion ? `当前 v${fromVersion} 未改动` : '当前版本未改动'}；`
+        + '请先在控制台「运行环境」页升级 Node.js 后重试。'
+      log('dsh-update: update blocked (target-node): ' + reason)
+      emitLifecycle('update.dsh', { step: 'blocked', reason: 'target-node', from: fromVersion, to: latest })
+      setState({ status: 'error', error: reason, nodeBlocked: true })
+      return
+    }
     const svc = getServerState ? getServerState() : { running: false }
     const wasRunning = !!(svc.running || svc.starting || svc.settling) // 被取消的启动请求在更新后也应恢复
+    setUpdatePhase(1, wasRunning ? '正在停止 DSH 服务…' : '服务未运行，跳过停止')
     if (wasRunning || svc.stopping || svc.settling || svc.starting) {
       log('dsh-update: stopping service before update')
       if (typeof stopService !== 'function' || await stopService() !== true) {
@@ -1420,6 +1552,7 @@ async function updateNow() {
     try { writeUpdateState({ kind: plan.kind, from: fromVersion, to: latest, phase: 'start' }) } catch { /* noop */ }
     txInfo = { kind: plan.kind, from: fromVersion, to: latest }
     emitLifecycle('update.dsh', { step: 'start', from: fromVersion, to: latest, kind: plan.kind })
+    setUpdatePhase(2, plan.kind === 'global' ? '正在写入新版本文件…' : '正在安装新版本…')
     let globalRootForRollback = ''
 
     if (plan.kind === 'managed') {
@@ -1427,6 +1560,7 @@ async function updateNow() {
       if (loadWebTabs) loadWebTabs('update') // 页面切"正在更新…"说明页，避免更新期间白屏
       try {
         if (markProgress) markProgress('install')
+        setUpdatePhase(2, '正在安装新版本（统一安装引擎）…')
         envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
         const status = await waitForJob()
         if (status !== 'done') throw new Error(`更新任务未完成（${status}）`)
@@ -1454,6 +1588,10 @@ async function updateNow() {
       if (markProgress) markProgress('install')
       // 首选：把后台预装好的整棵树改名顶上（实测 0.04s，替掉 40s 的解包落盘）
       const installDir = (report.dsh && report.dsh.dir) || ''
+      const stagedReady = !!(staging && staging.version === latest)
+      setUpdatePhase(2, stagedReady
+        ? '正在切换到已预装的安装包（秒级）…'
+        : '预装不可用，正在通过 npm 安装新版本（约 1–2 分钟）…')
       const sw = await swapStagedInto({ nodeBin: plan.nodeCmd, installDir, version: latest, from: fromVersion })
       if (sw.ok) {
         swapState = sw
@@ -1471,6 +1609,7 @@ async function updateNow() {
       } else {
         // 没有预装树（用户点得太快 / 预装失败 / 被渠道切换作废）→ 退回完整安装，行为与从前一致
         if (sw.reason !== 'no-staged-tree') log('dsh-update: staged swap unavailable (' + sw.reason + ')，改用 npm install -g')
+        setUpdatePhase(2, '正在通过 npm 安装新版本（约 1–2 分钟，请勿关闭启动器）…')
         const r = await runGlobalUpdate(plan.nodeCmd, globalRoot, latest)
         if (!r.ok) {
           if (wasRunning) {
@@ -1494,6 +1633,7 @@ async function updateNow() {
       let migrated = false
       try {
         if (markProgress) markProgress('install')
+        setUpdatePhase(2, '正在安装新版本（统一安装引擎）…')
         envInstall.startInstall(['dsh'], { dshVersion: latest, autoUpdate: true })
         const status = await waitForJob()
         if (status !== 'done') throw new Error(`迁移任务未完成（${status}）`)
@@ -1522,6 +1662,7 @@ async function updateNow() {
 
     // 重新探测 + 恢复服务（旧版已停止，拉起的是新版；含"已接管"服务——更新前已统一停掉）
     try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
+    setUpdatePhase(3, brokenDetail ? '新版本文件已就位，跳过启动' : '正在启动服务并等待就绪…')
     // startService（main.handleStart）不抛错，靠返回值判定：false = 服务没起来（含环境未就绪/端口占用）
     let startOk = true
     // 坏树的判定与"服务此前是否在跑"无关：即便更新前服务是停着的，也不能把一棵探测失败的树
@@ -1545,6 +1686,7 @@ async function updateNow() {
       else log('dsh-update: service is running after update (was stopped before), keeping page as-is')
     }
     // —— 更新事务校验：服务必须真的跑起来且版本对上，否则自动回滚（仅全局 npm 形态可回滚） ——
+    setUpdatePhase(4, '正在校验实际运行的版本…')
     let runningVersion = ''
     try {
       const re2 = await envDetect.detectEnv(false)
@@ -1557,6 +1699,7 @@ async function updateNow() {
       if (decision.action === 'rollback') {
         rollbackUsed = true
         const why = decision.reason
+        setUpdatePhase(2, `升级未成功，正在回滚到 v${fromVersion}…`)
         log(`dsh-update: v${latest} 启动失败/版本不符，回滚到 v${fromVersion} …（${why}）`)
         emitLifecycle('update.dsh', { step: 'rollback-start', from: fromVersion, to: latest, reason: why })
         // 校验可能已启动新版；回滚换文件也必须重新确认停服。
@@ -1660,14 +1803,16 @@ async function updateNow() {
     }
     notify('DeepSeek Harness', outcome.message)
     log(`dsh-update: updated to v${latest}${/凭据已变化/.test(outcome.message) ? ' (page credential changed)' : ''}`)
+    clearTargetRequirement() // 目标已装上：保留旧要求只会让环境页继续按目标范围判 Node
     emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
     finalizeSwap(swapState) // 更新确认成功：删掉旧树备份与暂存残留
     try { clearUpdateState() } catch { /* noop */ }
-    setState({ status: 'updated', current: latest })
+    setState({ status: 'updated', current: latest, nodeBlocked: false, phase: '完成', phaseIndex: UPDATE_PHASES.length, phaseDetail: '' })
   } catch (err) {
     log('dsh-update: update failed: ' + (err && err.message ? err.message : String(err)))
     emitLifecycle('update.dsh', { step: 'failed', error: ((err && err.message) || String(err)).slice(0, 128) })
-    setState({ status: 'error', error: err && err.message ? err.message : String(err) })
+    const message = err && err.message ? err.message : String(err)
+    setState({ status: 'error', error: message, nodeBlocked: false, phaseDetail: message })
     // 已明确失败（非被中断）：写终态，避免下次启动被自愈逻辑当成"未完成的更新"重装一遍。
     // 但改名切换事务不能标 failed —— 下次启动要靠它判断"补完 / 退回"。
     if (txInfo && !swapState) { try { writeUpdateState(Object.assign({}, txInfo, { phase: 'failed' })) } catch { /* noop */ } }
@@ -1706,6 +1851,10 @@ module.exports = {
   probeIndicatesBrokenTree,
   probeFailureDetail,
   probeDshVersion,
+  // 目标版本的 Node 预检（纯函数 + 本地/联网取数）
+  targetNodeBlockOf,
+  readStagedEngines,
+  fetchTargetEngines,
   // 切换动作本身也导出：测试用真实目录演练"顶上 / 退回"，而不是只测判定
   swapStagedInto,
   restoreSwap,

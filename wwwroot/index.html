@@ -106,11 +106,15 @@
         <span class="label">Node.js</span>
         <span class="version-value" id="nodeUpgradeVersion">-</span>
         <span class="version-hint" id="nodeUpgradeHint"></span>
-        <button class="btn sm primary hidden" id="btnNodeUpgrade" type="button" title="升级 Node.js（会先停止服务，完成后自动恢复）">升级到 24 LTS</button>
+        <button class="btn sm primary hidden" id="btnNodeUpgrade" type="button" title="升级 Node.js（会先停止服务，完成后自动恢复）">升级到 26 LTS</button>
       </div>
       <!-- 升级代价提示行：只有真有插件会在目标版本下失效（或判不了）时才占版面 -->
       <div class="row upgrade-cost hidden" id="dshUpdCompat"></div>
     </section>
+
+    <!-- DSH 更新进度/失败详情：只在更新进行中或失败时出现。
+         反馈"第几步 / 共几步 + 已用时间 + 当前动作"，安装阶段不伪造百分比。 -->
+    <section class="card dsh-upd-progress hidden" id="dshUpdateProgress" aria-live="polite"></section>
 
     <!-- 稳定性提示：上次未正常退出 / 已自动回退配置（仅对应事件发生时显示；可跳恢复页，也可关闭） -->
     <section class="card env-warning hidden" id="crashNote">

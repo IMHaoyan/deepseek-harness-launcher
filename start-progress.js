@@ -15,7 +15,7 @@ const LABELS = {
   spawn: '启动服务进程',
   ready: '等待服务就绪',
   load: '载入界面',
-  install: '安装新版本（npm）',
+  install: '安装新版本',
   restore: '写回健康检查点',
   reload: '重载配置并重新探测环境',
 }

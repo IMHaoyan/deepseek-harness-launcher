@@ -118,9 +118,18 @@ function dsh(kind, stopService, snapshot = { running: true }, extra = {}) {
     // 预装探测的"坏目标"结论（模块级状态）：置空后走的是正常的停服失败路径
     stageBlock: null,
     warming: null,
+    staging: null,
     path: require('node:path'),
     notify: () => {},
-    envDetect: { detectEnv: async () => ({ plan: { kind, dshVersion: '0.1.0' } }) },
+    // 目标版本 Node 预检：本组用例只关心停服失败路径，显式放行
+    Config: { nodeMajor: 26 },
+    readStagedEngines: () => '',
+    fetchTargetEngines: async () => '',
+    targetNodeBlockOf: () => null,
+    rememberTargetRequirement: () => {},
+    clearTargetRequirement: () => {},
+    setUpdatePhase: () => {},
+    envDetect: { detectEnv: async () => ({ node: { version: '26.13.1' }, plan: { kind, dshVersion: '0.1.0' } }) },
     setState: (patch) => Object.assign(state, patch),
     decideUpdateTarget: () => ({ action: 'install' }), channelOf: () => 'latest', userSwitchedChannel: '',
     // 用真实判定函数：否则回滚/收尾分支在 extract 出来的函数体里是未定义标识符，静默落进 catch
@@ -170,6 +179,34 @@ test('目标版本已被探测为不可运行：点更新直接拒绝，不停�
   assert.equal(h.state.status, 'error')
   assert.match(h.state.error, /禁用或卸载插件都无效/u, h.state.error)
   assert.match(h.state.error, /0\.1\.0 未改动/u, '必须告诉用户当前版本完好：' + h.state.error)
+})
+
+// 2026-11-22 家里机器现场：Node 24.14.1、目标 alpha.2 要求 ^24.22.3 || >=26.13.1。
+// 目标版本对 Node 的要求必须在停服前判定：否则会"装上 → 起不来 → 回滚"，且回滚后环境页
+// 只看旧 DSH，永远不出现 Node 升级入口。
+test('目标版本要求更高 Node：停服前直接拒绝，不安装/不写事务，并记住要求', async () => {
+  let stopped = 0
+  const remembered = [], events = []
+  const h = dsh('global', async () => { stopped++; return true }, { running: true }, {
+    Config: { nodeMajor: 26 },
+    envDetect: { detectEnv: async () => ({ node: { version: '24.14.1' }, plan: { kind: 'global', dshVersion: '0.1.0' } }) },
+    readStagedEngines: () => '^24.22.3 || >=26.13.1',
+    fetchTargetEngines: async () => '',
+    targetNodeBlockOf: require('../dsh-update').targetNodeBlockOf,
+    rememberTargetRequirement: (version, range) => remembered.push({ version, range }),
+    emitLifecycle: (name, payload) => events.push({ name, payload }),
+  })
+  await h.fn()
+  assert.equal(stopped, 0, '不该先停服')
+  assert.deepEqual(h.writes, [], '不该写更新事务')
+  assert.deepEqual(h.changes, [], '不该安装')
+  assert.equal(h.state.status, 'error')
+  assert.equal(h.state.nodeBlocked, true, '界面据此把按钮换成「先升级 Node.js」')
+  assert.match(h.state.error, /Node\.js 26 LTS/u, h.state.error)
+  assert.match(h.state.error, /当前 v0\.1\.0 未改动/u, h.state.error)
+  assert.deepEqual(remembered, [{ version: '0.2.0', range: '^24.22.3 || >=26.13.1' }],
+    '要把目标要求记下来，环境页才会出现 Node 升级入口')
+  assert.equal(events[0].payload.reason, 'target-node')
 })
 
 // 更新前服务本来就没在跑时，也不能把一棵探测失败的树当成成功：startOk 必须无条件为 false。

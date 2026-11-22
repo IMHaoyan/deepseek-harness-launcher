@@ -15,10 +15,12 @@ const os = require('os')
 const semver = require('semver')
 const { execFile } = require('child_process')
 
-// DSHL 安装 Node 的目标大版本：24 = 当前 Active LTS（Krypton）。
+// DSHL 安装 Node 的目标大版本：26 = 当前 Active LTS（Lithium）。
 // 只决定"要装/要升级到哪个大版本"；"现有 Node 能不能复用"仍看 DEFAULT_ENGINE_RANGE ——
 // 22.x 依旧可复用，不会因为换了目标版本就逼已有用户重装环境。
-const DEFAULT_NODE_MAJOR = 24
+// 2026-11-22：由 24 升到 26。最新 DSH 的 engines 是 ^24.22.3 || >=26.13.1；
+// 目标跟着最新稳定 LTS 走，旧版 Node 会收到一次显式升级入口（不静默、不自动）。
+const DEFAULT_NODE_MAJOR = 26
 // DSH 仓库 engines：node ^22.19.0 || >=24.0.0；已安装的 DSH 包自带 engines.node 时以它为准
 const DEFAULT_ENGINE_RANGE = '^22.19.0 || >=24.0.0'
 const DEFAULT_PNPM_VERSION = '11.8.0'
@@ -664,13 +666,41 @@ function buildPlan(node, dsh) {
   }
 }
 
+/**
+ * 探测/复用/升级判据该用哪个 engines 范围。
+ *
+ * 默认看**已安装 DSH** 的 engines；但更新流程可能已经知道"目标版本"要求更高
+ * （例如已装 0.2.2-rc.5、目标 0.2.3-alpha.2 要求 ^24.22.3）。那条要求由 dsh-update 记进
+ * Config.dshTargetEngines —— 否则回滚后环境页永远只看旧 DSH，Node 升级入口再也不会出现，
+ * 用户会陷入"点更新 → 装上 → 起不来 → 回滚"的死循环（2026-11-22 家里机器实测）。
+ *
+ * 只在目标版本**比已安装版本新**时采用，避免切渠道/降级后残留一条陈旧要求。
+ * @param {{version?:string, engines?:string}|null} dsh
+ * @returns {string}
+ */
+function engineRangeFor(dsh, target) {
+  const base = (dsh && dsh.engines) || DEFAULT_ENGINE_RANGE
+  const t = target === undefined ? (Config && Config.dshTargetEngines) : target
+  if (!t || typeof t.range !== 'string' || !semver.validRange(t.range)) return base
+  try {
+    const targetVersion = String(t.version || '').trim()
+    const installed = dsh && String(dsh.version || '').trim()
+    if (semver.valid(targetVersion) && semver.valid(installed) && !semver.gt(targetVersion, installed)) return base
+  } catch { return base }
+  return t.range
+}
+
 async function buildReport() {
   const { entries } = detectDshEntries()
   const sourceEntry = entries.find((e) => e.kind === 'source') || null
   // 选中：按优先级取第一个"已构建"的安装；源码存在但未构建时不占用名额，可回退到其他形态
   let dsh = entries.find((e) => e.built) || null
   if (!dsh && sourceEntry) dsh = sourceEntry // 只有未构建的源码 → 以 unbuilt 状态呈现
+  // 就绪判据用**已安装 DSH** 的 engines：当前版本能在现在的 Node 上跑，环境就是就绪的。
+  // 目标版本的更高要求只影响"Node 升级建议"（upgradeRange），不能把当前可用环境判成未就绪
+  // —— 否则回滚后环境页会显示"未就绪"，连带影响服务的启动/恢复。
   const range = (dsh && dsh.engines) || DEFAULT_ENGINE_RANGE
+  const upgradeRange = engineRangeFor(dsh)
   const node = await detectNode(range)
   // 尾查（只在一个"能跑的安装"都没找到时执行）：问 npm 它真正的全局前缀，再按它找一次。
   // 探测与安装必须同源——安装侧就是 `npm i -g --prefix <resolveGlobalRoot()>` 落的包；
@@ -724,20 +754,29 @@ async function buildReport() {
   const versionManager = FRESH_TEST ? '' : detectVersionManager()
   const targetMajor = Number(Config.nodeMajor) || DEFAULT_NODE_MAJOR
   const activeMajor = nodeMajorOf(node.version)
+  // 当前 Node 是否同时满足"已安装 DSH"与"目标 DSH"（upgradeRange）：同主版本补丁不足
+  // （26.10 < 26.13.1）也要能读到用户级安装事实，否则连升级入口都不会出现。
+  let upgradeNodeOk = true
+  try {
+    upgradeNodeOk = node.status === 'ok' && semver.satisfies(String(node.version || ''), upgradeRange, { includePrerelease: true })
+  } catch { upgradeNodeOk = true }
   let userNode = null
   let activePath = ''
-  if (!FRESH_TEST && !installedMsi && !versionManager && (node.status === 'tooOld' || activeMajor === null || activeMajor < targetMajor)) {
+  if (!FRESH_TEST && !installedMsi && !versionManager && (!upgradeNodeOk || activeMajor === null || activeMajor < targetMajor)) {
     userNode = await readUserNodeForUpgrade()
     if (userNode && userNode.exists) activePath = await resolveActiveNodePath(node)
   }
   // 用户显式配了 nodePath = 明确指定用哪份 Node：不提示改机器上那份 MSI（最小侵入，不猜用户意图）。
-  // range 必须传：同主版本的补丁差距（24.16 vs ^24.22.3）也要能给出升级入口。
-  const nodeUpgrade = Config.nodePath ? null : decideNodeUpgrade({ platform: process.platform, installedMsi, node, userNode, versionManager, targetMajor, activePath, range })
+  // range 必须传：同主版本的补丁差距（24.16 vs ^24.22.3）也要能给出升级入口；
+  // 这里用 upgradeRange（已安装 DSH 与目标 DSH 要求的并集），避免回滚后永远看不到升级入口。
+  const nodeUpgrade = Config.nodePath ? null : decideNodeUpgrade({ platform: process.platform, installedMsi, node, userNode, versionManager, targetMajor, activePath, range: upgradeRange })
 
   const plan = buildPlan(node, dsh)
   return {
     ready: !!plan,
     engineRange: range,
+    // 目标 DSH 与已安装 DSH 要求的并集：只用于"Node 升级建议/安装验收"，不用于当前环境就绪判定
+    targetEngineRange: upgradeRange,
     node,
     dsh: dsh ? {
       status: dsh.built ? 'ok' : 'unbuilt',
@@ -794,6 +833,7 @@ function envSummary(report) {
   return {
     ready: !!report.plan,
     engineRange: report.engineRange,
+    targetEngineRange: report.targetEngineRange || report.engineRange,
     node: { status: report.node.status, version: report.node.version, path: report.node.path, source: report.node.source },
     dsh: { status: report.dsh.status, kind: report.dsh.kind, version: report.dsh.version, built: report.dsh.built, dir: report.dsh.dir, root: report.dsh.root || null },
     pnpm: report.pnpm,
@@ -830,6 +870,7 @@ module.exports = {
   npmPrefixOf,
   legacyUserNodeLayout,
   nodeMajorOf,
+  engineRangeFor,
   decideNodeUpgrade,
   readUserNodeForUpgrade,
   msiNodeBin,

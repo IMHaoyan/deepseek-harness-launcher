@@ -159,6 +159,9 @@ function renderLauncher(state) {
 function renderDsh(state) {
   const s = state || {}
   const status = s.status || 'idle'
+  // 进度块独立于版本行的按钮分支：renderDsh 在 updating 分支会提前 return，
+  // 所以必须在入口先画，否则"更新中"永远看不到步骤与已用时间。
+  renderDshProgress(s)
   if (dshBusyRelease({ busy: busy.dsh, status, error: s.error })) busy.dsh = false
 
   // 目标版本的安装树已被证明跑不起来（主进程预装探测的结论）：不画"可更新到 vX"，
@@ -216,10 +219,75 @@ function renderDsh(state) {
 
   const note = document.createElement('span')
   note.className = 'upd-note' + ((status === 'up-to-date' || status === 'updated') ? ' ok' : '')
-  note.textContent = DSH_STATUS[status] || DSH_STATUS.idle
+  note.textContent = (status === 'error' && s.nodeBlocked) ? '需先升级 Node.js' : (DSH_STATUS[status] || DSH_STATUS.idle)
   // 失败原因按需降级到 tooltip：行内只放状态词，原因一长就会撑破这一行
   if (s.error) note.title = s.error
   box.appendChild(note)
+}
+
+// ---------- DSH 更新进度（更新窗口） ----------
+// 与控制台同一口径：第几步 / 共几步 + 已用时间 + 当前动作，不伪造百分比。
+let updDshTimer = null
+function stopUpdDshTimer() { if (updDshTimer) { clearInterval(updDshTimer); updDshTimer = null } }
+function fmtUpdElapsed(ms) {
+  const sec = Math.max(0, Math.floor((Number(ms) || 0) / 1000))
+  if (sec < 60) return `${sec} 秒`
+  return `${Math.floor(sec / 60)} 分 ${String(sec % 60).padStart(2, '0')} 秒`
+}
+function renderDshProgress(s) {
+  const box = $('updDshProgress')
+  if (!box) return
+  const status = s ? s.status : 'idle'
+  stopUpdDshTimer()
+
+  if (status === 'updating') {
+    box.classList.remove('hidden')
+    box.textContent = ''
+    const startedAt = Number(s.startedAt) || Date.now()
+    const head = document.createElement('div'); head.className = 'upd-p-head'
+    const phase = document.createElement('span'); phase.className = 'upd-p-phase'
+    phase.textContent = s.phase || '更新中…'
+    const elapsed = document.createElement('span'); elapsed.className = 'upd-p-elapsed'
+    const tick = () => { elapsed.textContent = '已用 ' + fmtUpdElapsed(Date.now() - startedAt) }
+    tick()
+    head.appendChild(phase); head.appendChild(elapsed); box.appendChild(head)
+
+    const count = Math.max(1, Number(s.phaseCount) || 5)
+    const idx = Math.min(count - 1, Math.max(0, Number(s.phaseIndex) || 0))
+    const steps = document.createElement('div'); steps.className = 'upd-p-steps'
+    for (let i = 0; i < count; i++) {
+      const seg = document.createElement('span')
+      seg.className = 'upd-p-step ' + (i < idx ? 'done' : i === idx ? 'current' : '')
+      steps.appendChild(seg)
+    }
+    box.appendChild(steps)
+    if (s.phaseDetail) {
+      const detail = document.createElement('div'); detail.className = 'upd-p-detail'
+      detail.textContent = s.phaseDetail
+      box.appendChild(detail)
+    }
+    updDshTimer = setInterval(() => {
+      if (box.classList.contains('hidden')) { stopUpdDshTimer(); return }
+      tick()
+    }, 1000)
+    return
+  }
+
+  if (status === 'error' && s && s.error) {
+    box.classList.remove('hidden')
+    box.textContent = ''
+    const head = document.createElement('div'); head.className = 'upd-p-head'
+    const title = document.createElement('span'); title.className = 'upd-p-phase'
+    title.textContent = (s.phaseDetail && s.phaseDetail === s.error) ? '更新未完成' : '检查/更新未完成'
+    head.appendChild(title); box.appendChild(head)
+    const err = document.createElement('div'); err.className = 'upd-p-error'
+    err.textContent = s.error
+    box.appendChild(err)
+    return
+  }
+
+  box.classList.add('hidden')
+  box.textContent = ''
 }
 
 /** 两者都有更新时的顺序建议：先更启动器（内含更稳的 DSH 更新链路），再更 DSH。 */

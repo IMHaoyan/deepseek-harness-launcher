@@ -137,7 +137,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', dshTargetEngines: null, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
 // 默认接收端在配置对象之外赋值：Config 这一行会被测试按源码片段求值，不能引用外部常量。
 Config.usageStatsUrl = USAGE_STATS_URL
 let firstRun = false
@@ -423,9 +423,9 @@ function logThrottled(key, message, everyMs = 60000) {
 }
 
 // 逐字段应用配置（loadConfig 与"健康快照恢复后重载"共用，保证校验规则一致）
-// 说明：nodeMajor 的旧默认值（22）可能已经随 Config 落盘进每个用户的 config.json。
-// 目标升到 Node.js 24 LTS 后必须做一次显式迁移，否则老用户下次重装 Node 仍会装 22；
-// 迁移只发生在"值仍是旧默认 22 且没有迁移标记"时，迁移过或用户显式改成别的值都完全尊重配置。
+// 说明：nodeMajor 的旧默认值（22 / 24）可能已经随 Config 落盘进每个用户的 config.json。
+// 目标升到 Node.js 26 LTS 后做一次显式迁移，否则老用户下次重装 Node 仍会装旧大版本；
+// 迁移按"当前值 < 目标且迁移标记不是当前目标"判定，每个目标只迁移一次。
 let configMigrationPending = false
 function applyConfigJson(cfg) {
   if (cfg.theme === 'light' || cfg.theme === 'dark' || cfg.theme === 'system') Config.theme = cfg.theme
@@ -483,10 +483,22 @@ function applyConfigJson(cfg) {
   if (typeof cfg.launcherUpdateSourceOk === 'string') Config.launcherUpdateSourceOk = cfg.launcherUpdateSourceOk.slice(0, 120)
   if (Number.isInteger(cfg.nodeMajor)) Config.nodeMajor = cfg.nodeMajor
   if (typeof cfg.nodeMajorMigratedTo === 'string' && cfg.nodeMajorMigratedTo) Config.nodeMajorMigratedTo = cfg.nodeMajorMigratedTo
-  // 旧默认值 22 → 新默认（Node.js 24 LTS）：只迁移一次并落标记；标记存在后用户的显式值不再被改
-  if (Number(cfg.nodeMajor) === 22 && !Config.nodeMajorMigratedTo) {
-    Config.nodeMajor = envDetect.DEFAULT_NODE_MAJOR
-    Config.nodeMajorMigratedTo = String(envDetect.DEFAULT_NODE_MAJOR)
+  // 目标 DSH 的 Node 要求（更新预检时记下）：让环境页在"还没升级成功"时也能给出 Node 升级入口。
+  Config.dshTargetEngines = null
+  if (cfg.dshTargetEngines && typeof cfg.dshTargetEngines === 'object'
+    && typeof cfg.dshTargetEngines.range === 'string' && cfg.dshTargetEngines.range) {
+    Config.dshTargetEngines = {
+      version: String(cfg.dshTargetEngines.version || ''),
+      range: cfg.dshTargetEngines.range,
+    }
+  }
+  // 旧默认值（22 → 24 → 26）：目标大版本提升后做一次性迁移并落标记；
+  // 标记已经是当前目标时不再改，避免每次启动都覆盖（用户显式选定的同目标值保持不变）。
+  const targetNodeMajor = envDetect.DEFAULT_NODE_MAJOR
+  if (Number.isInteger(Number(cfg.nodeMajor)) && Number(cfg.nodeMajor) < targetNodeMajor
+    && String(Config.nodeMajorMigratedTo || '') !== String(targetNodeMajor)) {
+    Config.nodeMajor = targetNodeMajor
+    Config.nodeMajorMigratedTo = String(targetNodeMajor)
     configMigrationPending = true
   }
   if (typeof cfg.nodeMirror === 'string') Config.nodeMirror = cfg.nodeMirror
@@ -5469,6 +5481,14 @@ function updateStateSnapshot() {
       // 预装探测已证明该目标版本自身跑不起来：界面不再提供更新按钮（见 dsh-update.js 的 stageBlock）
       targetBroken: dsh.targetBroken === true,
       targetBrokenDetail: dsh.targetBrokenDetail || '',
+      // 因目标版本要求更高 Node 而被拦下：按钮改为"先升级 Node.js"，不重复无效更新
+      nodeBlocked: dsh.nodeBlocked === true,
+      // 更新进度：UI 只画"第几步 / 共几步 + 已用时间"，不在安装阶段伪造百分比
+      phase: dsh.phase || '',
+      phaseIndex: Number.isInteger(dsh.phaseIndex) ? dsh.phaseIndex : 0,
+      phaseCount: Number.isInteger(dsh.phaseCount) ? dsh.phaseCount : 0,
+      phaseDetail: dsh.phaseDetail || '',
+      startedAt: Number(dsh.startedAt) || 0,
     },
   }
 }
@@ -7685,6 +7705,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           updater.onSourceChanged()
           Config.nodeMajor = envDetect.DEFAULT_NODE_MAJOR
           Config.nodeMajorMigratedTo = String(envDetect.DEFAULT_NODE_MAJOR)
+          Config.dshTargetEngines = null
           Config.nodeMirror = ''
           Config.npmRegistry = ''
           Config.dshUpdateCheckedAt = 0
@@ -7832,9 +7853,10 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           const opts = value && typeof value === 'object' ? value : {}
           delete opts.items
           // 目标 DSH 的 engines 范围必须带给安装侧：Node 的"复用/升级/验收"都按它判。
-          // 缺省时安装侧只能退回 DSHL 的默认范围（^22.19.0 || >=24.0.0），
-          // 会把 24.16.0 当成合格（而新 DSH 要求 ^24.22.3），装完仍起不来。
-          if (!opts.engineRange && envReport && envReport.engineRange) opts.engineRange = envReport.engineRange
+          // 优先用 targetEngineRange（已安装 DSH 与目标 DSH 要求的并集）：回滚后只看旧 DSH 的
+          // engines 会把 26.10 当成合格，升级入口点了也不会真正升级。
+          const engineRange = envReport && (envReport.targetEngineRange || envReport.engineRange)
+          if (!opts.engineRange && engineRange) opts.engineRange = engineRange
           // 「升级 Node.js」是唯一会动"已就绪环境"的安装动作：旧 node.exe 正被服务占用时，
           // MSI 的 major upgrade 会因删不掉旧文件而失败（这次失败是整包回滚，不会留半截）。
           // 所以先把服务停稳；停止无法确认就一个字节都不改（fail-closed）。

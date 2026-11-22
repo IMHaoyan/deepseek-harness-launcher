@@ -556,7 +556,7 @@ function missingEnvItems(env) {
 // 任务启动成功后切到运行环境页 —— 进度、日志、重试按钮都在那里，保证每个动作都有可见结果。
 async function startNodeUpgrade() {
   const up = (window._envSummary && window._envSummary.nodeUpgrade) || {};
-  const targetMajor = up.targetMajor || 24;
+  const targetMajor = up.targetMajor || 26;
   const msi = up.mode === 'msi';
   const ok = await confirmDialog({
     title: `升级 Node.js 到 ${targetMajor} LTS？`,
@@ -609,7 +609,7 @@ function renderEnvSummary(env) {
     const btn = $('btnNodeUpgrade');
     if (row && btn) {
       if (up) {
-        const targetMajor = up.targetMajor || 24;
+        const targetMajor = up.targetMajor || 26;
         row.classList.remove('hidden');
         btn.classList.remove('hidden');
         $('nodeUpgradeVersion').textContent = `v${up.from}`;
@@ -1918,6 +1918,11 @@ function renderDshUpdate(u) {
         btn.disabled = true;
         btn.textContent = '更新中…';
         btn.title = '更新完成后会自动重启服务';
+      } else if (u.nodeBlocked) {
+        // 目标版本要求更高 Node：重复点更新只会得到同一条拦截，按钮直接送到运行环境页
+        btn.disabled = false;
+        btn.textContent = '先升级 Node.js';
+        btn.title = (u.error || '新版本要求更高版本的 Node.js') + '（当前 DSH 版本不受影响）';
       } else {
         btn.disabled = false;
         btn.textContent = '重试';
@@ -1966,17 +1971,97 @@ function renderDshUpdate(u) {
     else if (status === 'updating') text = '更新中…';
     else if (status === 'updated') text = `已更新到 v${u.current}`;
     else if (status === 'up-to-date') text = '已是最新版本';
-    else if (status === 'error') text = '检查/更新失败';
-    flashVersionHint(rowHint, text, text === '检查/更新失败' ? (u.error || '') : '', 'dsh', { sticky });
+    else if (status === 'error') text = u.nodeBlocked ? '需先升级 Node.js' : '检查/更新失败';
+    flashVersionHint(rowHint, text, status === 'error' ? (u.error || '') : '', 'dsh', { sticky });
   }
 
   // 设置页不再有"DSH版本与更新"行：版本、检查、更新入口都在主页面行内
+
+  renderDshUpdateProgress(u);
+}
+
+// ---------- DSH 更新进度卡 ----------
+// 只画"第几步 / 共几步 + 已用时间 + 当前动作"：npm 安装没有可靠百分比，伪造进度比没有更糟。
+let dshUpdTimer = null;
+function stopDshUpdTimer() { if (dshUpdTimer) { clearInterval(dshUpdTimer); dshUpdTimer = null; } }
+function fmtUpdElapsed(ms) {
+  const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  return `${m} 分 ${String(s % 60).padStart(2, '0')} 秒`;
+}
+function renderDshUpdateProgress(u) {
+  const box = $('dshUpdateProgress');
+  if (!box) return;
+  const status = u ? u.status : 'idle';
+  stopDshUpdTimer();
+
+  if (status === 'updating') {
+    box.classList.remove('hidden');
+    box.textContent = '';
+    const startedAt = Number(u.startedAt) || Date.now();
+    const head = document.createElement('div'); head.className = 'upd-p-head';
+    const phase = document.createElement('span'); phase.className = 'upd-p-phase';
+    phase.textContent = u.phase || '更新中…';
+    const elapsed = document.createElement('span'); elapsed.className = 'upd-p-elapsed';
+    const tick = () => { elapsed.textContent = '已用 ' + fmtUpdElapsed(Date.now() - startedAt); };
+    tick();
+    head.appendChild(phase); head.appendChild(elapsed); box.appendChild(head);
+
+    const count = Math.max(1, Number(u.phaseCount) || 5);
+    const idx = Math.min(count - 1, Math.max(0, Number(u.phaseIndex) || 0));
+    const steps = document.createElement('div'); steps.className = 'upd-p-steps';
+    for (let i = 0; i < count; i++) {
+      const seg = document.createElement('span');
+      seg.className = 'upd-p-step ' + (i < idx ? 'done' : i === idx ? 'current' : '');
+      steps.appendChild(seg);
+    }
+    box.appendChild(steps);
+
+    if (u.phaseDetail) {
+      const detail = document.createElement('div'); detail.className = 'upd-p-detail';
+      detail.textContent = u.phaseDetail;
+      box.appendChild(detail);
+    }
+    dshUpdTimer = setInterval(() => {
+      if (box.classList.contains('hidden')) { stopDshUpdTimer(); return; }
+      tick();
+    }, 1000);
+    return;
+  }
+
+  if (status === 'error' && u && u.error) {
+    box.classList.remove('hidden');
+    box.textContent = '';
+    const head = document.createElement('div'); head.className = 'upd-p-head';
+    const title = document.createElement('span'); title.className = 'upd-p-phase';
+    title.textContent = (u.phaseDetail && u.phaseDetail === u.error) ? '更新未完成' : '检查/更新未完成';
+    head.appendChild(title); box.appendChild(head);
+    const err = document.createElement('div'); err.className = 'upd-p-error';
+    err.textContent = u.error;
+    box.appendChild(err);
+    // 因 Node 版本被拦：给一个直达运行环境页的按钮，不让用户自己找
+    if (/node\.js|node 版本|engines/iu.test(u.error)) {
+      const actions = document.createElement('div'); actions.className = 'upd-p-actions';
+      const btn = document.createElement('button');
+      btn.className = 'btn sm primary';
+      btn.textContent = '打开运行环境升级 Node.js';
+      btn.addEventListener('click', () => { if (typeof showPage === 'function') showPage('env'); });
+      actions.appendChild(btn);
+      box.appendChild(actions);
+    }
+    return;
+  }
+
+  box.classList.add('hidden');
+  box.textContent = '';
 }
 $('btnDshUpdateNow').addEventListener('click', () => {
   const u = window._dshUpdate;
   if (!u) { void cmd('dshCheckNow'); return; }
-  // 源码形态：打开源码目录手动更新；失败重试：源码=重新检查，其余=重试更新；其余情况=立即更新
+  // 源码形态：打开源码目录手动更新；Node 被拦：直接去运行环境；失败重试：源码=重新检查，其余=重试更新
   if (u.kind === 'source') void cmd('openDshDir');
+  else if (u.status === 'error' && u.nodeBlocked) { if (typeof showPage === 'function') showPage('env'); }
   else if (u.status === 'error') void cmd('dshUpdateNow');
   else if (u.status === 'available') void cmd('dshUpdateNow');
   else void cmd('dshCheckNow');
