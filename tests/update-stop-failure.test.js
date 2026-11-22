@@ -109,7 +109,7 @@ for (const failure of ['throw', 'error-event', 'no-handoff']) {
 
 // 执行真实 updateNow，但停服失败后任何磁盘/安装/页面操作都记录为违规。
 const source = read('dsh-update.js')
-const updateFunction = source.slice(source.indexOf('async function updateNow()'), source.indexOf('module.exports ='))
+const updateFunction = source.slice(source.indexOf('async function updateNow('), source.indexOf('module.exports ='))
 function dsh(kind, stopService, snapshot = { running: true }, extra = {}) {
   const writes = [], changes = []
   const state = { status: 'available', latest: '0.2.0', latestChannel: 'latest' }

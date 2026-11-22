@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const source = fs.readFileSync(path.join(__dirname, '..', 'dsh-update.js'), 'utf8')
-const body = source.slice(source.indexOf('async function updateNow()'), source.indexOf('module.exports ='))
+const body = source.slice(source.indexOf('async function updateNow('), source.indexOf('module.exports ='))
 
 for (const branch of ['verification', 'outcome']) {
   for (const failedStop of [false, 'throw']) {

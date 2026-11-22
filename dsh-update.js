@@ -535,6 +535,57 @@ async function recordTargetRequirementFrom(version, nodeBin) {
   } catch { /* 预取失败不影响检查 */ }
 }
 
+/**
+ * 更新前的只读预检：告诉渲染层"这次更新需不需要先升 Node、能不能由 dshl 升"。
+ * 只读、无副作用；真正的拦截仍在 updateNow 里（fail-closed），这里只用于把
+ * 「立即更新」合并成一次确认 + 一次串行执行，而不是让用户被拦下后再找第二个按钮。
+ */
+async function preflightNodeForTarget() {
+  if (!Config || !envDetect) return { ok: false, error: '更新器尚未初始化' }
+  try {
+    const report = await envDetect.detectEnv(false)
+    if (!report || !report.plan) return { ok: false, error: '运行环境未就绪，无法更新' }
+    const latest = state.latest || ''
+    if (!latest) return { ok: false, error: '尚未确认目标版本，请先检查更新' }
+    // 目标安装树已被证明跑不起来：不要为了一个注定失败的更新去升 Node。
+    if (stageBlock && stageBlock.version === latest) {
+      return { ok: false, error: `新版本 v${latest} 的安装包在本机无法运行，已取消升级` }
+    }
+    const fromVersion = report.plan.dshVersion || ''
+    const gate = decideUpdateTarget({
+      target: latest,
+      installed: fromVersion,
+      targetChannel: state.latestChannel || '',
+      currentChannel: channelOf(),
+      userChoseChannel: userSwitchedChannel !== '' && userSwitchedChannel === channelOf(),
+    })
+    const nonUpgrade = gate.nonUpgrade === true
+    const targetEngines = readStagedEngines(latest) || await fetchTargetEngines(latest, report.plan.nodeCmd)
+    const nodeVersion = (report.node && report.node.version) || ''
+    const block = gate.action === 'block'
+      ? null
+      : targetNodeBlockOf({ nodeVersion, targetMajor: nonUpgrade ? 0 : (Config && Config.nodeMajor), engines: targetEngines })
+    const up = report.nodeUpgrade || null
+    return {
+      ok: true,
+      latest,
+      fromVersion,
+      nodeVersion,
+      engines: targetEngines,
+      needsNode: !!block,
+      reason: block ? block.reason : '',
+      targetMajor: Number(Config.nodeMajor) || 0,
+      // 只有 dshl 真能执行升级（MSI/用户级）时才允许"一键串行"；nvm/自定义路径仍交给用户自己升级。
+      canUpgrade: !!(block && up && !nonUpgrade),
+      upgradeMode: up ? up.mode : '',
+      from: up ? up.from : nodeVersion,
+      gateBlocked: gate.action === 'block' ? (gate.reason || '') : '',
+    }
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) }
+  }
+}
+
 function pushState() {
   try { if (onState) onState() } catch { /* noop */ }
 }
@@ -1455,7 +1506,10 @@ async function checkOnce(reason, force) {
 
 // ---------- 更新（仅用户点击触发；失败旧版不动、服务拉回） ----------
 
-async function updateNow() {
+// opts.assumeWasRunning：串行流程（升级 Node → 更新 DSH）里服务已被 Node 安装停掉了，
+// 但用户起点是"服务在运行"；更新完成后必须按"原本在运行"处理（拉起服务、重载页面），
+// 不能在中间先起一次服务再停第二次。
+async function updateNow(opts = {}) {
   if (updating) return
   if (state.status !== 'available' && state.status !== 'error') {
     log(`dsh-update: updateNow ignored (status=${state.status})`)
@@ -1546,9 +1600,12 @@ async function updateNow() {
       return
     }
     const svc = getServerState ? getServerState() : { running: false }
-    const wasRunning = !!(svc.running || svc.starting || svc.settling) // 被取消的启动请求在更新后也应恢复
+    const serviceUp = !!(svc.running || svc.starting || svc.settling) // 被取消的启动请求在更新后也应恢复
+    // 串行流程里服务已在 Node 安装前停掉：用 assumeWasRunning 保留"更新后要拉起"的语义，
+    // 但停服动作只看真实状态，不对已停的服务重复调用 stopService。
+    const wasRunning = serviceUp || opts.assumeWasRunning === true
     setUpdatePhase(1, wasRunning ? '正在停止 DSH 服务…' : '服务未运行，跳过停止')
-    if (wasRunning || svc.stopping || svc.settling || svc.starting) {
+    if (serviceUp || svc.stopping || svc.settling || svc.starting) {
       log('dsh-update: stopping service before update')
       if (typeof stopService !== 'function' || await stopService() !== true) {
         throw new Error('更新已暂停：服务尚未确认停止，请稍候重试')
@@ -1861,6 +1918,7 @@ module.exports = {
   targetNodeBlockOf,
   readStagedEngines,
   fetchTargetEngines,
+  preflightNodeForTarget,
   // 切换动作本身也导出：测试用真实目录演练"顶上 / 退回"，而不是只测判定
   swapStagedInto,
   restoreSwap,

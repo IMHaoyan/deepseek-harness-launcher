@@ -156,6 +156,38 @@ function renderLauncher(state) {
   }
 }
 
+// 一次点击的更新入口：先只读预检，需要 Node 时把升级并进同一次确认。
+// 更新窗口没有运行环境页，确认后启动串行流程并关窗切到控制台环境页看 Node 进度。
+async function startDshUpdateSmart() {
+  let pre = null
+  try { pre = await cmd('dshUpdatePreflight') } catch { pre = null }
+  if (pre && pre.ok === true && pre.needsNode) {
+    if (!pre.canUpgrade) {
+      window.alert('需要 Node.js ' + (pre.targetMajor || 26) + ' LTS：'
+        + (pre.error || '本机 Node 由其他方式管理，请先用它的方式升级后再试'))
+      return false
+    }
+    const major = pre.targetMajor || 26
+    const ok = window.confirm(`先升级 Node.js 到 ${major} LTS，再更新 DSH？\n\n`
+      + `更新到 v${pre.latest || '新版本'} 需要 Node.js ${major} LTS`
+      + (pre.engines ? `（目标版本要求 ${pre.engines}）` : '')
+      + `，本机是 v${pre.nodeVersion || '未知'}。\n\n`
+      + `将先升级 Node.js${pre.upgradeMode === 'msi' ? '（需要一次管理员授权）' : ''}，完成后自动继续更新 DSH。`
+      + 'DSH 更新会重启服务，进行中的对话会中断；若 Node 升级失败，当前 DSH 不会被改动。')
+    if (!ok) return false
+    const r = await cmd('dshUpdateWithNode')
+    if (!r || r.ok === false) {
+      window.alert('无法开始升级：' + ((r && r.error) || '无响应，请查看日志'))
+      return false
+    }
+    if (r.direct) return true // 预检后 Node 已达标：直接更新 DSH，留在本窗口看进度
+    void cmd('openEnvPage')
+    return true
+  }
+  await cmd('dshUpdateNow')
+  return true
+}
+
 function renderDsh(state) {
   const s = state || {}
   const status = s.status || 'idle'
@@ -202,7 +234,12 @@ function renderDsh(state) {
       busy.dsh = true
       btn.disabled = true
       btn.textContent = '正在更新…'
-      await cmd('dshUpdateNow')
+      const started = await startDshUpdateSmart()
+      if (started === false) {
+        busy.dsh = false
+        btn.disabled = false
+        btn.textContent = `更新到 v${s.latest}`
+      }
     })
     box.appendChild(btn)
     // 耗时口径按实测给，并区分"预装就绪"与"还得现装"：两者差 4 倍左右，混着说用户没法预期
@@ -283,18 +320,22 @@ function renderDshProgress(s) {
     const err = document.createElement('div'); err.className = 'upd-p-error'
     err.textContent = s.error
     box.appendChild(err)
-    // 被 Node 版本拦下且环境页确实有升级入口：给一条明确的出路（关窗并切到控制台环境页），
-    // 避免用户只知道原因、不知道下一步。没有入口时不画按钮（文案已说明去用版本管理器升级）。
+    // 被 Node 版本拦下且环境页确实有升级入口：直接给"一步到位"的动作，
+    // 确认后启动串行流程并关窗切到控制台环境页看 Node 进度；没有入口时不画按钮。
     if (s.nodeBlocked && s.nodeUpgradeAvailable) {
       const actions = document.createElement('div'); actions.className = 'upd-p-actions'
       const btn = document.createElement('button')
       btn.className = 'upd-btn primary'
-      btn.textContent = '打开运行环境'
-      btn.title = '在控制台「运行环境」页升级 Node.js 后重试更新'
-      btn.addEventListener('click', () => {
+      btn.textContent = '升级 Node 并更新 DSH'
+      btn.title = '先升级 Node.js（可能需要一次管理员授权），成功后自动继续更新 DSH'
+      btn.addEventListener('click', async () => {
         btn.disabled = true
-        btn.textContent = '正在打开…'
-        void cmd('openEnvPage')
+        btn.textContent = '正在开始…'
+        const started = await startDshUpdateSmart()
+        if (started === false) {
+          btn.disabled = false
+          btn.textContent = '升级 Node 并更新 DSH'
+        }
       })
       actions.appendChild(btn)
       box.appendChild(actions)

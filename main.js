@@ -170,27 +170,63 @@ let envRefreshSeq = 0
 let envForceRefreshInFlight = false
 // 显式「升级 Node.js」任务是否停过服务：失败/取消后要负责把服务拉回来（成功路径由 onDone 自动启动）
 let nodeUpgradeRestartPending = false
+// 串行流程：用户点了「升级 Node 并更新 DSH」。Node 安装成功后不先启动服务，直接继续 DSH 更新；
+// 失败/取消时清掉，避免下一次普通安装完成后误触发一次 DSH 更新。
+let pendingDshUpdateAfterNode = false
+// 串行流程开始时服务是否在运行：决定 DSH 更新成功后要不要把服务拉起来（尊重"本来就没开"）。
+let pendingDshUpdateResume = false
 
 /**
  * 安装任务成功后的统一收尾：重探环境 →（Node 升级过时）复检被 Node 拦下的 DSH 更新状态 → 就绪则启动服务。
- * 抽成顶层函数是为了可测试：用桩执行它就能验证"先刷新再复检、只在 nodeBlocked 时复检、不自动更新 DSH"。
+ * 串行流程（pendingDshUpdateAfterNode）例外：Node 装完直接继续 DSH 更新，不先启动一次服务。
+ * 抽成顶层函数是为了可测试：用桩执行它就能验证顺序、条件与"不自动更新 DSH"。
  * @param {{job?:{items?:string[],silent?:boolean}}|null} snap envInstall.getJob() 的快照
  */
 async function afterEnvInstallDone(snap) {
   // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
   // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动。
   await refreshEnv(true)
-  // Node 升级完成后，之前"目标 DSH 要求更高 Node"的拦截结论已经过时：
-  // 立即复检一次，让版本行从「需先升级 Node.js」回到真实的「可更新 / 已是最新」。
-  // 只在确实装了 node 且当前就停在 nodeBlocked 错误态时触发，避免每次插件安装都多一次网络检查。
-  // 不 await：复检可能因网络慢而拖很久，绝不能挡住后面的服务启动；rejection 必须接住，否则界面停在旧结论。
+  // 串行流程标记只消费一次：无论后续成功与否，都不能让它影响下一次普通安装。
+  const queuedDshUpdate = pendingDshUpdateAfterNode
+  const queuedResume = pendingDshUpdateResume
+  pendingDshUpdateAfterNode = false
+  pendingDshUpdateResume = false
   const jobItems = snap && snap.job && Array.isArray(snap.job.items) ? snap.job.items : []
   const dshNow = dshUpdater.getState()
-  if (jobItems.includes('node') && dshNow.status === 'error' && dshNow.nodeBlocked) {
+  // Node 升级完成后，之前"目标 DSH 要求更高 Node"的拦截结论已经过时：
+  // 立即复检一次，让版本行从「需先升级 Node.js」回到真实的「可更新 / 已是最新」。
+  // 串行流程不走这里：updateNow 自己会重新判定，先跑复检只会把状态改成 checking 而挡住更新。
+  // 不 await：复检可能因网络慢而拖很久，绝不能挡住后面的服务启动；rejection 必须接住。
+  if (!queuedDshUpdate && jobItems.includes('node') && dshNow.status === 'error' && dshNow.nodeBlocked) {
     log('node upgraded: rechecking DSH update target requirement')
     void dshUpdater.checkOnce('manual', true).catch((err) => {
       log('dsh-update: Node 升级后的复检失败：' + ((err && err.message) || String(err)))
     })
+  }
+  // 串行流程：Node 已就绪，直接继续 DSH 更新。updateNow 会完成停服（若还需要）、安装、启动与校验；
+  // assumeWasRunning 保证成功后把服务拉起来，而不会在 Node 安装与 DSH 更新之间先起一次服务。
+  if (queuedDshUpdate) {
+    const d = dshUpdater.getState()
+    if (d.status === 'available' || d.status === 'error') {
+      log('node upgrade done: continuing queued DSH update')
+      try { if (consoleIsOpen()) showConsolePage('main') } catch { /* noop */ }
+      await dshUpdater.updateNow({ assumeWasRunning: queuedResume })
+      if (server.running()) {
+        // 与普通 Node 升级收尾保持一致：更新完成后补一次推荐插件/退役插件处理
+        await maybeAutoInstallRecommendedPlugins()
+        void maybeRemoveRetiredPlugins()
+        return // updateNow 已把服务拉起（含回滚后恢复）
+      }
+      log('queued DSH update finished without a running service, falling back to normal start')
+    } else {
+      log('queued DSH update skipped (status=' + (d.status || 'idle') + ')')
+    }
+  }
+  // 串行流程开始时服务本来就没运行：Node 装完也不能顺手把它拉起来。
+  // 更新后的启动由 updateNow 按 assumeWasRunning=false 决定；跳过/失败时同样保持停止。
+  if (queuedDshUpdate && !queuedResume) {
+    log('combined flow: service was stopped before upgrade, leaving it stopped')
+    return
   }
   // 静默任务（后台迁移）：只切换检测结果，不自动启动/重启服务（避免打断正在运行的会话）。
   const silent = !!(snap && snap.job && snap.job.silent)
@@ -232,6 +268,8 @@ function initEnvRuntime() {
     onFail: () => {
       // 显式升级任务在启动前停了服务：失败/取消后必须把服务拉回来
       // （fail-closed：不能让用户环境停在"服务已停、升级也没成"的半截状态）。
+      pendingDshUpdateAfterNode = false // 串行流程在 Node 阶段失败：DSH 一个字节都不动，也不排入更新
+      pendingDshUpdateResume = false
       if (!nodeUpgradeRestartPending) return
       nodeUpgradeRestartPending = false
       log('node upgrade job failed/cancelled, restarting service')
@@ -243,6 +281,65 @@ function initEnvRuntime() {
       })()
     },
   })
+}
+
+// 「升级 Node 并更新 DSH」：一次点击的串行流程入口。
+// 这里只做 fail-closed 停服 + 启动 Node 升级任务；Node 成功后由 afterEnvInstallDone 继续 DSH 更新。
+// Node 阶段失败/取消时 onFail 清标记并恢复服务，DSH 完全不动。
+async function startNodeUpgradeThenDshUpdate() {
+  const d = dshUpdater.getState()
+  if (pendingDshUpdateAfterNode) return { ok: false, error: '已在升级 Node.js 并更新 DSH' }
+  if (!(d.status === 'available' || d.status === 'error')) return { ok: false, error: '当前没有待执行的 DSH 更新' }
+  // 主进程再判一次（fail-closed）：不能只信渲染层传来的意图。
+  const pre = await dshUpdater.preflightNodeForTarget()
+  if (!pre || pre.ok !== true) return { ok: false, error: (pre && pre.error) || '更新前预检失败' }
+  if (pre.gateBlocked) return { ok: false, error: pre.gateBlocked }
+  // 预检与确认之间 Node 可能已经达标（用户刚手动升级过）：不再要求"重新点一次"，
+  // 直接走普通 DSH 更新；渲染层收到 direct 后留在「通用」页看进度。
+  if (!pre.needsNode) {
+    void dshUpdater.updateNow({ assumeWasRunning: server.running() })
+    return { ok: true, direct: true }
+  }
+  if (!pre.canUpgrade) {
+    return {
+      ok: false,
+      error: `Node.js 需要 ${pre.targetMajor || 26} LTS（目标要求 ${pre.engines || '更高版本'}），`
+        + '但运行环境页没有可执行的升级入口；请用当前 Node 的版本管理器升级后重试',
+    }
+  }
+  if (!(envReport && envReport.nodeUpgrade)) return { ok: false, error: '运行环境页没有可执行的 Node.js 升级入口' }
+  const snap = envInstall.getJob()
+  if (snap && snap.job && snap.job.status === 'running') return { ok: false, error: '已有安装任务正在进行，请等它结束后再试' }
+  const serviceWasUp = server.running()
+  if (serviceWasUp) {
+    log('node upgrade (combined): stopping service before MSI major upgrade')
+    nodeUpgradeRestartPending = true
+    let stopped = false
+    try { stopped = (await stopServer()) === true } catch (err) {
+      log('node upgrade (combined): stop service failed: ' + ((err && err.message) || String(err)))
+    }
+    if (!stopped) {
+      nodeUpgradeRestartPending = false
+      return { ok: false, error: '服务未能确认停止，已暂停升级（请先停止服务后重试）' }
+    }
+  }
+  pendingDshUpdateAfterNode = true
+  pendingDshUpdateResume = serviceWasUp
+  try {
+    const opts = { nodeUpgrade: true, forceNodeInstall: true }
+    const engineRange = (envReport && (envReport.targetEngineRange || envReport.engineRange)) || pre.engines
+    if (engineRange) opts.engineRange = engineRange
+    envInstall.startInstall(['node'], opts)
+    return { ok: true }
+  } catch (err) {
+    pendingDshUpdateAfterNode = false
+    pendingDshUpdateResume = false
+    if (nodeUpgradeRestartPending) {
+      nodeUpgradeRestartPending = false
+      if (envReady() && !server.running()) void handleStart()
+    }
+    return { ok: false, error: (err && err.message) || String(err) }
+  }
 }
 
 async function refreshEnv(force = false) {
@@ -7400,6 +7497,10 @@ function registerIpc() {
           return '{}'
         }
         case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
+        // 只读预检：渲染层据此把「立即更新」一次点击合并成"必要时先升 Node"的串行流程。
+        case 'dshUpdatePreflight': return JSON.stringify(await dshUpdater.preflightNodeForTarget())
+        // 更新窗口也能发起同一条串行动作（Node 升级成功后自动继续 DSH 更新）。
+        case 'dshUpdateWithNode': return JSON.stringify(await startNodeUpgradeThenDshUpdate())
         // 更新窗口里被 Node 版本拦下时的出路：关掉本窗口，把控制台切到「运行环境」页。
         // 只放行这一个固定页面，不接受参数 —— 更新窗口依旧无法驱动控制台的任意页面/动作。
         case 'openEnvPage': {
@@ -8040,6 +8141,10 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'updaterCheck': void updater.check(); return updater.getState()
         case 'updaterInstall': void updater.installNow(); return updater.getState()
         case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
+        // 只读预检：让「立即更新」在第一次点击时就知道需不需要先升 Node。
+        case 'dshUpdatePreflight': return JSON.stringify(await dshUpdater.preflightNodeForTarget())
+        // 一次点击的串行流程：Node 升级成功后再自动更新 DSH（见 startNodeUpgradeThenDshUpdate）
+        case 'dshUpdateWithNode': return JSON.stringify(await startNodeUpgradeThenDshUpdate())
         case 'dshCheckNow': {
           // 检查是异步的：这里立刻回执，结果由后端状态推送。必须接住 rejection ——
           // 否则未处理的 Promise 拒绝只在主进程日志里留一行，界面永远等不到任何反馈。

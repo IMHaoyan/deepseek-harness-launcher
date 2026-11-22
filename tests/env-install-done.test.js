@@ -21,34 +21,44 @@ assert.ok(fnStart > 0 && fnEnd > fnStart, 'main.js 里找不到 afterEnvInstallD
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-function harness({ dsh, checkOnce } = {}) {
+function harness({ dsh, checkOnce, pending = false, resume = true, runningAfterUpdate = true } = {}) {
   const events = []
   const logs = []
+  let running = true
   const ctx = {
     log: (m) => logs.push(String(m)),
     refreshEnv: async () => { events.push('refresh') },
     envReady: () => true,
     envReport: { pnpm: { status: 'ok' } },
-    handleStart: async () => { events.push('start') },
+    handleStart: async () => { events.push('start'); running = true },
     maybeAutoInstallRecommendedPlugins: async () => {},
     maybeRemoveRetiredPlugins: () => {},
-    server: { running: () => true },
+    server: { running: () => running },
     Config: { pluginSetupChoice: 'auto' },
     pluginSetup: { error: null },
     sleep: async () => {},
     openWebUi: () => {},
     startWhenReady: false,
+    pendingDshUpdateAfterNode: pending,
+    pendingDshUpdateResume: resume,
+    consoleIsOpen: () => true,
+    showConsolePage: (page) => { events.push('page:' + page) },
     dshUpdater: {
       getState: () => dsh || { status: 'idle' },
       checkOnce: (...args) => {
         events.push('check')
         return checkOnce ? checkOnce(...args) : Promise.resolve()
       },
-      updateNow: () => { events.push('updateNow'); return Promise.resolve() },
+      updateNow: (opts) => {
+        events.push('updateNow')
+        events.push('updateOpts:' + JSON.stringify(opts || {}))
+        running = runningAfterUpdate
+        return Promise.resolve()
+      },
     },
   }
   vm.runInNewContext(mainSrc.slice(fnStart, fnEnd) + '\n;globalThis.afterEnvInstallDone = afterEnvInstallDone', ctx)
-  return { run: (snap) => ctx.afterEnvInstallDone(snap), events, logs }
+  return { run: (snap) => ctx.afterEnvInstallDone(snap), events, logs, ctx }
 }
 
 test('装了 node 且被 Node 拦下：先刷新环境，再复检一次（不自动更新 DSH）', async () => {
@@ -88,4 +98,41 @@ test('静默安装：只刷新/复检，不自动启动服务', async () => {
   const h = harness({ dsh: { status: 'error', nodeBlocked: true } })
   await h.run({ job: { items: ['node'], silent: true } })
   assert.deepEqual(h.events, ['refresh', 'check'], '静默任务不能拉起服务：' + h.events.join(','))
+})
+
+// ---------- 串行流程：点一次「升级 Node 并更新 DSH」后，Node 成功即自动继续 DSH 更新 ----------
+test('串行流程：Node 成功后直接继续 DSH 更新，不先启动服务、不先复检', async () => {
+  const h = harness({ dsh: { status: 'error', nodeBlocked: true }, pending: true })
+  await h.run({ job: { items: ['node'], silent: false } })
+  assert.equal(h.events[0], 'refresh', '必须先重探环境')
+  assert.ok(h.events.includes('updateNow'), 'Node 成功后应自动继续 DSH 更新：' + h.events.join(','))
+  assert.ok(h.events.indexOf('page:main') < h.events.indexOf('updateNow'), '先切回「通用」再开始更新：' + h.events.join(','))
+  assert.equal(h.events.includes('check'), false, '串行流程不做会挡住更新的复检')
+  assert.equal(h.events.includes('start'), false, '不能先启动一次服务再停掉')
+  assert.ok(h.events.includes('page:main'), '切回「通用」展示 DSH 更新进度')
+  assert.equal(h.events.includes('updateOpts:{"assumeWasRunning":true}'), true, '按"原本在运行"收尾')
+  assert.equal(h.ctx.pendingDshUpdateAfterNode, false, '串行标记只能消费一次')
+})
+
+test('串行流程：已没有可更新的 DSH 时，退回正常启动服务', async () => {
+  const h = harness({ dsh: { status: 'up-to-date' }, pending: true })
+  await h.run({ job: { items: ['node'], silent: false } })
+  assert.equal(h.events.includes('updateNow'), false, '没有更新时不能触发更新')
+  assert.ok(h.events.includes('start'), '服务必须被拉起来：' + h.events.join(','))
+  assert.equal(h.ctx.pendingDshUpdateAfterNode, false, '标记仍要被消费')
+})
+
+test('串行流程：DSH 更新后服务未起来时，收尾负责兜底启动', async () => {
+  const h = harness({ dsh: { status: 'available' }, pending: true, runningAfterUpdate: false })
+  await h.run({ job: { items: ['node'], silent: false } })
+  assert.deepEqual(h.events.filter((e) => e === 'updateNow' || e === 'start'), ['updateNow', 'start'],
+    '更新后服务没起来时必须兜底启动：' + h.events.join(','))
+})
+
+test('串行流程：更新前服务本来就没运行，Node 装完也不擅自拉起', async () => {
+  const h = harness({ dsh: { status: 'up-to-date' }, pending: true, resume: false })
+  await h.run({ job: { items: ['node'], silent: false } })
+  assert.equal(h.events.includes('updateNow'), false, '没有可更新版本时不触发更新')
+  assert.equal(h.events.includes('start'), false, '服务原本停着，不能顺手拉起：' + h.events.join(','))
+  assert.equal(h.ctx.pendingDshUpdateResume, false, 'resume 标记也要被消费')
 })

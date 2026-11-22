@@ -485,14 +485,17 @@ test('main.js envInstall onDone：Node 升级成功后复检"被 Node 拦下"的
     '必须先刷新环境（看到新 Node）再判断要不要复检')
 })
 
-test('渲染层：nodeBlocked 按钮文案与真实动作一致（打开运行环境，而非直接升级）', () => {
+test('渲染层：nodeBlocked 的主操作是「升级 Node 并更新」（一次确认，串行执行）', () => {
   const block = sliceBetween(appJs, '} else if (u.nodeBlocked) {', '} else {', 'nodeBlocked 按钮分支')
-  assert.match(block, /btn\.textContent = '打开运行环境'/, '按钮应如实说明是跳转，不是直接升级')
+  assert.match(block, /btn\.textContent = '升级 Node 并更新'/, '主操作应直接完成整条依赖链，而不是只做跳转')
   assert.doesNotMatch(block, /btn\.textContent = '先升级 Node\.js'/, '不能承诺一个点击并不会执行的动作')
-  assert.match(block, /打开运行环境页升级 Node\.js/, 'tooltip 要说明真正的升级动作在环境页')
-  assert.match(block, /u\.nodeUpgradeAvailable/, '只有环境页真有升级入口时才给跳转按钮')
+  assert.match(block, /u\.nodeUpgradeAvailable/, '只有环境页真有升级入口时才给一键串联按钮')
   const clickBlock = sliceBetween(appJs, "$('btnDshUpdateNow').addEventListener", '\n});', 'DSH 更新按钮点击处理')
-  assert.match(clickBlock, /u\.nodeBlocked && u\.nodeUpgradeAvailable/, '没有入口时不能跳到空页面')
+  assert.match(clickBlock, /u\.nodeBlocked && u\.nodeUpgradeAvailable.*startDshUpdateWithNode/, '有入口时点击走串行流程')
+  const fn = sliceBetween(appJs, 'async function startDshUpdateWithNode()', 'function renderDshUpdate(u)', 'startDshUpdateWithNode')
+  assert.match(fn, /confirmDialog\(/, '系统级 Node 升级前必须有一次确认（UAC 之外的用户知情）')
+  assert.match(fn, /cmd\('dshUpdateWithNode'\)/, '确认后交给主进程串行执行')
+  assert.match(fn, /showPage\('env'\)/, '先展示 Node 安装进度，而不是停在主页面干等')
 })
 
 test('更新窗口：被 Node 拦下时有直达运行环境页的出口（只放行固定页面）', () => {
@@ -589,9 +592,11 @@ test('首页状态卡：Node.js 升级行只在有事实时出现，且与运行
   }
   assert.ok(!builtIndexHtml.includes('__WHALE_PATH__'), 'wwwroot/index.html 的鲸鱼路径占位符必须已被内联')
 
-  // 渲染：只在 nodeUpgrade 存在时去掉 hidden；按钮文案/提示跟 mode 走
+  // 渲染：只在 nodeUpgrade 存在、且没有待执行的 DSH 更新时显示；按钮文案/提示跟 mode 走
   assert.match(appJs, /const row = \$\('nodeUpgradeRow'\)/, '渲染层要更新首页升级行')
-  assert.match(appJs, /row\.classList\.(remove|add)\('hidden'\)/, '渲染层要切换首页行的显隐')
+  assert.match(appJs, /function applyNodeUpgradeVisibility\(\)/, '显隐规则要收敛成一个函数（环境推送与更新状态推送共用）')
+  assert.match(appJs, /row\.classList\.toggle\('hidden', !show\)/, '渲染层要切换首页行的显隐')
+  assert.match(appJs, /const dshPending = [^\n]*u\.status === 'available'/, '有 DSH 更新待执行时隐藏独立的 Node 行（由一键串行带上）')
   assert.match(appJs, /可升级到 Node\.js \$\{targetMajor\} LTS/, '首页提示要带上目标版本')
   assert.match(appJs, /免管理员授权/, 'user 模式要说明免管理员授权')
   // 共用入口：两张入口不能各写一套确认/payload（否则文案与行为会漂移）
@@ -675,4 +680,49 @@ test('env-install：MSI 安装脚本在提权进程内清理旧 Corepack 的 pnp
   const msiBody = sliceBetween(envInstallSrc, 'async function installNodeViaMsi', '// 清理旧版 Corepack', 'installNodeViaMsi')
   assert.match(msiBody, /cleanupStaleCorepackPnpmShims\(job, dir\)/, '安装流程也要在非提权场景下幂等清理一次')
   assert.match(msiBody, /r\.cleanupKnown && r\.cleanup/, '提权进程报告清理结果时要写进安装日志')
+})
+
+test('主进程：Node → DSH 串行流程（pending 标记 + assumeWasRunning，不中间起服务）', () => {
+  const helper = sliceBetween(mainJs, 'async function startNodeUpgradeThenDshUpdate()', 'async function refreshEnv', 'startNodeUpgradeThenDshUpdate')
+  assert.match(helper, /pendingDshUpdateAfterNode = true/, 'Node 任务启动前落标记')
+  assert.match(helper, /envInstall\.startInstall\(\['node'\]/, '只启动 Node 安装，DSH 等 Node 成功后再更新')
+  assert.match(helper, /stopServer\(\)/, '系统级 Node 升级前 fail-closed 停服')
+  assert.match(helper, /nodeUpgradeRestartPending = true/, '失败后要能恢复服务')
+  assert.match(helper, /pendingDshUpdateResume = serviceWasUp/, '按开始时的服务状态决定更新后是否拉起')
+  const ipc = sliceBetween(mainJs, "case 'dshUpdateWithNode'", "case 'dshCheckNow'", 'dshUpdateWithNode case')
+  assert.match(ipc, /startNodeUpgradeThenDshUpdate\(\)/, '控制台命令要接到串行入口')
+  const done = sliceBetween(mainJs, 'async function afterEnvInstallDone', 'function initEnvRuntime', 'afterEnvInstallDone')
+  assert.match(done, /const queuedDshUpdate = pendingDshUpdateAfterNode/, '收尾要消费串行标记')
+  assert.match(done, /updateNow\(\{ assumeWasRunning: queuedResume \}\)/, 'Node 成功后自动继续 DSH 更新，并按开始时的服务状态收尾')
+  assert.ok(done.indexOf('if (queuedDshUpdate)') < done.indexOf('await handleStart()'),
+    '串行流程不能先启动一次服务再停掉')
+  assert.match(done, /if \(!queuedDshUpdate && jobItems\.includes\('node'\)/, '串行流程不做会挡住更新的复检')
+  const upd = sliceBetween(read('dsh-update.js'), 'async function updateNow(opts = {})', 'module.exports =', 'updateNow')
+  assert.match(upd, /opts\.assumeWasRunning === true/, 'updateNow 要支持"实际已停但语义上仍在运行"')
+  assert.match(upd, /if \(serviceUp \|\| svc\.stopping/, '停服动作只看真实状态，不对已停服务重复调用')
+})
+
+test('一次点击：预检把 Node 升级并进「立即更新」（控制台与更新窗口两个入口）', () => {
+  const smart = sliceBetween(appJs, 'async function startDshUpdateSmart()', 'function renderDshUpdate(u)', 'startDshUpdateSmart')
+  assert.match(smart, /cmd\('dshUpdatePreflight'\)/, '首次点击要先只读预检，而不是先被拦下')
+  assert.match(smart, /pre\.needsNode/, '预检结果决定是否串行升级 Node')
+  assert.match(smart, /confirmDialog\(/, '系统级 Node 升级前必须确认')
+  assert.match(smart, /cmd\('dshUpdateWithNode'\)/, '确认后交给主进程串行执行')
+  assert.match(appJs, /u\.status === 'available'\) void startDshUpdateSmart\(\)/, '「立即更新」的首次点击走预检入口')
+
+  const updJs = read('ui-src/update.js')
+  assert.match(updJs, /async function startDshUpdateSmart\(\)/, '更新窗口也要有同一个预检入口')
+  assert.match(updJs, /cmd\('dshUpdatePreflight'\)/)
+  assert.match(updJs, /cmd\('dshUpdateWithNode'\)/)
+
+  const preflightCases = mainJs.match(/case 'dshUpdatePreflight'/g) || []
+  assert.equal(preflightCases.length, 2, '控制台与更新窗口都要能预检')
+  const withNodeCases = mainJs.match(/case 'dshUpdateWithNode'/g) || []
+  assert.equal(withNodeCases.length, 2, '控制台与更新窗口都能发起串行流程')
+
+  const helper = sliceBetween(mainJs, 'async function startNodeUpgradeThenDshUpdate()', 'async function refreshEnv', 'startNodeUpgradeThenDshUpdate')
+  assert.match(helper, /preflightNodeForTarget\(\)/, '主进程不能只信渲染层：自己再判一次')
+  assert.match(helper, /d\.status === 'available' \|\| d\.status === 'error'/, '首次点击（available）也能进入串行流程')
+  assert.match(helper, /pre\.canUpgrade/, '没有可执行入口时 fail-closed')
+  assert.match(helper, /pendingDshUpdateResume = serviceWasUp/, '按点击前服务是否运行决定更新后是否拉起')
 })

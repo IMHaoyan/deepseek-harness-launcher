@@ -607,24 +607,19 @@ function renderEnvSummary(env) {
     const up = env && env.nodeUpgrade;
     const row = $('nodeUpgradeRow');
     const btn = $('btnNodeUpgrade');
-    if (row && btn) {
-      if (up) {
-        const targetMajor = up.targetMajor || 26;
-        row.classList.remove('hidden');
-        btn.classList.remove('hidden');
-        $('nodeUpgradeVersion').textContent = `v${up.from}`;
-        $('nodeUpgradeHint').textContent = up.mode === 'msi'
-          ? `可升级到 Node.js ${targetMajor} LTS（需一次管理员授权）`
-          : `可升级到 Node.js ${targetMajor} LTS（免管理员授权）`;
-        btn.textContent = `升级到 ${targetMajor} LTS`;
-        btn.title = up.mode === 'msi'
-          ? '官方 MSI 安装：升级会先停止服务，并需要一次管理员授权；完成后自动恢复服务'
-          : '用户级安装：升级会先停止服务，免管理员授权；完成后自动恢复服务';
-      } else {
-        row.classList.add('hidden');
-        btn.classList.add('hidden');
-      }
+    if (row && btn && up) {
+      const targetMajor = up.targetMajor || 26;
+      $('nodeUpgradeVersion').textContent = `v${up.from}`;
+      $('nodeUpgradeHint').textContent = up.mode === 'msi'
+        ? `可升级到 Node.js ${targetMajor} LTS（需一次管理员授权）`
+        : `可升级到 Node.js ${targetMajor} LTS（免管理员授权）`;
+      btn.textContent = `升级到 ${targetMajor} LTS`;
+      btn.title = up.mode === 'msi'
+        ? '官方 MSI 安装：升级会先停止服务，并需要一次管理员授权；完成后自动恢复服务'
+        : '用户级安装：升级会先停止服务，免管理员授权；完成后自动恢复服务';
     }
+    // 显隐统一由"有没有升级事实 + 有没有待执行的 DSH 更新"决定（见 applyNodeUpgradeVisibility）
+    applyNodeUpgradeVisibility();
   }
 
   // 环境页状态卡
@@ -1866,9 +1861,110 @@ $('btnUpCheckNow').addEventListener('click', () => void cmd('updaterCheck'));
 $('btnUpManual').addEventListener('click', () => void cmd('openLauncherDownload'));
 
 // ---------- DSH 更新（检测全自动、更新全手动：点"立即更新"才执行） ----------
-// 主页最低端"DSH版本"行按钮：只有检测到更新（或更新中/失败重试）才显示；
-// 设置页"DSH版本与更新"行：检查按钮常驻，详情行显示检查/更新进度与结果；
-// 源码安装（kind=source）不自动更新：按钮改为"打开源码目录"，需手动 git pull && pnpm run build
+
+/** 当前 Node 升级目标大版本（来自环境探测；缺省 26，与主进程策略一致）。 */
+function nodeTargetMajor() {
+  const up = window._envSummary && window._envSummary.nodeUpgrade;
+  return (up && up.targetMajor) || 26;
+}
+
+/**
+ * 「Node.js 升级」行的显隐：有可升级事实、且当前没有待执行的 DSH 更新时才显示。
+ * 有 DSH 更新时，Node 会被「立即更新」一键串行带上，不再作为第三个必须点的按钮；
+ * 用户仍可去运行环境页手动提前升级。状态变化后由 renderEnvSummary / renderDshUpdate 共同刷新。
+ */
+function applyNodeUpgradeVisibility() {
+  const row = $('nodeUpgradeRow');
+  const btn = $('btnNodeUpgrade');
+  if (!row || !btn) return;
+  const up = window._envSummary && window._envSummary.nodeUpgrade;
+  const u = window._dshUpdate;
+  const dshPending = !!(u && (u.status === 'available' || u.status === 'updating' || (u.status === 'error' && u.nodeBlocked)));
+  const show = !!(up && !dshPending);
+  row.classList.toggle('hidden', !show);
+  btn.classList.toggle('hidden', !show);
+}
+
+/**
+ * 首次点击「立即更新」：先只读预检，必要时把 Node 升级并进同一次确认。
+ * 这样用户不会先被拦下、再去找第二个按钮；预检不可用时仍退回原来的更新入口（主进程会给出准确错误）。
+ */
+async function startDshUpdateSmart() {
+  const u = window._dshUpdate || {};
+  if (window._dshUpdatePlanning) return; // 预检可能几秒：防双击/重复确认
+  if (u.kind === 'source') { void cmd('openDshDir'); return; }
+  window._dshUpdatePlanning = true;
+  const btn = $('btnDshUpdateNow');
+  if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+  let started = false;
+  try {
+    let pre = null;
+    try { pre = await cmd('dshUpdatePreflight'); } catch { pre = null; }
+    if (!pre || pre.ok !== true) { void cmd('dshUpdateNow'); started = true; return; }
+    if (!pre.needsNode) { void cmd('dshUpdateNow'); started = true; return; }
+    if (!pre.canUpgrade) {
+      showConsoleToast('✕ 需要 Node.js ' + (pre.targetMajor || 26) + ' LTS：'
+        + (pre.error || '本机 Node 由其他方式管理，请先用它的方式升级后再试'));
+      return;
+    }
+    const major = pre.targetMajor || 26;
+    const ok = await confirmDialog({
+      title: `先升级 Node.js 到 ${major} LTS，再更新 DSH？`,
+      body: `更新到 v${pre.latest || '新版本'} 需要 Node.js ${major} LTS`
+        + (pre.engines ? `（目标版本要求 ${pre.engines}）` : '')
+        + `，本机是 v${pre.nodeVersion || '未知'}。\n\n`
+        + '将先升级 Node.js' + (pre.upgradeMode === 'msi' ? '（需要一次管理员授权）' : '')
+        + '，完成后自动继续更新 DSH。DSH 更新会重启服务，进行中的对话会中断；'
+        + '若 Node 升级失败，当前 DSH 不会被改动。',
+      confirmText: '开始升级并更新',
+      danger: true,
+    });
+    if (!ok) return;
+    const r = await cmd('dshUpdateWithNode');
+    if (!r || r.ok === false) {
+      showConsoleToast('✕ 无法开始升级：' + ((r && r.error) || '无响应，请查看日志'));
+      return;
+    }
+    started = true;
+    // 预检后 Node 已达标：直接更新 DSH，留在「通用」页看进度
+    if (r.direct) return;
+    // 先看 Node 安装进度；Node 完成后主进程会切回「通用」显示 DSH 更新进度
+    showPage('env');
+  } finally {
+    window._dshUpdatePlanning = false;
+    // 没有真正开始更新（取消确认/预检失败/无法升级）：把按钮恢复成当前状态的正确文案
+    if (!started && window._dshUpdate) renderDshUpdate(window._dshUpdate);
+  }
+}
+
+/**
+ * 「升级 Node 并更新 DSH」：一次确认 + 一次 UAC，Node 成功后主进程自动继续 DSH 更新。
+ * 这是 nodeBlocked 状态下的主操作；用确认框说清两个阶段与中断风险，不做无提示的后台系统变更。
+ */
+async function startDshUpdateWithNode() {
+  const u = window._dshUpdate || {};
+  const from = String((window._envSummary && window._envSummary.node && window._envSummary.node.version) || '较低版本');
+  const major = nodeTargetMajor();
+  const ok = await confirmDialog({
+    title: `先升级 Node.js 到 ${major} LTS，再更新 DSH？`,
+    body: `更新到 v${u.latest || '新版本'} 需要 Node.js ${major} LTS，本机是 v${from}。\n\n`
+      + '将先升级 Node.js（需要一次管理员授权），完成后自动继续更新 DSH。'
+      + 'DSH 更新会重启服务，进行中的对话会中断；若 Node 升级失败，当前 DSH 不会被改动。',
+    confirmText: '开始升级并更新',
+    danger: true,
+  });
+  if (!ok) return;
+  const r = await cmd('dshUpdateWithNode');
+  if (!r || r.ok === false) {
+    showConsoleToast('✕ 无法开始升级：' + ((r && r.error) || '无响应，请查看日志'));
+    return;
+  }
+  // 预检后 Node 已达标：直接更新 DSH，留在「通用」页看进度
+  if (r.direct) return;
+  // 先看 Node 安装进度；Node 完成后主进程会切回「通用」显示 DSH 更新进度
+  showPage('env');
+}
+
 function renderDshUpdate(u) {
   window._dshUpdate = u || null;
   const status = u ? u.status : 'idle';
@@ -1919,16 +2015,17 @@ function renderDshUpdate(u) {
         btn.textContent = '更新中…';
         btn.title = '更新完成后会自动重启服务';
       } else if (u.nodeBlocked) {
-        // 目标版本要求更高 Node：重复点更新只会得到同一条拦截。
-        // 有升级入口时送到运行环境页；没有入口（nvm/Scoop/自定义路径）就如实给"重试"，
-        // 不把用户导向一个没有按钮的页面。
+        // 目标版本要求更高 Node：有可执行的升级入口时给"一步到位"的动作（先升 Node 再自动更新 DSH），
+        // 没有入口（nvm/Scoop/自定义路径）才退回"重试"，不把用户导向没有按钮的页面。
         btn.disabled = false;
         if (u.nodeUpgradeAvailable) {
-          btn.textContent = '打开运行环境';
-          btn.title = (u.error || '新版本要求更高版本的 Node.js') + '（点此打开运行环境页升级 Node.js；当前 DSH 版本不受影响）';
+          btn.textContent = '升级 Node 并更新';
+          btn.title = (u.error || '新版本要求更高版本的 Node.js')
+            + `（点此先升级 Node.js ${nodeTargetMajor()} LTS（一次管理员授权），成功后自动更新 DSH；当前版本不受影响）`;
         } else {
           btn.textContent = '重试';
-          btn.title = (u.error || '新版本要求更高版本的 Node.js') + '（请先用当前 Node 的版本管理器升级，再点此重试；当前 DSH 版本不受影响）';
+          btn.title = (u.error || '新版本要求更高版本的 Node.js')
+            + '（请先用当前 Node 的版本管理器升级，再点此重试；当前 DSH 版本不受影响）';
         }
       } else {
         btn.disabled = false;
@@ -1985,6 +2082,8 @@ function renderDshUpdate(u) {
   // 设置页不再有"DSH版本与更新"行：版本、检查、更新入口都在主页面行内
 
   renderDshUpdateProgress(u);
+  // DSH 更新待执行时隐藏独立的 Node 升级按钮（由「立即更新」一键串行带上）
+  applyNodeUpgradeVisibility();
 }
 
 // ---------- DSH 更新进度卡 ----------
@@ -2047,14 +2146,15 @@ function renderDshUpdateProgress(u) {
     const err = document.createElement('div'); err.className = 'upd-p-error';
     err.textContent = u.error;
     box.appendChild(err);
-    // 因 Node 版本被拦且环境页确有升级入口：给一个直达运行环境页的按钮，不让用户自己找。
+    // 因 Node 版本被拦且环境页确有升级入口：给一个"一步到位"的动作（先升 Node 再自动更新 DSH）。
     // 入口不存在（nvm/Scoop/自定义 nodePath）时不画按钮 —— 错误文案已说明去用对应方式升级。
     if (u.nodeBlocked && u.nodeUpgradeAvailable) {
       const actions = document.createElement('div'); actions.className = 'upd-p-actions';
       const btn = document.createElement('button');
       btn.className = 'btn sm primary';
-      btn.textContent = '打开运行环境升级 Node.js';
-      btn.addEventListener('click', () => { if (typeof showPage === 'function') showPage('env'); });
+      btn.textContent = '升级 Node 并更新 DSH';
+      btn.title = `先升级 Node.js ${nodeTargetMajor()} LTS（一次管理员授权），成功后自动继续更新 DSH`;
+      btn.addEventListener('click', () => { void startDshUpdateWithNode(); });
       actions.appendChild(btn);
       box.appendChild(actions);
     }
@@ -2067,11 +2167,12 @@ function renderDshUpdateProgress(u) {
 $('btnDshUpdateNow').addEventListener('click', () => {
   const u = window._dshUpdate;
   if (!u) { void cmd('dshCheckNow'); return; }
-  // 源码形态：打开源码目录手动更新；Node 被拦：直接去运行环境；失败重试：源码=重新检查，其余=重试更新
+  // 源码形态：打开源码目录手动更新；Node 被拦：一次确认后串行升级 Node 再更新；
+  // 失败重试：源码=重新检查，其余=重试更新；正常更新：预检后必要时串行带上 Node。
   if (u.kind === 'source') void cmd('openDshDir');
-  else if (u.status === 'error' && u.nodeBlocked && u.nodeUpgradeAvailable) { if (typeof showPage === 'function') showPage('env'); }
+  else if (u.status === 'error' && u.nodeBlocked && u.nodeUpgradeAvailable) void startDshUpdateWithNode();
   else if (u.status === 'error') void cmd('dshUpdateNow');
-  else if (u.status === 'available') void cmd('dshUpdateNow');
+  else if (u.status === 'available') void startDshUpdateSmart();
   else void cmd('dshCheckNow');
 });
 // 主页面"DSH版本"行：悬停"检查更新"按钮
