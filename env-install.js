@@ -579,6 +579,23 @@ async function runElevatedMsi(msiPath, logPath, opts = {}) {
     `$r = '${ps(resultFile)}'`,
     'try {',
     `  $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i','${ps(msiPath)}','/qn','/norestart','/l*v','${ps(logPath)}') -Verb RunAs -Wait -PassThru`,
+    // 与 MSI 共用同一次管理员授权清理旧版 Corepack 的 pnpm shim：
+    // Node 25/26 不再内置 Corepack，升级后这些 shim 指向已删除的目标，却排在 PATH 前面遮蔽全局 pnpm。
+    // 放在这里而不是安装后再删：Program Files 需要管理员权限，单独再弹一次 UAC 对用户是额外打扰。
+    '  if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {',
+    '    $dir = $null',
+    `    try { $dir = (Get-ItemProperty 'HKLM:\\SOFTWARE\\Node.js' -ErrorAction Stop).InstallPath } catch {}`,
+    `    if (-not $dir) { $dir = Join-Path $env:ProgramFiles 'nodejs' }`,
+    `    if ($dir -and -not (Test-Path (Join-Path $dir 'node_modules\\corepack\\dist\\pnpm.js'))) {`,
+    `      foreach ($n in @('pnpm','pnpm.cmd','pnpm.ps1')) {`,
+    '        $f = Join-Path $dir $n',
+    `        if (Test-Path -LiteralPath $f) {`,
+    `          $t = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue`,
+    `          if ($t -match 'corepack') { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }`,
+    '        }',
+    '      }',
+    '    }',
+    '  }',
     `  'CODE=' + $p.ExitCode | Out-File -FilePath $r -Encoding utf8`,
     `} catch { 'CANCELLED=' + $_.Exception.Message | Out-File -FilePath $r -Encoding utf8 }`,
   ].join('; ')
@@ -817,7 +834,39 @@ async function installNodeViaMsi(job, onInstallStart, opts = {}) {
     version = String(out.stdout || '').trim().replace(/^v/, '')
   } catch { /* 版本探测失败不影响：文件确实在 */ }
   job.logLine(`Node.js 安装完成（官方 MSI）：${dir}${version ? ' · v' + version : ''}`)
+  // Node 25/26 起官方发行包不再内置 Corepack。MSI major upgrade 只移除自己的文件，
+  // 旧版 corepack 生成的 pnpm shim 会留在安装目录并继续排在 PATH 前面，但它们指向的
+  // node_modules\corepack 已经不存在 → pnpm 变成"存在但读不到版本"（2026-11-22 实测）。
+  cleanupStaleCorepackPnpmShims(job, dir)
   return { ok: true, nodeBin, dir, version, detail: r.detail, cancelled: false, policy: false }
+}
+
+// 清理旧版 Corepack 留下的 pnpm 三件套（仅在 Windows 官方 MSI 安装目录内）。
+// 判据必须同时成立：① 文件内容确实是 corepack shim；② 它引用的 corepack 目标文件已不存在。
+// 任一不成立就不动 —— 既能修好 Node 25/26 升级后的死 shim，也不碰用户自己装的 pnpm / nvm shim。
+const COREPACK_PNPM_SHIMS = ['pnpm', 'pnpm.cmd', 'pnpm.ps1']
+function cleanupStaleCorepackPnpmShims(job, nodeDir) {
+  const dir = String(nodeDir || '')
+  if (!IS_WIN || !dir) return []
+  const corepackTarget = path.join(dir, 'node_modules', 'corepack', 'dist', 'pnpm.js')
+  if (fs.existsSync(corepackTarget)) return [] // Corepack 仍在：shim 有效，不动
+  const removed = []
+  for (const name of COREPACK_PNPM_SHIMS) {
+    const file = path.join(dir, name)
+    let text = ''
+    try { text = fs.readFileSync(file, 'utf8') } catch { continue }
+    if (!/corepack/i.test(text)) continue // 不是 corepack 生成的 shim（例如 npm 全局安装）→ 不动
+    try {
+      fs.rmSync(file, { force: true })
+      removed.push(name)
+    } catch (e) {
+      job.logLine(`清理旧版 Corepack 的 ${name} 失败（pnpm 可能仍被它遮蔽）：${(e && e.message) || String(e)}`)
+    }
+  }
+  if (removed.length) {
+    job.logLine(`已清理旧版 Corepack 遗留的 pnpm 命令：${removed.join('、')}（新版 Node 不再内置 Corepack，PATH 将回落到全局 pnpm）`)
+  }
+  return removed
 }
 
 // MSI 那份 npmrc 的等效物（**兜底路径**用）：字节级复刻官方 MSI 写入的内容
@@ -2123,6 +2172,7 @@ module.exports = {
   detectVersionManager,
   cleanupLegacyDshInUserNodeDir,
   writeMsiEquivalentNpmrc,
+  cleanupStaleCorepackPnpmShims,
   MSI_NPMRC_BYTES,
   resolveGlobalRoot,
   normalizeInstallItems,

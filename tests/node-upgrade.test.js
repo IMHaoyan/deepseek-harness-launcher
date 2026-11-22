@@ -14,6 +14,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 
 const envDetect = require('../env-detect')
@@ -598,4 +599,60 @@ test('首页状态卡：Node.js 升级行只在有事实时出现，且与运行
   // 安装进行中两个入口一起进忙态
   assert.match(appJs, /const homeUpBtn = \$\('btnNodeUpgrade'\)/, '任务进行中首页按钮也要禁用')
   assert.match(appJs, /homeUpBtn\.disabled = running/, '任务进行中首页按钮要进忙态')
+})
+
+// ---------- F. Node 25/26 不再内置 Corepack：MSI 升级后必须清掉失效的旧 pnpm shim ----------
+//
+// 2026-11-22 实测：Node 24 → 26 的 MSI major upgrade 留下了 2026-09 生成的
+// C:\Program Files\nodejs\pnpm.cmd（内容指向 node_modules\corepack\dist\pnpm.js），
+// 但 Node 26 不再内置 corepack，该目标已不存在；它排在 PATH 前面，导致 pnpm 变成
+// "存在但读不到版本"，全局 pnpm 11.8.0 永远轮不到。
+test('env-install：清理旧版 Corepack 的 pnpm shim（只删 corepack 且目标已不存在的）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-corepack-'))
+  const logLines = []
+  const job = { logLine: (m) => logLines.push(String(m)) }
+  try {
+    const shim = (name) => path.join(dir, name)
+    fs.writeFileSync(shim('pnpm.cmd'), '@IF EXIST "%~dp0\node.exe" (\r\n  "%~dp0\node.exe"  "%~dp0\node_modules\corepack\dist\pnpm.js" %*\r\n)\r\n')
+    fs.writeFileSync(shim('pnpm'), '#!/bin/sh\nexec node "$basedir/node_modules/corepack/dist/pnpm.js" "$@"\n')
+    fs.writeFileSync(shim('pnpm.ps1'), '# corepack shim\n')
+    // 非 corepack 的 shim（例如 npm 全局安装的同名命令）不能被误删
+    fs.writeFileSync(shim('yarn.cmd'), '@echo off\r\nyarn %*\r\n')
+    const removed = envInstall.cleanupStaleCorepackPnpmShims(job, dir)
+    assert.deepEqual(removed.sort(), ['pnpm', 'pnpm.cmd', 'pnpm.ps1'].sort())
+    for (const n of ['pnpm', 'pnpm.cmd', 'pnpm.ps1']) assert.equal(fs.existsSync(shim(n)), false, `${n} 应被删除`)
+    assert.equal(fs.existsSync(shim('yarn.cmd')), true, '非 corepack shim 不能动')
+    assert.ok(logLines.some((l) => l.includes('已清理旧版 Corepack')), '清理要留日志：' + logLines.join(' | '))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('env-install：Corepack 仍在时保留 shim；非 corepack 的同名命令也不动', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dshl-corepack-'))
+  try {
+    fs.mkdirSync(path.join(dir, 'node_modules', 'corepack', 'dist'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'node_modules', 'corepack', 'dist', 'pnpm.js'), '// corepack\n')
+    fs.writeFileSync(path.join(dir, 'pnpm.cmd'), '"%~dp0\node.exe" "%~dp0\node_modules\corepack\dist\pnpm.js" %*\r\n')
+    let removed = envInstall.cleanupStaleCorepackPnpmShims({ logLine: () => {} }, dir)
+    assert.deepEqual(removed, [], 'Corepack 目标存在时不能删 shim')
+
+    fs.rmSync(path.join(dir, 'node_modules'), { recursive: true, force: true })
+    fs.writeFileSync(path.join(dir, 'pnpm.cmd'), '@echo off\r\npnpm-real %*\r\n')
+    removed = envInstall.cleanupStaleCorepackPnpmShims({ logLine: () => {} }, dir)
+    assert.deepEqual(removed, [], '内容不是 corepack 的 pnpm 命令不能删')
+    assert.equal(fs.existsSync(path.join(dir, 'pnpm.cmd')), true)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('env-install：MSI 安装脚本在同一次提权里清理旧 Corepack 的 pnpm shim', () => {
+  const body = sliceBetween(envInstallSrc, 'async function runElevatedMsi', '// ---------- 各阶段实现', 'runElevatedMsi')
+  assert.match(body, /node_modules.+corepack.+dist.+pnpm\.js/, '要先判断 corepack 目标是否真的不存在')
+  assert.match(body, /Remove-Item -LiteralPath \$f/, '在提权进程内删除残留 shim（Program Files 需要管理员）')
+  assert.match(body, /ExitCode -eq 0 -or \$p\.ExitCode -eq 3010/, 'MSI 成功（含需重启）才清理')
+  assert.match(body, /-match 'corepack'/, '只删内容确实是 corepack shim 的文件')
+  const msiBody = sliceBetween(envInstallSrc, 'async function installNodeViaMsi', '// 清理旧版 Corepack', 'installNodeViaMsi')
+  assert.match(msiBody, /cleanupStaleCorepackPnpmShims\(job, dir\)/, '安装流程也要在非提权场景下幂等清理一次')
 })

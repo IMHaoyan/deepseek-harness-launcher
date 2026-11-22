@@ -1452,7 +1452,15 @@ async function startServerInner(occupantRetry = 0) {
       } else {
         log('captured dsh web launch URL (token auth page)')
       }
-      if (server.running()) void refreshWebUiOnReady(false) // 加载早于本行到达的标签会停在鉴权页/空白，立即补拉
+      if (server.running()) {
+        // 启动后第一次拿到 launch token：窗口可能早于服务创建、先恢复了旧地址（停在 Host 配对/鉴权页）。
+        // 那一页不是空白，常规 refreshWebUiOnReady(false) 会跳过它 —— 首次就绪强制重载一次；
+        // 之后的服务自重启仍走"只修空白/加载页"的保守策略，避免打断用户正在看的页面。
+        const firstReady = !webInitialReadyReloaded
+        webInitialReadyReloaded = true
+        if (firstReady) log('web ui: first ready after startup, force-reloading tabs to the authenticated URL')
+        void refreshWebUiOnReady(firstReady)
+      }
     }
   }
   child.stdout.on('data', onData)
@@ -5564,6 +5572,9 @@ const WEB_DIVIDER_W = 5
 
 let webWin = null
 let webTabs = []        // { id, view(WebContentsView), title }
+// 本次启动是否已经做过"服务就绪后的首次强制重载"：启动时窗口可能先恢复了旧地址
+// （服务还没起），页面会停在 DSH 的 Host 配对/鉴权页；它不是空白页，常规 refresh 会跳过。
+let webInitialReadyReloaded = false
 let webActiveId = null
 let webRightId = null
 let webSplitOn = false
