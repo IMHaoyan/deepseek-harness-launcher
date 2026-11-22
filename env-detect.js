@@ -430,11 +430,20 @@ function sameWinDir(a, b) {
 /**
  * 旧版 Node 的升级建议（纯函数，便于测试）。只在"这份 Node 确实由 dshl 的安装方式管理"时给建议，
  * 用户自装 / 版本管理器管理的 Node 一律不碰（保持"启动器不侵入被管理工具"的边界）：
- *   - 当前生效 Node 的大版本已 >= 目标（如 26 用户）→ 不提示（不去动机器上残留的旧 MSI）
- *   - 官方 MSI 产品大版本 < 目标 → mode 'msi'：官方 MSI 原生支持 major upgrade，
+ *   - 当前生效 Node 已满足 DSH 声明的 engines，且大版本 >= 目标（如 26 用户）→ 不提示
+ *     （不去动机器上残留的旧 MSI）
+ *   - 两档触发，判据都是"会不会导致 DSH 起不来"，而不是只看大版本号：
+ *       ① 大版本 < 目标 → 主动升级到目标 LTS（旧行为，22 → 24）
+ *       ② 大版本已达标但补丁版不满足 engines → 同主版本补丁升级
+ *          （实例：最新 DSH 要求 ^24.22.3，本机 24.16.0 会被环境门禁判为 tooOld；
+ *           旧逻辑只看 major，24 >= 24 直接返回 null，界面连升级入口都不给，用户无路可走）
+ *   - 官方 MSI 产品需要升级 → mode 'msi'：官方 MSI 原生支持 major upgrade，
  *     Upgrade 表（WIX_UPGRADE_DETECTED / RemoveExistingProducts）会先移除旧产品再装新版本
- *   - 无 MSI、用户级目录里那份正是当前生效版本且大版本 < 目标 → mode 'user'：zip 目录替换
+ *   - 无 MSI、用户级目录里那份正是当前生效版本且需要升级 → mode 'user'：zip 目录替换
  *   - 版本管理器在场 → 一律不提示（不去和 nvm/volta/fnm 争 PATH）
+ *
+ * @param {object} input
+ * @param {string} [input.range] 目标 DSH 的 engines.node（缺省用 DEFAULT_ENGINE_RANGE）
  */
 function decideNodeUpgrade(input) {
   const o = input || {}
@@ -442,29 +451,42 @@ function decideNodeUpgrade(input) {
   if (platform !== 'win32') return null
   if (o.versionManager) return null
   const targetMajor = Number(o.targetMajor) || DEFAULT_NODE_MAJOR
+  const range = String(o.range || DEFAULT_ENGINE_RANGE)
+  const satisfies = (v) => {
+    const clean = String(v || '').trim().replace(/^v/i, '')
+    if (!clean) return false
+    try { return semver.satisfies(clean, range, { includePrerelease: true }) } catch { return false }
+  }
   const activeVersion = String((o.node && o.node.version) || '').trim().replace(/^v/i, '')
   const activeMajor = nodeMajorOf(activeVersion)
-  if (activeMajor !== null && activeMajor >= targetMajor) return null
+  // 已达标（既满足 engines，又不落后于目标大版本）→ 不提示
+  if (satisfies(activeVersion) && activeMajor !== null && activeMajor >= targetMajor) return null
+  // 是否需要把某个已安装的版本换掉：落后大版本，或补丁版不满足 engines
+  const belowTarget = (v) => {
+    const m = nodeMajorOf(v)
+    if (m === null) return false
+    return m < targetMajor || !satisfies(v)
+  }
   const msi = o.installedMsi
   if (msi && msi.version) {
-    const m = nodeMajorOf(msi.version)
-    if (m !== null && m < targetMajor) {
-      return { mode: 'msi', from: String(msi.version), targetMajor, dir: String(msi.installPath || ''), reason: 'msi-older-major' }
+    if (belowTarget(msi.version)) {
+      const reason = nodeMajorOf(msi.version) < targetMajor ? 'msi-older-major' : 'msi-below-engines'
+      return { mode: 'msi', from: String(msi.version), targetMajor, range, dir: String(msi.installPath || ''), reason }
     }
     return null
   }
   const u = o.userNode
   if (u && u.exists && u.version) {
     const userVersion = String(u.version).trim().replace(/^v/i, '')
-    const uv = nodeMajorOf(userVersion)
-    if (uv === null || uv >= targetMajor) return null
+    if (!belowTarget(userVersion)) return null
     // 证明"用户级目录里那份就是当前生效的"：
     //   ① 能拿到生效路径 → 必须与用户级目录同目录（最硬的证据）；
     //   ② 拿不到路径（PATH 上是裸 node 且 where 也解析不了）→ 退回完整版本串相等。
     const activePath = String(o.activePath || '')
     const evidence = activePath ? sameWinDir(path.dirname(activePath), u.dir) : (activeVersion === '' || userVersion === activeVersion)
     if (evidence) {
-      return { mode: 'user', from: userVersion, targetMajor, dir: String(u.dir || ''), reason: 'user-level-older-major' }
+      const reason = nodeMajorOf(userVersion) < targetMajor ? 'user-level-older-major' : 'user-level-below-engines'
+      return { mode: 'user', from: userVersion, targetMajor, range, dir: String(u.dir || ''), reason }
     }
   }
   return null
@@ -704,12 +726,13 @@ async function buildReport() {
   const activeMajor = nodeMajorOf(node.version)
   let userNode = null
   let activePath = ''
-  if (!FRESH_TEST && !installedMsi && !versionManager && (activeMajor === null || activeMajor < targetMajor)) {
+  if (!FRESH_TEST && !installedMsi && !versionManager && (node.status === 'tooOld' || activeMajor === null || activeMajor < targetMajor)) {
     userNode = await readUserNodeForUpgrade()
     if (userNode && userNode.exists) activePath = await resolveActiveNodePath(node)
   }
   // 用户显式配了 nodePath = 明确指定用哪份 Node：不提示改机器上那份 MSI（最小侵入，不猜用户意图）。
-  const nodeUpgrade = Config.nodePath ? null : decideNodeUpgrade({ platform: process.platform, installedMsi, node, userNode, versionManager, targetMajor, activePath })
+  // range 必须传：同主版本的补丁差距（24.16 vs ^24.22.3）也要能给出升级入口。
+  const nodeUpgrade = Config.nodePath ? null : decideNodeUpgrade({ platform: process.platform, installedMsi, node, userNode, versionManager, targetMajor, activePath, range })
 
   const plan = buildPlan(node, dsh)
   return {

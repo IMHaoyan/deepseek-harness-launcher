@@ -110,20 +110,29 @@ for (const failure of ['throw', 'error-event', 'no-handoff']) {
 // 执行真实 updateNow，但停服失败后任何磁盘/安装/页面操作都记录为违规。
 const source = read('dsh-update.js')
 const updateFunction = source.slice(source.indexOf('async function updateNow()'), source.indexOf('module.exports ='))
-function dsh(kind, stopService, snapshot = { running: true }) {
+function dsh(kind, stopService, snapshot = { running: true }, extra = {}) {
   const writes = [], changes = []
   const state = { status: 'available', latest: '0.2.0', latestChannel: 'latest' }
-  const ctx = {
+  const ctx = Object.assign({
     state, updating: false, rollbackUsed: false, log: () => {},
+    // 预装探测的"坏目标"结论（模块级状态）：置空后走的是正常的停服失败路径
+    stageBlock: null,
+    warming: null,
+    path: require('node:path'),
+    notify: () => {},
     envDetect: { detectEnv: async () => ({ plan: { kind, dshVersion: '0.1.0' } }) },
     setState: (patch) => Object.assign(state, patch),
     decideUpdateTarget: () => ({ action: 'install' }), channelOf: () => 'latest', userSwitchedChannel: '',
+    // 用真实判定函数：否则回滚/收尾分支在 extract 出来的函数体里是未定义标识符，静默落进 catch
+    decideRollback: require('../dsh-update').decideRollback,
+    decideUpdateOutcome: require('../dsh-update').decideUpdateOutcome,
+    readPageCredential: () => ({ hasToken: true }),
     emitLifecycle: () => {}, getServerState: () => snapshot, stopService,
     writeUpdateState: (value) => writes.push(value),
     loadWebTabs: () => changes.push('page'),
     envInstall: { startInstall: () => changes.push('install'), resolveGlobalRoot: () => { changes.push('resolve'); throw new Error('must not proceed') } },
     markProgress: () => changes.push('progress'),
-  }
+  }, extra)
   const fn = new Function(...Object.keys(ctx), updateFunction + ';return updateNow')(...Object.values(ctx))
   return { fn, writes, changes, state }
 }
@@ -145,4 +154,63 @@ test('正在停止/交接但 running=false 仍必须通过停服检查', async (
     assert.equal(h.state.status, 'error')
     assert.deepEqual(h.writes, [])
   }
+})
+
+// 2026-11-22：0.2.3-alpha.1 的安装树自身跑不起来。预装探测给出结论后，点击更新必须
+// **一个副作用都不产生**（不停服、不安装、不写事务）—— 完整安装只会把同一棵坏树顶上。
+test('目标版本已被探测为不可运行：点更新直接拒绝，不停服/不安装/不写事务', async () => {
+  let stopped = 0
+  const h = dsh('global', async () => { stopped++; return true }, { running: true }, {
+    stageBlock: { version: '0.2.0', detail: "The requested module 'x' does not provide an export named 'Y'" },
+  })
+  await h.fn()
+  assert.equal(stopped, 0, '不该先停服再发现装不了')
+  assert.deepEqual(h.writes, [], '不该写更新事务')
+  assert.deepEqual(h.changes, [], '不该切页面/安装')
+  assert.equal(h.state.status, 'error')
+  assert.match(h.state.error, /禁用或卸载插件都无效/u, h.state.error)
+  assert.match(h.state.error, /0\.1\.0 未改动/u, '必须告诉用户当前版本完好：' + h.state.error)
+})
+
+// 更新前服务本来就没在跑时，也不能把一棵探测失败的树当成成功：startOk 必须无条件为 false。
+test('更新前服务未运行 + 完整安装探测出坏树：仍必须回滚，不得宣告成功', async () => {
+  const events = []
+  const h = dsh('global', async () => { events.push('stop'); return true }, { running: false }, {
+    Config: {}, saveConfig: () => {},
+    envDetect: { detectEnv: async () => ({ plan: { kind: 'global', dshVersion: '0.1.0', nodeCmd: 'mock' } }) },
+    envInstall: { resolveGlobalRoot: async () => 'mock', startInstall: () => events.push('install') },
+    swapStagedInto: async () => ({ ok: false, reason: 'no-staged-tree' }),
+    runGlobalUpdate: async (_node, _root, version) => { events.push('install:' + version); return { ok: true } },
+    probeDshVersion: async () => ({ version: '', output: "SyntaxError: The requested module 'x' does not provide an export named 'Y'" }),
+    probeIndicatesBrokenTree: (output) => /does not provide an export named/u.test(String(output)),
+    probeFailureDetail: () => "does not provide an export named 'Y'",
+    startService: async () => { events.push('start'); return true },
+    reloadWebTabs: () => events.push('reload'),
+    refreshEnv: async () => {},
+  })
+  await h.fn()
+  assert.deepEqual(events, ['install:0.2.0', 'stop', 'install:0.1.0'], '应回装旧版，且不拉起坏树：' + events.join(','))
+  assert.equal(h.state.status, 'error', '不得因为"更新前没在跑"就宣告成功')
+  assert.match(h.state.error, /无法启动|回滚/u, h.state.error)
+})
+
+// 竞态：用户在后台预装完成前就点了更新（stageBlock 还没产生）。
+// 此时走完整安装之前的切换阶段才发现坏树 —— 必须停在这里，不许把完整安装跑完。
+test('竞态：预装结论尚未产生时点击，切换阶段发现坏树 → 不跑完整安装，拉回旧服务', async () => {
+  const events = []
+  const h = dsh('global', async () => { events.push('stop'); return true }, { running: true }, {
+    // 模拟"后台预装还在进行中"：必须先等它收场，再停服/决定路径
+    warming: { then(resolve) { events.push('warm'); resolve() } },
+    envInstall: { resolveGlobalRoot: async () => 'mock', startInstall: () => events.push('install') },
+    swapStagedInto: async () => ({ ok: false, reason: 'staged-tree-broken', detail: "The requested module 'x' does not provide an export named 'Y'" }),
+    startService: async () => { events.push('start'); return true },
+    reloadWebTabs: () => events.push('reload'),
+    refreshEnv: async () => {},
+  })
+  await h.fn()
+  assert.deepEqual(events, ['warm', 'stop', 'start', 'reload'], '先等在途预装收场，再停服；停服后只做"把旧版拉回来"，不装新包：' + events.join(','))
+  assert.equal(h.writes[0].phase, 'start', '事务在切换前落盘（用于中断恢复）')
+  assert.equal(h.writes[h.writes.length - 1].phase, 'failed', '明确失败要落终态，避免下次启动重装')
+  assert.equal(h.state.status, 'error')
+  assert.match(h.state.error, /禁用或卸载插件都无效/u, h.state.error)
 })

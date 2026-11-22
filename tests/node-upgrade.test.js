@@ -91,6 +91,7 @@ test('decideNodeUpgrade：win32 + 旧版官方 MSI → mode=msi（官方 MSI 原
     mode: 'msi',
     from: '22.23.2',
     targetMajor: 24,
+    range: envDetect.DEFAULT_ENGINE_RANGE,
     dir: 'C:\\Program Files\\nodejs\\',
     reason: 'msi-older-major',
   })
@@ -141,6 +142,7 @@ test('decideNodeUpgrade：无 MSI、用户级目录里那份正是生效版本 �
     mode: 'user',
     from: '22.23.2',
     targetMajor: 24,
+    range: envDetect.DEFAULT_ENGINE_RANGE,
     dir: 'C:\\Users\\tester\\AppData\\Local\\Programs\\nodejs',
     reason: 'user-level-older-major',
   })
@@ -173,12 +175,65 @@ test('decideNodeUpgrade：能解析出生效路径时以路径为准（同版本
   assert.equal(r.from, '22.23.2')
 })
 
+// 2026-11-22 现场：最新 DSH 的 engines 是 ^24.22.3 || >=26.13.1，本机 24.16.0。
+// 旧逻辑只看大版本（24 >= 24）→ 直接 null，环境页不给任何升级入口，用户被卡死。
+const NEW_RANGE = '^24.22.3 || >=26.13.1'
+
+test('decideNodeUpgrade：同主版本但补丁版不满足 engines → 仍必须给升级入口（24.16.0）', () => {
+  const r = envDetect.decideNodeUpgrade({
+    platform: 'win32',
+    range: NEW_RANGE,
+    installedMsi: { version: '24.16.0', installPath: 'C:\\Program Files\\nodejs\\' },
+    node: { status: 'tooOld', version: '24.16.0', path: 'C:\\Program Files\\nodejs\\node.exe' },
+    versionManager: '',
+  })
+  assert.equal(r.mode, 'msi')
+  assert.equal(r.reason, 'msi-below-engines')
+  assert.equal(r.from, '24.16.0')
+  assert.equal(r.targetMajor, 24)
+  assert.equal(r.range, NEW_RANGE)
+})
+
+test('decideNodeUpgrade：补丁版已满足 engines → null（不为版本差异反复提示）', () => {
+  assert.equal(envDetect.decideNodeUpgrade({
+    platform: 'win32',
+    range: NEW_RANGE,
+    installedMsi: { version: '24.22.3', installPath: 'C:\\Program Files\\nodejs\\' },
+    node: { status: 'ok', version: '24.22.3', path: 'C:\\Program Files\\nodejs\\node.exe' },
+    versionManager: '',
+  }), null)
+  // 26.x（engines 的另一个分支）同样不提示
+  assert.equal(envDetect.decideNodeUpgrade({
+    platform: 'win32',
+    range: NEW_RANGE,
+    installedMsi: { version: '22.23.2', installPath: 'C:\\Program Files\\nodejs\\' },
+    node: { status: 'ok', version: '26.13.1', path: 'C:\\Program Files\\nodejs\\node.exe' },
+    versionManager: '',
+  }), null)
+})
+
+test('decideNodeUpgrade：用户级同主版本补丁不足（24.16.0）→ mode=user', () => {
+  const userDir = 'C:\\Users\\tester\\AppData\\Local\\Programs\\nodejs'
+  const r = envDetect.decideNodeUpgrade({
+    platform: 'win32',
+    range: NEW_RANGE,
+    installedMsi: null,
+    userNode: { exists: true, version: '24.16.0', dir: userDir },
+    node: { status: 'tooOld', version: '24.16.0' },
+    activePath: userDir + '\\node.exe',
+    versionManager: '',
+  })
+  assert.equal(r.mode, 'user')
+  assert.equal(r.reason, 'user-level-below-engines')
+  assert.equal(r.range, NEW_RANGE)
+})
+
 // ---------- B. 安装侧：decideNodeInstallPlan 的显式升级语义 ----------
 
 test('decideNodeInstallPlan（显式升级）：旧 MSI → upgrade-msi，已达标 → reuse/already-target', () => {
   assert.deepEqual(
     envInstall.decideNodeInstallPlan({ upgrade: true, installedMsi: { version: '22.23.2' } }),
-    { action: 'upgrade-msi', reason: 'upgrade-msi', from: '22.23.2', targetMajor: envDetect.DEFAULT_NODE_MAJOR },
+    { action: 'upgrade-msi', reason: 'upgrade-msi', from: '22.23.2', targetMajor: envDetect.DEFAULT_NODE_MAJOR, range: envDetect.DEFAULT_ENGINE_RANGE },
   )
   const done = envInstall.decideNodeInstallPlan({ upgrade: true, installedMsi: { version: '24.22.1' } })
   assert.equal(done.action, 'reuse')
@@ -189,7 +244,7 @@ test('decideNodeInstallPlan（显式升级）：旧 MSI → upgrade-msi，已达
 test('decideNodeInstallPlan（显式升级）：无 MSI 但用户级安装旧 → upgrade-user', () => {
   assert.deepEqual(
     envInstall.decideNodeInstallPlan({ upgrade: true, userNode: { exists: true, version: '22.23.2', dir: 'D:\\nodejs' } }),
-    { action: 'upgrade-user', reason: 'upgrade-user', from: '22.23.2', targetMajor: envDetect.DEFAULT_NODE_MAJOR },
+    { action: 'upgrade-user', reason: 'upgrade-user', from: '22.23.2', targetMajor: envDetect.DEFAULT_NODE_MAJOR, range: envDetect.DEFAULT_ENGINE_RANGE },
   )
 })
 
@@ -207,8 +262,86 @@ test('decideNodeInstallPlan（显式升级）：版本管理器在场 → refuse
   assert.equal(r.versionManager, 'nvm')
 })
 
-// ---------- C. envSummary 透传：渲染层只消费事实、不重算 ----------
+test('decideNodeInstallPlan（显式升级）：同主版本补丁不足必须升级，不能误判 already-target', () => {
+  const need = envInstall.decideNodeInstallPlan({ upgrade: true, range: NEW_RANGE, installedMsi: { version: '24.16.0' } })
+  assert.equal(need.action, 'upgrade-msi')
+  assert.equal(need.from, '24.16.0')
+  // 验收以 engines 为准：24.22.3 才是达标
+  const done = envInstall.decideNodeInstallPlan({ upgrade: true, range: NEW_RANGE, installedMsi: { version: '24.22.3' } })
+  assert.equal(done.action, 'reuse')
+  assert.equal(done.reason, 'already-target')
+})
 
+test('decideNodeInstallPlan（自动）：MSI 不满足 engines → upgrade-msi（同主版本也要升）', () => {
+  const r = envInstall.decideNodeInstallPlan({
+    range: NEW_RANGE,
+    installedMsi: { version: '24.16.0' },
+    msiUsable: true,
+    nodeOk: false,
+    nodeVersion: '24.16.0',
+  })
+  assert.equal(r.action, 'upgrade-msi')
+  assert.equal(r.reason, 'msi-too-old')
+})
+
+test('decideUserNodeReuse：复用判据同样按 DSH engines（24.16.0 不满足 ^24.22.3 不能复用）', () => {
+  assert.equal(envInstall.decideUserNodeReuse({ exists: true, version: '24.16.0', range: NEW_RANGE }).reuse, false)
+  assert.equal(envInstall.decideUserNodeReuse({ exists: true, version: '24.22.3', range: NEW_RANGE }).reuse, true)
+})
+
+test('pickBundledNodeFile：只挑满足 engines 的最高补丁版；不满足返回 null（触发联网选版本）', () => {
+  const names = [
+    'node-v24.22.1-x64.msi', 'node-v24.22.3-x64.msi', 'node-v24.22.3-x64.msi.sha256', 'node-v24.10.0-x64.msi',
+  ]
+  assert.equal(envInstall.pickBundledNodeFile(names, 'msi', NEW_RANGE, 24).ver, '24.22.3')
+  // 只有旧内置包时不能拿来充数：必须让调用方走联网，否则会重复装同一个不合格版本
+  assert.equal(envInstall.pickBundledNodeFile(['node-v24.22.1-x64.msi'], 'msi', NEW_RANGE, 24), null)
+  assert.equal(envInstall.pickBundledNodeFile(['node-v24.22.1-win-x64.zip'], 'zip', NEW_RANGE, 24), null)
+  // 字符串排序陷阱：24.22.10 必须排在 24.22.9 之前
+  assert.equal(envInstall.pickBundledNodeFile(['node-v24.22.9-x64.msi', 'node-v24.22.10-x64.msi'], 'msi', NEW_RANGE, 24).ver, '24.22.10')
+  // 其他大版本不混进来
+  assert.equal(envInstall.pickBundledNodeFile(['node-v26.13.1-x64.msi'], 'msi', NEW_RANGE, 24), null)
+})
+
+test('接线：主进程把 DSH 的 engines 范围带给安装侧（缺省时才用 DSHL 默认范围）', () => {
+  assert.match(mainJs, /if \(!opts\.engineRange && envReport && envReport\.engineRange\) opts\.engineRange = envReport\.engineRange/,
+    'main.js 的 envInstall 入口必须注入 engineRange')
+  assert.match(envDetectSrc, /decideNodeUpgrade\(\{[^}]*range\s*\}/s,
+    'env-detect buildReport 必须把 range 传给 decideNodeUpgrade')
+  assert.match(envInstallSrc, /const engineRange = \(job\.opts && job\.opts\.engineRange\) \|\| envDetect\.DEFAULT_ENGINE_RANGE/,
+    'env-install 的安装决策必须使用目标 DSH 的 engines 范围')
+})
+
+test('msiUsableOf：只判"能执行"，版本太旧不算 broken（否则自动升级会被拒绝）', () => {
+  assert.equal(envInstall.msiUsableOf({ exists: true, version: '24.16.0' }), true, '同主版本但补丁不足 → 可执行，应走升级')
+  assert.equal(envInstall.msiUsableOf({ exists: true, version: '22.23.2' }), true, '旧大版本 → 可执行，应走升级')
+  assert.equal(envInstall.msiUsableOf({ exists: false, version: '' }), false, '文件不在 → 产品坏了')
+  assert.equal(envInstall.msiUsableOf({ exists: true, version: '' }), false, '读不出版本 → 不能复用')
+})
+
+test('verifyUpgradedNode：实探版本必须更高、主版本达标、满足 engines（不轻信退出码/注册表）', () => {
+  const v = (o) => envInstall.verifyUpgradedNode(o)
+  assert.equal(v({ probed: '24.22.3', from: '24.16.0', targetMajor: 24, range: NEW_RANGE }).ok, true)
+  assert.equal(v({ probed: '26.13.1', from: '24.16.0', targetMajor: 24, range: NEW_RANGE }).ok, true)
+  // 22 → 24 的升级请求如果实际还停在 22，不能报成功
+  assert.equal(v({ probed: '22.23.2', from: '22.23.2', targetMajor: 24, range: '^22.19.0 || >=24.0.0' }).reason, 'not-newer')
+  // 主版本没到目标 LTS
+  assert.equal(v({ probed: '23.11.1', from: '22.23.2', targetMajor: 24, range: '>=22' }).reason, 'major-below-target')
+  // 同主版本但补丁不够（24.22.1 不满足 ^24.22.3）
+  assert.equal(v({ probed: '24.22.1', from: '24.16.0', targetMajor: 24, range: NEW_RANGE }).reason, 'engines-unsatisfied')
+  // 读不出版本 → 失败（注册表版本不能顶替实探）
+  assert.equal(v({ probed: '', from: '24.16.0', targetMajor: 24, range: NEW_RANGE }).reason, 'version-unreadable')
+})
+
+test('接线：升级验收走 verifyUpgradedNode + 实探 nodeBin，且 msiUsable 不再按 engines 判', () => {
+  assert.match(envInstallSrc, /verifyUpgradedNode\(\{ probed, from: plan\.from, targetMajor: plan\.targetMajor, range: engineRange \}\)/,
+    'MSI 升级验收必须把实探版本交给 verifyUpgradedNode')
+  assert.match(envInstallSrc, /probeUserNodeVersion\(nodeBin, job\)/, 'MSI 升级后要实探刚装好的 node.exe')
+  assert.match(envInstallSrc, /verifyUpgradedNode\(\{ probed: afterVersion, from: plan\.from/, '用户级升级同样走统一验收')
+  assert.doesNotMatch(envInstallSrc, /msiUsable = installedMsi[\s\S]{0,200}decideUserNodeReuse/, 'msiUsable 不能按 engines 判（版本太旧会误判成产品坏了）')
+})
+
+// ---------- C. envSummary 透传：渲染层只消费事实、不重算 ----------
 test('envSummary：nodeUpgrade 原样透出（同一份事实对象）；报告缺该字段时回落 null', () => {
   const up = { mode: 'msi', from: '22.23.2', targetMajor: 24, dir: 'C:\\Program Files\\nodejs\\', reason: 'msi-older-major' }
   assert.strictEqual(envDetect.envSummary(makeReport(up)).nodeUpgrade, up, '环境页升级卡片的唯一输入必须原样透出')
@@ -268,19 +401,19 @@ test('main.js envInstall：「升级 Node.js」先停稳服务，失败/取消�
   assert.match(onFailBody, /handleStart\(\)/, '环境就绪且服务没在跑 → 必须把服务拉回来')
 })
 
-test('env-install.js：MSI 升级带 upgradeFrom，并按注册表版本验收大版本（不轻信退出码）', () => {
+test('env-install.js：MSI 升级带 upgradeFrom，并按实探版本 + engines 验收（不轻信退出码）', () => {
   assert.match(envInstallSrc, /plan\.action === 'install-msi' \|\| plan\.action === 'upgrade-msi'/, '要区分首次安装与升级')
   assert.match(envInstallSrc, /upgradeFrom: plan\.from/, '升级要把已安装版本交给 installNodeViaMsi')
-  assert.match(envInstallSrc, /envDetect\.nodeMajorOf\(afterVersion\) !== plan\.targetMajor/,
-    '装完要按注册表版本验收大版本，防止 msiexec 报成功但产品没换')
+  assert.match(envInstallSrc, /verifyUpgradedNode\(\{ probed, from: plan\.from/,
+    '装完要按实探 node.exe 版本验收（严格更高 + 主版本 + engines），注册表/退出码不算数')
   assert.match(envInstallSrc, /官方 MSI major upgrade/, '日志要如实说明走的是 major upgrade')
 })
 
-test('env-install.js：用户级 zip 升级走 force + keepBackupWithGlobals，并按探测版本验收', () => {
+test('env-install.js：用户级 zip 升级走 force + keepBackupWithGlobals，并按实探版本验收', () => {
   const seg = sliceBetween(envInstallSrc, "} else if (plan.action === 'upgrade-user') {", '} else {', 'upgrade-user 分支')
   assert.match(seg, /force: true/, '升级要强制替换目录（不复用旧版本）')
   assert.match(seg, /keepBackupWithGlobals: true/, '旧目录里有用户全局包时要保留备份（data-safety）')
-  assert.match(seg, /nodeMajorOf\(afterVersion\) !== plan\.targetMajor/, '替换后要探测版本验收')
+  assert.match(seg, /verifyUpgradedNode\(\{ probed: afterVersion, from: plan\.from/, '替换后要按实探版本验收')
   // installNodeUserLevel 必须真的消费这两个开关，否则传了也白传
   assert.match(envInstallSrc, /opts\.keepBackupWithGlobals/, 'installNodeUserLevel 要读 keepBackupWithGlobals')
   assert.match(envInstallSrc, /const force = opts\.force === true/, 'installNodeUserLevel 要读 force')

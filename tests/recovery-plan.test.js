@@ -196,6 +196,31 @@ test('单次失败不提升级（噪音），连续 >=2 次才说；自动回退
 // 2026-10 用户问："多个插件同时失败，为什么不一次禁用全部失败的" —— 问得对。
 // 旧实现只处理 target 一个，然后在文案里写"本次先处理 X……这里会给出下一个"，
 // 3 个坏插件 = 3 次确认框 + 3 次重启。动作现在的作用域就是"本次失败点名的这一批"。
+// 内核自身依赖不匹配（2026-11-22 实测）：它长得像插件失败，但禁用插件修不了。
+// 说明页必须说清"不是插件的问题"，并且不能给「管理插件」入口 —— 那是把人送到一个解决不了问题的地方。
+test('DSH 自身组件加载失败 → 非插件文案、无插件动作、无管理插件入口', () => {
+  const p = plan.planRecovery({
+    failure: {
+      kind: 'dsh-core-mismatch',
+      target: '',
+      line: "SyntaxError: The requested module '@deepseek-ai/cordis-plugin-loader' does not provide an export named 'EntryValidationError'",
+      count: 2,
+    },
+    // 即使 capabilities 里恰好有可禁用的插件，也不该被这个分类拿去用
+    capabilities: pluginCap({ plugin: { name: 'dsh-mcp-client', toggleable: true, disabled: false, installed: true } }),
+  })
+  assert.equal(p.title, 'DSH 自身组件加载失败')
+  assert.match(p.sub, /不是插件的问题/u)
+  assert.match(p.sub, /禁用或卸载插件都不会解决/u)
+  assert.ok(!/禁用 dsh-mcp-client|管理插件/.test(p.sub), '文案不能引导用户去动插件：' + p.sub)
+  assert.equal(p.primary, null, '说明页没有能安全执行的修复动作（重装在「运行环境」页）')
+  assert.equal(p.entry, null, '不该给「管理插件」入口')
+  assert.match(p.blocked, /运行环境/u, '必须给出去处：' + p.blocked)
+  assert.match(p.blocked, /回退到上一个可用版本/u)
+  assert.match(p.blocked, /不要重装同一个坏版本/u)
+  assert.equal(p.reason, 'bootUnknown', '复用既有的说明页 reason，避免页面白名单漂移')
+})
+
 test('多插件失败 → 一个动作覆盖整批，按钮上写清有几个', () => {
   const p = plan.planRecovery({
     failure: {

@@ -76,6 +76,10 @@ let checkTimeoutMs = CHECK_TIMEOUT_MS // initDshUpdater 可覆盖（测试用短
 let updating = false
 let warming = null // 当前预热任务（防重入）
 let staging = null // 已就绪的预装树：{ version, installDir, stagePkg, stagePrefix, stageRoot, binPath }
+// 预装探测已证明"这个版本的安装树自身跑不起来"时记在这里：{ version, detail }。
+// 有了它，点击更新时不再退回完整安装 —— 完整安装装出来的是同一棵树，只会把服务切坏再回滚。
+// 只对**确定性**证据生效（模块解析/导出缺失）；偶发超时仍按原逻辑退回完整安装。
+let stageBlock = null
 let lastNotifiedVersion = '' // 同一新版本只提示一次
 let rollbackUsed = false // 每次更新周期最多一次回滚
 let lastFetchError = '' // 最近一次取版本失败的原因（用于给用户可读的检查失败提示）
@@ -188,14 +192,14 @@ async function recoverSwapTransaction(st, nodeBin, ctx) {
   if (!installDir || !backupDir) return null
   const installed = readPkgAt(installDir)
   const staged = stagePkg ? readPkgAt(stagePkg) : null
-  const probe = staged ? await probeDshVersion(nodeBin, path.join(stagePkg, 'lib', 'bin.js')) : ''
+  const probe = staged ? await probeDshVersion(nodeBin, path.join(stagePkg, 'lib', 'bin.js')) : { version: '', output: '' }
   const decided = decideSwapRecovery({
     target,
     installVersion: installed ? installed.version : '',
     backupExists: fs.existsSync(backupDir),
     stagedPkgExists: !!staged,
     stagedVersion: staged ? staged.version : '',
-    probeVersion: probe,
+    probeVersion: probe.version,
   })
   const stageRoot = stageRootOf(installDir)
   const finish = (payload, keepExtra = []) => {
@@ -423,7 +427,14 @@ function initDshUpdater(o) {
 }
 
 function getState() {
-  return Object.assign({}, state, { channel: channelOf() })
+  // targetBroken：预装探测已确定这个目标版本的安装树自身跑不起来。界面据此**不再提供更新按钮**，
+  // 否则就是"界面承诺了一个必然失败的动作"（2026-11-22 用户实际踩到）。
+  const broken = !!(stageBlock && state.latest && stageBlock.version === state.latest)
+  return Object.assign({}, state, {
+    channel: channelOf(),
+    targetBroken: broken,
+    targetBrokenDetail: broken ? stageBlock.detail : '',
+  })
 }
 
 // 控制台切换更新渠道时调用（必须在 Config.dshChannel 已更新之后）：作废缓存里的版本号。
@@ -433,6 +444,7 @@ function getState() {
 function noteChannelChange() {
   userSwitchedChannel = channelOf()
   staging = null // 旧渠道的预装树作废（暂存目录名是版本号，下次检查会自己清场）
+  stageBlock = null // "目标版本不可用"的结论同样绑定版本号，换渠道后不再成立
   setState({ status: 'idle', error: '', latest: '', latestChannel: '', prewarmed: false, staged: false, stageVersion: '' })
 }
 
@@ -788,7 +800,11 @@ function decideStagedInstall(input) {
   if (src.installDirExists !== true) return { action: 'discard', reason: 'no-install-dir' }
   if (src.stagedPkgExists !== true) return { action: 'discard', reason: 'staging-incomplete' }
   if (String(src.stagedVersion || '') !== target) return { action: 'discard', reason: 'staged-version-mismatch' }
-  if (String(src.probeVersion || '') !== target) return { action: 'discard', reason: 'probe-failed' }
+  if (String(src.probeVersion || '') !== target) {
+    // 探测失败分两种证据等级：确定性（树自身依赖坏了）vs 偶发（超时/spawn 失败）。
+    // 前者换完整安装也一样坏，调用方必须直接拦住；后者仍可退回完整安装重试。
+    return { action: 'discard', reason: src.probeBroken === true ? 'staged-tree-broken' : 'probe-failed' }
+  }
   // 线上 .bin 的 shim 指向包内相对路径；bin 入口布局变了，换目录就会让 shim 失效
   if (src.installedBinLayout && String(src.stagedBinLayout || '') !== String(src.installedBinLayout)) {
     return { action: 'discard', reason: 'bin-layout-changed' }
@@ -836,20 +852,76 @@ function readPkgAt(dir) {
   } catch { return null }
 }
 
-/** 探测：用指定 node 跑一次 dsh --version（实测 0.14s，足够做"新树能不能跑"的门禁）。 */
+/**
+ * 探测：用指定 node 跑一次 dsh --version（实测 0.14s，足够做"新树能不能跑"的门禁）。
+ * 返回结构化结果：version 供门禁比较，output 是**失败证据** —— 只留空版本号无法区分
+ *   a) 这棵树自身依赖坏了（换完整安装也一样坏 → 必须直接拦住），
+ *   b) 这次探测偶发失败：超时 / spawn 失败（值得退回完整安装再试）。
+ * 2026-11-22：0.2.3-alpha.1 就是 (a)，旧实现把证据丢掉，退回完整安装后把坏树顶上，
+ * 服务起不来又被启动失败分类误判成「插件不兼容」。
+ */
 function probeDshVersion(nodeBin, binPath) {
   return new Promise((resolve) => {
-    if (!binPath || !fs.existsSync(binPath)) return resolve('')
+    // 输出只留尾部 16 KiB：坏树可能刷出很长的堆栈，没必要整段进日志/内存
+    const MAX_OUT = 16 * 1024
+    const cap = (text) => (text.length > MAX_OUT ? text.slice(-MAX_OUT) : text)
+    const done = (version, output) => resolve({ version: String(version || '').trim(), output: cap(String(output || '')) })
+    if (!binPath || !fs.existsSync(binPath)) return done('', 'probe: bin not found (' + String(binPath || '') + ')')
     let child = null
     try {
       child = spawn(nodeBin || 'node', [binPath, '--version'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    } catch { return resolve('') }
+    } catch (err) { return done('', (err && err.message) || String(err)) }
     let out = ''
-    const t = setTimeout(() => { try { child.kill() } catch { /* noop */ } }, 30000)
-    child.stdout.on('data', (d) => { out += String(d) })
-    child.on('error', () => { clearTimeout(t); resolve('') })
-    child.on('exit', () => { clearTimeout(t); resolve(String(out).trim().split(/\r?\n/)[0].trim()) })
+    let errOut = ''
+    let timedOut = false
+    let settled = false
+    const t = setTimeout(() => {
+      timedOut = true
+      try { child.kill() } catch { /* noop */ }
+      // 兜底：kill 在 Windows 上不保证立刻收尾；超时后最多再等 3 秒，绝不让探测永远悬着。
+      setTimeout(() => finish(null, 'SIGKILL'), 3000)
+    }, 30000)
+    const finish = (code, signal) => {
+      if (settled) return
+      settled = true
+      clearTimeout(t)
+      // 只有"正常退出 + 无信号 + 未超时 + stdout 首行是合法版本号"才算探测成功。
+      // 非零退出/超时即使 stdout 里碰巧有版本字样也不能放行 —— 那说明进程后来还是死了。
+      const firstLine = String(out).trim().split(/\r?\n/u)[0].trim()
+      const ok = code === 0 && !signal && !timedOut && semver.valid(firstLine) !== null
+      const output = [
+        out,
+        errOut,
+        timedOut ? 'probe timed out after 30s' : '',
+        code !== 0 ? 'probe exited with code ' + String(code) + (signal ? ' (signal ' + signal + ')' : '') : '',
+      ].filter(Boolean).join('\n')
+      done(ok ? firstLine : '', output)
+    }
+    child.stdout.on('data', (d) => { out = cap(out + String(d)) })
+    child.stderr.on('data', (d) => { errOut = cap(errOut + String(d)) })
+    child.on('error', (err) => { clearTimeout(t); if (!settled) { settled = true; done('', (err && err.message) || String(err)) } })
+    // 等 close 才能保证 stdout/stderr 已收齐（exit 只表示进程结束，管道里的数据可能还在路上）。
+    // exit 之后再挂一个很短的兜底：极端情况下 close 迟迟不来，也不能让探测永远悬着。
+    child.on('close', (code, signal) => finish(code, signal))
+    child.on('exit', (code, signal) => setTimeout(() => finish(code, signal), 250))
   })
+}
+
+/**
+ * 探测输出是否证明安装树**自身**跑不起来（纯函数，便于单测）。
+ * 只认"模块解析 / 导出缺失"这类确定性错误：超时、spawn 失败不在此列 ——
+ * 它们可能只是这次环境抖动，完整安装值得再试一次。
+ */
+function probeIndicatesBrokenTree(output) {
+  const text = String(output || '')
+  return /does not provide an export named|ERR_MODULE_NOT_FOUND|Cannot find package|ERR_PACKAGE_PATH_NOT_EXPORTED|ERR_UNSUPPORTED_DIR_IMPORT/iu.test(text)
+}
+
+/** 把探测输出压成一条可放进通知/日志/错误框的证据（优先挑出模块解析那一行）。 */
+function probeFailureDetail(output) {
+  const lines = String(output || '').split(/\r?\n/u).map((line) => line.trim()).filter(Boolean)
+  const hit = lines.find((line) => /does not provide an export named|ERR_[A-Z_]+|Cannot find package/iu.test(line))
+  return String(hit || lines[0] || '').slice(0, 200)
 }
 
 /** 清理暂存目录：删掉 keep 之外的版本目录与 old-/rejected- 备份，返回删掉的名字。 */
@@ -915,21 +987,33 @@ async function stageLatest(version, nodeBin, kind, installDir) {
     return { ok: false, reason: last.error || 'npm 预装失败' }
   }
   const staged = readPkgAt(paths.stagePkg)
-  const probe = staged ? await probeDshVersion(nodeBin, path.join(paths.stagePkg, 'lib', 'bin.js')) : ''
+  const probe = staged ? await probeDshVersion(nodeBin, path.join(paths.stagePkg, 'lib', 'bin.js')) : { version: '', output: '' }
+  const probeBroken = probeIndicatesBrokenTree(probe.output)
   const decided = decideStagedInstall({
     targetVersion: version,
     installDirExists: fs.existsSync(installDir),
     stagedPkgExists: !!staged,
     stagedVersion: staged ? staged.version : '',
-    probeVersion: probe,
+    probeVersion: probe.version,
+    probeBroken,
     stagedBinLayout: staged ? staged.binLayout : '',
     installedBinLayout: installed.binLayout,
   })
   if (decided.action !== 'use') {
-    log(`dsh-update: staged tree rejected (${decided.reason})：退回完整安装路径`)
+    if (decided.reason === 'staged-tree-broken') {
+      stageBlock = { version, detail: probeFailureDetail(probe.output) }
+      log(`dsh-update: target v${version} 的安装树自身无法运行，已阻止升级：${stageBlock.detail}`)
+      setState({}) // 立刻推送：界面要马上收起"更新到 vX"，而不是等下一次状态变化
+    } else if (stageBlock && stageBlock.version === version) {
+      stageBlock = null // 这轮不再是确定性证据：别拿旧结论拦住重试
+    }
+    log(decided.reason === 'staged-tree-broken'
+      ? `dsh-update: staged tree rejected (${decided.reason})：该版本安装树自身无法运行，点击更新将被拦截`
+      : `dsh-update: staged tree rejected (${decided.reason})：退回完整安装路径`)
     try { fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) } catch { /* noop */ }
     return { ok: false, reason: decided.reason }
   }
+  stageBlock = null
   staging = {
     version,
     installDir,
@@ -959,18 +1043,25 @@ async function swapStagedInto(input) {
   // 顶上之前再判一次（预装到现在之间磁盘上可能被别的东西改过）
   const installed = readPkgAt(installDir)
   const staged = readPkgAt(paths.stagePkg)
-  const probe = staged ? await probeDshVersion(nodeBin, path.join(paths.stagePkg, 'lib', 'bin.js')) : ''
+  const probe = staged ? await probeDshVersion(nodeBin, path.join(paths.stagePkg, 'lib', 'bin.js')) : { version: '', output: '' }
+  const probeBroken = probeIndicatesBrokenTree(probe.output)
   const decided = decideStagedInstall({
     targetVersion: version,
     installDirExists: fs.existsSync(installDir),
     stagedPkgExists: !!staged,
     stagedVersion: staged ? staged.version : '',
-    probeVersion: probe,
+    probeVersion: probe.version,
+    probeBroken,
     stagedBinLayout: staged ? staged.binLayout : '',
     installedBinLayout: installed ? installed.binLayout : '',
   })
   if (decided.action !== 'use') {
     staging = null
+    if (decided.reason === 'staged-tree-broken') {
+      stageBlock = { version, detail: probeFailureDetail(probe.output) }
+      setState({ staged: false, stageVersion: '' }) // 与 stageBlock 同一次推送
+      return { ok: false, reason: decided.reason, detail: stageBlock.detail }
+    }
     setState({ staged: false, stageVersion: '' })
     return { ok: false, reason: decided.reason }
   }
@@ -1003,9 +1094,9 @@ async function swapStagedInto(input) {
   }
   // 改名成功 ≠ 新树能跑：立刻探测，不过就把旧树改回来
   const after = await probeDshVersion(nodeBin, path.join(installDir, 'lib', 'bin.js'))
-  if (after !== version) {
+  if (after.version !== version) {
     const back = await restoreSwap({ installDir, backupDir: paths.backupDir }, nodeBin)
-    log(`dsh-update: post-swap probe failed (${after || '空'})，改名回退 ${back.ok ? 'ok' : 'failed'}`)
+    log(`dsh-update: post-swap probe failed (${after.version || '空'})，改名回退 ${back.ok ? 'ok' : 'failed'}`)
     return { ok: false, reason: 'post-swap-probe-failed' }
   }
   staging = null
@@ -1030,8 +1121,8 @@ async function restoreSwap(state, nodeBin) {
   const probed = await probeDshVersion(nodeBin || 'node', path.join(installDir, 'lib', 'bin.js'))
   // 改名成功 ≠ 恢复出来的树能跑：探测不出来就如实失败，让调用方保留事务、下次启动再处理，
   // 绝不把"空版本"当成回滚成功去发通知。
-  if (!probed) return { ok: false, error: '恢复出来的旧树不可用（版本探测失败）', version: '', rejected }
-  return { ok: true, version: probed, rejected }
+  if (!probed.version) return { ok: false, error: '恢复出来的旧树不可用（版本探测失败）', version: '', rejected }
+  return { ok: true, version: probed.version, rejected }
 }
 
 /** 切换成功后的收尾：删掉旧树备份与暂存残留（正在预装的那份不能碰）。 */
@@ -1219,8 +1310,9 @@ async function checkOnce(reason, force) {
     if (semver.gt(latest.version, current, { includePrerelease: true })) {
       log(`dsh-update: new version v${latest.version} available (current v${current}, kind=${plan.kind}, channel=${latest.channel || channelOf()}, tag=${latest.tag || '?'}, reason=${reason || 'timer'})`)
       const newVersionSeen = prevLatest !== latest.version
-      // 换了目标版本：上一版的预装树作废（暂存目录名就是版本号，stageLatest 会自己清场）
-      if (newVersionSeen) staging = null
+      // 换了目标版本：上一版的预装树作废（暂存目录名就是版本号，stageLatest 会自己清场），
+      // "目标版本自身不可用"的结论也只对旧版本成立，必须一起清掉。
+      if (newVersionSeen) { staging = null; stageBlock = null }
       setState(Object.assign({ status: 'available' }, newVersionSeen ? { prewarmed: false, staged: false, stageVersion: '' } : {}))
       // 后台就绪（不阻塞检测）：全局形态预装一整套可切换的安装树，点击"立即更新"时只剩改名 + 重启服务。
       // 仅缓存预热过（prewarmed 但没 staged）时也再试一次预装——预装失败过不该永久放弃。
@@ -1266,6 +1358,7 @@ async function updateNow() {
   rollbackUsed = false // 每个更新周期最多一次回滚
   let txInfo = null // 事务信息（catch 里写终态用：区分"失败"与"被中断"）
   let swapState = null // catch 同样需要判断是否已经切换目录
+  let brokenDetail = '' // 完整安装后探测到"这棵树自身跑不起来"的证据（有值时跳过启动，直接走回滚）
   setState({ status: 'updating', error: '' })
   try {
     const report = await envDetect.detectEnv(false)
@@ -1291,6 +1384,24 @@ async function updateNow() {
     // 非升级（用户显式切渠道导致的版本号下降）也要在通知里说清楚，绝不静默
     const nonUpgrade = gate.nonUpgrade === true
     if (nonUpgrade) log(`dsh-update: non-upgrade install allowed by explicit channel choice (v${fromVersion} → v${latest})`)
+    // 后台预装可能还在写盘：先等它收场，再决定更新路径。用户点得快时 staging 还是 null，
+    // 直接走完整安装会白装一遍（预装马上会给出同一棵坏树的结论），还会先把服务停掉。
+    if (warming) {
+      log('dsh-update: 等待在途预装完成后再决定更新路径')
+      try { await warming } catch { /* warmLatest 自己吞错，这里只等它收场 */ }
+    }
+    // 预装探测已证明目标版本的安装树自身跑不起来（确定性证据）：完整安装装出来的还是同一棵树。
+    // 必须在这里拦住 —— 一旦停服并换上坏树，用户会先看到"插件不兼容"的误导页，再经历一次回滚。
+    // 放在停服之前：失败时服务保持原样，连中断都没有。
+    if (stageBlock && stageBlock.version === latest) {
+      const reason = `新版本 v${latest} 的安装包在本机无法运行（${stageBlock.detail || '依赖导出缺失'}）。`
+        + '可能是该版本发布包有问题，也可能是本次预装不完整；禁用或卸载插件都无效。'
+        + `已取消升级，${fromVersion ? `当前 v${fromVersion} 未改动` : '当前版本未改动'}；可稍后重试检查更新。`
+      log('dsh-update: update blocked (target-broken): ' + reason)
+      emitLifecycle('update.dsh', { step: 'blocked', reason: 'target-broken', from: fromVersion, to: latest })
+      setState({ status: 'error', error: reason })
+      return
+    }
     // 在任何更新事务/包文件写入前完成停服；失败保持旧版，不留下待修复事务。
     if (!['managed', 'global', 'npx'].includes(plan.kind)) {
       throw new Error(plan.kind === 'source'
@@ -1347,6 +1458,16 @@ async function updateNow() {
       if (sw.ok) {
         swapState = sw
         log(`dsh-update: staged swap ok in ${sw.ms}ms（备份保留至校验/回滚结束）：${sw.backupDir}`)
+      } else if (sw.reason === 'staged-tree-broken') {
+        // 与上面的预装期拦截同一判据的兜底（预装树在点击前一刻被改坏 / 结论被并发清掉）。
+        // 完整安装只会装出同一棵坏树，所以直接收场，并把刚才为更新停掉的服务拉回旧版。
+        if (wasRunning) {
+          try { await startService() } catch { /* noop */ }
+          if (reloadWebTabs) reloadWebTabs()
+        }
+        throw new Error(`新版本 v${latest} 的安装包在本机无法运行（${sw.detail || '依赖导出缺失'}）：`
+          + '可能是该版本发布包有问题，也可能是本次预装不完整；禁用或卸载插件都无效。'
+          + '已取消升级，当前版本未改动；可稍后重试检查更新')
       } else {
         // 没有预装树（用户点得太快 / 预装失败 / 被渠道切换作废）→ 退回完整安装，行为与从前一致
         if (sw.reason !== 'no-staged-tree') log('dsh-update: staged swap unavailable (' + sw.reason + ')，改用 npm install -g')
@@ -1357,6 +1478,14 @@ async function updateNow() {
             if (reloadWebTabs) reloadWebTabs()
           }
           throw new Error(r.error)
+        }
+        // 完整安装同样可能装出一棵自身跑不起来的树（官方包坏了 / 下载不完整）。先探测再启动：
+        // 明知起不来还去拉服务，用户只会先看到一次"启动失败"的说明页，再等一次回滚。
+        const installedProbe = await probeDshVersion(plan.nodeCmd, path.join(installDir, 'lib', 'bin.js'))
+        if (probeIndicatesBrokenTree(installedProbe.output)) {
+          brokenDetail = probeFailureDetail(installedProbe.output)
+          stageBlock = { version: latest, detail: brokenDetail }
+          log('dsh-update: 完整安装后的树自身无法运行，跳过启动并回滚：' + brokenDetail)
         }
       }
     } else if (plan.kind === 'npx') {
@@ -1395,9 +1524,17 @@ async function updateNow() {
     try { await refreshEnv(true) } catch (err) { log('dsh-update: refresh failed: ' + err.message) }
     // startService（main.handleStart）不抛错，靠返回值判定：false = 服务没起来（含环境未就绪/端口占用）
     let startOk = true
+    // 坏树的判定与"服务此前是否在跑"无关：即便更新前服务是停着的，也不能把一棵探测失败的树
+    // 当成更新成功。startOk=false 会无条件进入下面的统一回滚/报错路径。
+    if (brokenDetail) {
+      startOk = false
+      log('dsh-update: skip starting broken install tree')
+    }
     if (wasRunning) {
-      try { startOk = (await startService()) !== false } catch (err) { startOk = false; log('dsh-update: restart threw: ' + err.message) }
-      if (!startOk) log('dsh-update: restart failed (handleStart returned false)')
+      if (!brokenDetail) {
+        try { startOk = (await startService()) !== false } catch (err) { startOk = false; log('dsh-update: restart threw: ' + err.message) }
+        if (!startOk) log('dsh-update: restart failed (handleStart returned false)')
+      }
       if (reloadWebTabs) reloadWebTabs() // 强制重载：新版页面替换旧会话，杜绝残留白屏
     } else if (loadWebTabs) {
       // 更新前服务没在运行：只有"现在也确实没起来"才切"未启动"说明页。
@@ -1414,6 +1551,8 @@ async function updateNow() {
       runningVersion = re2 && re2.plan ? (re2.plan.dshVersion || '') : ''
     } catch { /* noop */ }
     const decision = decideRollback({ startOk, runningVersion, latest, fromVersion, kind: plan.kind, rollbackUsed })
+    // 探测到"新树自身跑不起来"时，把具体证据带进用户可见文案：否则"启动失败"看起来像玄学。
+    const brokenNote = brokenDetail ? '（原因：' + brokenDetail + '）' : ''
     if (decision.action !== 'none') {
       if (decision.action === 'rollback') {
         rollbackUsed = true
@@ -1440,11 +1579,11 @@ async function updateNow() {
           Config.dshUpdateCheckedAt = Date.now()
           try { saveConfig() } catch { /* noop */ }
           if (restarted) {
-            notify('DeepSeek Harness', `新版本 v${latest} 启动失败，已自动回滚到 v${fromVersion}（原配置不受影响；如仍异常请查看控制台日志）`)
-            setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}` })
+            notify('DeepSeek Harness', `新版本 v${latest} 无法启动，已自动回滚到 v${fromVersion}${brokenNote}（原配置不受影响；如仍异常请查看控制台日志）`)
+            setState({ status: 'error', error: `v${latest} 无法启动，已回滚到 v${fromVersion}${brokenNote}` })
           } else {
             notify('DeepSeek Harness', `已回滚到 v${fromVersion}，但服务未能重新启动：请打开控制台「恢复」页处理`, undefined, 'recovery')
-            setState({ status: 'error', error: `v${latest} 启动失败，已回滚到 v${fromVersion}，但服务未恢复` })
+            setState({ status: 'error', error: `v${latest} 无法启动，已回滚到 v${fromVersion}，但服务未恢复${brokenNote}` })
           }
           log(`dsh-update: rolled back to v${fromVersion}${restarted ? '' : '（服务未恢复）'}`)
           emitLifecycle('update.dsh', { step: 'rollback-ok', from: fromVersion, to: latest, restarted })
@@ -1454,7 +1593,7 @@ async function updateNow() {
         log('dsh-update: rollback failed: ' + (rb.error || ''))
         emitLifecycle('update.dsh', { step: 'rollback-failed', from: fromVersion, to: latest })
         notify('DeepSeek Harness', `DSH v${latest} 启动失败，回滚到 v${fromVersion} 也未成功；请手动执行：npm i -g --prefix "${globalRootForRollback}" @deepseek-ai/dsh@${fromVersion}，然后重新启动服务`)
-        setState({ status: 'error', error: `v${latest} 启动失败，回滚也未成功（请查看控制台日志）` })
+        setState({ status: 'error', error: `v${latest} 无法启动，回滚也未成功${brokenNote}（请查看控制台日志）` })
         // 改名回退也可能只做了一半：此时安装目录可能不存在，事务状态就是唯一的修复凭据，不能清
         if (!swapState) { try { clearUpdateState() } catch { /* noop */ } }
         return
@@ -1507,16 +1646,16 @@ async function updateNow() {
         }
         // 恢复本身也可能只做了一半：把事务留在盘上，交给下次启动的 recoverInterruptedUpdate
         log('dsh-update: restore by rename failed（保留更新事务，交给下次启动修复）: ' + (rb.error || ''))
-        notify('DeepSeek Harness', outcome.message + '；已保留更新事务，重启启动器会自动修复')
-        setState({ status: 'error', error: outcome.message })
+        notify('DeepSeek Harness', outcome.message + brokenNote + '；已保留更新事务，重启启动器会自动修复')
+        setState({ status: 'error', error: outcome.message + brokenNote })
         return
       }
-      notify('DeepSeek Harness', outcome.message)
+      notify('DeepSeek Harness', outcome.message + brokenNote)
       log(`dsh-update: reported failure after install (${outcome.reason}, startOk=${startOk}, runningVersion=${runningVersion || '?'}, latest=${latest})`)
       emitLifecycle('update.dsh', { step: 'updated-start-failed', from: fromVersion, to: latest, kind: plan.kind, startOk, runningVersion })
       // 新版已经顶上但没确认成功：备份留着（路径已记日志），不在这里删，给人工退路
       if (!swapState) { try { clearUpdateState() } catch { /* noop */ } }
-      setState({ status: 'error', error: outcome.message })
+      setState({ status: 'error', error: outcome.message + brokenNote })
       return
     }
     notify('DeepSeek Harness', outcome.message)
@@ -1563,6 +1702,10 @@ module.exports = {
   decideStagedInstall,
   decideSwapRecovery,
   staleStageEntries,
+  // 探测证据的判定（纯函数，供测试钉住"确定性坏树"与"偶发失败"的分界）
+  probeIndicatesBrokenTree,
+  probeFailureDetail,
+  probeDshVersion,
   // 切换动作本身也导出：测试用真实目录演练"顶上 / 退回"，而不是只测判定
   swapStagedInto,
   restoreSwap,

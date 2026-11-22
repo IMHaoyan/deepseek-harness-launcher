@@ -1897,6 +1897,13 @@ function renderDshUpdate(u) {
         btn.disabled = false;
         btn.textContent = '手动更新';
         btn.title = `新版本 v${latest}${nextMark} 可用：当前为源码安装，点此打开源码目录（git pull && pnpm run build 后重启服务）`;
+      } else if (status === 'available' && u.targetBroken) {
+        // 目标版本的安装树已被证明跑不起来：不给可点的"立即更新"，否则文案承诺了一个必然失败的动作。
+        btn.disabled = true;
+        btn.textContent = '该版本不可用';
+        btn.title = `新版本 v${latest}${nextMark} 的安装包在本机无法运行`
+          + (u.targetBrokenDetail ? `（${u.targetBrokenDetail}）` : '（依赖导出缺失）')
+          + '：可能是该版本发布包有问题，也可能是本次安装不完整；禁用或卸载插件无效。可稍后重试检查更新';
       } else if (status === 'available') {
         btn.disabled = false;
         btn.textContent = '立即更新';
@@ -1927,12 +1934,12 @@ function renderDshUpdate(u) {
     const bad = c && c.ok === true && Array.isArray(c.incompatible) ? c.incompatible : [];
     const unknown = c && c.ok === true && Array.isArray(c.unknown) ? c.unknown : [];
     let text = '';
-    if (status === 'available' && bad.length) {
+    if (status === 'available' && !(u && u.targetBroken) && bad.length) {
       const names = bad.map((x) => x.name).join('、');
       text = `⚠ 升级后 ${bad.length} 个插件会失效：${names}。插件不会被动到；等作者发布兼容版后在插件页更新即可，也可逐条授权豁免`;
-    } else if (status === 'available' && unknown.length) {
+    } else if (status === 'available' && !(u && u.targetBroken) && unknown.length) {
       text = `⚠ 未能确认 ${unknown.length} 个插件的兼容性：${unknown.map((x) => x.name).join('、')}`;
-    } else if (status === 'available' && c && c.ok === false) {
+    } else if (status === 'available' && !(u && u.targetBroken) && c && c.ok === false) {
       text = '⚠ 未能确认已装插件在新版本下的兼容性（读不到 profile 或目标版本非法）';
     }
     compatEl.textContent = text;
@@ -1955,7 +1962,7 @@ function renderDshUpdate(u) {
     let sticky = false;
     if (status === 'checking') { text = '正在检查更新…'; sticky = true; }
     // 版本号（含 (next) 标记）由上面的常驻"目标版本"显示，这里不再重复一遍
-    else if (status === 'available') text = '发现新版本';
+    else if (status === 'available') text = u.targetBroken ? '新版本安装包不可用' : '发现新版本';
     else if (status === 'updating') text = '更新中…';
     else if (status === 'updated') text = `已更新到 v${u.current}`;
     else if (status === 'up-to-date') text = '已是最新版本';

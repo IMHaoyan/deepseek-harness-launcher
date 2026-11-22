@@ -1,7 +1,7 @@
 // recovery-plan.js — 启动失败 → 恢复界面「一个状态一个动作」的判定（纯函数，无 IO、可单测）
 //
 // 为什么需要它：boot-failure.js 早就把失败分类成了 kind/target（plugin-tree / module-missing /
-// bundle-missing / settings-invalid / bind / unknown），但那份结果此前只喂了两处 —— 通知里的一句
+// bundle-missing / settings-invalid / bind / dsh-core-mismatch / unknown），但那份结果此前只喂了两处 —— 通知里的一句
 // reason，和「是不是确定性失败、要不要提前停重试」的判定。用户面对的状态页永远只有一句
 // 「服务未启动」和一个「启动服务」按钮：对一个插件树挂掉的服务，点下去必然还是同样的失败。
 //
@@ -295,7 +295,27 @@ function planRecovery(input) {
     }
   }
 
-  // ② 插件类失败：这是唯一能"定点修"的一类。
+  // ② 内核自身依赖不匹配：**不是插件问题**。它和插件失败共用同一种 ESM 报错，但禁用/卸载
+  //    插件不会改变任何字节 —— 坏的是 DSH 安装树自己的内置组件。所以这里既不给插件动作，
+  //    也不给「管理插件」入口（那是把人送到一个解决不了问题的地方）。
+  //    动作给什么？没有能在说明页安全执行的：重装/回退 DSH 属于「运行环境」页的写操作，
+  //    且需要用户确认改安装树。按 fail-closed 原则只给解释与去处。
+  if (kind === 'dsh-core-mismatch') {
+    return {
+      scenario: 'unknown',
+      reason: 'bootUnknown',
+      title: 'DSH 自身组件加载失败',
+      sub: withRunFacts('DSH 安装包里的内置组件与它依赖的包版本不匹配，服务因此起不来。'
+        + '这不是插件的问题：禁用或卸载插件都不会解决。', failure, capabilities),
+      detail: detail || reasonText,
+      primary: null,
+      entry: null,
+      blocked: '请打开 DSHL 控制台「运行环境」页重装 DSH；若这是升级到某个新版本后才出现的，'
+        + '回退到上一个可用版本（不要重装同一个坏版本）。',
+    }
+  }
+
+  // ②' 插件类失败：这是唯一能"定点修"的一类。
   if (PLUGIN_KINDS.has(kind)) {
     const facts = pluginFacts(capabilities)
     const byName = new Map(facts.map((p) => [p.name, p]))

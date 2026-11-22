@@ -14,6 +14,9 @@ for (const branch of ['verification', 'outcome']) {
       const state = { status: 'available', latest: '0.2.0', latestChannel: 'latest' }
       const ctx = {
         updating: false, rollbackUsed: false, state, userSwitchedChannel: '',
+        // 预装探测的"坏目标"结论（模块级状态）：本用例关心的是停服/回滚顺序，显式置空
+        stageBlock: null,
+        warming: null,
         Config: {}, saveConfig: () => {}, log: () => {}, notify: () => {},
         channelOf: () => 'latest', decideUpdateTarget: () => ({ action: 'install' }),
         envDetect: { detectEnv: async () => ({ plan: { kind: 'global', dshVersion: '0.1.0', nodeCmd: 'mock' }, dsh: { dir: 'mock' } }) },

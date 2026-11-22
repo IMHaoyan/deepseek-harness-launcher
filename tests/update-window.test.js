@@ -180,6 +180,20 @@ test('徽标两档的渲染契约：文案、样式与悬停解释都跟着 tier
   assert.match(builtCss, /\.win-btn\.update-badge\.ready/, 'wwwroot 未同步：请执行 npm run build:assets')
 })
 
+test('更新窗口：目标版本安装包已证明跑不起来时不提供更新按钮（文案必须等于可执行的动作）', () => {
+  // 主进程把预装探测的结论放进快照；窗口必须据此收起按钮，而不是继续承诺"更新到 vX"。
+  assert.match(mainJs, /targetBroken: dsh\.targetBroken === true/, '快照应带 targetBroken')
+  assert.match(mainJs, /targetBrokenDetail: dsh\.targetBrokenDetail \|\| ''/, '快照应带失败证据（tooltip 用）')
+  assert.match(js, /const broken = s\.targetBroken === true/, 'renderDsh 应读取 targetBroken')
+  assert.match(js, /if \(status === 'available' && broken\) \{/, '坏目标必须在画更新按钮之前拦下')
+  assert.match(js, /安装包当前不可用/, '行内要给结论词')
+  assert.match(js, /禁用或卸载插件无效/, 'tooltip 必须说清这不是插件问题')
+  // 渲染顺序：坏目标分支必须在 `status === 'available' && s.latest` 的按钮分支之前 return
+  const iBroken = js.indexOf("if (status === 'available' && broken) {")
+  const iButton = js.indexOf("if (status === 'available' && s.latest) {")
+  assert.ok(iBroken > 0 && iButton > iBroken, '坏目标分支必须先于更新按钮分支')
+})
+
 test('更新窗口：DSH 行的点击闩锁必须由主进程终态释放（不许永远停在「更新中…」）', () => {
   // 判定是纯函数：直接跑真实源码片段，而不是只做正则匹配
   const start = js.indexOf('function dshBusyRelease(input) {')

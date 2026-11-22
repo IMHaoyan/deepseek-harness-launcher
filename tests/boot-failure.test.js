@@ -33,6 +33,25 @@ const EACCES = [
   'Error: listen EACCES: permission denied 127.0.0.1:3080',
 ].join('\n')
 
+// 真实语料（2026-11-22，0.2.3-alpha.1 安装树的 `dsh --version` 原文，路径按既有语料惯例改写为 x）：
+// DSH 安装包**自己的内置组件**在加载期就引用了依赖里不存在的导出 —— 与任何用户插件无关。
+const CORE_MISMATCH = [
+  'file:///C:/Users/x/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:7',
+  'import Loader, { EntryGroup, EntryTree, EntryValidationError, ModuleLoader, formatIssues, isJsExpr, relocate, validateOptions } from "@deepseek-ai/cordis-plugin-loader";',
+  '                                        ^^^^^^^^^^^^^^^^^^^^',
+  "SyntaxError: The requested module '@deepseek-ai/cordis-plugin-loader' does not provide an export named 'EntryValidationError'",
+  '    at #asyncInstantiate (node:internal/modules/esm/module_job:327:21)',
+].join('\n')
+
+// 同样的 ESM 报错，但导入方是装在 profile 里的用户插件：仍按插件问题处理。
+const PROFILE_EXPORT_MISMATCH = [
+  'file:///C:/Users/x/.dsh/profiles/web/node_modules/my-third-party-plugin/lib/index.js:3',
+  'import { SessionLogOffset } from "@deepseek-ai/dsh-session";',
+  "SyntaxError: The requested module '@deepseek-ai/dsh-session' does not provide an export named 'SessionLogOffset'",
+  // 公共栈帧里一定会出现安装树路径 —— 判据不能拿它当"导入方"
+  '    at async runCli (file:///C:/Users/x/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js:21:9)',
+].join('\n')
+
 // —— firstErrorLine ——
 
 test('firstErrorLine：插件树失败取到插件那一行（这是用户最需要看到的一句）', () => {
@@ -70,6 +89,34 @@ test('classify：插件与新 DSH 不兼容 → plugin-tree，且点名是哪个
   assert.equal(c.target, 'dsh-better-sidebar')
   assert.equal(c.eligible, true)
   assert.match(c.reason, /dsh-better-sidebar/u)
+})
+
+// 2026-11-22：0.2.3-alpha.1 的安装包自己坏了（app-boot 引用 loader 未导出的 EntryValidationError）。
+// 旧规则只看 "does not provide an export named" 就判 plugin-tree，说明页于是让用户去禁用插件 ——
+// 用户照做后错误一字不变。这条测试钉住"内核自身依赖不匹配"与"插件不兼容"必须分开。
+test('classify：DSH 安装树自身导出缺失 → dsh-core-mismatch，不说成插件问题', () => {
+  const c = bf.classifyBootFailure(CORE_MISMATCH)
+  assert.equal(c.kind, 'dsh-core-mismatch')
+  assert.equal(c.target, '', '内核问题不该点名某个插件')
+  assert.equal(c.eligible, true, '磁盘上的坏安装树是确定性失败，重试无用')
+  assert.match(c.reason, /dsh-app-boot/u, '要点名坏在哪个内置组件：' + c.reason)
+  assert.match(c.reason, /EntryValidationError/u, '要点名缺的导出：' + c.reason)
+  assert.match(c.reason, /禁用或卸载插件无效/u, '必须直接告诉用户禁用插件没用：' + c.reason)
+  assert.doesNotMatch(c.reason, /插件与新版本 DSH 不兼容|插件 [^ ]+ 加载失败/u, '不能把锅甩给用户插件：' + c.reason)
+  // 证据行仍是用户最需要看的那一句
+  assert.match(c.line, /does not provide an export named/u)
+})
+
+test('classify：同样的导出缺失但导入方在 profile 里 → 仍按插件问题处理（不误伤）', () => {
+  const c = bf.classifyBootFailure(PROFILE_EXPORT_MISMATCH)
+  assert.equal(c.kind, 'plugin-tree')
+  assert.match(c.reason, /插件引用了当前 DSH 不再提供的导出/u)
+})
+
+test('classify：有 loader entry 证据时，即使栈里出现安装树路径也不判内核问题', () => {
+  // PLUGIN_TREE 的栈帧同样指向 dsh-app-boot —— 判据必须以 loader entry 这段反证优先
+  assert.equal(bf.coreMismatchOf(PLUGIN_TREE), null)
+  assert.equal(bf.classifyBootFailure(PLUGIN_TREE).kind, 'plugin-tree')
 })
 
 test('classify：bundle 声明与 node_modules 不一致 → bundle-missing + 包名', () => {

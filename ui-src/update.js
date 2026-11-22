@@ -161,7 +161,10 @@ function renderDsh(state) {
   const status = s.status || 'idle'
   if (dshBusyRelease({ busy: busy.dsh, status, error: s.error })) busy.dsh = false
 
-  renderVersion($('updDshVersion'), s.current, status === 'available' ? s.latest : '', status === 'updating')
+  // 目标版本的安装树已被证明跑不起来（主进程预装探测的结论）：不画"可更新到 vX"，
+  // 也不给更新按钮 —— 否则界面就承诺了一个必然失败、还会把服务切坏的动作。
+  const broken = s.targetBroken === true
+  renderVersion($('updDshVersion'), s.current, status === 'available' && !broken ? s.latest : '', status === 'updating')
 
   const box = $('updDshActions')
   box.textContent = ''
@@ -170,6 +173,20 @@ function renderDsh(state) {
     const note = document.createElement('span')
     note.className = 'upd-note'
     note.textContent = '更新中…'
+    box.appendChild(note)
+    return
+  }
+
+  if (status === 'available' && broken) {
+    const note = document.createElement('span')
+    note.className = 'upd-note'
+    note.textContent = s.latest ? `v${s.latest} 的安装包当前不可用` : '新版本安装包当前不可用'
+    // 具体原因（官方包自身依赖不匹配）放 tooltip：这一行只放结论，长错误会撑破布局
+    note.title = s.targetBrokenDetail
+      ? '这个版本的安装包在本机无法运行：' + s.targetBrokenDetail
+        + '\n可能是该版本发布包有问题，也可能是本次安装不完整；禁用或卸载插件无效。可稍后重试检查更新。'
+      : '这个版本的安装包在本机无法运行（依赖导出缺失）。可能是该版本发布包有问题，也可能是本次安装不完整；'
+        + '禁用或卸载插件无效。可稍后重试检查更新。'
     box.appendChild(note)
     return
   }

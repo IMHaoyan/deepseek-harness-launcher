@@ -103,7 +103,7 @@ const RULES = [
 ]
 
 // 参与确定性判定的种类：这些失败的根因是磁盘上的持久状态，重试不会改变结果
-const DETERMINISTIC_KINDS = new Set(['bundle-missing', 'plugin-tree', 'settings-invalid', 'module-missing'])
+const DETERMINISTIC_KINDS = new Set(['bundle-missing', 'plugin-tree', 'settings-invalid', 'module-missing', 'dsh-core-mismatch'])
 
 // —— 多插件失败：一次失败里到底有几个插件坏了 ——
 // DSH 侧多插件激活失败是一个 AggregateError，成员**逐条打印**：
@@ -117,6 +117,52 @@ const TARGET_RES = [
   /Cannot find package '([^']+)'/gu,
 ]
 const MAX_TARGETS = 8
+
+// —— 内核自身依赖不匹配（不是插件问题）——
+// 真实语料（2026-11-22，0.2.3-alpha.1 在本机安装后的 `dsh --version` 原文）：
+//   file:///…/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:7
+//   import Loader, { …, EntryValidationError, … } from "@deepseek-ai/cordis-plugin-loader";
+//   SyntaxError: The requested module '@deepseek-ai/cordis-plugin-loader' does not provide an export named 'EntryValidationError'
+// 这一步发生在**加载任何用户插件之前**：坏的是 DSH 安装树自己的内置组件，用户禁谁都没用。
+// 旧规则只凭 "does not provide an export named" 就判成 plugin-tree，说明页于是写「禁用插件」，
+// 用户照做后报错一字不变 —— 2026-11-22 实际踩到。
+//
+// 两条判据缺一不可：
+//   1) 有 ESM 的导出缺失原文；
+//   2) 报错现场的导入方路径落在 DSH 安装树里（node_modules/@deepseek-ai/dsh*），
+//      且**不在** <DSH_HOME>/profiles 下（用户插件装在那里）。
+// 用户插件失败的行里通常还带 "failed to import loader entry <id> (<pkg>)"，那是明确反证，先排除。
+const EXPORT_MISMATCH_RE = /The requested module '([^']+)' does not provide an export named '([^']+)'/iu
+const LOADER_ENTRY_EVIDENCE_RE = /failed to import loader entry/iu
+// 用户插件的位置是 <DSH_HOME>/profiles/<name>/node_modules/...（DSH_HOME 可被用户改掉，
+// 所以不能只认 .dsh/profiles 这个字面量；这个形状不会出现在 DSH 自己的安装树里）。
+const PROFILE_PATH_RE = /[\\/]profiles[\\/][^\\/]+[\\/]node_modules[\\/]/iu
+// 贪心前缀：一行里可能同时出现 <dsh>/node_modules/<dsh-app-boot>/…，要报的是**最内层**那个包
+const CORE_PKG_PATH_RE = /.*node_modules[\\/]@deepseek-ai[\\/](dsh(?:-[a-z0-9._-]+)?)[\\/]/iu
+
+/**
+ * 这次 ESM 导出缺失是不是 DSH 安装树**自身**的问题（纯函数）。
+ * @param {string} text 子进程 stderr
+ * @returns {{importerPkg:string, missingPkg:string, exportName:string}|null}
+ */
+function coreMismatchOf(text) {
+  const raw = String(text === undefined || text === null ? '' : text)
+  const miss = EXPORT_MISMATCH_RE.exec(raw)
+  if (!miss) return null
+  // 有 loader entry 证据 ⇒ 至少有一个用户插件在加载期失败，按插件问题处理（旧行为不变）
+  if (LOADER_ENTRY_EVIDENCE_RE.test(raw)) return null
+  // 只看**报错现场**（import 语句与 SyntaxError 之前）：后面的调用栈里有 dsh/lib/bin.js 这类
+  // 公共栈帧，拿它当"导入方"会把任何 ESM 失败都误判成内核问题。
+  const lines = raw.split(/\r?\n/u)
+  const errAt = lines.findIndex((line) => EXPORT_MISMATCH_RE.test(line))
+  const scene = errAt >= 0 ? lines.slice(0, errAt + 1) : lines
+  for (const line of scene) {
+    if (PROFILE_PATH_RE.test(line)) return null // 导入方是装在 <DSH_HOME>/profiles 里的用户插件
+    const m = CORE_PKG_PATH_RE.exec(line)
+    if (m) return { importerPkg: '@deepseek-ai/' + m[1], missingPkg: miss[1], exportName: miss[2] }
+  }
+  return null
+}
 
 /**
  * 收集本次失败里**所有**被点名的包，去重保序。
@@ -207,6 +253,21 @@ function classifyBootFailure(text) {
   const lines = raw.split(/\r?\n/u).slice(-TAIL_SCAN_LINES)
   // 一次失败里所有被点名的包：给界面回答"是不是还有别的插件也坏了"
   const targets = pluginTargets(raw)
+  // 先判内核自身依赖不匹配：它和插件失败共用同一种 ESM 报错，但修法完全相反（换安装树 vs 禁用插件）。
+  const core = coreMismatchOf(raw)
+  if (core) {
+    const line = firstErrorLine(raw)
+    return {
+      kind: 'dsh-core-mismatch',
+      target: '',
+      targets,
+      signature: signatureOf(line || core.missingPkg + ' ' + core.exportName),
+      eligible: true,
+      line,
+      reason: `DSH 安装树自身依赖不匹配：${core.importerPkg} 需要的导出 ${core.exportName}`
+        + ` 在 ${core.missingPkg} 里不存在（禁用或卸载插件无效）`,
+    }
+  }
   for (const rule of RULES) {
     for (const line of lines) {
       const m = rule.re.exec(line)
@@ -271,6 +332,7 @@ module.exports = {
   signatureOf,
   firstErrorLine,
   pluginTargets,
+  coreMismatchOf,
   classifyBootFailure,
   nextFailureStreak,
   isDeterministic,

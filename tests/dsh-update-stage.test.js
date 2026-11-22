@@ -81,11 +81,58 @@ test('decideStagedInstall：只有版本对得上、测得通、bin 布局没变
   assert.equal(d({ stagedVersion: '0.1.9' }).reason, 'staged-version-mismatch')
   assert.equal(d({ probeVersion: '' }).reason, 'probe-failed')
   assert.equal(d({ probeVersion: '0.1.9' }).reason, 'probe-failed')
+  // 探测证据是"树自身依赖坏了"时，结论必须与偶发失败分开：完整安装会装出同一棵坏树，不能重试
+  assert.equal(d({ probeVersion: '', probeBroken: true }).reason, 'staged-tree-broken')
+  assert.equal(d({ probeVersion: '0.1.9', probeBroken: true }).reason, 'staged-tree-broken')
+  // 探测成功时 probeBroken 不该改变结论（防御脏字段）
+  assert.equal(d({ probeBroken: true }).action, 'use')
   // bin 入口布局变了就不能整目录顶上（线上 .bin shim 指向包内相对路径）
   assert.equal(d({ stagedBinLayout: 'dsh=bin/dsh.mjs' }).reason, 'bin-layout-changed')
   // 读不到线上布局时不据此拒绝（宁可放行，也别因为读不到就永远不预装）
   assert.equal(d({ installedBinLayout: '' }).action, 'use')
   assert.equal(d({ targetVersion: '' }).reason, 'no-target')
+})
+
+test('probeIndicatesBrokenTree：只认确定性证据（模块解析/导出缺失），不认超时与 spawn 失败', () => {
+  const real = [
+    'file:///C:/Users/x/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:7',
+    "SyntaxError: The requested module '@deepseek-ai/cordis-plugin-loader' does not provide an export named 'EntryValidationError'",
+  ].join('\n')
+  assert.equal(dshUpdater.probeIndicatesBrokenTree(real), true)
+  for (const text of [
+    'Error [ERR_MODULE_NOT_FOUND]: Cannot find package \'x\'',
+    "Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './x' is not defined",
+  ]) {
+    assert.equal(dshUpdater.probeIndicatesBrokenTree(text), true, '模块解析类错误是确定性证据：' + text)
+  }
+  for (const text of ['probe timed out after 30s', 'EACCES: permission denied', '', undefined]) {
+    assert.equal(dshUpdater.probeIndicatesBrokenTree(text), false,
+      '超时/权限/spawn 失败不能被当成"树坏了"：' + JSON.stringify(text))
+  }
+  // 证据压成一行：优先挑出模块解析那一行，而不是 node 内部栈
+  const detail = dshUpdater.probeFailureDetail(real)
+  assert.match(detail, /does not provide an export named/u)
+  assert.ok(detail.length <= 200)
+})
+
+test('probeDshVersion：只有正常退出才采信版本号；非零退出即使 stdout 有版本也不算可用', async (t) => {
+  const dir = tmpRoot(t)
+  const write = (name, body) => {
+    const file = path.join(dir, name)
+    fs.writeFileSync(file, body)
+    return file
+  }
+  const good = write('good.js', "console.log('9.9.9')\nprocess.exit(0)\n")
+  const bad = write('bad.js', "console.log('9.9.9')\nprocess.exit(1)\n")
+  const noBin = path.join(dir, 'missing.js')
+  const ok = await dshUpdater.probeDshVersion(process.execPath, good)
+  assert.equal(ok.version, '9.9.9')
+  const crashed = await dshUpdater.probeDshVersion(process.execPath, bad)
+  assert.equal(crashed.version, '', '非零退出不能当成可运行的新树')
+  assert.match(crashed.output, /exited with code 1/u, '要留下退出码证据：' + crashed.output)
+  const missing = await dshUpdater.probeDshVersion(process.execPath, noBin)
+  assert.equal(missing.version, '')
+  assert.match(missing.output, /bin not found/u)
 })
 
 test('decideSwapRecovery：按文件系统事实决定补完 / 退回 / 无需修复 / 只能重装', () => {

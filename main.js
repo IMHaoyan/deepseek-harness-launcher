@@ -5466,6 +5466,9 @@ function updateStateSnapshot() {
       // 就绪程度决定"点击后大概多久"（更新窗口与控制台 tooltip 共用同一份口径）
       prewarmed: !!dsh.prewarmed,
       staged: !!dsh.staged,
+      // 预装探测已证明该目标版本自身跑不起来：界面不再提供更新按钮（见 dsh-update.js 的 stageBlock）
+      targetBroken: dsh.targetBroken === true,
+      targetBrokenDetail: dsh.targetBrokenDetail || '',
     },
   }
 }
@@ -7828,6 +7831,10 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           const items = value && Array.isArray(value.items) ? value.items : []
           const opts = value && typeof value === 'object' ? value : {}
           delete opts.items
+          // 目标 DSH 的 engines 范围必须带给安装侧：Node 的"复用/升级/验收"都按它判。
+          // 缺省时安装侧只能退回 DSHL 的默认范围（^22.19.0 || >=24.0.0），
+          // 会把 24.16.0 当成合格（而新 DSH 要求 ^24.22.3），装完仍起不来。
+          if (!opts.engineRange && envReport && envReport.engineRange) opts.engineRange = envReport.engineRange
           // 「升级 Node.js」是唯一会动"已就绪环境"的安装动作：旧 node.exe 正被服务占用时，
           // MSI 的 major upgrade 会因删不掉旧文件而失败（这次失败是整包回滚，不会留半截）。
           // 所以先把服务停稳；停止无法确认就一个字节都不改（fail-closed）。
