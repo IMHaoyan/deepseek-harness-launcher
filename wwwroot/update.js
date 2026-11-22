@@ -283,6 +283,22 @@ function renderDshProgress(s) {
     const err = document.createElement('div'); err.className = 'upd-p-error'
     err.textContent = s.error
     box.appendChild(err)
+    // 被 Node 版本拦下且环境页确实有升级入口：给一条明确的出路（关窗并切到控制台环境页），
+    // 避免用户只知道原因、不知道下一步。没有入口时不画按钮（文案已说明去用版本管理器升级）。
+    if (s.nodeBlocked && s.nodeUpgradeAvailable) {
+      const actions = document.createElement('div'); actions.className = 'upd-p-actions'
+      const btn = document.createElement('button')
+      btn.className = 'upd-btn primary'
+      btn.textContent = '打开运行环境'
+      btn.title = '在控制台「运行环境」页升级 Node.js 后重试更新'
+      btn.addEventListener('click', () => {
+        btn.disabled = true
+        btn.textContent = '正在打开…'
+        void cmd('openEnvPage')
+      })
+      actions.appendChild(btn)
+      box.appendChild(actions)
+    }
     return
   }
 

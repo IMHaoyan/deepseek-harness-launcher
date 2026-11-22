@@ -1315,7 +1315,8 @@ select, input[type="checkbox"], input[type="radio"], input[type="range"] {
 .dsh-upd-progress .upd-p-elapsed { margin-left: auto; font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 .dsh-upd-progress .upd-p-steps { display: flex; gap: 6px; margin: 10px 0 8px; }
 .dsh-upd-progress .upd-p-step { flex: 1; height: 4px; border-radius: 999px; background: var(--inset); position: relative; overflow: hidden; }
-.dsh-upd-progress .upd-p-step.done,
+/* 已完成压低亮度、当前步保持高亮：静止帧也能分清"走到第几步"，不依赖动画（reduced-motion 同样成立） */
+.dsh-upd-progress .upd-p-step.done { background: var(--brand); opacity: 0.45; }
 .dsh-upd-progress .upd-p-step.current { background: var(--brand); }
 .dsh-upd-progress .upd-p-step.current::after {
   content: "";

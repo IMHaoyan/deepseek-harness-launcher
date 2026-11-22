@@ -1919,10 +1919,17 @@ function renderDshUpdate(u) {
         btn.textContent = '更新中…';
         btn.title = '更新完成后会自动重启服务';
       } else if (u.nodeBlocked) {
-        // 目标版本要求更高 Node：重复点更新只会得到同一条拦截，按钮直接送到运行环境页
+        // 目标版本要求更高 Node：重复点更新只会得到同一条拦截。
+        // 有升级入口时送到运行环境页；没有入口（nvm/Scoop/自定义路径）就如实给"重试"，
+        // 不把用户导向一个没有按钮的页面。
         btn.disabled = false;
-        btn.textContent = '先升级 Node.js';
-        btn.title = (u.error || '新版本要求更高版本的 Node.js') + '（当前 DSH 版本不受影响）';
+        if (u.nodeUpgradeAvailable) {
+          btn.textContent = '打开运行环境';
+          btn.title = (u.error || '新版本要求更高版本的 Node.js') + '（点此打开运行环境页升级 Node.js；当前 DSH 版本不受影响）';
+        } else {
+          btn.textContent = '重试';
+          btn.title = (u.error || '新版本要求更高版本的 Node.js') + '（请先用当前 Node 的版本管理器升级，再点此重试；当前 DSH 版本不受影响）';
+        }
       } else {
         btn.disabled = false;
         btn.textContent = '重试';
@@ -2040,8 +2047,9 @@ function renderDshUpdateProgress(u) {
     const err = document.createElement('div'); err.className = 'upd-p-error';
     err.textContent = u.error;
     box.appendChild(err);
-    // 因 Node 版本被拦：给一个直达运行环境页的按钮，不让用户自己找
-    if (/node\.js|node 版本|engines/iu.test(u.error)) {
+    // 因 Node 版本被拦且环境页确有升级入口：给一个直达运行环境页的按钮，不让用户自己找。
+    // 入口不存在（nvm/Scoop/自定义 nodePath）时不画按钮 —— 错误文案已说明去用对应方式升级。
+    if (u.nodeBlocked && u.nodeUpgradeAvailable) {
       const actions = document.createElement('div'); actions.className = 'upd-p-actions';
       const btn = document.createElement('button');
       btn.className = 'btn sm primary';
@@ -2061,7 +2069,7 @@ $('btnDshUpdateNow').addEventListener('click', () => {
   if (!u) { void cmd('dshCheckNow'); return; }
   // 源码形态：打开源码目录手动更新；Node 被拦：直接去运行环境；失败重试：源码=重新检查，其余=重试更新
   if (u.kind === 'source') void cmd('openDshDir');
-  else if (u.status === 'error' && u.nodeBlocked) { if (typeof showPage === 'function') showPage('env'); }
+  else if (u.status === 'error' && u.nodeBlocked && u.nodeUpgradeAvailable) { if (typeof showPage === 'function') showPage('env'); }
   else if (u.status === 'error') void cmd('dshUpdateNow');
   else if (u.status === 'available') void cmd('dshUpdateNow');
   else void cmd('dshCheckNow');

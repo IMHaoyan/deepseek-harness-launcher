@@ -128,8 +128,9 @@ test('渲染层：点击当刻就反馈，且"检查中"提示不参与 8 秒自
 
 test('主进程：两处 dshCheckNow 都必须接住异步检查的 rejection（否则界面永远等不到反馈）', () => {
   const mainJs = read('main.js')
+  // dsh:cmd / update:cmd 两个入口，以及 Node 升级成功后的 onDone 复检（node-upgrade.test.js 另有细项断言）
   const wired = mainJs.match(/dshUpdater\.checkOnce\('manual', true\)\.catch\(/g) || []
-  assert.equal(wired.length, 2, 'dsh:cmd 与 update:cmd 两个入口都要接住 rejection')
+  assert.equal(wired.length, 3, 'dsh:cmd / update:cmd / Node 升级复检三个入口都要接住 rejection')
   assert.doesNotMatch(mainJs, /void dshUpdater\.checkOnce\('manual', true\);\s*return '\{\}'/,
     '不能再保留"发出去就不管"的旧写法')
 })

@@ -1445,6 +1445,8 @@ async function checkOnce(reason, force) {
   } catch (err) {
     if (timedOut) return
     log('dsh-update: check failed: ' + (err && err.message ? err.message : String(err)))
+    // nodeBlocked 必须显式复位：上一轮"目标要求更高 Node"的拦截结论不适用于一次网络失败，
+    // 否则按钮会继续显示「打开运行环境」，而错误原因其实是"检查失败"。
     setState(force ? { status: 'error', error: err && err.message ? err.message : String(err), nodeBlocked: false } : { status: 'idle' })
   } finally {
     if (!timedOut) finishCheck()
@@ -1484,7 +1486,7 @@ async function updateNow() {
     if (gate.action === 'block') {
       log(`dsh-update: update blocked (${gate.code}): ${gate.reason}`)
       emitLifecycle('update.dsh', { step: 'blocked', reason: gate.code, from: fromVersion, to: latest })
-      setState({ status: 'error', error: gate.reason })
+      setState({ status: 'error', error: gate.reason, nodeBlocked: false })
       return
     }
     // 非升级（用户显式切渠道导致的版本号下降）也要在通知里说清楚，绝不静默
@@ -1533,7 +1535,11 @@ async function updateNow() {
         : (targetEngines ? `Node.js ${targetEngines}` : '更新版本的 Node.js')
       const reason = `新版本 v${latest} 要求 ${need}，本机是 v${nodeBlock.nodeVersion || '未知'}。`
         + `已取消升级，${fromVersion ? `当前 v${fromVersion} 未改动` : '当前版本未改动'}；`
-        + '请先在控制台「运行环境」页升级 Node.js 后重试。'
+        // 有 dshl 能执行的升级入口才让用户去环境页；nvm/Scoop/自定义 nodePath 等由用户自己管理，
+        // 不能把用户导向一个"没有入口"的页面（界面承诺必须与真实存在的动作一致）。
+        + (report.nodeUpgrade
+          ? '请先在控制台「运行环境」页升级 Node.js 后重试。'
+          : '本机 Node.js 由其他方式管理（版本管理器或自定义路径），请先升级到 Node.js ' + Config.nodeMajor + ' LTS 后重试。')
       log('dsh-update: update blocked (target-node): ' + reason)
       emitLifecycle('update.dsh', { step: 'blocked', reason: 'target-node', from: fromVersion, to: latest })
       setState({ status: 'error', error: reason, nodeBlocked: true })

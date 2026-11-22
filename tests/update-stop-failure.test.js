@@ -204,9 +204,28 @@ test('目标版本要求更高 Node：停服前直接拒绝，不安装/不写�
   assert.equal(h.state.nodeBlocked, true, '界面据此把按钮换成「先升级 Node.js」')
   assert.match(h.state.error, /Node\.js 26 LTS/u, h.state.error)
   assert.match(h.state.error, /当前 v0\.1\.0 未改动/u, h.state.error)
+  assert.match(h.state.error, /其他方式管理/u, '没有可执行的升级入口时，不能把用户导向"没有入口"的运行环境页')
   assert.deepEqual(remembered, [{ version: '0.2.0', range: '^24.22.3 || >=26.13.1' }],
     '要把目标要求记下来，环境页才会出现 Node 升级入口')
   assert.equal(events[0].payload.reason, 'target-node')
+})
+
+test('目标版本要求更高 Node 且环境页有升级入口：文案直接指向运行环境页', async () => {
+  const h = dsh('global', async () => true, { running: true }, {
+    Config: { nodeMajor: 26 },
+    envDetect: {
+      detectEnv: async () => ({
+        node: { version: '24.14.1' },
+        plan: { kind: 'global', dshVersion: '0.1.0' },
+        nodeUpgrade: { mode: 'msi', from: '24.14.1', targetMajor: 26 },
+      }),
+    },
+    readStagedEngines: () => '^24.22.3 || >=26.13.1',
+    targetNodeBlockOf: require('../dsh-update').targetNodeBlockOf,
+  })
+  await h.fn()
+  assert.match(h.state.error, /运行环境/u, '有入口时给最短路径：' + h.state.error)
+  assert.doesNotMatch(h.state.error, /其他方式管理/u)
 })
 
 // 更新前服务本来就没在跑时，也不能把一棵探测失败的树当成成功：startOk 必须无条件为 false。

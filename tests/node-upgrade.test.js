@@ -471,6 +471,40 @@ test('main.js envInstall：「升级 Node.js」先停稳服务，失败/取消�
   assert.match(onFailBody, /handleStart\(\)/, '环境就绪且服务没在跑 → 必须把服务拉回来')
 })
 
+test('main.js envInstall onDone：Node 升级成功后复检"被 Node 拦下"的 DSH 更新状态', () => {
+  const onDoneBody = sliceBetween(mainJs, 'onDone: () => {', 'onFail: () => {', 'initInstaller onDone')
+  assert.match(onDoneBody, /afterEnvInstallDone\(envInstall\.getJob\(\)\)/,
+    'onDone 只做接线，实际收尾放在可测试的顶层函数里（见 tests/env-install-done.test.js）')
+  const body = sliceBetween(mainJs, 'async function afterEnvInstallDone', 'function initEnvRuntime', 'afterEnvInstallDone')
+  assert.match(body, /jobItems\.includes\('node'\)/, '只有确实装了 Node 才复检，插件安装不该多一次网络检查')
+  assert.match(body, /dshNow\.nodeBlocked/, '只复检"因 Node 要求被拦"的错误态')
+  assert.match(body, /dshUpdater\.checkOnce\('manual', true\)\.catch\(/,
+    '复检必须接住 rejection（否则界面停在旧结论）')
+  assert.ok(body.indexOf('await refreshEnv(true)') < body.indexOf("jobItems.includes('node')"),
+    '必须先刷新环境（看到新 Node）再判断要不要复检')
+})
+
+test('渲染层：nodeBlocked 按钮文案与真实动作一致（打开运行环境，而非直接升级）', () => {
+  const block = sliceBetween(appJs, '} else if (u.nodeBlocked) {', '} else {', 'nodeBlocked 按钮分支')
+  assert.match(block, /btn\.textContent = '打开运行环境'/, '按钮应如实说明是跳转，不是直接升级')
+  assert.doesNotMatch(block, /btn\.textContent = '先升级 Node\.js'/, '不能承诺一个点击并不会执行的动作')
+  assert.match(block, /打开运行环境页升级 Node\.js/, 'tooltip 要说明真正的升级动作在环境页')
+  assert.match(block, /u\.nodeUpgradeAvailable/, '只有环境页真有升级入口时才给跳转按钮')
+  const clickBlock = sliceBetween(appJs, "$('btnDshUpdateNow').addEventListener", '\n});', 'DSH 更新按钮点击处理')
+  assert.match(clickBlock, /u\.nodeBlocked && u\.nodeUpgradeAvailable/, '没有入口时不能跳到空页面')
+})
+
+test('更新窗口：被 Node 拦下时有直达运行环境页的出口（只放行固定页面）', () => {
+  const updateJs = read('ui-src/update.js')
+  assert.match(updateJs, /s\.nodeBlocked && s\.nodeUpgradeAvailable/, '失败详情里要识别 Node 拦截，且只在有入口时给下一步')
+  assert.match(updateJs, /cmd\('openEnvPage'\)/, '按钮要真的触发跳转命令')
+  const updateCmd = sliceBetween(mainJs, "ipcMain.handle('update:cmd'", 'ipcMain.handle(', 'update:cmd 分支')
+  assert.match(updateCmd, /case 'openEnvPage'/, '主进程要放行这个固定动作')
+  assert.match(updateCmd, /showConsolePage\('env'\)/, '只打开运行环境页，不接受任意页面参数')
+  assert.match(mainJs, /nodeUpgradeAvailable: !!\(envReport && envReport\.nodeUpgrade\)/,
+    '快照要把"环境页是否有 Node 升级入口"如实带给渲染层')
+})
+
 test('env-install.js：MSI 升级带 upgradeFrom，并按实探版本 + engines 验收（不轻信退出码）', () => {
   assert.match(envInstallSrc, /plan\.action === 'install-msi' \|\| plan\.action === 'upgrade-msi'/, '要区分首次安装与升级')
   assert.match(envInstallSrc, /upgradeFrom: plan\.from/, '升级要把已安装版本交给 installNodeViaMsi')

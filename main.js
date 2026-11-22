@@ -171,6 +171,49 @@ let envForceRefreshInFlight = false
 // 显式「升级 Node.js」任务是否停过服务：失败/取消后要负责把服务拉回来（成功路径由 onDone 自动启动）
 let nodeUpgradeRestartPending = false
 
+/**
+ * 安装任务成功后的统一收尾：重探环境 →（Node 升级过时）复检被 Node 拦下的 DSH 更新状态 → 就绪则启动服务。
+ * 抽成顶层函数是为了可测试：用桩执行它就能验证"先刷新再复检、只在 nodeBlocked 时复检、不自动更新 DSH"。
+ * @param {{job?:{items?:string[],silent?:boolean}}|null} snap envInstall.getJob() 的快照
+ */
+async function afterEnvInstallDone(snap) {
+  // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
+  // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动。
+  await refreshEnv(true)
+  // Node 升级完成后，之前"目标 DSH 要求更高 Node"的拦截结论已经过时：
+  // 立即复检一次，让版本行从「需先升级 Node.js」回到真实的「可更新 / 已是最新」。
+  // 只在确实装了 node 且当前就停在 nodeBlocked 错误态时触发，避免每次插件安装都多一次网络检查。
+  // 不 await：复检可能因网络慢而拖很久，绝不能挡住后面的服务启动；rejection 必须接住，否则界面停在旧结论。
+  const jobItems = snap && snap.job && Array.isArray(snap.job.items) ? snap.job.items : []
+  const dshNow = dshUpdater.getState()
+  if (jobItems.includes('node') && dshNow.status === 'error' && dshNow.nodeBlocked) {
+    log('node upgraded: rechecking DSH update target requirement')
+    void dshUpdater.checkOnce('manual', true).catch((err) => {
+      log('dsh-update: Node 升级后的复检失败：' + ((err && err.message) || String(err)))
+    })
+  }
+  // 静默任务（后台迁移）：只切换检测结果，不自动启动/重启服务（避免打断正在运行的会话）。
+  const silent = !!(snap && snap.job && snap.job.silent)
+  if (silent) {
+    log('silent install done, detection switched (service left as-is)')
+    if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
+    return
+  }
+  if (envReady()) {
+    log('environment ready after install, starting service')
+    await handleStart()
+    await maybeAutoInstallRecommendedPlugins() // 插件市场与全部预装插件同批，最后仅重启一次
+    void maybeRemoveRetiredPlugins() // 以及自动卸掉已从注册表摘除的退役插件（老用户升级后生效）
+    if (server.running() && Config.pluginSetupChoice !== 'pending' && !pluginSetup.error) {
+      await sleep(400)
+      openWebUi({ hideConsole: true }) // 新手完成感：服务就绪后自动回到 DeepSeek Harness
+    }
+  } else {
+    startWhenReady = true
+    log('environment not ready right after install, deferred start armed')
+  }
+}
+
 function initEnvRuntime() {
   envDetect.initEnv({ realHome: realHome, Config, log })
   envInstall.initInstaller({
@@ -181,33 +224,10 @@ function initEnvRuntime() {
     saveConfig, // 安装侧记账 npm 全局根后立刻落盘（探测/更新都读它）
     onPush: pushEnv,
     onDone: () => {
-      // 安装完成后：重新探测环境，就绪则自动启动服务并弹出 DSH 独立窗口；
-      // 若探测暂未就绪（竞态/文件延迟），由 onTick 补启动。
-      // 静默任务（后台迁移）：只切换检测结果，不自动启动/重启服务（避免打断正在运行的会话）。
-      nodeUpgradeRestartPending = false // 成功路径统一由下面的 onDone 逻辑启动服务
-      const snap = envInstall.getJob()
-      const silent = !!(snap && snap.job && snap.job.silent)
-      void (async () => {
-        await refreshEnv(true)
-        if (silent) {
-          log('silent install done, detection switched (service left as-is)')
-          if (envReady() && envReport && envReport.pnpm && envReport.pnpm.status === 'ok') { void maybeAutoInstallRecommendedPlugins(); void maybeRemoveRetiredPlugins() }
-          return
-        }
-        if (envReady()) {
-          log('environment ready after install, starting service')
-          await handleStart()
-          await maybeAutoInstallRecommendedPlugins() // 插件市场与全部预装插件同批，最后仅重启一次
-          void maybeRemoveRetiredPlugins() // 以及自动卸掉已从注册表摘除的退役插件（老用户升级后生效）
-          if (server.running() && Config.pluginSetupChoice !== 'pending' && !pluginSetup.error) {
-            await sleep(400)
-            openWebUi({ hideConsole: true }) // 新手完成感：服务就绪后自动回到 DeepSeek Harness
-          }
-        } else {
-          startWhenReady = true
-          log('environment not ready right after install, deferred start armed')
-        }
-      })()
+      nodeUpgradeRestartPending = false // 成功路径统一由 afterEnvInstallDone 启动服务
+      void afterEnvInstallDone(envInstall.getJob()).catch((err) => {
+        log('环境安装收尾失败：' + ((err && err.message) || String(err)))
+      })
     },
     onFail: () => {
       // 显式升级任务在启动前停了服务：失败/取消后必须把服务拉回来
@@ -5481,8 +5501,11 @@ function updateStateSnapshot() {
       // 预装探测已证明该目标版本自身跑不起来：界面不再提供更新按钮（见 dsh-update.js 的 stageBlock）
       targetBroken: dsh.targetBroken === true,
       targetBrokenDetail: dsh.targetBrokenDetail || '',
-      // 因目标版本要求更高 Node 而被拦下：按钮改为"先升级 Node.js"，不重复无效更新
+      // 因目标版本要求更高 Node 而被拦下：按钮改为"打开运行环境"，不重复无效更新
       nodeBlocked: dsh.nodeBlocked === true,
+      // 环境页当前是否真的存在可执行的 Node 升级入口（nvm/Scoop/自定义 nodePath 时为 false）：
+      // 为 false 时界面不能承诺"去环境页升级"，否则就是把用户导向一个没有按钮的页面。
+      nodeUpgradeAvailable: !!(envReport && envReport.nodeUpgrade),
       // 更新进度：UI 只画"第几步 / 共几步 + 已用时间"，不在安装阶段伪造百分比
       phase: dsh.phase || '',
       phaseIndex: Number.isInteger(dsh.phaseIndex) ? dsh.phaseIndex : 0,
@@ -7361,6 +7384,13 @@ function registerIpc() {
           return '{}'
         }
         case 'dshUpdateNow': void dshUpdater.updateNow(); return '{}'
+        // 更新窗口里被 Node 版本拦下时的出路：关掉本窗口，把控制台切到「运行环境」页。
+        // 只放行这一个固定页面，不接受参数 —— 更新窗口依旧无法驱动控制台的任意页面/动作。
+        case 'openEnvPage': {
+          if (updateWindowHandle) updateWindowHandle.close()
+          showConsolePage('env')
+          return '{}'
+        }
         // 自动更新失败时的手动出路：打开固定发布页。不接受任何 URL 参数 ——
         // 更新窗口/控制台只能"打开这一页"，没法借命令跳转到任意地址。
         case 'openLauncherDownload': try { shell.openExternal(LAUNCHER_RELEASES_URL) } catch { /* noop */ } return '{}'
