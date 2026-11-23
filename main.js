@@ -2367,6 +2367,21 @@ function inspectWebBootFailure(text) {
   if (!body || !/Failed to load plugins|did not activate/iu.test(body)) return false
   let found = []
   try { found = pluginActivation.parseActivationIssues(body) } catch { found = [] }
+  // 页面可能把 required 列表与冲突行拆在不同块里，或在中间夹了非条目行；
+  // 单独扫一遍冲突原文，确保归因仍能拿到 usage-billing 这类元凶。
+  if (!found.some((it) => /Conflicting shortcut defaults/iu.test(it.detail || ''))) {
+    const conflict = /Conflicting shortcut defaults:[^\n]+/iu.exec(body)
+    if (conflict) {
+      found.push({
+        kind: 'ui-page',
+        packageName: '',
+        entryId: '',
+        detail: 'failed: Error: ' + conflict[0],
+        services: [],
+        required: false,
+      })
+    }
+  }
   if (!found.length) {
     found = [{
       kind: 'ui-page',
@@ -4062,24 +4077,41 @@ function pluginUiState() {
   const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
   const isDisabled = (npm) => { try { return pluginSwitch.isDisabled(npm) === true } catch { return false } }
   const canToggle = (npm) => { try { return pluginSwitch.canToggle(npm) === true } catch { return false } }
-  // 只拿「当前启用中、且不在忽略清单」的第三方 bundle 做归因候选：
-  // 已停用的插件不可能是本次冲突的元凶；不由 DSHL 管理的插件（如电脑操作）也不替用户停用。
-  const candidates = thirdParty
-    .filter((npm) => !IGNORED_NPM_PLUGINS.has(npm))
-    .filter((npm) => !isDisabled(npm))
-    .map((npm) => ({ npm, name: pluginNameForNpm(npm) }))
-  const suspects = pluginActivation.attributeCulprits(issues, candidates)
-    .map((s) => ({
-      npm: s.npm,
-      name: s.name,
-      reasons: s.reasons,
-      canToggle: canToggle(s.npm),
-      inBundles: bundles.includes(s.npm),
-      actionable: canToggle(s.npm) || bundles.includes(s.npm),
-    }))
-    .filter((s) => s.actionable)
   const q = Config.pluginQuarantine
   const removedFromBundles = new Set((q && Array.isArray(q.removedFromBundles)) ? q.removedFromBundles : [])
+  const quarantined = new Set([
+    ...(q && Array.isArray(q.disabled) ? q.disabled : []),
+    ...removedFromBundles,
+  ])
+  const disabledOf = (npm) => {
+    if (removedFromBundles.has(npm)) return !bundles.includes(npm)
+    return isDisabled(npm)
+  }
+  // 候选不排除“已经被隔离/手动停用”的包：冲突报错仍然点名它时，卡片必须能说出
+  // “疑似是它，但已经停用了”，而不是因为停用就从清单里消失、变成“未能确定”。
+  const candidateNames = Array.from(new Set([...thirdParty, ...quarantined]))
+    .filter((npm) => !IGNORED_NPM_PLUGINS.has(npm))
+  const candidates = candidateNames.map((npm) => ({
+    npm,
+    name: pluginNameForNpm(npm),
+    disabled: disabledOf(npm),
+    inBundles: bundles.includes(npm),
+    canToggle: canToggle(npm),
+  }))
+  const suspects = pluginActivation.attributeCulprits(issues, candidates)
+    .map((s) => {
+      const info = candidates.find((c) => c.npm === s.npm) || {}
+      const disabled = info.disabled === true
+      return {
+        npm: s.npm,
+        name: s.name,
+        reasons: s.reasons,
+        canToggle: info.canToggle === true,
+        inBundles: info.inBundles === true,
+        disabled,
+        actionable: !disabled && (info.canToggle === true || info.inBundles === true),
+      }
+    })
   const critical = issues.filter((it) => pluginActivation.isUiCriticalIssue(it))
   const requiredCount = issues.filter((it) => it.required === true).length
   return {
@@ -4098,7 +4130,7 @@ function pluginUiState() {
     thirdParty,
     canSafeMode: thirdParty.length > 0,
     suspects,
-    canBatchDisable: suspects.length > 0,
+    canBatchDisable: suspects.some((s) => s.actionable),
     safeMode: Config.pluginSafeModeBackup || null,
     quarantine: q ? {
       at: q.at || '',
@@ -6705,6 +6737,15 @@ function webPushState() {
     consoleOpen: consoleIsOpen(),
     launcherVersion: app.getVersion(),
     service: servicePhase(),
+    // DSH 独立窗口的「处理插件冲突」按钮：与控制台主页面同一个状态源
+    pluginRecovery: (() => {
+      const pu = pluginUiState()
+      return {
+        show: !!(pu.degraded || pu.safeMode || pu.quarantine),
+        degraded: !!pu.degraded,
+        count: pu.criticalCount || pu.requiredCount || pu.count || 0,
+      }
+    })(),
     dshVersionText: dshTitleTooltipVersion(), // 标题栏悬停提示（'' = 还没探测到，壳就只显示标题）
     // 「有更新」徽标：两者任一有更新就显示；两档语义（有更新 / 可更新）由 updateBadgeTier 说了算，
     // 壳只按 tier 渲染文案与样式，不自己判断
@@ -8307,6 +8348,7 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
           if (!SELF_TEST) showConsolePage(page)
           return JSON.stringify({ ok: true, page })
         }
+        case 'browser:pluginRecovery': if (!SELF_TEST) showConsolePage('recovery'); return '{}'
         case 'browser:winMin': if (webWin && !webWin.isDestroyed()) { try { webWin.minimize() } catch { /* noop */ } } return '{}'
         case 'browser:winMax': {
           if (webWin && !webWin.isDestroyed()) {

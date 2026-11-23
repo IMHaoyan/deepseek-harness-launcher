@@ -4,7 +4,7 @@
 const $ = (id) => document.getElementById(id);
 const send = (name, payload) => window.browserBridge.send(name, payload);
 
-let state = { tabs: [], activeId: null, rightId: null, splitOn: false, splitRatio: 0.5, maximized: false, tabsEnabled: false, consoleOpen: false, update: null };
+let state = { tabs: [], activeId: null, rightId: null, splitOn: false, splitRatio: 0.5, maximized: false, tabsEnabled: false, consoleOpen: false, update: null, pluginRecovery: null };
 let restartErrTimer = null; // 重启失败的红字提示窗口：期间 render 不覆盖按钮文案
 
 // DSH 侧就绪说明（徽标悬停提示用）。口径与控制台「立即更新」按钮的 tooltip 完全一致，
@@ -67,6 +67,19 @@ function render() {
       btnUpdateNotice.title = title;
       btnUpdateNotice.setAttribute('aria-label', title);
     }
+  }
+
+  // 插件冲突恢复入口：DSH 独立窗口也要能一步跳到恢复卡，不能只藏在控制台里
+  const pr = state.pluginRecovery || {};
+  const btnPR = $('btnPluginRecovery');
+  if (btnPR) {
+    btnPR.classList.toggle('hidden', !pr.show);
+    btnPR.classList.toggle('warn', !!pr.degraded);
+    btnPR.textContent = pr.degraded ? '处理插件冲突' : '插件恢复';
+    btnPR.title = pr.degraded
+      ? 'DSH 界面未就绪：打开恢复页处理插件冲突'
+      : '查看插件恢复状态';
+    btnPR.setAttribute('aria-label', btnPR.title);
   }
 
   // 控制台打开时隐藏刷新/重启：控制台内部有自己的操作；关闭后恢复 DSH 快捷动作。
@@ -209,6 +222,7 @@ $('btnRestart').addEventListener('click', async () => {
   if (r && r.ok === false) flashRestartError(r.reason);
 });
 $('btnConsole').addEventListener('click', () => send('consoleToggle'));
+$('btnPluginRecovery').addEventListener('click', () => send('pluginRecovery'));
 $('btnUpdateNotice').addEventListener('click', () => send('updateOpen'));
 $('btnMin').addEventListener('click', () => send('winMin'));
 $('btnMax').addEventListener('click', () => send('winMax'));

@@ -1536,7 +1536,8 @@ function pluginSuspectLine(s) {
   const name = (s && (s.name || s.npm)) || '';
   const npm = (s && s.npm) || '';
   const reason = (s && Array.isArray(s.reasons) && s.reasons[0]) || '';
-  return name + (npm && npm !== name ? `（${npm}）` : '') + (reason ? '：' + reason : '');
+  return name + (npm && npm !== name ? `（${npm}）` : '') + (reason ? '：' + reason : '')
+    + (s && s.disabled ? '（已临时禁用）' : '');
 }
 
 function pluginQuarantineNames(q) {
@@ -1555,6 +1556,7 @@ function renderPluginRecovery(p) {
   const safe = ui.safeMode || null;
   const quarantine = ui.quarantine || null;
   const suspects = Array.isArray(ui.suspects) ? ui.suspects : [];
+  const actionableSuspects = suspects.filter((s) => s && s.actionable);
   const show = !!(ui.degraded || safe || quarantine);
   card.classList.toggle('hidden', !show);
   if (!show) return;
@@ -1585,9 +1587,16 @@ function renderPluginRecovery(p) {
       ? `${requiredCount} 个界面必需插件未激活`
       : (criticalCount ? `${criticalCount} 个界面相关插件未激活` : `${ui.count || allIssues.length || 0} 个插件未激活`);
     const lines = [`${countText}${names.length ? '：' + names.join('、') : ''}；继续重启不会改变。`];
+    const actionable = actionableSuspects;
     if (suspects.length) {
       lines.push('根据报错，疑似冲突插件：' + suspects.map(pluginSuspectLine).join('；') + '。');
-      lines.push(`将只禁用以上 ${suspects.length} 个疑似冲突插件，其他插件不受影响；会先备份 Profile，之后可整体恢复。`);
+      if (actionable.length === suspects.length) {
+        lines.push(`将只禁用以上 ${actionable.length} 个疑似冲突插件，其他插件不受影响；会先备份 Profile，之后可整体恢复。`);
+      } else if (actionable.length) {
+        lines.push(`其中 ${actionable.length} 个尚未停用，将只禁用这 ${actionable.length} 个；其余已停用的不需要重复操作。`);
+      } else {
+        lines.push('这些疑似冲突插件已经处于停用状态；如果界面仍未恢复，请重启 DSH，或使用安全模式。');
+      }
     } else {
       lines.push('未能从报错中唯一确定具体插件；可用安全模式先只加载官方插件。');
     }
@@ -1617,12 +1626,12 @@ function renderPluginRecovery(p) {
     detail.title = quarantine.manifest ? '备份：' + quarantine.manifest : '';
   }
   if (btnDisable) {
-    const showDisable = !!(ui.degraded && suspects.length);
+    const showDisable = !!(ui.degraded && actionableSuspects.length);
     btnDisable.classList.toggle('hidden', !showDisable);
     btnDisable.disabled = !showDisable;
-    btnDisable.textContent = pluginBatchDisableLabel(suspects);
+    btnDisable.textContent = pluginBatchDisableLabel(actionableSuspects);
     btnDisable.title = showDisable
-      ? '根据报错疑似为：\n' + suspects.map(pluginSuspectLine).join('\n')
+      ? '根据报错疑似为：\n' + actionableSuspects.map(pluginSuspectLine).join('\n')
       : '';
   }
   if (btnSafe) {
@@ -1725,7 +1734,7 @@ $('btnRecoveryDiagDir').addEventListener('click', () => { void cmd('openDiagnost
 // 插件冲突恢复：按插件隔离 / 安全模式 / 恢复 Profile（都会重启服务，确认框说明真实动作与备份）
 $('btnPluginDisableSuspects').addEventListener('click', async () => {
   const ui = window._pluginUi || {};
-  const suspects = Array.isArray(ui.suspects) ? ui.suspects : [];
+  const suspects = (Array.isArray(ui.suspects) ? ui.suspects : []).filter((s) => s && s.actionable);
   if (!suspects.length) return;
   const lines = suspects.map((s) => '· ' + pluginSuspectLine(s));
   const existing = (ui.quarantine && Array.isArray(ui.quarantine.disabled)) ? ui.quarantine.disabled : [];

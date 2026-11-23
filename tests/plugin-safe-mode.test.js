@@ -16,6 +16,8 @@ const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\
 const main = read('main.js')
 const app = read('ui-src/app.js')
 const html = read('ui-src/index.html')
+const browserHtml = read('ui-src/browser.html')
+const browserJs = read('ui-src/browser.js')
 
 function sliceBetween(src, startMarker, endMarker, label) {
   const at = src.indexOf(startMarker)
@@ -87,7 +89,10 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(state, /pluginActivation\.attributeCulprits\(issues, candidates\)/, '冲突元凶要归因到具体包')
   assert.match(state, /\.filter\(\(npm\) => !IGNORED_NPM_PLUGINS\.has\(npm\)\)/, '忽略清单里的插件不参与自动停用')
   assert.match(state, /suspects,/, '状态里要带精确的待禁用清单')
-  assert.match(state, /canBatchDisable: suspects\.length > 0/, '有元凶才给按插件隔离按钮')
+  assert.match(state, /canBatchDisable: suspects\.some\(\(s\) => s\.actionable\)/, '只有还能停用的元凶才给按钮')
+  assert.match(state, /const quarantined = new Set\(\[/, '已隔离的包也要参与归因候选')
+  assert.match(state, /disabled: disabledOf\(npm\)/, '候选要带“当前是否已停用”')
+  assert.match(state, /actionable: !disabled &&/, '已停用的元凶不能重复给禁用按钮')
   assert.match(state, /quarantine: q \? \{/, '隔离记录要下发，恢复页才能列清楚停了谁')
   assert.match(main, /pluginUi: pluginUiState\(\),/, '状态快照要下发 pluginUi')
 
@@ -105,6 +110,8 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(render, /将只禁用以上/, '执行前就要说明只会禁用哪些插件')
   assert.match(render, /疑似冲突插件/, '归因是报错推断，界面必须说“疑似”而不是武断定罪')
   assert.match(render, /pluginSuspectLine/, '详情要逐条列出插件名与冲突原因')
+  assert.match(render, /actionableSuspects/, '批量按钮只能操作还能停用的 suspect')
+  assert.match(app, /pluginSuspectLine[\s\S]{0,300}已临时禁用/, '已停用的元凶要标明，而不是从卡片上消失')
   assert.match(app, /renderPluginRecovery\(state\.pluginUi\)/, '状态推送时要渲染这张卡')
   assert.match(app, /pluginDegraded \? '处理插件冲突'/, '主页面警示卡要升级为「处理插件冲突」')
   assert.match(app, /cmd\('pluginSafeMode'\)/, '安全模式按钮要真的调用主进程')
@@ -158,4 +165,13 @@ test('Profile 快照恢复：原状态没有补丁层时要把新建的补丁文
   assert.match(fn, /补丁层备份已不存在/, '必须 fail-closed')
   assert.match(fn, /snap\.patchExisted === false/, '原状态没有补丁层')
   assert.match(fn, /fs\.unlinkSync\(DSH_PROFILE_PATCH\)/, '要把隔离期间新建的补丁文件删掉')
+})
+
+test('DSH 独立窗口：插件冲突时顶栏出现恢复按钮，直达恢复页', () => {
+  assert.match(browserHtml, /id="btnPluginRecovery"/, '独立窗口顶栏要有恢复按钮')
+  assert.match(browserJs, /state\.pluginRecovery/, '按钮显隐由主进程状态驱动')
+  assert.match(browserJs, /send\('pluginRecovery'\)/, '按钮要真的调用主进程')
+  assert.match(main, /pluginRecovery: \(\(\) => \{/, '状态推送要带 pluginRecovery')
+  assert.match(main, /case 'browser:pluginRecovery': if \(!SELF_TEST\) showConsolePage\('recovery'\)/,
+    '独立窗口按钮直接打开恢复页')
 })

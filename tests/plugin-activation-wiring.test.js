@@ -195,3 +195,37 @@ test('失败页原文 → 19 条证据 / required 2 / 自动打开恢复页，�
   assert.equal(server.activationIssues.length, 19)
   assert.deepEqual(state.pages, ['recovery'], '自动打开只做一次')
 })
+
+test('页面解析提前停住时，单独扫冲突原文仍能归因到 usage-billing', () => {
+  const activation = require('../plugin-activation')
+  const server = { activationIssues: [], activationAutoOpened: false }
+  const ctx = {
+    server,
+    pluginActivation: activation,
+    IGNORED_NPM_PLUGINS: new Set(['dsh-computer-use-win']),
+    log: () => {},
+    broadcastState: () => {},
+    consoleIsOpen: () => true,
+    showConsolePage: () => {},
+  }
+  vm.createContext(ctx)
+  const add = main.slice(main.indexOf('function addActivationIssues('), main.indexOf('function noteActivationEvidence('))
+  const inspect = main.slice(main.indexOf('function inspectWebBootFailure('), main.indexOf('function activationIssueOf('))
+  vm.runInContext(add + '\n' + inspect, ctx)
+
+  const text = [
+    'HARNESS',
+    'Failed to load plugins',
+    'web boot: 1 required entry did not activate',
+    '@deepseek-ai/dsh-client-ui-sidebar (required): pending (waiting for service: uiWorkspace)',
+    '',
+    '@deepseek-ai/dsh-client-ui-workspace: failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+  ].join('\n')
+  assert.equal(ctx.inspectWebBootFailure(text), true)
+  assert.equal(server.activationIssues.length, 2, 'parser 停住后，冲突原文要由兜底补上')
+  const suspects = activation.attributeCulprits(server.activationIssues, [
+    { npm: '@kenz1117/dsh-ui-usage-billing', name: '用量与计费' },
+  ])
+  assert.equal(suspects.length, 1)
+  assert.equal(suspects[0].npm, '@kenz1117/dsh-ui-usage-billing')
+})

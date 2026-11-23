@@ -27,6 +27,8 @@
     <button id="btnNew" class="bar-btn" title="新建标签页">＋</button>
     <div class="drag-space"></div>
     <div class="win-group">
+      <!-- 插件冲突时在 DSH 独立窗口直接给出恢复入口；正常状态隐藏，不占位 -->
+      <button id="btnPluginRecovery" class="bar-btn plugin-recovery warn hidden" title="DSH 界面未就绪：打开恢复页处理插件冲突">处理插件冲突</button>
       <!-- 有更新徽标：DSHL 或 DSH 任一新版本可用时显示（绿色，位置在控制台按钮左边）。
            点击打开独立的「更新」窗口；无更新时整颗隐藏，不留空位。 -->
       <button id="btnUpdateNotice" class="bar-btn win-btn update-badge hidden" title="有新版本可更新" aria-label="有新版本可更新">
