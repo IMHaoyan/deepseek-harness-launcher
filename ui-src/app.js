@@ -493,6 +493,20 @@ function render(state) {
   renderDesktopShell(state.desktopShell);
   renderRecovery(state);
   renderPluginRecovery(state.pluginUi);
+  // 插件冲突常驻跳转：警示卡被「知道了」关掉后，主页面仍要有一条路到恢复卡
+  {
+    const jump = $('btnPluginRecoveryJump');
+    if (jump) {
+      const pu = state.pluginUi || {};
+      const showJump = !!(pu.degraded || pu.safeMode || pu.quarantine);
+      jump.classList.toggle('hidden', !showJump);
+      jump.classList.toggle('primary', !!pu.degraded);
+      jump.textContent = pu.degraded ? '处理插件冲突' : '查看插件恢复状态';
+      jump.title = pu.degraded
+        ? '打开恢复页：禁用疑似冲突插件或使用安全模式'
+        : '查看已临时禁用的插件并恢复';
+    }
+  }
 
   // 缩放微调按钮（拖动/双击输入；值变化时应用）
   zoomWidgets.launcher.setFromState(state.zoom);
@@ -1858,6 +1872,7 @@ $('btnCrashNoteDiag').addEventListener('click', async () => {
 });
 $('btnTest').addEventListener('click', () => cmd('testNotify'));
 $('btnLogs').addEventListener('click', () => showPage('log'));
+$('btnPluginRecoveryJump').addEventListener('click', () => showPage('recovery'));
 
 $('btnConsoleReturn').addEventListener('click', () => { void cmd('consoleClose'); });
 document.querySelectorAll('#consoleNav .console-nav-item').forEach((el) => {

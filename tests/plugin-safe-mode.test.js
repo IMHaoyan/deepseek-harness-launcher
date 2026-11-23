@@ -91,9 +91,13 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(state, /quarantine: q \? \{/, '隔离记录要下发，恢复页才能列清楚停了谁')
   assert.match(main, /pluginUi: pluginUiState\(\),/, '状态快照要下发 pluginUi')
 
-  for (const id of ['pluginRecoveryCard', 'pluginRecoveryTitle', 'btnPluginSafeMode', 'btnPluginSafeModeRestore', 'btnPluginDisableSuspects', 'btnPluginQuarantineRestore', 'btnPluginOpenList']) {
+  for (const id of ['pluginRecoveryCard', 'pluginRecoveryTitle', 'btnPluginSafeMode', 'btnPluginSafeModeRestore', 'btnPluginDisableSuspects', 'btnPluginQuarantineRestore', 'btnPluginOpenList', 'btnPluginRecoveryJump']) {
     assert.match(html, new RegExp('id="' + id + '"'), `index.html 缺 ${id}`)
   }
+  assert.match(app, /pu\.degraded \? '处理插件冲突' : '查看插件恢复状态'/,
+    '主页面常驻按钮要随状态换文案')
+  assert.match(app, /btnPluginRecoveryJump'\)\.addEventListener\('click', \(\) => showPage\('recovery'\)\)/,
+    '主页面按钮要一步跳到恢复卡')
   const render = sliceBetween(app, 'function renderPluginRecovery(p)', 'function renderRecovery(state)', 'renderPluginRecovery')
   assert.match(render, /安全模式已启用/, '安全模式生效后要能解释当前状态')
   assert.match(render, /恢复到安全模式前的完整 Profile/, '要给整体恢复的出路')
