@@ -2312,6 +2312,34 @@ function haltAutoRestart(failure) {
 
 // ---------- 插件没生效的证据（DSH 只在 stderr 里说，解析见 plugin-activation.js） ----------
 
+/** 把解析出的条目并入本轮证据；返回是否有新增。 */
+function addActivationIssues(found) {
+  if (!Array.isArray(found) || !found.length) return false
+  let changed = false
+  for (const issue of found) {
+    const key = issue.kind + '\u0000' + issue.packageName + '\u0000' + issue.detail
+    if (server.activationIssues.some((it) => it.key === key)) continue
+    server.activationIssues.push(Object.assign({ key }, issue))
+    changed = true
+  }
+  if (!changed) return false
+  log('插件未生效（服务照常运行，重启不会改变）：'
+    + server.activationIssues.map((it) => (it.packageName || '(页面)') + ' → ' + it.detail).join('；'))
+  broadcastState() // 插件卡片要立刻显示"未生效"，不能等下一次状态推送
+  // UI 关键条目失败时 DSH 的界面就是一张 Failed to load plugins 页；只留主页面提示
+  // 用户可能根本不知道要点「控制台」。每世代自动打开一次恢复页，把按插件禁用/安全模式摆到眼前。
+  const criticalFailure = server.activationIssues.some((it) => pluginActivation.isUiCriticalIssue(it)
+    && !IGNORED_NPM_PLUGINS.has(String((it && it.packageName) || '')))
+  if (criticalFailure && !server.activationAutoOpened && !consoleIsOpen()) {
+    try {
+      showConsolePage('recovery')
+      server.activationAutoOpened = true
+      log('插件冲突：自动打开恢复页')
+    } catch { /* 打不开控制台也不影响证据记录，主页面警示卡仍可进入 */ }
+  }
+  return true
+}
+
 /**
  * 逐行喂 stderr：命中「bundle 被跳过 / 行没激活」就记一条证据。
  *
@@ -2325,29 +2353,33 @@ function noteActivationEvidence(line) {
   if (win.length > ACTIVATION_WINDOW_LINES) win.splice(0, win.length - ACTIVATION_WINDOW_LINES)
   let found = []
   try { found = pluginActivation.parseActivationIssues(win.join('\n')) } catch { return }
-  if (!found.length) return
-  let changed = false
-  for (const issue of found) {
-    const key = issue.kind + '\u0000' + issue.packageName + '\u0000' + issue.detail
-    if (server.activationIssues.some((it) => it.key === key)) continue
-    server.activationIssues.push(Object.assign({ key }, issue))
-    changed = true
+  addActivationIssues(found)
+}
+
+/**
+ * 页面兜底：DSH 0.2.x 的 required 失败页（`web boot: … did not activate`）不一定进 stderr。
+ * 页面已经渲染出完整证据时，把它当第二来源补进 activationIssues；解析不出条目也要留一条
+ * 合成证据，让恢复卡至少能提供安全模式，而不是让用户对着失败页无路可走。
+ * 只读 document.body.innerText，不改 DSH 的页面。
+ */
+function inspectWebBootFailure(text) {
+  const body = String(text || '')
+  if (!body || !/Failed to load plugins|did not activate/iu.test(body)) return false
+  let found = []
+  try { found = pluginActivation.parseActivationIssues(body) } catch { found = [] }
+  if (!found.length) {
+    found = [{
+      kind: 'ui-page',
+      packageName: '',
+      entryId: '',
+      detail: 'Failed to load plugins',
+      services: [],
+      required: true,
+    }]
   }
-  if (!changed) return
-  log('插件未生效（服务照常运行，重启不会改变）：'
-    + server.activationIssues.map((it) => it.packageName + ' → ' + it.detail).join('；'))
-  broadcastState() // 插件卡片要立刻显示"未生效"，不能等下一次状态推送
-  // required 条目失败时 DSH 的界面就是一张 Failed to load plugins 页；只留主页面提示
-  // 用户可能根本不知道要点「控制台」。每世代自动打开一次恢复页，把按插件禁用/安全模式摆到眼前。
-  const criticalFailure = server.activationIssues.some((it) => pluginActivation.isUiCriticalIssue(it)
-    && !IGNORED_NPM_PLUGINS.has(String((it && it.packageName) || '')))
-  if (criticalFailure && !server.activationAutoOpened && !consoleIsOpen()) {
-    try {
-      showConsolePage('recovery')
-      server.activationAutoOpened = true
-      log('插件冲突：自动打开恢复页')
-    } catch { /* 打不开控制台也不影响证据记录，主页面警示卡仍可进入 */ }
-  }
+  const added = addActivationIssues(found)
+  if (added) log('插件失败页：从页面原文补录 ' + found.length + ' 条证据')
+  return added
 }
 
 /**
@@ -7000,6 +7032,26 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
             })
             .catch(() => { /* noop */ })
         } catch { /* noop */ }
+      }
+    }
+    // 失败页兜底：required 激活失败不一定写 stderr，页面原文是第二证据来源。
+    // 只读 document.body.innerText，不改 DSH 页面；正常页面没有这两个签名，直接返回空串。
+    if (!SELF_TEST) {
+      const url = wc.getURL() || ''
+      if (url.startsWith(WEB_URL) || url === WEB_URL) {
+        const inspect = () => {
+          if (wc.isDestroyed()) return
+          try {
+            // 只在“失败页”采信：有失败签名且**没有聊天输入框**。
+            // 正常 DSH 页面里用户可能正好在聊天中粘贴这段报错，不能把正文当成启动失败。
+            wc.executeJavaScript("(function(){var b=document.body;if(!b)return '';var t=b.innerText||'';var hit=t.indexOf('Failed to load plugins')>=0||(t.indexOf('web boot:')>=0&&t.indexOf('did not activate')>=0);if(!hit)return '';var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');if(c&&c.getClientRects().length)return '';return t.slice(0,20000)})()")
+              .then((text) => { if (!wc.isDestroyed()) inspectWebBootFailure(text) })
+              .catch(() => { /* noop */ })
+          } catch { /* noop */ }
+        }
+        inspect()
+        // SPA 可能 did-finish-load 后才挂载失败页；补一次延迟读取
+        setTimeout(inspect, 2000)
       }
     }
   })

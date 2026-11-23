@@ -128,3 +128,70 @@ test('打包清单包含新模块（否则装出来的 exe 缺文件）', () => 
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
   assert.ok(pkg.build.files.includes('plugin-activation.js'), 'electron-builder files 要含 plugin-activation.js')
 })
+
+test('失败页兜底：stderr 没给 required 失败时，从页面原文补证据', () => {
+  assert.match(main, /function inspectWebBootFailure\(text\)/, '要有页面原文解析入口')
+  assert.match(main, /Failed to load plugins|did not activate/, '只对失败页做检查')
+  assert.match(main, /inspectWebBootFailure\(text\)/, 'did-finish-load 时要把页面文本送进解析')
+  assert.match(main, /setTimeout\(inspect, 2000\)/, 'SPA 延迟挂载时补读一次')
+  assert.match(main, /kind: 'ui-page'/, '解析不出条目也要留一条合成证据，至少能进安全模式')
+  assert.match(main, /document\.querySelector\('textarea,\[contenteditable=true\],input\[type=text\]'\)/,
+    '只在没有聊天输入框的失败页采信，避免聊天正文里的报错文本误触发')
+  assert.match(main, /function addActivationIssues\(found\)/, 'stderr 与页面两个来源共用同一份去重/推送/自动打开逻辑')
+})
+
+test('失败页原文 → 19 条证据 / required 2 / 自动打开恢复页，且重复读页不重复记', () => {
+  const activation = require('../plugin-activation')
+  const server = { activationIssues: [], activationAutoOpened: false }
+  const state = { broadcasts: 0, pages: [] }
+  const ctx = {
+    server,
+    pluginActivation: activation,
+    IGNORED_NPM_PLUGINS: new Set(['dsh-computer-use-win']),
+    log: () => {},
+    broadcastState: () => { state.broadcasts += 1 },
+    consoleIsOpen: () => false,
+    showConsolePage: (page) => { state.pages.push(page) },
+  }
+  vm.createContext(ctx)
+  const add = main.slice(main.indexOf('function addActivationIssues('), main.indexOf('function noteActivationEvidence('))
+  const inspect = main.slice(main.indexOf('function inspectWebBootFailure('), main.indexOf('function activationIssueOf('))
+  assert.ok(add.includes('function addActivationIssues'), '找不到 addActivationIssues')
+  assert.ok(inspect.includes('function inspectWebBootFailure'), '找不到 inspectWebBootFailure')
+  vm.runInContext(add + '\n' + inspect, ctx)
+
+  const text = [
+    'HARNESS',
+    'Failed to load plugins',
+    'web boot: 2 required entries did not activate',
+    '@deepseek-ai/dsh-client-ui-sidebar (required): pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-conversation: pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-message-quotes: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-chat (required): pending (waiting for services: uiWorkspace, uiConversation)',
+    '@deepseek-ai/dsh-client-ui-workspace: failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+    '@deepseek-ai/dsh-client-ui-workflow-run: pending (waiting for services: uiConversation, uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-skill: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-subagent: pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-reference: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-secret-mask: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-schedule: pending (waiting for services: conversation, uiConversation, uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-goal: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-entry-customization: pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-plan: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-user-questions: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-trajectory: pending (waiting for service: uiConversation)',
+    '@deepseek-ai/dsh-client-ui-deliverables: pending (waiting for service: uiConversation)',
+    'dsh-mcp-connector: pending (waiting for service: conversation)',
+    '@deepseek-ai/dsh-client-ui-directory-picker-native: pending (waiting for service: uiWorkspace)',
+  ].join('\n')
+
+  assert.equal(ctx.inspectWebBootFailure(text), true)
+  assert.equal(server.activationIssues.length, 19)
+  assert.equal(server.activationIssues.filter((i) => i.required === true).length, 2)
+  assert.deepEqual(state.pages, ['recovery'], 'UI 关键失败要自动打开恢复页')
+  assert.equal(state.broadcasts, 1)
+
+  assert.equal(ctx.inspectWebBootFailure(text), false, '重复读同一页不新增证据')
+  assert.equal(server.activationIssues.length, 19)
+  assert.deepEqual(state.pages, ['recovery'], '自动打开只做一次')
+})
