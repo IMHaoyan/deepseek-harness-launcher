@@ -4119,6 +4119,24 @@ function clearPersistedDisabledFor(names) {
 
 /** 安全模式：保留官方 bundle + 桌面登录辅助，其余第三方 bundle 临时停用；先备份再写。 */
 async function enablePluginSafeMode() {
+  const warnings = []
+  // 重复进入安全模式会拿“已安全模式”的 Profile 再拍一次快照，覆盖最初备份。
+  // 已有可恢复记录时拒绝；备份缺失的死记录清掉并留下说明。
+  const safeBak = Config.pluginSafeModeBackup
+  if (safeBak) {
+    const restorable = !!(safeBak.manifest && fs.existsSync(safeBak.manifest)
+      && !(safeBak.patchExisted === true && (!safeBak.patch || !fs.existsSync(safeBak.patch))))
+    if (restorable) {
+      return { ok: false, error: '当前已处于安全模式，请先恢复安全模式前的 Profile' }
+    }
+    warnings.push('已清除失效的安全模式记录（备份缺失）')
+    log('插件安全模式：清除失效的安全模式记录（备份缺失）')
+    Config.pluginSafeModeBackup = null
+    if (!saveConfig()) {
+      Config.pluginSafeModeBackup = safeBak
+      return { ok: false, error: '清理失效的安全模式记录失败，未进入安全模式' }
+    }
+  }
   // 安全模式与按插件隔离各有一份 Profile 快照；同时存在会让两个“恢复”互相覆盖。
   // 有**可恢复的**隔离记录时先要求用户恢复它，回到同一条时间线再进安全模式；
   // 备份已缺失的记录是死元数据，清掉它，避免用户被一个点不动的入口卡住。
@@ -4129,6 +4147,8 @@ async function enablePluginSafeMode() {
     if (restorable) {
       return { ok: false, error: '当前有按插件隔离的记录，请先在恢复页「恢复禁用前的 Profile」，再使用安全模式' }
     }
+    warnings.push('已清除失效的插件隔离记录（备份缺失）')
+    log('插件安全模式：清除失效的插件隔离记录（备份缺失）')
     Config.pluginQuarantine = null
     if (!saveConfig()) {
       Config.pluginQuarantine = quarantine
@@ -4142,48 +4162,58 @@ async function enablePluginSafeMode() {
   if (!thirdParty.length) return { ok: false, error: '当前 Profile 没有可停用的第三方插件' }
   const backup = profileSnapshotPaths('safe')
   let patchExisted = false
-  let snap = null
   try {
-    snap = { manifest: backup.manifest, patch: backup.patch }
     patchExisted = snapshotProfileFiles(backup).patchExisted
-    const next = JSON.parse(JSON.stringify(manifest))
-    next.dsh.profile.bundles = bundles.filter((n) => safeModeKeepsBundle(n))
-    writeProfileManifestAtomic(next)
   } catch (error) {
-    dropProfileSnapshot(snap)
-    return { ok: false, error: '写入安全模式 Profile 失败：' + ((error && error.message) || String(error)) }
+    dropProfileSnapshot(backup)
+    return { ok: false, error: '备份当前 Profile 失败：' + ((error && error.message) || String(error)) }
   }
-  Config.pluginSafeModeBackup = {
+  const record = {
     at: new Date().toISOString(),
     manifest: backup.manifest,
     patch: backup.patch,
     patchExisted,
     removed: thirdParty,
   }
+  // 先持久化恢复凭证，再改 Profile：进程在改到一半退出也能从备份恢复。
+  Config.pluginSafeModeBackup = record
   if (!saveConfig()) {
-    // 恢复入口没落盘就不能继续：先把 Profile 退回快照，避免“已停用却找不到恢复记录”
+    Config.pluginSafeModeBackup = null
+    dropProfileSnapshot(backup)
+    return { ok: false, error: '保存安全模式恢复记录失败，未修改 Profile' }
+  }
+  try {
+    const next = JSON.parse(JSON.stringify(manifest))
+    next.dsh.profile.bundles = bundles.filter((n) => safeModeKeepsBundle(n))
+    writeProfileManifestAtomic(next)
+  } catch (error) {
     let rollbackError = ''
     try { restoreProfileFiles({ manifest: backup.manifest, patch: backup.patch, patchExisted }) }
-    catch (error) { rollbackError = (error && error.message) || String(error) }
+    catch (e) { rollbackError = (e && e.message) || String(e) }
     Config.pluginSafeModeBackup = null
-    saveConfig()
-    if (rollbackError) {
+    const cleared = saveConfig()
+    if (rollbackError || !cleared) {
+      Config.pluginSafeModeBackup = record
+      if (!cleared) saveConfig()
       return {
         ok: false,
-        error: '保存安全模式恢复记录失败，且回滚失败：' + rollbackError + '；原备份：' + backup.manifest,
+        error: '写入安全模式 Profile 失败：' + ((error && error.message) || String(error))
+          + (rollbackError ? '；回滚失败：' + rollbackError : '')
+          + (!cleared ? '；恢复记录未能清除' : '')
+          + '；原备份：' + backup.manifest,
         backup: backup.manifest,
       }
     }
-    dropProfileSnapshot(snap)
-    return { ok: false, error: '保存安全模式恢复记录失败，Profile 已回滚' }
+    dropProfileSnapshot(backup)
+    return { ok: false, error: '写入安全模式 Profile 失败，已恢复：' + ((error && error.message) || String(error)) }
   }
   invalidatePluginInventory()
   log(`插件安全模式：已临时停用 ${thirdParty.length} 个第三方 bundle（${thirdParty.join('、')}）；备份 ${backup.manifest}`)
   const r = await restartDshForConsole()
   if (r && r.ok === false) {
-    return { ok: false, error: 'Profile 已切换，但服务重启失败（' + (r.reason || 'unknown') + '）', backup: backup.manifest }
+    return { ok: false, error: 'Profile 已切换，但服务重启失败（' + (r.reason || 'unknown') + '）', backup: backup.manifest, removed: thirdParty, warnings }
   }
-  return { ok: true, backup: backup.manifest, removed: thirdParty }
+  return { ok: true, backup: backup.manifest, removed: thirdParty, warnings }
 }
 
 /** 恢复安全模式前的 Profile（只认本次记录、且备份仍存在）。 */
@@ -4245,6 +4275,7 @@ function takeProfileRollback(kind) {
 // （如 `usage-billing.open-dashboard`），能唯一对上某个包时，就应该只停它。
 // 一次备份、一次重启，并在状态里保留「本次到底停了哪几个」的清单，恢复时按快照整体拷回。
 async function disableSuspectPlugins(npmList) {
+  const staleWarnings = []
   const safeBak = Config.pluginSafeModeBackup
   if (safeBak) {
     const restorable = !!(safeBak.manifest && fs.existsSync(safeBak.manifest)
@@ -4252,6 +4283,8 @@ async function disableSuspectPlugins(npmList) {
     if (restorable) {
       return { ok: false, error: '当前处于安全模式，请先恢复安全模式前的 Profile，再按插件禁用' }
     }
+    staleWarnings.push('已清除失效的安全模式记录（备份缺失）')
+    log('插件隔离：清除失效的安全模式记录（备份缺失）')
     Config.pluginSafeModeBackup = null
     if (!saveConfig()) {
       Config.pluginSafeModeBackup = safeBak
@@ -4304,6 +4337,31 @@ async function disableSuspectPlugins(npmList) {
     if (!reuse) dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
     return { ok: false, error: '备份当前 Profile 失败，未做任何修改：' + ((error && error.message) || String(error)) }
   }
+  // 预写恢复凭证：在动 Profile 之前就把「备份在哪、禁用清单是什么」落盘。
+  // 即使进程在 setEnabled / 写清单途中退出，恢复页仍有完整入口。
+  const preliminaryDisabled = Array.from(new Set([
+    ...((reuse && Array.isArray(prior.disabled)) ? prior.disabled : []),
+    ...targets.map((t) => t.npm),
+  ]))
+  const preliminaryRemoved = Array.from(new Set([
+    ...((reuse && Array.isArray(prior.removedFromBundles)) ? prior.removedFromBundles : []),
+    ...targets.filter((t) => !t.toggle).map((t) => t.npm),
+  ]))
+  const recordAt = (reuse && prior.at) ? prior.at : new Date().toISOString()
+  Config.pluginQuarantine = {
+    at: recordAt,
+    manifest: manifestBak,
+    patch: patchBak,
+    patchExisted,
+    disabled: preliminaryDisabled,
+    removedFromBundles: preliminaryRemoved,
+  }
+  if (!saveConfig()) {
+    Config.pluginQuarantine = prior || null
+    if (!reuse) dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
+    dropProfileSnapshot(rollback)
+    return { ok: false, error: '保存恢复记录失败，未修改 Profile' }
+  }
   const rollbackNow = () => {
     let fileError = ''
     try { restoreProfileFiles(rollback) } catch (error) { fileError = (error && error.message) || String(error) }
@@ -4312,17 +4370,22 @@ async function disableSuspectPlugins(npmList) {
   }
   const abort = (error, failed) => {
     const { fileError, warnings } = rollbackNow()
-    // 回滚失败时保留回滚快照（以及原备份）作为人工恢复路径，不能删掉最后的证据
+    Config.pluginQuarantine = prior || null
+    const restoredConfig = saveConfig()
+    // 回滚失败 / durable 没清干净 / 记录没回滚成功时，保留原备份作为人工恢复路径
+    const keepOriginal = !reuse && (fileError || warnings.length > 0 || !restoredConfig)
     if (!fileError) dropProfileSnapshot(rollback)
-    if (!reuse && !fileError) dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
+    if (!reuse && !keepOriginal) dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
     let suffix = ''
     if (fileError) suffix += '；回滚失败：' + fileError + '（原备份：' + manifestBak + '）'
     if (warnings.length) suffix += '；停用状态未清除：' + warnings.join('、')
+    if (!restoredConfig) suffix += '；恢复记录未能回滚'
     return {
       ok: false,
       error: error + suffix,
       failed: failed || [],
-      backup: fileError ? manifestBak : undefined,
+      backup: (fileError || keepOriginal) ? manifestBak : undefined,
+      warnings: staleWarnings,
     }
   }
   const disabled = []
@@ -4357,29 +4420,10 @@ async function disableSuspectPlugins(npmList) {
         removedFromBundles.map((npm) => ({ npm, error: '写入 Profile 失败，未能从 bundle 列表移除' })))
     }
   }
-  const allDisabled = Array.from(new Set([
-    ...((reuse && Array.isArray(prior.disabled)) ? prior.disabled : []),
-    ...disabled,
-  ]))
-  const allRemoved = Array.from(new Set([
-    ...((reuse && Array.isArray(prior.removedFromBundles)) ? prior.removedFromBundles : []),
-    ...removedFromBundles,
-  ]))
-  Config.pluginQuarantine = {
-    at: (reuse && prior.at) ? prior.at : new Date().toISOString(),
-    manifest: manifestBak,
-    patch: patchBak,
-    patchExisted,
-    disabled: allDisabled,
-    removedFromBundles: allRemoved,
-  }
-  if (!saveConfig()) {
-    Config.pluginQuarantine = prior || null
-    return abort('保存恢复记录失败，已回滚')
-  }
+  // 预写记录已经是最终清单：本次所有 target 要么成功停用、要么在上面的分支整批回滚。
   dropProfileSnapshot(rollback)
   invalidatePluginInventory()
-  log(`插件隔离：本次停用冲突插件 ${disabled.length} 个（${disabled.join('、')}）；累计 ${allDisabled.length} 个；备份 ${manifestBak}`)
+  log(`插件隔离：本次停用冲突插件 ${disabled.length} 个（${disabled.join('、')}）；累计 ${preliminaryDisabled.length} 个；备份 ${manifestBak}`)
   const r = await restartDshForConsole()
   const payload = {
     ok: true,
@@ -4387,6 +4431,7 @@ async function disableSuspectPlugins(npmList) {
     disabled: disabled.map((npm) => ({ npm, name: pluginNameForNpm(npm) })),
     failed,
     already,
+    warnings: staleWarnings,
   }
   if (r && r.ok === false) {
     return Object.assign(payload, {

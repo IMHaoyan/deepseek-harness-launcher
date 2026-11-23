@@ -237,6 +237,13 @@ function attributeCulprits(issues, candidates) {
       byAlias.get(alias).add(c.npm)
     }
   }
+  // 短名可能撞车（@a/foo-bar 与 @b/foo-bar）：只有唯一归属时才用短名做点名归因
+  const shortOwners = new Map()
+  for (const c of list) {
+    const short = String(c.npm).split('/').pop().toLowerCase()
+    if (!shortOwners.has(short)) shortOwners.set(short, new Set())
+    shortOwners.get(short).add(c.npm)
+  }
   const out = new Map()
   const add = (candidate, reason) => {
     if (!out.has(candidate.npm)) {
@@ -260,9 +267,12 @@ function attributeCulprits(issues, candidates) {
       // 失败条目自己若也是第三方 bundle，同样可能是冲突的一方（禁用任一方都能解冲突）
       if (cand) add(cand, reason)
     }
-    // 2) 报错里完整点名了某个第三方包（完整包名或短名）时也认；子串命中不算
+    // 2) 报错里完整点名了某个第三方包时也认；短名只在唯一归属时才用
     for (const c of list) {
-      if (mentionsPackage(detail, c.npm)) add(c, reason)
+      if (mentionsPackage(detail, c.npm, { short: false })) { add(c, reason); continue }
+      const short = String(c.npm).split('/').pop().toLowerCase()
+      const owners = shortOwners.get(short)
+      if (owners && owners.size === 1 && mentionsPackage(detail, short)) add(c, reason)
     }
   }
   return Array.from(out.values())
@@ -271,8 +281,9 @@ function attributeCulprits(issues, candidates) {
 /**
  * 报错里是否**完整点名**了这个包（完整包名或完整短名），而不是子串碰巧命中。
  * 例：候选 `dsh-image` 不能因为报错里有 `dsh-image-gen` 就被归因。
+ * opts.short === false 时只认完整包名（短名撞车时由调用方决定是否采用）。
  */
-function mentionsPackage(detail, npm) {
+function mentionsPackage(detail, npm, opts) {
   const text = String(detail == null ? '' : detail)
   const name = String(npm == null ? '' : npm)
   const short = name.split('/').pop()
@@ -281,6 +292,7 @@ function mentionsPackage(detail, npm) {
     return new RegExp('(^|[^\\w@/-])' + escaped + '([^\\w@/-]|$)', 'u').test(text)
   }
   if (name && hit(name)) return true
+  if (opts && opts.short === false) return false
   return short.length >= 5 && hit(short)
 }
 

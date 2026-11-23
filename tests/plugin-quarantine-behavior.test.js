@@ -291,3 +291,18 @@ test('失效的隔离记录不阻塞安全模式：先清掉死元数据再进�
   assert.equal(t.ctx.Config.pluginQuarantine, null, '死记录要清掉')
   assert.ok(t.ctx.Config.pluginSafeModeBackup, '安全模式记录要建立')
 })
+
+test('重复进入安全模式不会覆盖最初备份', async () => {
+  const t = setup()
+  t.reset()
+  assert.equal((await t.ctx.enablePluginSafeMode()).ok, true)
+  const first = t.ctx.Config.pluginSafeModeBackup
+  // 模拟用户在安全模式里又启用了一个第三方插件（Profile 不再是纯安全模式）
+  const manifest = JSON.parse(t.read(t.pkg))
+  manifest.dsh.profile.bundles.push('dsh-usage-billing')
+  fs.writeFileSync(t.pkg, JSON.stringify(manifest, null, 2) + '\n')
+  const r = await t.ctx.enablePluginSafeMode()
+  assert.equal(r.ok, false)
+  assert.match(r.error, /当前已处于安全模式/)
+  assert.equal(t.ctx.Config.pluginSafeModeBackup, first, '最初备份不能被覆盖')
+})

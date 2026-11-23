@@ -62,7 +62,8 @@ test('安全模式：先备份 package.json / cordis.patch.yml，再写 bundle �
   assert.match(enable, /next\.dsh\.profile\.bundles = bundles\.filter\(\(n\) => safeModeKeepsBundle\(n\)\)/,
     '安全模式只保留官方 bundle + 桌面登录辅助')
   assert.match(enable, /writeProfileManifestAtomic\(next\)/, '清单要原子落盘')
-  assert.match(enable, /Config\.pluginSafeModeBackup = \{/, '备份落点要持久化，恢复时才找得到')
+  assert.match(enable, /const record = \{/, '备份落点要结构化成记录')
+  assert.match(enable, /Config\.pluginSafeModeBackup = record/, '先持久化恢复凭证再改 Profile')
   assert.match(enable, /if \(!saveConfig\(\)\)/, '恢复记录没落盘就不能继续')
   assert.match(enable, /await restartDshForConsole\(\)/, '改完 Profile 必须重启服务才生效')
   assert.match(enable, /Config\.pluginQuarantine/, '有按插件隔离记录时不允许再叠一层安全模式快照')

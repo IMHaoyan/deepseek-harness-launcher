@@ -1711,16 +1711,17 @@ $('btnPluginDisableSuspects').addEventListener('click', async () => {
   if (!ok) return;
   const r = await cmd('pluginDisableSuspects', { npms: suspects.map((s) => s.npm) });
   const done = ((r && Array.isArray(r.disabled)) ? r.disabled : []).map((d) => d.name || d.npm).filter(Boolean);
+  const extra = (r && Array.isArray(r.warnings) && r.warnings.length) ? '；' + r.warnings.join('；') : '';
   if (!r || r.ok === false) {
     const prefix = done.length ? `已禁用 ${done.join('、')}，但` : '';
-    showConsoleToast('✕ ' + prefix + ((r && r.error) || '操作失败，请查看日志'));
+    showConsoleToast('✕ ' + prefix + ((r && r.error) || '操作失败，请查看日志') + extra);
     return;
   }
   const failed = Array.isArray(r.failed) ? r.failed : [];
   const base = done.length ? `✓ 已禁用 ${done.join('、')}，正在重启 DSH` : '✓ 正在重启 DSH';
-  showConsoleToast(failed.length
+  showConsoleToast((failed.length
     ? `${base}；未能停用 ${failed.map((f) => f.npm).join('、')}`
-    : base);
+    : base) + extra);
 });
 $('btnPluginQuarantineRestore').addEventListener('click', async () => {
   const q = (window._pluginUi || {}).quarantine || null;
@@ -1746,8 +1747,9 @@ $('btnPluginSafeMode').addEventListener('click', async () => {
   });
   if (!ok) return;
   const r = await cmd('pluginSafeMode');
-  if (!r || r.ok === false) showConsoleToast('✕ 安全模式启动失败：' + ((r && r.error) || '无响应，请查看日志'));
-  else showConsoleToast('✓ 已进入安全模式，正在重启 DSH');
+  const extra = (r && Array.isArray(r.warnings) && r.warnings.length) ? '；' + r.warnings.join('；') : '';
+  if (!r || r.ok === false) showConsoleToast('✕ 安全模式启动失败：' + ((r && r.error) || '无响应，请查看日志') + extra);
+  else showConsoleToast('✓ 已进入安全模式，正在重启 DSH' + extra);
 });
 $('btnPluginSafeModeRestore').addEventListener('click', async () => {
   const ok = await confirmDialog({

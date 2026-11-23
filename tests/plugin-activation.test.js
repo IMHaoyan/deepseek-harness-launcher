@@ -233,3 +233,27 @@ test('mentionsPackage：完整点名才算，子串不算', () => {
   assert.equal(activation.mentionsPackage('failed: usage-billing.open broke', 'dsh-ui-usage-billing'), false,
     '短名不完整匹配时不走点名归因（前缀归因另有规则）')
 })
+
+test('mentionsPackage：相邻字母/下划线/同短名都不算唯一归因', () => {
+  assert.equal(activation.mentionsPackage('xfoo-bar', 'foo-bar'), false)
+  assert.equal(activation.mentionsPackage('foo-barista', 'foo-bar'), false)
+  assert.equal(activation.mentionsPackage('foo_bar', 'foo-bar'), false)
+  assert.equal(activation.mentionsPackage('foo-bar.x', 'foo-bar'), true)
+})
+
+test('attributeCulprits：两个作用域包短名相同 → 短名点名不归因；完整包名仍唯一', () => {
+  const candidates = [
+    { npm: '@a/foo-bar', name: 'A' },
+    { npm: '@b/foo-bar', name: 'B' },
+  ]
+  const short = [{
+    kind: 'inactive',
+    packageName: '@deepseek-ai/x',
+    entryId: 'x',
+    detail: 'failed: foo-bar exploded',
+    services: [],
+  }]
+  assert.deepEqual(activation.attributeCulprits(short, candidates), [])
+  const full = [{ ...short[0], detail: 'failed: @a/foo-bar exploded' }]
+  assert.deepEqual(activation.attributeCulprits(full, candidates).map((f) => f.npm), ['@a/foo-bar'])
+})
