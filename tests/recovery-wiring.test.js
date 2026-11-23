@@ -478,14 +478,16 @@ test('控制台主页把「未生效」升级为界面未就绪，并给出恢�
   // 时 DSH 会给一张 Failed to load plugins 页，提示卡必须升级成警示 + 「处理插件冲突」。
   const at = app.indexOf("const notActive = (state.plugins || []).filter")
   assert.ok(at > 0, '控制台主页要有这一行')
-  const block = app.slice(at, at + 1100)
-  assert.match(block, /个插件未生效（重启不会改变）/, '文案要说清"重启不会改变"')
+  const block = app.slice(at, at + 2200)
+  assert.match(block, /个插件未生效（重启不会改变）/, '普通未生效仍保留中性文案')
   assert.match(block, /可在恢复页禁用疑似冲突插件或使用安全模式/, '界面未就绪时给出恢复页的隔离/安全模式出口')
   assert.match(block, /可在「插件管理」页查看/, '普通未生效仍指向插件管理页')
   assert.match(block, /pluginDegraded/, '要区分"界面未就绪"与普通未生效')
   assert.match(block, /notActive\.length \|\| pluginDegraded/,
     '失败的常是 DSH 自带的 UI 包（插件页没有卡），不能只靠 notActive.length 才报')
-  assert.match(block, /插件冲突导致页面加载失败/, '没有卡片证据时也要给出界面未就绪的说明')
+  assert.match(block, /pu\.suspects/, '主页面提示要优先点名疑似冲突插件')
+  assert.match(block, /疑似冲突插件/, '不能拿 notActive 里的 dsh-mcp-client 顶替冲突元凶')
+  assert.match(block, /界面必需插件未激活/, '没有归因结果时列 required 条目')
   assert.match(block, /notes\.push/, '走既有的提示卡，不新开模块')
   // 插件冲突属于需要处理的异常：警示样式与主按钮要跟着 pluginDegraded 升级。
   assert.match(app, /crashEl\.classList\.toggle\('env-warning', alert \|\| pluginDegraded\)/,

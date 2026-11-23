@@ -415,16 +415,29 @@ function render(state) {
     // "界面未就绪"，并把恢复页的主操作（按插件禁用 / 安全模式）露出来，不能只留一行中性提示。
     // ★ 不能只在 notActive.length 里判断：失败的常是 DSH 自带的 @deepseek-ai/* UI 包，
     //   它们在插件页没有卡片，notActive 会是空的，但 pluginUi.degraded 已经是 true。
-    const pluginDegraded = !!(state.pluginUi && state.pluginUi.degraded);
+    const pu = state.pluginUi || {};
+    const pluginDegraded = !!pu.degraded;
     // 忽略清单里的包（如电脑操作）即使装着并在插件页显示真实状态，也不拉高主页面的全局警示
     const notActive = (state.plugins || []).filter((p) => p && p.activation && !p.ignored);
+    const suspects = Array.isArray(pu.suspects) ? pu.suspects : [];
+    const criticalIssues = Array.isArray(pu.issues) ? pu.issues.filter((x) => x && x.critical) : [];
     if (notActive.length || pluginDegraded) {
-      if (notActive.length) {
+      if (pluginDegraded) {
+        // 界面未就绪时先点名疑似冲突插件；没有归因结果再列 required 条目。
+        // 不能拿 notActive 里的 dsh-mcp-client 来顶替 —— 它不是这次界面失败的原因。
+        if (suspects.length) {
+          const names = suspects.slice(0, 3).map((s) => (s.name || s.npm) + (s.disabled ? '（已临时禁用）' : ''));
+          notes.push(`DSH 界面未就绪：疑似冲突插件 ${names.join('、')} → 可在恢复页处理`);
+        } else {
+          const names = criticalIssues.slice(0, 3).map((x) => x.packageName || x.entryId).filter(Boolean);
+          const count = Number(pu.requiredCount) || criticalIssues.length || 1;
+          notes.push(`DSH 界面未就绪：${count} 个界面必需插件未激活${names.length ? '：' + names.join('、') : ''}`
+            + ' → 可在恢复页禁用疑似冲突插件或使用安全模式');
+        }
+      } else if (notActive.length) {
         const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
-        notes.push(`${pluginDegraded ? 'DSH 界面未就绪：' : ''}${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
-          + `${notActive.length > 3 ? ' 等' : ''} → ${pluginDegraded ? '可在恢复页禁用疑似冲突插件或使用安全模式' : '可在「插件管理」页查看'}`);
-      } else {
-        notes.push('DSH 界面未就绪：插件冲突导致页面加载失败 → 可在恢复页禁用疑似冲突插件或使用安全模式');
+        notes.push(`${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
+          + `${notActive.length > 3 ? ' 等' : ''} → 可在「插件管理」页查看`);
       }
     }
     crashEl.classList.toggle('env-warning', alert || pluginDegraded); // 插件冲突也要用警示卡，而不是中性一行

@@ -2386,15 +2386,18 @@ function inspectWebBootFailure(text) {
   let found = []
   try { found = pluginActivation.parseActivationIssues(body) } catch { found = [] }
   // 页面可能把 required 列表与冲突行拆在不同块里，或在中间夹了非条目行；
-  // 单独扫一遍冲突原文，确保归因仍能拿到 usage-billing 这类元凶。
-  if (!found.some((it) => /Conflicting shortcut defaults/iu.test(it.detail || ''))) {
-    const conflict = /Conflicting shortcut defaults:[^\n]+/iu.exec(body)
-    if (conflict) {
+  // 单独扫一遍冲突原文（按空白归一化，避免长行换行把 usage-billing 截掉），
+  // 确保归因仍能拿到 usage-billing 这类元凶。
+  const conflictAt = body.indexOf('Conflicting shortcut defaults:')
+  if (conflictAt >= 0) {
+    const snippet = body.slice(conflictAt, conflictAt + 300).replace(/\s+/gu, ' ').trim()
+    const covered = !!snippet && found.some((it) => String(it.detail || '').includes(snippet.slice(0, 60)))
+    if (!covered) {
       found.push({
         kind: 'ui-page',
         packageName: '',
         entryId: '',
-        detail: 'failed: Error: ' + conflict[0],
+        detail: 'failed: Error: ' + snippet,
         services: [],
         required: false,
       })
@@ -7123,7 +7126,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
             // 只在“失败页”采信：有失败签名且**没有聊天输入框**。
             // 正常 DSH 页面里用户可能正好在聊天中粘贴这段报错，不能把正文当成启动失败；
             // 反过来，页面有可见聊天输入框且没有失败签名 = 真实界面已加载，清掉过期的“未就绪”判定。
-            wc.executeJavaScript("(function(){var b=document.body;if(!b)return '';var t=b.innerText||'';var hit=t.indexOf('Failed to load plugins')>=0||(t.indexOf('web boot:')>=0&&t.indexOf('did not activate')>=0);var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');var composer=!!(c&&c.getClientRects().length);if(hit&&!composer)return JSON.stringify({failed:true,text:t.slice(0,20000)});if(!hit&&composer)return JSON.stringify({healthy:true});return ''})()")
+            wc.executeJavaScript("(function(){var b=document.body;if(!b)return '';var t=b.innerText||'';var all=(document.documentElement&&document.documentElement.textContent)||t;var hit=t.indexOf('Failed to load plugins')>=0||(t.indexOf('web boot:')>=0&&t.indexOf('did not activate')>=0)||all.indexOf('Conflicting shortcut defaults')>=0;var failurePage=/^HARNESS\\s+Failed to load plugins/i.test(t.trim())||t.indexOf('web boot:')>=0;var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');var composer=!!(c&&c.getClientRects().length);if(failurePage)return JSON.stringify({failed:true,text:all.slice(0,20000)});if(hit&&!composer)return JSON.stringify({failed:true,text:all.slice(0,20000)});if(!hit&&composer)return JSON.stringify({healthy:true});return ''})()")
               .then((raw) => {
                 if (wc.isDestroyed() || !raw) return
                 let st = null
