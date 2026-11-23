@@ -74,6 +74,11 @@ const TEXTS = {
     sub: '', // 由 detail 参数填充（占用原因 + 建议端口）
     btn: '换到空闲端口并启动',
   },
+  authWait: {
+    title: '正在完成登录验证…',
+    sub: '服务已启动，正在换取会话凭据；完成后会自动进入。',
+    btn: '重新加载',
+  },
   auth: {
     title: '服务已自行重启，页面需要重新连接',
     sub: '服务在正常运行，窗口里的登录凭据通常仍然有效：先刷新一次页面即可恢复。'
@@ -221,7 +226,7 @@ function renderProgress(p) {
 // 动作按钮的出场时机：需要用户介入的状态（未启动 / 端口被占用 / 页面加载失败 / 凭据失效）立刻给按钮；
 // 纯"进行中"的状态（启动 / 重启 / 更新 / 插件变更 / 回退）先不给 —— 主进程就绪后会自动把说明页换成真实页面，
 // 提前摆一个「重新加载」只会让人以为必须手点。超过阈值还停在说明页（说明卡住了）才放出兜底按钮 + 提示。
-const BUSY_REVEAL_MS = { start: 15000, restart: 15000, restartManual: 15000, plugin: 15000, recovery: 15000, update: 90000 }
+const BUSY_REVEAL_MS = { start: 15000, restart: 15000, restartManual: 15000, plugin: 15000, recovery: 15000, update: 90000, authWait: 15000 }
 const revealMs = BUSY_REVEAL_MS[reason] || 0
 const hintEl = document.getElementById('hint')
 

@@ -7006,7 +7006,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       const url = wc.getURL() || ''
       if ((url.startsWith(WEB_URL) || url === WEB_URL) && !url.includes('token=')) {
         try {
-          wc.executeJavaScript("(function(){var b=document.body;return !!(b&&b.innerText.indexOf('authentication required')>=0&&b.innerText.length<300)})()")
+          wc.executeJavaScript("(function(){var b=document.body;if(!b)return false;var t=(b.innerText||'').trim();return !!(t.length<300&&(t.indexOf('authentication required')>=0||t.toLowerCase().indexOf('unauthorized')>=0))})()")
             .then((hit) => {
               if (wc.isDestroyed()) return
               if (!hit) {
@@ -7020,7 +7020,14 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
                 return
               }
               if (server.launchUrl) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } return }
-              if (!server.claimed()) return
+              if (!server.claimed()) {
+                // 自己拉起的服务：token/cookie 可能还没换好。别把裸 401 文本留给用户，
+                // 先显示“正在完成登录验证”，就绪流程拿到凭据后会自动刷新进真实页面。
+                tab.blank = true
+                webPushState()
+                try { wc.loadURL(loadingUrl('authWait', tab.id, loadingParams())) } catch { /* noop */ }
+                return
+              }
               if (server.authPending) {
                 // 说明页点过「刷新页面」仍落回 401：确认没有有效凭据 → 换成带「重启服务」动作的说明页
                 tab.blank = true
@@ -9587,6 +9594,15 @@ function init() {
   lifecycle.initLifecycle({ dir: LOG_DIR, log })
   health.initHealth({ configPath: CONFIG_PATH, snapshotDir: HEALTH_SNAPSHOT_DIR, extraFiles: healthExtraFiles(), log })
   diagnostics.initDiagnostics({ dir: DIAG_DIR, log })
+  // 安装/升级结束：安装器会直接结束旧进程，marker 来不及 markClean。
+  // 版本已经变了，这不是“上次启动器崩溃”，不弹崩溃提示（用户升级后看到的假告警）。
+  if (runGuardHandle && runGuardHandle.previousRun
+    && crashNote.endedByVersionChange(runGuardHandle.previousRun, app.getVersion())) {
+    const prev = runGuardHandle.previousRun
+    lifecycle.emit('app.exit.versionChanged', { from: prev.version, to: app.getVersion() })
+    log(`run-guard: previous run version ${prev.version || '?'} != current ${app.getVersion()}（升级/换版结束），不记崩溃`)
+    runGuardHandle.previousRun = undefined
+  }
   registerIpc()
   installPermissionPolicy()
   // 桌面壳桥（desktop-shell.js）：给 DSH 页面提供 data-platform + dshDesktop.keyboard/shortcuts。

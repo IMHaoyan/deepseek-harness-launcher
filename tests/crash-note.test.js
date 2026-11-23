@@ -57,3 +57,19 @@ test('endedBySystemRestart：机器在运行开始之后才开机 → 判为随�
   assert.equal(crashNote.endedBySystemRestart({}), false)
   assert.equal(crashNote.endedBySystemRestart(null), false)
 })
+test('endedByVersionChange：前一次版本不同 = 安装/升级结束，不记崩溃；同版本/缺版本不猜', () => {
+  assert.equal(crashNote.endedByVersionChange({ version: '1.4.18-alpha.10' }, '1.4.18-alpha.11'), true)
+  assert.equal(crashNote.endedByVersionChange({ version: '1.4.18-alpha.11' }, '1.4.18-alpha.11'), false)
+  assert.equal(crashNote.endedByVersionChange({ version: '' }, '1.4.18-alpha.11'), false)
+  assert.equal(crashNote.endedByVersionChange({ unreadable: true }, '1.4.18-alpha.11'), false)
+  assert.equal(crashNote.endedByVersionChange(undefined, '1.4.18-alpha.11'), false)
+})
+
+test('主进程接线：前一次版本与当前不同 → 直接清掉崩溃证据', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8')
+  assert.match(main, /crashNote\.endedByVersionChange\(runGuardHandle\.previousRun, app\.getVersion\(\)\)/)
+  assert.match(main, /endedByVersionChange[\s\S]{0,800}runGuardHandle\.previousRun = undefined/,
+    '版本变化必须把 previousRun 清掉，后续不再弹崩溃卡/生成诊断')
+})

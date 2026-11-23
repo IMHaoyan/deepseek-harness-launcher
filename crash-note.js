@@ -77,6 +77,19 @@ function endedBySystemRestart(input) {
   return bootAt > started
 }
 
+/**
+ * 前一次运行的版本与当前不同 → 那次退出发生在安装/升级/换版过程中，
+ * 不能据此判定“启动器崩溃”。这条只用于**少报**：版本相同或读不到版本时不做判断。
+ * @param {{version?: string}|undefined} prevRun run-guard marker 里记录的上次运行
+ * @param {string} currentVersion 当前 app.getVersion()
+ * @returns {boolean}
+ */
+function endedByVersionChange(prevRun, currentVersion) {
+  const from = prevRun && typeof prevRun.version === 'string' ? prevRun.version : ''
+  const to = typeof currentVersion === 'string' ? currentVersion : ''
+  return !!(from && to && from !== to)
+}
+
 module.exports = {
   STREAK_WINDOW_MS,
   ALERT_STREAK,
@@ -85,4 +98,5 @@ module.exports = {
   severityFor,
   shouldNotify,
   endedBySystemRestart,
+  endedByVersionChange,
 }

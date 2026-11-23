@@ -87,3 +87,11 @@ test('等待文案报实测口径（冷启动 8~15 秒 / 重启 7~10 秒），�
   assert.match(loadingSrc, /sub2: '就绪后窗口会自动刷新进入。'/, '重启页第二行应放在 sub2 字段里')
   assert.match(loadingSrc, /renderSub\('（已等待 ' \+ sec \+ ' 秒）'\)/, '已等待秒数要跟在最后一行（走 renderSub）')
 })
+
+test('裸 401 unauthorized 也认成凭据页；自管服务未就绪时先显示 authWait', () => {
+  assert.match(mainSrc, /toLowerCase\(\)\.indexOf\('unauthorized'\)/,
+    '新版 DSH 的裸 401 正文是 unauthorized，不能只认 authentication required')
+  assert.match(mainSrc, /loadingUrl\('authWait'/, '自管服务未拿到 token 时先显示登录验证页')
+  assert.ok(textsKeys().has('authWait'), 'authWait 必须有文案，不能 fallback 成“正在启动”')
+  assert.match(loadingSrc, /authWait: \{[\s\S]*?正在完成登录验证/)
+})
