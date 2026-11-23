@@ -111,6 +111,13 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(app, /btnPluginsQuarantineRestore'\)\.addEventListener\('click', restoreQuarantineProfile\)/,
     '卡片隐藏后，插件页工具栏必须保留恢复入口')
   assert.match(main, /show: !!pu\.degraded/, '标题栏的「插件恢复」按钮只跟未就绪状态走，恢复完就消失')
+  assert.match(html, /id="diagSlotsDetails"/, '健康检查点默认收起，不再抢冲突处理的版面')
+  assert.match(app, /classList\.toggle\('recovery-alert', !!ui\.degraded\)/, '只有未就绪才给红框强调')
+  assert.match(app, /recoverySlotCount/, '收起时也要显示检查点数量')
+  assert.match(read('ui-src/console.css'), /--console-nav-w: 420px/, '侧栏导航宽度放大到 1.5 倍（280 → 420）')
+  assert.match(read('ui-src/browser.css'), /bar-btn\.plugin-recovery\.warn[\s\S]{0,160}background: var\(--danger\)/,
+    '标题栏「处理插件冲突」红底白字')
+  assert.match(browserJs, /⚠️ 处理插件冲突/, '标题栏按钮文字前带 ⚠️')
   assert.match(app, /pu\.degraded \? '处理插件冲突' : '查看插件恢复状态'/,
     '主页面常驻按钮要随状态换文案')
   assert.match(app, /const showJump = pluginRecoveryVisible\(pu\)/,

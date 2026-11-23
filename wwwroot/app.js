@@ -1586,6 +1586,8 @@ function renderPluginRecovery(p) {
   // 按插件隔离成功后，页面已健康，这张卡就不该继续挂着：恢复入口移到插件页的工具栏。
   const show = pluginRecoveryVisible(ui);
   card.classList.toggle('hidden', !show);
+  // 只有真正“未就绪”才升级成红色强调；安全模式是用户主动选择，保持中性。
+  card.classList.toggle('recovery-alert', !!ui.degraded);
   // 隔离记录的恢复入口：无论卡片是否显示，都放进插件页（低噪音、可找到）。
   const btnPluginsRestore = $('btnPluginsQuarantineRestore');
   if (btnPluginsRestore) {
@@ -1735,6 +1737,8 @@ function renderRecovery(state) {
   // 健康检查点：紧凑行（最新在上；主进程侧有 5s 缓存）
   const wrap = $('recoverySlots');
   const slots = Array.isArray(r.checkpoints) ? r.checkpoints : [];
+  const slotCount = $('recoverySlotCount');
+  if (slotCount) slotCount.textContent = slots.length ? `（${slots.length}）` : '';
   if (wrap) {
     const sig = JSON.stringify(slots);
     if (wrap.dataset.sig !== sig) {

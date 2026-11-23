@@ -75,7 +75,7 @@ function render() {
   if (btnPR) {
     btnPR.classList.toggle('hidden', !pr.show);
     btnPR.classList.toggle('warn', !!pr.degraded);
-    btnPR.textContent = pr.degraded ? '处理插件冲突' : '插件恢复';
+    btnPR.textContent = pr.degraded ? '⚠️ 处理插件冲突' : '插件恢复';
     btnPR.title = pr.degraded
       ? 'DSH 界面未就绪：打开恢复页处理插件冲突'
       : '查看插件恢复状态';

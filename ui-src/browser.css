@@ -203,8 +203,14 @@ body:not(.ready) #tabbar { visibility: hidden; }
 .bar-btn.restart:disabled:hover { background: transparent; }
 .bar-btn.restart.failed { color: var(--danger); font-weight: 600; }
 .bar-btn.restart.failed:hover { background: var(--danger-soft); }
-.bar-btn.plugin-recovery.warn { color: var(--danger); font-weight: 600; }
-.bar-btn.plugin-recovery.warn:hover { background: var(--danger-soft); }
+/* 处理插件冲突：红底白字 + ⚠️，顶栏里必须一眼可见 */
+.bar-btn.plugin-recovery.warn {
+  background: var(--danger);
+  color: #fff;
+  font-weight: 600;
+  border-radius: 6px;
+}
+.bar-btn.plugin-recovery.warn:hover { background: #C81010; color: #fff; }
 
 /* 窗口按钮组：贴右缘、彼此无间距、全高直角（Edge 式） */
 .win-group {
