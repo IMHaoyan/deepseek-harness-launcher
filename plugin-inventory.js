@@ -40,6 +40,7 @@ function shortName(npm) {
  *   stateOf?: (npm: string) => {version?: string},   // 权威：profile 清单里的版本
  *   isDisabled?: (npm: string) => boolean,           // 权威：补丁层的启停状态
  *   canToggle?: (npm: string) => boolean,            // 权威：能不能安全停用
+ *   isIgnored?: (npm: string) => boolean,            // 不由 DSHL 管理（已安装仍展示，但不拉高全局警示）
  *   busyOf?: (id: string) => string,                 // 正在进行的动作（''=空闲）
  *   busyLabel?: (action: string) => string
  * }} input
@@ -58,6 +59,7 @@ function inventoryCards(input = {}) {
   const stateOf = probe(input.stateOf, {})
   const isDisabled = probe(input.isDisabled, false)
   const canToggle = probe(input.canToggle, false)
+  const isIgnored = probe(input.isIgnored, false)
   const busyOf = probe(input.busyOf, '')
   // ★ 「未生效」的证据必须也接给这一类卡片：DSH 对"bundle 被跳过 / 行没激活"只写 stderr、
   //   退出码 0，服务照常起 —— 而**能出这种事的恰恰多半是第三方插件**，正是本分组覆盖的那批。
@@ -110,6 +112,8 @@ function inventoryCards(input = {}) {
       busy,
       error: '',
       activation: String(activationOf(npm) || ''),
+      // 不由 DSHL 管理 ≠ 从插件页消失：用户装了就展示，但主页面不据此拉高警示
+      ignored: isIgnored(npm) === true,
       lastChange: '',
       autoInstall: false, // 不是 DSHL 代管的，永不参与自动安装/自动维护
       tags: [],

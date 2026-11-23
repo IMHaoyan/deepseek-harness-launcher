@@ -37,31 +37,38 @@ test('safeModeKeepsBundle：只保留官方 @deepseek-ai/* 与桌面登录辅助
   assert.equal(ctx.keep('dsh-computer-use-win'), false)
 })
 
-test('电脑操作不再归 DSHL 管理：注册表移除 + 忽略清单 + 三条数据链过滤', () => {
+test('电脑操作不再归 DSHL 管理，但用户装了它仍应在插件页可见', () => {
   const regOnly = main.slice(main.indexOf('const MANAGED_NPM_PLUGINS = ['), main.indexOf('\n]\n', main.indexOf('const MANAGED_NPM_PLUGINS = [')) + 3)
   assert.doesNotMatch(regOnly, /dsh-computer-use-win/, '注册表里不应再有电脑操作卡片')
   assert.match(main, /IGNORED_NPM_PLUGINS = new Set\(\['dsh-computer-use-win'\]\)/, '要有明确的忽略清单')
-  assert.match(main, /if \(IGNORED_NPM_PLUGINS\.has\(String\(packageName \|\| ''\)\)\) return undefined/,
-    '未生效证据要过滤掉忽略清单里的包')
-  assert.match(main, /Array\.from\(IGNORED_NPM_PLUGINS\)/, 'Profile 其他插件清单也要过滤（否则会以「Profile」卡片回来）')
+  assert.match(main, /if \(!\(opts && opts\.includeIgnored\) && IGNORED_NPM_PLUGINS\.has\(name\)\) return undefined/,
+    '未生效证据默认过滤忽略清单（不拉高主页面警示）')
+  assert.doesNotMatch(main, /Array\.from\(IGNORED_NPM_PLUGINS\)/, '不能把忽略包塞进 inventory 的 known 集合（否则装了就看不见）')
+  const inv = sliceBetween(main, 'function pluginInventoryCards()', 'function invalidatePluginInventory', 'pluginInventoryCards')
+  assert.match(inv, /const known = new Set\(MANAGED_NPM_PLUGINS\.map\(\(d\) => d\.npm\)\.concat\(\[market\.PLUGIN_NAME\]\)\)/,
+    'Profile 其他插件清单只排除受管注册表与市场，不排除忽略清单')
+  assert.match(inv, /activationIssueOf\(npm, \{ includeIgnored: true \}\)/,
+    '已安装时卡片要显示它真实的未生效状态，不能把失败说成已启用')
+  assert.match(inv, /isIgnored: \(npm\) => IGNORED_NPM_PLUGINS\.has\(String\(npm \|\| ''\)\)/,
+    '要告诉清单卡片它属于忽略清单，主页面才能跳过它的全局警示')
+  assert.match(app, /p\.activation && !p\.ignored/, '主页面不把忽略清单里的包算进“未生效”提示')
   assert.match(main, /filter\(\(x\) => !IGNORED_NPM_PLUGINS\.has\(String\(\(x && x\.name\) \|\| ''\)\)\)/,
     '升级兼容预判也不应再点名它')
 })
 
 test('安全模式：先备份 package.json / cordis.patch.yml，再写 bundle 列表；可整体恢复', () => {
   const enable = sliceBetween(main, 'async function enablePluginSafeMode()', 'async function restorePluginSafeMode()', 'enablePluginSafeMode')
-  assert.match(enable, /copyFileSync\(DSH_PROFILE_PACKAGE, manifestBak\)/, '必须先备份 package.json')
-  assert.match(enable, /copyFileSync\(DSH_PROFILE_PATCH, patchBak\)/, '用户补丁层也要备份')
+  assert.match(enable, /snapshotProfileFiles\(backup\)/, '必须先备份当前 Profile（patch 存在但复制失败要 fail-closed）')
   assert.match(enable, /next\.dsh\.profile\.bundles = bundles\.filter\(\(n\) => safeModeKeepsBundle\(n\)\)/,
     '安全模式只保留官方 bundle + 桌面登录辅助')
   assert.match(enable, /writeProfileManifestAtomic\(next\)/, '清单要原子落盘')
-  assert.match(enable, /Config\.pluginSafeModeBackup = \{ at: new Date\(\)\.toISOString\(\), manifest: manifestBak, patch: patchBak, removed: thirdParty \}/,
-    '备份落点要持久化，恢复时才找得到')
+  assert.match(enable, /Config\.pluginSafeModeBackup = \{/, '备份落点要持久化，恢复时才找得到')
+  assert.match(enable, /if \(!saveConfig\(\)\)/, '恢复记录没落盘就不能继续')
   assert.match(enable, /await restartDshForConsole\(\)/, '改完 Profile 必须重启服务才生效')
+  assert.match(enable, /Config\.pluginQuarantine/, '有按插件隔离记录时不允许再叠一层安全模式快照')
 
-  const restore = sliceBetween(main, 'async function restorePluginSafeMode()', '/** 插件卡片 / 提示条用的人类可读名字', 'restorePluginSafeMode')
-  assert.match(restore, /copyFileSync\(bak\.manifest, DSH_PROFILE_PACKAGE\)/, '恢复要拷回 package.json')
-  assert.match(restore, /copyFileSync\(bak\.patch, DSH_PROFILE_PATCH\)/, '有补丁层备份时也要拷回')
+  const restore = sliceBetween(main, 'async function restorePluginSafeMode()', 'function takeProfileRollback', 'restorePluginSafeMode')
+  assert.match(restore, /restoreProfileFiles\(\{ manifest: bak\.manifest/, '恢复要按快照整体拷回')
   assert.match(restore, /Config\.pluginSafeModeBackup = null/, '恢复后清掉备份记录')
   assert.match(restore, /await restartDshForConsole\(\)/, '恢复后重启服务')
   assert.match(main, /case 'pluginSafeMode': return JSON\.stringify\(await withProfileOp\(/, '安全模式写入口要走 profile 写锁')
@@ -73,16 +80,74 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(state, /degraded: issues\.length > 0/, '有未激活条目就是界面未就绪')
   assert.match(state, /thirdParty,/, '要告诉界面哪些第三方 bundle 会被临时停用')
   assert.match(state, /canSafeMode: thirdParty\.length > 0/, '没有第三方插件时不能给安全模式按钮')
+  assert.match(state, /pluginActivation\.attributeCulprits\(issues, candidates\)/, '冲突元凶要归因到具体包')
+  assert.match(state, /\.filter\(\(npm\) => !IGNORED_NPM_PLUGINS\.has\(npm\)\)/, '忽略清单里的插件不参与自动停用')
+  assert.match(state, /suspects,/, '状态里要带精确的待禁用清单')
+  assert.match(state, /canBatchDisable: suspects\.length > 0/, '有元凶才给按插件隔离按钮')
+  assert.match(state, /quarantine: q \? \{/, '隔离记录要下发，恢复页才能列清楚停了谁')
   assert.match(main, /pluginUi: pluginUiState\(\),/, '状态快照要下发 pluginUi')
 
-  for (const id of ['pluginRecoveryCard', 'pluginRecoveryTitle', 'btnPluginSafeMode', 'btnPluginSafeModeRestore', 'btnPluginOpenList']) {
+  for (const id of ['pluginRecoveryCard', 'pluginRecoveryTitle', 'btnPluginSafeMode', 'btnPluginSafeModeRestore', 'btnPluginDisableSuspects', 'btnPluginQuarantineRestore', 'btnPluginOpenList']) {
     assert.match(html, new RegExp('id="' + id + '"'), `index.html 缺 ${id}`)
   }
   const render = sliceBetween(app, 'function renderPluginRecovery(p)', 'function renderRecovery(state)', 'renderPluginRecovery')
   assert.match(render, /安全模式已启用/, '安全模式生效后要能解释当前状态')
   assert.match(render, /恢复到安全模式前的完整 Profile/, '要给整体恢复的出路')
+  assert.match(render, /已临时禁用/, '按插件隔离后要显示当前实际禁用了什么')
+  assert.match(render, /将只禁用以上/, '执行前就要说明只会禁用哪些插件')
+  assert.match(render, /疑似冲突插件/, '归因是报错推断，界面必须说“疑似”而不是武断定罪')
+  assert.match(render, /pluginSuspectLine/, '详情要逐条列出插件名与冲突原因')
   assert.match(app, /renderPluginRecovery\(state\.pluginUi\)/, '状态推送时要渲染这张卡')
   assert.match(app, /pluginDegraded \? '处理插件冲突'/, '主页面警示卡要升级为「处理插件冲突」')
   assert.match(app, /cmd\('pluginSafeMode'\)/, '安全模式按钮要真的调用主进程')
   assert.match(app, /cmd\('pluginSafeModeRestore'\)/, '恢复按钮要真的调用主进程')
+})
+
+test('按插件隔离：批量文案、确认框、执行结果都必须点名具体插件', () => {
+  const label = sliceBetween(app, 'function pluginBatchDisableLabel', 'function pluginSuspectLine', 'pluginBatchDisableLabel')
+  assert.match(label, /names\.length === 1/, '1 个元凶直呼其名')
+  assert.match(label, /names\.length === 2/, '2 个元凶两个都列出')
+  assert.match(label, /这 \$\{names\.length\} 个冲突插件/, '3+ 用数量 + 详情列全')
+  assert.match(app, /cmd\('pluginDisableSuspects', \{ npms: suspects\.map\(\(s\) => s\.npm\) \}\)/,
+    '按钮要把精确的包名列表交给主进程')
+  assert.match(app, /'将只禁用以下疑似冲突插件：\\n'/, '确认框要逐条列出将禁用的插件')
+  assert.match(app, /已有隔离记录，本次会扩大隔离范围/, '二次隔离要说明恢复仍回到最初状态')
+  assert.match(app, /已禁用 \$\{done\.join\('、'\)\}/, '执行后要用主进程回执的真实清单，而不是只回显请求')
+  assert.match(app, /cmd\('pluginQuarantineRestore'\)/, '恢复按钮要真的调用主进程')
+  assert.match(app, /window\._pluginUi = ui/, '点击处理要拿到当前卡片状态')
+})
+
+test('按插件隔离：只允许第三方 bundle、先备份、一次重启、可整体恢复', () => {
+  const disable = sliceBetween(main, 'async function disableSuspectPlugins', 'async function restorePluginQuarantine', 'disableSuspectPlugins')
+  assert.match(disable, /thirdParty\.includes\(n\)/, 'fail-closed：只接受当前 Profile 的第三方 bundle')
+  assert.match(disable, /snapshotProfileFiles\(backup\)/, '写前备份 package.json 与存在的补丁层')
+  assert.match(disable, /pluginSwitch\.setEnabled\(npm, false\)/, '逐个子集停用，不动其他插件')
+  assert.match(disable, /if \(!target\.toggle\)/, '只有“没有可切换加载项”才允许退化为从 bundle 列表移除')
+  assert.match(disable, /removedFromBundles\.push\(npm\)/, '补丁层没有加载项时退化为从 bundle 列表移除')
+  assert.match(disable, /writeProfileManifestAtomic\(next\)/, '清单要原子落盘')
+  assert.match(disable, /Config\.pluginQuarantine = \{/, '精确禁用清单要持久化，恢复页才列得出来')
+  assert.match(disable, /const reuse = !!\(prior && prior\.manifest && fs\.existsSync\(prior\.manifest\)\)/,
+    '二次隔离要复用最初的快照，一次恢复回到第一次隔离前')
+  assert.match(disable, /\.\.\.\(\(reuse && Array\.isArray\(prior\.disabled\)\) \? prior\.disabled : \[\]\)/,
+    '禁用清单要取并集，不能把之前隔离的插件从卡片上抹掉')
+  assert.match(disable, /if \(!saveConfig\(\)\)/, '恢复记录没落盘就不能继续')
+  assert.match(disable, /const abort = \(error, failed\) =>/, '任何写失败都要整批回滚，不能留下半状态')
+  assert.match(disable, /await restartDshForConsole\(\)/, '所有改动后只重启一次')
+  assert.match(main, /case 'pluginDisableSuspects': return JSON\.stringify\(await withProfileOp\(/, '写入口要走 profile 写锁')
+
+  const restore = sliceBetween(main, 'async function restorePluginQuarantine', 'function pluginDisplayName', 'restorePluginQuarantine')
+  assert.match(restore, /restoreProfileFiles\(\{ manifest: q\.manifest/, '恢复要按快照整体拷回')
+  assert.match(restore, /clearPersistedDisabledFor\(q\.disabled\)/, '要先清 durable 的停用选择')
+  assert.match(restore, /if \(warnings\.length\)/, 'durable 清理失败时不能假装恢复成功')
+  assert.match(restore, /Config\.pluginQuarantine = null/, '恢复后清掉记录')
+  assert.match(restore, /await restartDshForConsole\(\)/, '恢复后重启服务')
+  assert.match(main, /case 'pluginQuarantineRestore': return JSON\.stringify\(await withProfileOp\(/, '恢复入口也要走 profile 写锁')
+})
+
+test('Profile 快照恢复：原状态没有补丁层时要把新建的补丁文件删掉', () => {
+  const fn = sliceBetween(main, 'function restoreProfileFiles(snap)', 'function dropProfileSnapshot', 'restoreProfileFiles')
+  assert.match(fn, /snap\.patchExisted === true/, '有补丁层但备份缺失要报错，不能跳过')
+  assert.match(fn, /补丁层备份已不存在/, '必须 fail-closed')
+  assert.match(fn, /snap\.patchExisted === false/, '原状态没有补丁层')
+  assert.match(fn, /fs\.unlinkSync\(DSH_PROFILE_PATCH\)/, '要把隔离期间新建的补丁文件删掉')
 })

@@ -435,7 +435,9 @@
           <span class="diag-state-text" id="pluginRecoveryTitle">插件导致界面未就绪</span>
         </div>
         <div class="diag-ops">
-          <button class="btn sm primary" id="btnPluginSafeMode">安全模式启动</button>
+          <button class="btn sm primary hidden" id="btnPluginDisableSuspects">禁用冲突插件并重启 DSH</button>
+          <button class="btn sm" id="btnPluginSafeMode">安全模式启动</button>
+          <button class="btn sm hidden" id="btnPluginQuarantineRestore">恢复禁用前的 Profile</button>
           <button class="btn sm hidden" id="btnPluginSafeModeRestore">恢复安全模式前的 Profile</button>
           <button class="btn sm" id="btnPluginOpenList">查看插件</button>
         </div>

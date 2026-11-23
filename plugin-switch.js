@@ -414,6 +414,11 @@ function persistDisabled(packageName, disabled) {
   return { ok: true }
 }
 
+/** 只清掉 durable 的「已停用」选择，不碰补丁层（恢复 Profile 备份后调用）。 */
+function clearPersistedDisabled(packageName) {
+  return persistDisabled(packageName, false)
+}
+
 /** Turn one installed bundle plugin on/off through the user patch layer. */
 function setEnabled(packageName, enabled) {
   try {
@@ -541,6 +546,7 @@ module.exports = {
   isMarketDisabled,
   reconcileDisabledPackages,
   setEnabled,
+  clearPersistedDisabled,
   pruneRows,
   removeRows,
   defaultPatchPath,

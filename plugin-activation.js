@@ -168,6 +168,122 @@ function activationIssueHint(issue, extra) {
   return lines.join('\n')
 }
 
+// ---------- 冲突元凶归因：从报错里找出「是哪个第三方插件」 ----------
+// DSH 的冲突行只写快捷键前缀（如 `session.toggleRead and usage-billing.open-dashboard`），
+// 不写包名；而用户需要知道「到底会禁用哪几个插件」。这里把前缀与 Profile 里的第三方
+// bundle 做保守匹配：同一前缀对应多个包时不算归因，宁可退回安全模式，也不误伤。
+const SHORTCUT_CONFLICT_RE = /Conflicting shortcut defaults:\s*([^\n]+)/iu
+const GENERIC_SHORTCUT_PREFIXES = new Set([
+  'session', 'workspace', 'settings', 'setting', 'chat', 'ui', 'app', 'core', 'base', 'web',
+  'desktop', 'agent', 'model', 'theme', 'editor', 'terminal', 'search', 'file', 'files', 'git',
+  'mcp', 'tool', 'tools', 'panel', 'sidebar', 'conversation', 'message', 'messages', 'user',
+  'system', 'config', 'dsh',
+])
+const WEAK_PACKAGE_TOKENS = new Set(['dsh', 'ui', 'plugin', 'bundle', 'next', 'app', 'client', 'desktop', 'web'])
+
+/**
+ * 从一条冲突证据里抠出快捷键前缀（`usage-billing.open-dashboard` → `usage-billing`）。
+ * 只认 `Conflicting shortcut defaults:` 这一段，避免把普通报错里的 `a.b` 当快捷键。
+ * @param {string} detail
+ * @returns {string[]}
+ */
+function shortcutPrefixes(detail) {
+  const text = String(detail == null ? '' : detail)
+  const m = SHORTCUT_CONFLICT_RE.exec(text)
+  if (!m) return []
+  const chunk = m[1].replace(/\s*\([^)]*\)\s*$/u, '')
+  const out = []
+  for (const raw of chunk.split(/\s+and\s+|,\s*/iu)) {
+    const id = String(raw || '').trim().replace(/^[`'"]+|[`'"]+$/gu, '')
+    const dot = id.indexOf('.')
+    if (dot <= 0) continue
+    const prefix = id.slice(0, dot).toLowerCase()
+    if (prefix && !out.includes(prefix)) out.push(prefix)
+  }
+  return out
+}
+
+/**
+ * 包名 → 可能的快捷键前缀别名。第三方插件常用 `dsh-ui-usage-billing` 包名 +
+ * `usage-billing` 前缀；这里去掉 installer 装饰词后再比较。
+ * @param {string} npm
+ * @returns {string[]}
+ */
+function packageAliases(npm) {
+  const short = String(npm == null ? '' : npm).split('/').pop().toLowerCase()
+  if (!short) return []
+  const aliases = new Set([short])
+  const parts = short.split('-').filter(Boolean)
+  const core = parts.filter((p) => !WEAK_PACKAGE_TOKENS.has(p))
+  if (core.length) aliases.add(core.join('-'))
+  // 无连字符的 `dshmarket` / `dshcontext`：去掉 dsh 后仍保留可识别的主体
+  if (short.startsWith('dsh') && !short.startsWith('dsh-') && short.length > 4) aliases.add(short.slice(3))
+  return Array.from(aliases).filter(Boolean)
+}
+
+/**
+ * 把 activationIssues 归因到具体第三方包。
+ * @param {Array<{packageName?:string, detail?:string}>} issues 证据列表
+ * @param {Array<{npm:string, name?:string}>} candidates 当前启用中的第三方 bundle
+ * @returns {Array<{npm:string, name:string, reasons:string[]}>} 去重后的元凶
+ */
+function attributeCulprits(issues, candidates) {
+  const list = (Array.isArray(candidates) ? candidates : [])
+    .filter((c) => c && typeof c.npm === 'string' && c.npm)
+  const byAlias = new Map()
+  for (const c of list) {
+    for (const alias of packageAliases(c.npm)) {
+      if (!byAlias.has(alias)) byAlias.set(alias, new Set())
+      byAlias.get(alias).add(c.npm)
+    }
+  }
+  const out = new Map()
+  const add = (candidate, reason) => {
+    if (!out.has(candidate.npm)) {
+      out.set(candidate.npm, { npm: candidate.npm, name: candidate.name || candidate.npm, reasons: [] })
+    }
+    const entry = out.get(candidate.npm)
+    if (reason && !entry.reasons.includes(reason)) entry.reasons.push(reason)
+  }
+  for (const issue of (Array.isArray(issues) ? issues : [])) {
+    if (!issue) continue
+    const detail = String(issue.detail || '')
+    // 冲突证据常带 `failed: Error:` 前缀；卡片上只留「Conflicting shortcut defaults: …」
+    const reason = shortDetail(detail).replace(/^failed:\s*/u, '').replace(/^Error:\s*/u, '')
+    // 1) 冲突快捷键前缀 → 唯一别名匹配。官方前缀 / 通用词 / 歧义匹配一律不归因。
+    for (const prefix of shortcutPrefixes(detail)) {
+      if (GENERIC_SHORTCUT_PREFIXES.has(prefix)) continue
+      const hits = byAlias.get(prefix)
+      if (!hits || hits.size !== 1) continue
+      const npm = Array.from(hits)[0]
+      const cand = list.find((c) => c.npm === npm)
+      // 失败条目自己若也是第三方 bundle，同样可能是冲突的一方（禁用任一方都能解冲突）
+      if (cand) add(cand, reason)
+    }
+    // 2) 报错里完整点名了某个第三方包（完整包名或短名）时也认；子串命中不算
+    for (const c of list) {
+      if (mentionsPackage(detail, c.npm)) add(c, reason)
+    }
+  }
+  return Array.from(out.values())
+}
+
+/**
+ * 报错里是否**完整点名**了这个包（完整包名或完整短名），而不是子串碰巧命中。
+ * 例：候选 `dsh-image` 不能因为报错里有 `dsh-image-gen` 就被归因。
+ */
+function mentionsPackage(detail, npm) {
+  const text = String(detail == null ? '' : detail)
+  const name = String(npm == null ? '' : npm)
+  const short = name.split('/').pop()
+  const hit = (needle) => {
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+    return new RegExp('(^|[^\\w@/-])' + escaped + '([^\\w@/-]|$)', 'u').test(text)
+  }
+  if (name && hit(name)) return true
+  return short.length >= 5 && hit(short)
+}
+
 /**
  * 在证据列表里找某个包的条目。
  * @param {Array} issues 证据列表
@@ -186,6 +302,10 @@ module.exports = {
   describeActivationIssue,
   activationIssueHint,
   findActivationIssue,
+  shortcutPrefixes,
+  packageAliases,
+  attributeCulprits,
+  mentionsPackage,
   // 纯函数（测试用）
   stripStamp,
   shortDetail,

@@ -176,3 +176,14 @@ test('INVENTORY_ID_PREFIX 与 main.js 的分发分支同源（改一处必须改
     'main.js 必须用同一个常量判前缀，不能自己写字符串字面量')
   assert.ok(!/'profile:'/.test(main), 'main.js 里不该出现硬编码的 profile: 前缀')
 })
+
+test('忽略清单里的包：已安装仍展示，但标记 ignored（主页面不据此拉高全局警示）', () => {
+  const [c] = inv.inventoryCards(base({
+    targets: [T('dsh-computer-use-win')],
+    isIgnored: (npm) => npm === 'dsh-computer-use-win',
+  }))
+  assert.equal(c.subtitle, 'dsh-computer-use-win', '用户装了它，就应该在插件页看得到')
+  assert.equal(c.ignored, true, '主页面据此跳过它')
+  const [d] = inv.inventoryCards(base())
+  assert.equal(d.ignored, false, '正常第三方插件不带这个标记')
+})

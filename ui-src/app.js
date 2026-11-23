@@ -414,7 +414,8 @@ function render(state) {
     // 有 required 插件失败时 DSH 会直接给一张 Failed to load plugins 页：这条必须升级成
     // "界面未就绪"，并把恢复页的主操作（安全模式）露出来，不能只留一行中性提示。
     let pluginDegraded = false;
-    const notActive = (state.plugins || []).filter((p) => p && p.activation);
+    // 忽略清单里的包（如电脑操作）即使装着并在插件页显示真实状态，也不拉高主页面的全局警示
+    const notActive = (state.plugins || []).filter((p) => p && p.activation && !p.ignored);
     if (notActive.length) {
       pluginDegraded = !!(state.pluginUi && state.pluginUi.degraded);
       const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
@@ -1498,47 +1499,116 @@ async function doRestoreSlot(s) {
   if (st) render(st);
 }
 
-// ---------- 插件冲突恢复：界面未就绪 → 安全模式 / 恢复 Profile ----------
+// ---------- 插件冲突恢复：界面未就绪 → 只停冲突元凶 / 安全模式 / 恢复 Profile ----------
 // 位置：日志与反馈页顶部（与检查点卡片相邻）。主页面只给「处理插件冲突」入口，
 // 真正的写操作集中在这里，和「一个状态一个主操作」的恢复页约定一致。
+// 批量文案规则（用户要求「清楚知道哪几个插件被禁用」）：
+//   1 个 → 直呼其名；2 个 → 两个都列出；3+ → 「这 N 个」，完整清单在详情与确认框里。
+function pluginBatchDisableLabel(suspects) {
+  const names = (Array.isArray(suspects) ? suspects : [])
+    .map((s) => (s && (s.name || s.npm)) || '').filter(Boolean);
+  if (!names.length) return '禁用冲突插件并重启 DSH';
+  if (names.length === 1) return `禁用 ${names[0]} 并重启 DSH`;
+  if (names.length === 2) return `禁用 ${names[0]}、${names[1]} 并重启 DSH`;
+  return `禁用这 ${names.length} 个冲突插件并重启 DSH`;
+}
+
+function pluginSuspectLine(s) {
+  const name = (s && (s.name || s.npm)) || '';
+  const npm = (s && s.npm) || '';
+  const reason = (s && Array.isArray(s.reasons) && s.reasons[0]) || '';
+  return name + (npm && npm !== name ? `（${npm}）` : '') + (reason ? '：' + reason : '');
+}
+
+function pluginQuarantineNames(q) {
+  const list = (q && Array.isArray(q.disabled)) ? q.disabled : [];
+  return list.map((d) => {
+    const name = d.name || d.npm || '';
+    return d.npm && d.npm !== name ? `${name}（${d.npm}）` : name;
+  }).filter(Boolean);
+}
+
 function renderPluginRecovery(p) {
   const card = $('pluginRecoveryCard');
   if (!card) return;
   const ui = p || {};
+  window._pluginUi = ui;
   const safe = ui.safeMode || null;
-  const show = !!(ui.degraded || safe);
+  const quarantine = ui.quarantine || null;
+  const suspects = Array.isArray(ui.suspects) ? ui.suspects : [];
+  const show = !!(ui.degraded || safe || quarantine);
   card.classList.toggle('hidden', !show);
   if (!show) return;
   const title = $('pluginRecoveryTitle');
   const detail = $('pluginRecoveryDetail');
   const btnSafe = $('btnPluginSafeMode');
-  const btnRestore = $('btnPluginSafeModeRestore');
+  const btnSafeRestore = $('btnPluginSafeModeRestore');
+  const btnDisable = $('btnPluginDisableSuspects');
+  const btnQuarantineRestore = $('btnPluginQuarantineRestore');
   const dot = $('pluginRecoveryDot');
+  const offNow = quarantine ? (quarantine.disabled || []).filter((d) => d.disabled) : [];
+  const offNames = offNow.map((d) => {
+    const name = d.name || d.npm || '';
+    return d.npm && d.npm !== name ? `${name}（${d.npm}）` : name;
+  }).filter(Boolean);
+  const allQuarantineNames = pluginQuarantineNames(quarantine);
   if (dot) dot.className = 'dot' + (ui.degraded ? ' stopped' : ' running');
   if (ui.degraded) {
     const names = (ui.issues || []).slice(0, 4).map((x) => x.packageName || x.entryId).filter(Boolean);
+    const lines = [`${ui.count || 0} 个插件未激活${names.length ? '：' + names.join('、') : ''}；继续重启不会改变。`];
+    if (suspects.length) {
+      lines.push('根据报错，疑似冲突插件：' + suspects.map(pluginSuspectLine).join('；') + '。');
+      lines.push(`将只禁用以上 ${suspects.length} 个疑似冲突插件，其他插件不受影响；会先备份 Profile，之后可整体恢复。`);
+    } else {
+      lines.push('未能从报错中唯一确定具体插件；可用安全模式先只加载官方插件。');
+    }
+    if (offNames.length) lines.push(`已临时禁用 ${offNames.length} 个：${offNames.join('、')}。`);
     title.textContent = '插件导致界面未就绪';
-    detail.textContent = `${ui.count || 0} 个插件未激活${names.length ? '：' + names.join('、') : ''}。`
-      + '继续重启不会改变；先用安全模式只加载官方插件，确认界面恢复后再逐个启用第三方插件。'
-      + ((ui.thirdParty || []).length
-        ? `将临时停用：${ui.thirdParty.slice(0, 6).join('、')}${ui.thirdParty.length > 6 ? ' 等' : ''}。`
-        : '');
+    detail.textContent = lines.join('');
     detail.title = (ui.issues || []).map((x) => (x.packageName || x.entryId) + '：' + (x.detail || '')).join('\n');
-  } else {
+  } else if (safe) {
     title.textContent = '安全模式已启用';
     const removed = (safe && Array.isArray(safe.removed)) ? safe.removed : [];
-    detail.textContent = `第三方插件已临时停用${safe && safe.at ? '（' + (fmtLocalTime(safe.at) || safe.at) + '）' : ''}；`
+    const lines = [`第三方插件已临时停用${safe && safe.at ? '（' + (fmtLocalTime(safe.at) || safe.at) + '）' : ''}；`
       + (removed.length ? `本次停用 ${removed.length} 个：${removed.slice(0, 6).join('、')}${removed.length > 6 ? ' 等' : ''}。` : '')
-      + '可在「插件」页逐个重新启用，或恢复到安全模式前的完整 Profile。';
+      + '可在「插件」页逐个重新启用，或恢复到安全模式前的完整 Profile。'];
+    if (allQuarantineNames.length) lines.push(`此前按插件隔离：${allQuarantineNames.join('、')}。`);
+    detail.textContent = lines.join('');
     detail.title = safe && safe.manifest ? '备份：' + safe.manifest : '';
+  } else if (quarantine) {
+    title.textContent = '已临时禁用冲突插件';
+    const time = quarantine.at ? (fmtLocalTime(quarantine.at) || quarantine.at) : '';
+    if (offNow.length) {
+      detail.textContent = `为排除插件冲突，已临时禁用 ${offNow.length} 个插件${time ? '（' + time + '）' : ''}：`
+        + offNames.join('、')
+        + '。插件没有被卸载；界面恢复后可恢复禁用前的 Profile，或在「插件」页逐个重新启用。';
+    } else {
+      detail.textContent = `此前的隔离记录${time ? '（' + time + '）' : ''}已不再生效：相关插件已重新启用。仍可恢复到禁用前的 Profile。`;
+    }
+    detail.title = quarantine.manifest ? '备份：' + quarantine.manifest : '';
+  }
+  if (btnDisable) {
+    const showDisable = !!(ui.degraded && suspects.length);
+    btnDisable.classList.toggle('hidden', !showDisable);
+    btnDisable.disabled = !showDisable;
+    btnDisable.textContent = pluginBatchDisableLabel(suspects);
+    btnDisable.title = showDisable
+      ? '根据报错疑似为：\n' + suspects.map(pluginSuspectLine).join('\n')
+      : '';
   }
   if (btnSafe) {
-    btnSafe.classList.toggle('hidden', !ui.degraded || !ui.canSafeMode);
-    btnSafe.disabled = !ui.degraded || !ui.canSafeMode;
+    const canSafe = !!(ui.degraded && ui.canSafeMode);
+    btnSafe.classList.toggle('hidden', !canSafe);
+    btnSafe.disabled = !canSafe;
+    btnSafe.textContent = suspects.length ? '安全模式启动（停用全部第三方）' : '安全模式启动';
   }
-  if (btnRestore) {
-    btnRestore.classList.toggle('hidden', !safe);
-    btnRestore.disabled = !safe;
+  if (btnSafeRestore) {
+    btnSafeRestore.classList.toggle('hidden', !safe);
+    btnSafeRestore.disabled = !safe;
+  }
+  if (btnQuarantineRestore) {
+    btnQuarantineRestore.classList.toggle('hidden', !quarantine);
+    btnQuarantineRestore.disabled = !quarantine;
   }
 }
 
@@ -1623,7 +1693,50 @@ $('btnRecoveryDiag').addEventListener('click', async () => {
   else setRecoveryDiagStatus('✕ 生成失败，请查看日志', 'error');
 });
 $('btnRecoveryDiagDir').addEventListener('click', () => { void cmd('openDiagnosticsDir') });
-// 插件冲突恢复：安全模式 / 恢复 Profile（都会重启服务，确认框说明真实动作与备份）
+// 插件冲突恢复：按插件隔离 / 安全模式 / 恢复 Profile（都会重启服务，确认框说明真实动作与备份）
+$('btnPluginDisableSuspects').addEventListener('click', async () => {
+  const ui = window._pluginUi || {};
+  const suspects = Array.isArray(ui.suspects) ? ui.suspects : [];
+  if (!suspects.length) return;
+  const lines = suspects.map((s) => '· ' + pluginSuspectLine(s));
+  const existing = (ui.quarantine && Array.isArray(ui.quarantine.disabled)) ? ui.quarantine.disabled : [];
+  const ok = await confirmDialog({
+    title: suspects.length === 1 ? '禁用疑似冲突插件并重启 DSH？' : `禁用这 ${suspects.length} 个疑似冲突插件并重启 DSH？`,
+    body: '将只禁用以下疑似冲突插件：\n' + lines.join('\n')
+      + '\n\n会先备份当前 Profile；界面恢复后可在本页整体恢复。其他插件不受影响。'
+      + (existing.length ? '\n\n已有隔离记录，本次会扩大隔离范围；恢复时仍回到第一次隔离前的状态。' : ''),
+    confirmText: '禁用并重启',
+    danger: true,
+  });
+  if (!ok) return;
+  const r = await cmd('pluginDisableSuspects', { npms: suspects.map((s) => s.npm) });
+  const done = ((r && Array.isArray(r.disabled)) ? r.disabled : []).map((d) => d.name || d.npm).filter(Boolean);
+  if (!r || r.ok === false) {
+    const prefix = done.length ? `已禁用 ${done.join('、')}，但` : '';
+    showConsoleToast('✕ ' + prefix + ((r && r.error) || '操作失败，请查看日志'));
+    return;
+  }
+  const failed = Array.isArray(r.failed) ? r.failed : [];
+  const base = done.length ? `✓ 已禁用 ${done.join('、')}，正在重启 DSH` : '✓ 正在重启 DSH';
+  showConsoleToast(failed.length
+    ? `${base}；未能停用 ${failed.map((f) => f.npm).join('、')}`
+    : base);
+});
+$('btnPluginQuarantineRestore').addEventListener('click', async () => {
+  const q = (window._pluginUi || {}).quarantine || null;
+  const names = pluginQuarantineNames(q);
+  const ok = await confirmDialog({
+    title: '恢复禁用前的 Profile？',
+    body: '会用备份覆盖当前 Profile 并重启 DSH；隔离期间对插件做的改动（启停/安装）会被撤销。'
+      + (names.length ? '\n\n当前隔离：' + names.join('、') : ''),
+    confirmText: '恢复并重启',
+    danger: true,
+  });
+  if (!ok) return;
+  const r = await cmd('pluginQuarantineRestore');
+  if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
+  else showConsoleToast('✓ 已恢复禁用前的 Profile，正在重启 DSH');
+});
 $('btnPluginSafeMode').addEventListener('click', async () => {
   const ok = await confirmDialog({
     title: '以安全模式重启 DSH？',
@@ -1639,7 +1752,7 @@ $('btnPluginSafeMode').addEventListener('click', async () => {
 $('btnPluginSafeModeRestore').addEventListener('click', async () => {
   const ok = await confirmDialog({
     title: '恢复安全模式前的 Profile？',
-    body: '会用备份覆盖当前 Profile 并重启 DSH；安全模式期间对插件做的启停会被撤销。',
+    body: '会用备份覆盖当前 Profile 并重启 DSH；安全模式期间对插件做的改动（启停/安装）会被撤销。',
     confirmText: '恢复并重启',
     danger: true,
   });

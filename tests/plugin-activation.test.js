@@ -138,3 +138,98 @@ test('importCheckIssue：空 detail 也不产出空冒号文案（fail-closed �
   assert.match(described, /启动前自检失败：/)
   assert.doesNotMatch(described, /：$/u, '不能只留一个空冒号')
 })
+
+// ---------- 冲突元凶归因：从快捷键前缀对回具体第三方包 ----------
+const USAGE = '@kenz1117/dsh-ui-usage-billing'
+const WORKSPACE = '@deepseek-ai/dsh-client-ui-workspace'
+const conflict = (detail) => ({
+  kind: 'inactive',
+  packageName: WORKSPACE,
+  entryId: 'deepseek-workspace',
+  detail,
+  services: [],
+})
+
+test('shortcutPrefixes：只抠 Conflicting shortcut defaults 段里的前缀', () => {
+  assert.deepEqual(
+    activation.shortcutPrefixes('failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)'),
+    ['session', 'usage-billing'],
+  )
+  assert.deepEqual(activation.shortcutPrefixes('some random a.b error'), [])
+})
+
+test('packageAliases：dsh-ui-usage-billing → usage-billing；dsh-rewind-plugin → rewind', () => {
+  const usage = activation.packageAliases(USAGE)
+  assert.ok(usage.includes('usage-billing'))
+  assert.ok(activation.packageAliases('dsh-rewind-plugin').includes('rewind'))
+  assert.ok(activation.packageAliases('@agents-anywhere/dsh-bridge-next').includes('bridge'))
+})
+
+test('attributeCulprits：一个冲突 → 只归因到唯一匹配的第三方包', () => {
+  const issues = [conflict('failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)')]
+  const found = activation.attributeCulprits(issues, [
+    { npm: USAGE, name: '用量与计费' },
+    { npm: 'dsh-better-sidebar', name: '侧边栏' },
+  ])
+  assert.equal(found.length, 1)
+  assert.equal(found[0].npm, USAGE)
+  assert.equal(found[0].name, '用量与计费')
+  assert.match(found[0].reasons[0], /usage-billing\.open-dashboard/)
+})
+
+test('attributeCulprits：多个冲突 → 多个元凶；同一插件两条冲突只出现一次', () => {
+  const issues = [
+    conflict('Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)'),
+    conflict('Error: Conflicting shortcut defaults: usage-billing.open-settings and image-gen.open (desktop:macos)'),
+  ]
+  const found = activation.attributeCulprits(issues, [
+    { npm: USAGE, name: '用量与计费' },
+    { npm: 'dsh-image-gen', name: '图像生成' },
+  ])
+  assert.deepEqual(found.map((f) => f.npm).sort(), [USAGE, 'dsh-image-gen'].sort())
+  const usage = found.find((f) => f.npm === USAGE)
+  assert.equal(usage.reasons.length, 2)
+})
+
+test('attributeCulprits：官方/通用前缀、歧义匹配、无匹配都不归因（退回安全模式）', () => {
+  const generic = [conflict('Error: Conflicting shortcut defaults: session.toggleRead and workspace.open (desktop:macos)')]
+  assert.deepEqual(activation.attributeCulprits(generic, [{ npm: 'dsh-session', name: '会话' }]), [])
+
+  const ambiguous = [conflict('Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)')]
+  assert.deepEqual(activation.attributeCulprits(ambiguous, [
+    { npm: USAGE, name: '用量与计费' },
+    { npm: '@other/dsh-usage-billing', name: '另一个计费' },
+  ]), [])
+
+  const none = [conflict('Error: Conflicting shortcut defaults: a.one and b.two (desktop:macos)')]
+  assert.deepEqual(activation.attributeCulprits(none, [{ npm: USAGE, name: '用量与计费' }]), [])
+})
+
+test('attributeCulprits：报错里直接点名包名时也认', () => {
+  const issues = [conflict(`failed: Error: plugin ${USAGE} broke the service chain`)]
+  const found = activation.attributeCulprits(issues, [{ npm: USAGE, name: '用量与计费' }])
+  assert.equal(found.length, 1)
+  assert.equal(found[0].npm, USAGE)
+})
+
+test('attributeCulprits：失败条目本身是第三方 bundle、且前缀对得上时也算元凶', () => {
+  const issue = {
+    kind: 'inactive',
+    packageName: USAGE,
+    entryId: 'usage-billing',
+    detail: 'failed: Error: Conflicting shortcut defaults: usage-billing.open and session.toggleRead (desktop:macos)',
+    services: [],
+  }
+  const found = activation.attributeCulprits([issue], [{ npm: USAGE, name: '用量与计费' }])
+  assert.equal(found.length, 1)
+  assert.equal(found[0].npm, USAGE)
+})
+
+test('mentionsPackage：完整点名才算，子串不算', () => {
+  assert.equal(activation.mentionsPackage('failed: dsh-image broke', 'dsh-image'), true)
+  assert.equal(activation.mentionsPackage('failed: dsh-image-gen broke', 'dsh-image'), false,
+    'dsh-image 不能因为 dsh-image-gen 被误归因')
+  assert.equal(activation.mentionsPackage('failed: ' + USAGE + ' broke', USAGE), true)
+  assert.equal(activation.mentionsPackage('failed: usage-billing.open broke', 'dsh-ui-usage-billing'), false,
+    '短名不完整匹配时不走点名归因（前缀归因另有规则）')
+})

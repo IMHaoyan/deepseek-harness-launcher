@@ -137,7 +137,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', dshTargetEngines: null, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginSafeModeBackup: null, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', dshTargetEngines: null, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginSafeModeBackup: null, pluginQuarantine: null, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
 // 默认接收端在配置对象之外赋值：Config 这一行会被测试按源码片段求值，不能引用外部常量。
 Config.usageStatsUrl = USAGE_STATS_URL
 let firstRun = false
@@ -685,7 +685,24 @@ function applyConfigJson(cfg) {
       at: typeof safe.at === 'string' ? safe.at : '',
       manifest: safe.manifest,
       patch: safe.patch,
+      patchExisted: typeof safe.patchExisted === 'boolean' ? safe.patchExisted : undefined,
       removed: Array.isArray(safe.removed) ? safe.removed.filter((x) => typeof x === 'string').slice(0, 64) : [],
+    }
+  }
+  // 按插件隔离（只禁用冲突元凶）的备份落点；与安全模式互不覆盖，各自可整体恢复
+  Config.pluginQuarantine = null
+  const quarantine = cfg.pluginQuarantine
+  if (quarantine && typeof quarantine === 'object'
+    && typeof quarantine.manifest === 'string' && quarantine.manifest
+    && typeof quarantine.patch === 'string') {
+    Config.pluginQuarantine = {
+      at: typeof quarantine.at === 'string' ? quarantine.at : '',
+      manifest: quarantine.manifest,
+      patch: quarantine.patch,
+      patchExisted: typeof quarantine.patchExisted === 'boolean' ? quarantine.patchExisted : undefined,
+      disabled: Array.isArray(quarantine.disabled) ? quarantine.disabled.filter((x) => typeof x === 'string').slice(0, 64) : [],
+      removedFromBundles: Array.isArray(quarantine.removedFromBundles)
+        ? quarantine.removedFromBundles.filter((x) => typeof x === 'string').slice(0, 64) : [],
     }
   }
   // 旧版「随包 payload」→ npm 版本的一次性迁移：只做一次，避免每次启动都读 profile
@@ -2321,11 +2338,17 @@ function noteActivationEvidence(line) {
   broadcastState() // 插件卡片要立刻显示"未生效"，不能等下一次状态推送
 }
 
-/** 某个包本轮启动的未生效证据（没有则 undefined）。 */
-function activationIssueOf(packageName) {
-  // 不再归 DSHL 管理的插件：不展示、不计入"未生效"，避免用户在插件页继续看到它。
-  if (IGNORED_NPM_PLUGINS.has(String(packageName || ''))) return undefined
-  return pluginActivation.findActivationIssue(server.activationIssues, packageName)
+/**
+ * 某个包本轮启动的未生效证据（没有则 undefined）。
+ * 忽略清单里的包默认不参与“未生效”判定（不升级预判、不拉高主页面警示）；
+ * 但插件页的 Profile 清单仍可以取到它的证据 —— 用户自己装了它，就该看到它真实的状态，
+ * 不能因为“不由 DSHL 管理”就把失败说成已启用。
+ */
+function activationIssueOf(packageName, opts) {
+  const name = String(packageName || '')
+  if (!name) return undefined
+  if (!(opts && opts.includeIgnored) && IGNORED_NPM_PLUGINS.has(name)) return undefined
+  return pluginActivation.findActivationIssue(server.activationIssues, name)
 }
 
 /**
@@ -3910,8 +3933,9 @@ function pluginInventoryCards() {
     inventoryCardsCache = { key, cards: [] }
     return []
   }
-  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm)
-    .concat([market.PLUGIN_NAME], Array.from(IGNORED_NPM_PLUGINS)))
+  // 忽略清单只表示「DSHL 不主动管理它」（不注册成受管插件、不参与升级预判）。
+  // 用户如果自己装了它，仍应出现在「Profile 中的其他插件」里，而不是从插件页消失。
+  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm).concat([market.PLUGIN_NAME]))
   let cards = []
   try {
     cards = pluginInventory.inventoryCards({
@@ -3926,11 +3950,13 @@ function pluginInventoryCards() {
       },
       isDisabled: (npm) => pluginSwitch.isDisabled(npm),
       canToggle: (npm) => pluginSwitch.canToggle(npm),
+      isIgnored: (npm) => IGNORED_NPM_PLUGINS.has(String(npm || '')),
       busyOf: (id) => String(pluginActionBusy.get(id) || ''),
       busyLabel: pluginBusyLabel,
-      // 「未生效」的证据：与注册表卡片同源（同一个 activationIssueOf），不另造一份判据
+      // 「未生效」的证据：与注册表卡片同源（同一个 activationIssueOf），不另造一份判据。
+      // 这里显式包含忽略清单：不受 DSHL 管理 ≠ 可以把它失败的事实藏起来。
       activationOf: (npm) => {
-        const issue = activationIssueOf(npm)
+        const issue = activationIssueOf(npm, { includeIgnored: true })
         return issue ? pluginActivation.describeActivationIssue(issue) : ''
       },
     })
@@ -3989,6 +4015,26 @@ function pluginUiState() {
   const manifest = readProfileManifestSafe()
   const bundles = profileBundlesOf(manifest)
   const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
+  const isDisabled = (npm) => { try { return pluginSwitch.isDisabled(npm) === true } catch { return false } }
+  const canToggle = (npm) => { try { return pluginSwitch.canToggle(npm) === true } catch { return false } }
+  // 只拿「当前启用中、且不在忽略清单」的第三方 bundle 做归因候选：
+  // 已停用的插件不可能是本次冲突的元凶；不由 DSHL 管理的插件（如电脑操作）也不替用户停用。
+  const candidates = thirdParty
+    .filter((npm) => !IGNORED_NPM_PLUGINS.has(npm))
+    .filter((npm) => !isDisabled(npm))
+    .map((npm) => ({ npm, name: pluginNameForNpm(npm) }))
+  const suspects = pluginActivation.attributeCulprits(issues, candidates)
+    .map((s) => ({
+      npm: s.npm,
+      name: s.name,
+      reasons: s.reasons,
+      canToggle: canToggle(s.npm),
+      inBundles: bundles.includes(s.npm),
+      actionable: canToggle(s.npm) || bundles.includes(s.npm),
+    }))
+    .filter((s) => s.actionable)
+  const q = Config.pluginQuarantine
+  const removedFromBundles = new Set((q && Array.isArray(q.removedFromBundles)) ? q.removedFromBundles : [])
   return {
     degraded: issues.length > 0,
     count: issues.length,
@@ -4000,38 +4046,144 @@ function pluginUiState() {
     })),
     thirdParty,
     canSafeMode: thirdParty.length > 0,
+    suspects,
+    canBatchDisable: suspects.length > 0,
     safeMode: Config.pluginSafeModeBackup || null,
+    quarantine: q ? {
+      at: q.at || '',
+      manifest: q.manifest || '',
+      disabled: (q.disabled || []).map((npm) => ({
+        npm,
+        name: pluginNameForNpm(npm),
+        // 从 bundle 列表移除的插件在补丁层里可能没有停用行，判据要按移除事实来
+        disabled: removedFromBundles.has(npm) ? !bundles.includes(npm) : isDisabled(npm),
+      })),
+    } : null,
   }
+}
+
+/** 安全模式 / 插件隔离共用的 Profile 快照工具：先备份、失败即停，恢复时也按快照整体拷回。 */
+function profileSnapshotPaths(kind) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  return {
+    manifest: `${DSH_PROFILE_PACKAGE}.bak-dshl-${kind}-${stamp}`,
+    patch: `${DSH_PROFILE_PATCH}.bak-dshl-${kind}-${stamp}`,
+  }
+}
+
+/** 备份当前 package.json（以及存在时的补丁层）。任何复制失败都抛错，由调用方 fail-closed。 */
+function snapshotProfileFiles(paths) {
+  fs.copyFileSync(DSH_PROFILE_PACKAGE, paths.manifest)
+  const patchExisted = fs.existsSync(DSH_PROFILE_PATCH)
+  if (patchExisted) fs.copyFileSync(DSH_PROFILE_PATCH, paths.patch)
+  return { patchExisted }
+}
+
+/**
+ * 把快照拷回 Profile。
+ * patchExisted=false 表示原状态没有补丁层：恢复时要把当前补丁文件删掉，
+ * 否则隔离/安全模式期间新建的停用行会留下来，插件仍然起不来。
+ */
+function restoreProfileFiles(snap) {
+  if (snap.patchExisted === true) {
+    if (!snap.patch || !fs.existsSync(snap.patch)) throw new Error('补丁层备份已不存在：' + (snap.patch || '(空路径)'))
+    fs.copyFileSync(snap.patch, DSH_PROFILE_PATCH)
+  } else if (snap.patchExisted === false) {
+    if (fs.existsSync(DSH_PROFILE_PATCH)) fs.unlinkSync(DSH_PROFILE_PATCH)
+  } else if (snap.patch && fs.existsSync(snap.patch)) {
+    // 旧记录没有 patchExisted：有备份就恢复，没有就保持现状
+    fs.copyFileSync(snap.patch, DSH_PROFILE_PATCH)
+  }
+  fs.copyFileSync(snap.manifest, DSH_PROFILE_PACKAGE)
+}
+
+function dropProfileSnapshot(snap) {
+  if (!snap) return
+  try { if (snap.manifest) fs.unlinkSync(snap.manifest) } catch { /* noop */ }
+  try { if (snap.patch) fs.unlinkSync(snap.patch) } catch { /* noop */ }
+}
+
+/** 清掉一批包的 durable「停用」选择；返回未能清除的说明（空数组=全部成功）。 */
+function clearPersistedDisabledFor(names) {
+  const warnings = []
+  for (const npm of (Array.isArray(names) ? names : [])) {
+    try {
+      const r = pluginSwitch.clearPersistedDisabled(npm)
+      if (r && r.ok === false) warnings.push(npm + '（' + (r.error || '状态未清除') + '）')
+    } catch (error) {
+      warnings.push(npm + '（' + ((error && error.message) || String(error)) + '）')
+    }
+  }
+  return warnings
 }
 
 /** 安全模式：保留官方 bundle + 桌面登录辅助，其余第三方 bundle 临时停用；先备份再写。 */
 async function enablePluginSafeMode() {
+  // 安全模式与按插件隔离各有一份 Profile 快照；同时存在会让两个“恢复”互相覆盖。
+  // 有**可恢复的**隔离记录时先要求用户恢复它，回到同一条时间线再进安全模式；
+  // 备份已缺失的记录是死元数据，清掉它，避免用户被一个点不动的入口卡住。
+  const quarantine = Config.pluginQuarantine
+  if (quarantine) {
+    const restorable = !!(quarantine.manifest && fs.existsSync(quarantine.manifest)
+      && !(quarantine.patchExisted === true && (!quarantine.patch || !fs.existsSync(quarantine.patch))))
+    if (restorable) {
+      return { ok: false, error: '当前有按插件隔离的记录，请先在恢复页「恢复禁用前的 Profile」，再使用安全模式' }
+    }
+    Config.pluginQuarantine = null
+    if (!saveConfig()) {
+      Config.pluginQuarantine = quarantine
+      return { ok: false, error: '清理失效的插件隔离记录失败，未进入安全模式' }
+    }
+  }
   const manifest = readProfileManifestSafe()
   if (!manifest) return { ok: false, error: '读不到当前 Profile 的 package.json' }
   const bundles = profileBundlesOf(manifest)
   const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
   if (!thirdParty.length) return { ok: false, error: '当前 Profile 没有可停用的第三方插件' }
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const manifestBak = `${DSH_PROFILE_PACKAGE}.bak-dshl-safe-${stamp}`
-  const patchBak = `${DSH_PROFILE_PATCH}.bak-dshl-safe-${stamp}`
+  const backup = profileSnapshotPaths('safe')
+  let patchExisted = false
+  let snap = null
   try {
-    fs.copyFileSync(DSH_PROFILE_PACKAGE, manifestBak)
-    try { fs.copyFileSync(DSH_PROFILE_PATCH, patchBak) } catch { /* 没有用户补丁层也可以安全模式 */ }
+    snap = { manifest: backup.manifest, patch: backup.patch }
+    patchExisted = snapshotProfileFiles(backup).patchExisted
     const next = JSON.parse(JSON.stringify(manifest))
     next.dsh.profile.bundles = bundles.filter((n) => safeModeKeepsBundle(n))
     writeProfileManifestAtomic(next)
   } catch (error) {
+    dropProfileSnapshot(snap)
     return { ok: false, error: '写入安全模式 Profile 失败：' + ((error && error.message) || String(error)) }
   }
-  Config.pluginSafeModeBackup = { at: new Date().toISOString(), manifest: manifestBak, patch: patchBak, removed: thirdParty }
-  try { saveConfig() } catch { /* noop */ }
+  Config.pluginSafeModeBackup = {
+    at: new Date().toISOString(),
+    manifest: backup.manifest,
+    patch: backup.patch,
+    patchExisted,
+    removed: thirdParty,
+  }
+  if (!saveConfig()) {
+    // 恢复入口没落盘就不能继续：先把 Profile 退回快照，避免“已停用却找不到恢复记录”
+    let rollbackError = ''
+    try { restoreProfileFiles({ manifest: backup.manifest, patch: backup.patch, patchExisted }) }
+    catch (error) { rollbackError = (error && error.message) || String(error) }
+    Config.pluginSafeModeBackup = null
+    saveConfig()
+    if (rollbackError) {
+      return {
+        ok: false,
+        error: '保存安全模式恢复记录失败，且回滚失败：' + rollbackError + '；原备份：' + backup.manifest,
+        backup: backup.manifest,
+      }
+    }
+    dropProfileSnapshot(snap)
+    return { ok: false, error: '保存安全模式恢复记录失败，Profile 已回滚' }
+  }
   invalidatePluginInventory()
-  log(`插件安全模式：已临时停用 ${thirdParty.length} 个第三方 bundle（${thirdParty.join('、')}）；备份 ${manifestBak}`)
+  log(`插件安全模式：已临时停用 ${thirdParty.length} 个第三方 bundle（${thirdParty.join('、')}）；备份 ${backup.manifest}`)
   const r = await restartDshForConsole()
   if (r && r.ok === false) {
-    return { ok: false, error: 'Profile 已切换，但服务重启失败（' + (r.reason || 'unknown') + '）', backup: manifestBak }
+    return { ok: false, error: 'Profile 已切换，但服务重启失败（' + (r.reason || 'unknown') + '）', backup: backup.manifest }
   }
-  return { ok: true, backup: manifestBak, removed: thirdParty }
+  return { ok: true, backup: backup.manifest, removed: thirdParty }
 }
 
 /** 恢复安全模式前的 Profile（只认本次记录、且备份仍存在）。 */
@@ -4039,18 +4191,259 @@ async function restorePluginSafeMode() {
   const bak = Config.pluginSafeModeBackup
   if (!bak || !bak.manifest) return { ok: false, error: '没有可恢复的安全模式备份' }
   if (!fs.existsSync(bak.manifest)) return { ok: false, error: '安全模式备份已不存在：' + bak.manifest }
+  if (bak.patchExisted === true && (!bak.patch || !fs.existsSync(bak.patch))) {
+    return { ok: false, error: '安全模式补丁层备份已不存在：' + (bak.patch || '(空路径)') }
+  }
+  let rollback = null
+  try { rollback = takeProfileRollback('safe-restore') } catch (error) {
+    return { ok: false, error: '备份当前 Profile 失败，恢复未执行：' + ((error && error.message) || String(error)) }
+  }
   try {
-    fs.copyFileSync(bak.manifest, DSH_PROFILE_PACKAGE)
-    if (bak.patch && fs.existsSync(bak.patch)) fs.copyFileSync(bak.patch, DSH_PROFILE_PATCH)
+    restoreProfileFiles({ manifest: bak.manifest, patch: bak.patch, patchExisted: bak.patchExisted })
   } catch (error) {
+    let rollbackError = ''
+    try { restoreProfileFiles(rollback) } catch (e) { rollbackError = (e && e.message) || String(e) }
+    if (rollbackError) {
+      return {
+        ok: false,
+        error: '恢复 Profile 失败：' + ((error && error.message) || String(error))
+          + '；回滚失败：' + rollbackError
+          + '；原备份：' + bak.manifest + '；回滚快照：' + rollback.manifest,
+      }
+    }
+    dropProfileSnapshot(rollback)
     return { ok: false, error: '恢复 Profile 失败：' + ((error && error.message) || String(error)) }
   }
   Config.pluginSafeModeBackup = null
-  try { saveConfig() } catch { /* noop */ }
+  const saved = saveConfig()
+  dropProfileSnapshot(rollback)
   invalidatePluginInventory()
-  log('插件安全模式：已恢复安全模式前的 Profile')
+  log('插件安全模式：已恢复安全模式前的 Profile' + (saved ? '' : '（恢复记录未能保存）'))
   const r = await restartDshForConsole()
+  if (!saved) {
+    Config.pluginSafeModeBackup = bak
+    return { ok: false, error: 'Profile 已恢复，但恢复记录未能保存；重启后可能仍显示恢复入口' }
+  }
   if (r && r.ok === false) return { ok: false, error: 'Profile 已恢复，但服务重启失败（' + (r.reason || 'unknown') + '）' }
+  return { ok: true }
+}
+
+/** 为一次写操作拍当前的临时回滚快照（不持久化，操作结束就删）。 */
+function takeProfileRollback(kind) {
+  const paths = profileSnapshotPaths('rollback-' + kind)
+  try {
+    const { patchExisted } = snapshotProfileFiles(paths)
+    return { manifest: paths.manifest, patch: paths.patch, patchExisted }
+  } catch (error) {
+    dropProfileSnapshot(paths)
+    throw error
+  }
+}
+
+// ---------- 按插件隔离：只停用报错归因出的冲突元凶 ----------
+// 安全模式会一次停掉全部第三方插件，用户还得逐个试；冲突行本身已经点名了快捷键前缀
+// （如 `usage-billing.open-dashboard`），能唯一对上某个包时，就应该只停它。
+// 一次备份、一次重启，并在状态里保留「本次到底停了哪几个」的清单，恢复时按快照整体拷回。
+async function disableSuspectPlugins(npmList) {
+  const safeBak = Config.pluginSafeModeBackup
+  if (safeBak) {
+    const restorable = !!(safeBak.manifest && fs.existsSync(safeBak.manifest)
+      && !(safeBak.patchExisted === true && (!safeBak.patch || !fs.existsSync(safeBak.patch))))
+    if (restorable) {
+      return { ok: false, error: '当前处于安全模式，请先恢复安全模式前的 Profile，再按插件禁用' }
+    }
+    Config.pluginSafeModeBackup = null
+    if (!saveConfig()) {
+      Config.pluginSafeModeBackup = safeBak
+      return { ok: false, error: '清理失效的安全模式记录失败，未做任何修改' }
+    }
+  }
+  const manifest = readProfileManifestSafe()
+  if (!manifest) return { ok: false, error: '读不到当前 Profile 的 package.json' }
+  const bundles = profileBundlesOf(manifest)
+  const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
+  const requested = Array.from(new Set((Array.isArray(npmList) ? npmList : [])
+    .filter((n) => typeof n === 'string' && n)))
+  // fail-closed：只允许停用当前 Profile 里声明为 bundle 的第三方插件，
+  // 官方插件、已移除的包、任意字符串都不能借这个入口被写进补丁层。
+  const allowed = requested.filter((n) => thirdParty.includes(n))
+  if (!allowed.length) {
+    return { ok: false, error: '没有可停用的冲突插件（只允许停用当前 Profile 里的第三方 bundle）' }
+  }
+  const already = []
+  const targets = []
+  for (const npm of allowed) {
+    let off = false
+    let toggle = false
+    try { off = pluginSwitch.isDisabled(npm) === true } catch { off = false }
+    try { toggle = pluginSwitch.canToggle(npm) === true } catch { toggle = false }
+    if (off) already.push(npm)
+    else targets.push({ npm, toggle })
+  }
+  if (!targets.length) return { ok: false, error: '这些插件已经处于停用状态' }
+  // 已有隔离记录时复用**最初**的 Profile 快照：多次扩大禁用范围后，一次恢复仍能回到
+  // 第一次隔离之前，而不是只退回上一轮。记录里的 disabled 取并集，卡片才能列全。
+  const prior = Config.pluginQuarantine
+  const reuse = !!(prior && prior.manifest && fs.existsSync(prior.manifest))
+  let manifestBak = reuse ? prior.manifest : ''
+  let patchBak = reuse ? String(prior.patch || '') : ''
+  let patchExisted = reuse ? prior.patchExisted : undefined
+  if (!reuse) {
+    const backup = profileSnapshotPaths('quarantine')
+    manifestBak = backup.manifest
+    patchBak = backup.patch
+    try {
+      patchExisted = snapshotProfileFiles(backup).patchExisted
+    } catch (error) {
+      dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
+      return { ok: false, error: '备份当前 Profile 失败：' + ((error && error.message) || String(error)) }
+    }
+  }
+  let rollback = null
+  try { rollback = takeProfileRollback('quarantine') } catch (error) {
+    if (!reuse) dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
+    return { ok: false, error: '备份当前 Profile 失败，未做任何修改：' + ((error && error.message) || String(error)) }
+  }
+  const rollbackNow = () => {
+    let fileError = ''
+    try { restoreProfileFiles(rollback) } catch (error) { fileError = (error && error.message) || String(error) }
+    const warnings = clearPersistedDisabledFor(targets.map((t) => t.npm))
+    return { fileError, warnings }
+  }
+  const abort = (error, failed) => {
+    const { fileError, warnings } = rollbackNow()
+    // 回滚失败时保留回滚快照（以及原备份）作为人工恢复路径，不能删掉最后的证据
+    if (!fileError) dropProfileSnapshot(rollback)
+    if (!reuse && !fileError) dropProfileSnapshot({ manifest: manifestBak, patch: patchBak })
+    let suffix = ''
+    if (fileError) suffix += '；回滚失败：' + fileError + '（原备份：' + manifestBak + '）'
+    if (warnings.length) suffix += '；停用状态未清除：' + warnings.join('、')
+    return {
+      ok: false,
+      error: error + suffix,
+      failed: failed || [],
+      backup: fileError ? manifestBak : undefined,
+    }
+  }
+  const disabled = []
+  const failed = []
+  const removedFromBundles = []
+  for (const target of targets) {
+    const npm = target.npm
+    // 没有可切换的加载项：从 bundle 列表移除（与安全模式同一手段）。
+    // 只有这种“能力不足”才走 fallback；有加载项却写失败属于硬错误，整批回滚。
+    if (!target.toggle) {
+      disabled.push(npm)
+      removedFromBundles.push(npm)
+      continue
+    }
+    let result = null
+    try { result = pluginSwitch.setEnabled(npm, false) } catch (error) {
+      result = { ok: false, error: (error && error.message) || String(error) }
+    }
+    if (result && result.ok) { disabled.push(npm); continue }
+    failed.push({ npm, error: (result && result.error) || '无法停用' })
+  }
+  if (failed.length) {
+    return abort('未能停用全部冲突插件，已回滚：' + failed.map((f) => `${f.npm}（${f.error}）`).join('；'), failed)
+  }
+  if (removedFromBundles.length) {
+    try {
+      const next = JSON.parse(JSON.stringify(manifest))
+      next.dsh.profile.bundles = bundles.filter((n) => !removedFromBundles.includes(n))
+      writeProfileManifestAtomic(next)
+    } catch (error) {
+      return abort('写入 Profile 失败，已回滚：' + ((error && error.message) || String(error)),
+        removedFromBundles.map((npm) => ({ npm, error: '写入 Profile 失败，未能从 bundle 列表移除' })))
+    }
+  }
+  const allDisabled = Array.from(new Set([
+    ...((reuse && Array.isArray(prior.disabled)) ? prior.disabled : []),
+    ...disabled,
+  ]))
+  const allRemoved = Array.from(new Set([
+    ...((reuse && Array.isArray(prior.removedFromBundles)) ? prior.removedFromBundles : []),
+    ...removedFromBundles,
+  ]))
+  Config.pluginQuarantine = {
+    at: (reuse && prior.at) ? prior.at : new Date().toISOString(),
+    manifest: manifestBak,
+    patch: patchBak,
+    patchExisted,
+    disabled: allDisabled,
+    removedFromBundles: allRemoved,
+  }
+  if (!saveConfig()) {
+    Config.pluginQuarantine = prior || null
+    return abort('保存恢复记录失败，已回滚')
+  }
+  dropProfileSnapshot(rollback)
+  invalidatePluginInventory()
+  log(`插件隔离：本次停用冲突插件 ${disabled.length} 个（${disabled.join('、')}）；累计 ${allDisabled.length} 个；备份 ${manifestBak}`)
+  const r = await restartDshForConsole()
+  const payload = {
+    ok: true,
+    backup: manifestBak,
+    disabled: disabled.map((npm) => ({ npm, name: pluginNameForNpm(npm) })),
+    failed,
+    already,
+  }
+  if (r && r.ok === false) {
+    return Object.assign(payload, {
+      ok: false,
+      error: '冲突插件已停用，但服务重启失败（' + (r.reason || 'unknown') + '）',
+    })
+  }
+  return payload
+}
+
+/** 恢复按插件隔离前的 Profile（整体拷回快照，并清掉 durable 的停用选择）。 */
+async function restorePluginQuarantine() {
+  const q = Config.pluginQuarantine
+  if (!q || !q.manifest) return { ok: false, error: '没有可恢复的插件隔离备份' }
+  if (!fs.existsSync(q.manifest)) return { ok: false, error: '插件隔离备份已不存在：' + q.manifest }
+  if (q.patchExisted === true && (!q.patch || !fs.existsSync(q.patch))) {
+    return { ok: false, error: '插件隔离补丁层备份已不存在：' + (q.patch || '(空路径)') }
+  }
+  // setEnabled(false) 会把「停用」写进 dshmarket 的 durable 状态；只拷回补丁层不够。
+  // 先清 durable，任何一项失败都不动 Profile，并保留恢复记录供重试。
+  const warnings = clearPersistedDisabledFor(q.disabled)
+  if (warnings.length) {
+    return { ok: false, error: '恢复未执行：以下插件的停用状态未能清除：' + warnings.join('、'), warnings }
+  }
+  let rollback = null
+  try { rollback = takeProfileRollback('quarantine-restore') } catch (error) {
+    return { ok: false, error: '备份当前 Profile 失败，恢复未执行：' + ((error && error.message) || String(error)) }
+  }
+  try {
+    restoreProfileFiles({ manifest: q.manifest, patch: q.patch, patchExisted: q.patchExisted })
+  } catch (error) {
+    let rollbackError = ''
+    try { restoreProfileFiles(rollback) } catch (e) { rollbackError = (e && e.message) || String(e) }
+    if (rollbackError) {
+      return {
+        ok: false,
+        error: '恢复 Profile 失败：' + ((error && error.message) || String(error))
+          + '；回滚失败：' + rollbackError
+          + '；原备份：' + q.manifest + '；回滚快照：' + rollback.manifest,
+      }
+    }
+    dropProfileSnapshot(rollback)
+    return { ok: false, error: '恢复 Profile 失败：' + ((error && error.message) || String(error)) }
+  }
+  Config.pluginQuarantine = null
+  const saved = saveConfig()
+  dropProfileSnapshot(rollback)
+  invalidatePluginInventory()
+  log('插件隔离：已恢复停用前的 Profile' + (saved ? '' : '（恢复记录未能保存）'))
+  const r = await restartDshForConsole()
+  if (!saved) {
+    Config.pluginQuarantine = q
+    return { ok: false, error: 'Profile 已恢复，但恢复记录未能保存；重启后可能仍显示恢复入口' }
+  }
+  if (r && r.ok === false) {
+    return { ok: false, error: 'Profile 已恢复，但服务重启失败（' + (r.reason || 'unknown') + '）' }
+  }
   return { ok: true }
 }
 
@@ -4063,6 +4456,16 @@ function pluginDisplayName(id) {
   }
   const def = MANAGED_NPM_PLUGINS.find((d) => d.id === id)
   return def ? def.name : String(id || '')
+}
+
+/** 包名 → 冲突恢复卡上的短名字（注册表里有中文名就用它；否则去掉 dsh/ui 装饰词）。 */
+function pluginNameForNpm(npm) {
+  const name = String(npm || '')
+  const def = MANAGED_NPM_PLUGINS.find((d) => d.npm === name)
+  if (def) return def.name
+  const short = pluginInventory.shortName(name)
+  const friendly = short.replace(/^dsh-(?:ui-)?/u, '').replace(/^dsh/u, '')
+  return friendly || short || name
 }
 
 /** 记一次插件动作失败：能归类就并入聚合（同 kind 累加失败项，换 kind 重新开始）。 */
@@ -8202,9 +8605,11 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'pluginCheckUpdates': return JSON.stringify(await checkManagedPluginUpdates())
         case 'pluginSetNote': return JSON.stringify(setManagedPluginNote(value && value.id, value && value.text))
         case 'pluginsApplyRestart': return JSON.stringify(await withProfileOp('重启生效', () => applyPendingPluginChanges()))
-        // 插件冲突急救：安全模式 / 恢复安全模式前的 Profile。两者都走 profile 写锁。
+        // 插件冲突急救：安全模式 / 按插件隔离 / 恢复 Profile。三者都走 profile 写锁。
         case 'pluginSafeMode': return JSON.stringify(await withProfileOp('插件安全模式', () => enablePluginSafeMode()))
         case 'pluginSafeModeRestore': return JSON.stringify(await withProfileOp('恢复安全模式前的 Profile', () => restorePluginSafeMode()))
+        case 'pluginDisableSuspects': return JSON.stringify(await withProfileOp('禁用冲突插件', () => disableSuspectPlugins(value && value.npms)))
+        case 'pluginQuarantineRestore': return JSON.stringify(await withProfileOp('恢复禁用前的 Profile', () => restorePluginQuarantine()))
         case 'pluginsInstallAll': {
           if (pluginInstallAllRunning) return JSON.stringify({ ok: false, error: '插件批量操作正在进行中' })
           if (profileOpBusy()) return JSON.stringify(profileBusyError())

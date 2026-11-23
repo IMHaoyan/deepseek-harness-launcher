@@ -467,8 +467,8 @@ test('清单插件的动作分发：走官方 CLI 卸载，且停用/启用要�
 // ---------- ⑫「未生效」必须有出口 ----------
 test('「未生效」证据接到清单卡片上，且与注册表卡片同源', () => {
   const fn = body('pluginInventoryCards')
-  assert.match(fn, /activationOf: \(npm\) => \{[\s\S]{0,160}?activationIssueOf\(npm\)/,
-    '清单卡片也要走 activationIssueOf（同一个判据，不另造一份）')
+  assert.match(fn, /activationOf: \(npm\) => \{[\s\S]{0,200}?activationIssueOf\(npm, \{ includeIgnored: true \}\)/,
+    '清单卡片也要走 activationIssueOf（同一个判据，不另造一份）；忽略清单里的包装了也要显示真实状态')
   assert.match(fn, /pluginActivation\.describeActivationIssue\(issue\)/, '文案同源')
   assert.match(inventory, /activation: String\(activationOf\(npm\) \|\| ''\)/, '纯函数侧要真的用上这个探针')
 })
