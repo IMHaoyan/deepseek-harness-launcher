@@ -924,6 +924,7 @@ const server = {
   activationWindow: [], // 最近几行 stderr 的滑动窗口（warning 头 + 紧随的条目行要一起看）
   activationIssues: [], // 本轮启动里解析出的问题条目（去重，随世代清空）
   activationAutoOpened: false, // required 插件失败时是否已自动打开恢复页（每世代只自动一次）
+  uiPageHealthy: false, // 页面实际已加载真实 DSH 界面（有可见聊天输入框）→ 覆盖过期的激活证据
   startPromise: null, // 进行中的启动：并发调用共用同一次启动，不再 spawn 第二个 dsh web 抢同一个端口
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
@@ -2362,9 +2363,26 @@ function noteActivationEvidence(line) {
  * 合成证据，让恢复卡至少能提供安全模式，而不是让用户对着失败页无路可走。
  * 只读 document.body.innerText，不改 DSH 的页面。
  */
+/**
+ * 页面已加载真实 DSH 界面（可见聊天输入框，且没有失败页签名）：
+ * 以页面为准解除“界面未就绪”。启动日志里的 required 失败可能是上一次页面/热重载留下的，
+ * 不能在页面已经正常时继续挂着恢复卡。
+ */
+function markUiPageHealthy() {
+  if (server.uiPageHealthy) return false
+  server.uiPageHealthy = true
+  if (server.activationIssues.some((it) => pluginActivation.isUiCriticalIssue(it))) {
+    log('DSH 页面已加载真实界面：解除“界面未就绪”判定（保留日志证据）')
+  }
+  broadcastState()
+  return true
+}
+
 function inspectWebBootFailure(text) {
   const body = String(text || '')
   if (!body || !/Failed to load plugins|did not activate/iu.test(body)) return false
+  const wasHealthy = server.uiPageHealthy === true
+  server.uiPageHealthy = false
   let found = []
   try { found = pluginActivation.parseActivationIssues(body) } catch { found = [] }
   // 页面可能把 required 列表与冲突行拆在不同块里，或在中间夹了非条目行；
@@ -2394,7 +2412,18 @@ function inspectWebBootFailure(text) {
   }
   const added = addActivationIssues(found)
   if (added) log('插件失败页：从页面原文补录 ' + found.length + ' 条证据')
-  return added
+  if (wasHealthy && !added) {
+    log('插件失败页重新出现：恢复“界面未就绪”判定')
+    broadcastState()
+    if (!server.activationAutoOpened && !consoleIsOpen()) {
+      try {
+        showConsolePage('recovery')
+        server.activationAutoOpened = true
+        log('插件冲突：自动打开恢复页')
+      } catch { /* noop */ }
+    }
+  }
+  return added || wasHealthy
 }
 
 /**
@@ -2429,6 +2458,7 @@ function resetActivationEvidence() {
   server.activationWindow = []
   server.activationIssues = []
   server.activationAutoOpened = false
+  server.uiPageHealthy = false
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
@@ -4115,7 +4145,7 @@ function pluginUiState() {
   const critical = issues.filter((it) => pluginActivation.isUiCriticalIssue(it))
   const requiredCount = issues.filter((it) => it.required === true).length
   return {
-    degraded: critical.length > 0,
+    degraded: critical.length > 0 && server.uiPageHealthy !== true,
     count: issues.length,
     criticalCount: critical.length,
     requiredCount,
@@ -7091,9 +7121,16 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
           if (wc.isDestroyed()) return
           try {
             // 只在“失败页”采信：有失败签名且**没有聊天输入框**。
-            // 正常 DSH 页面里用户可能正好在聊天中粘贴这段报错，不能把正文当成启动失败。
-            wc.executeJavaScript("(function(){var b=document.body;if(!b)return '';var t=b.innerText||'';var hit=t.indexOf('Failed to load plugins')>=0||(t.indexOf('web boot:')>=0&&t.indexOf('did not activate')>=0);if(!hit)return '';var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');if(c&&c.getClientRects().length)return '';return t.slice(0,20000)})()")
-              .then((text) => { if (!wc.isDestroyed()) inspectWebBootFailure(text) })
+            // 正常 DSH 页面里用户可能正好在聊天中粘贴这段报错，不能把正文当成启动失败；
+            // 反过来，页面有可见聊天输入框且没有失败签名 = 真实界面已加载，清掉过期的“未就绪”判定。
+            wc.executeJavaScript("(function(){var b=document.body;if(!b)return '';var t=b.innerText||'';var hit=t.indexOf('Failed to load plugins')>=0||(t.indexOf('web boot:')>=0&&t.indexOf('did not activate')>=0);var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');var composer=!!(c&&c.getClientRects().length);if(hit&&!composer)return JSON.stringify({failed:true,text:t.slice(0,20000)});if(!hit&&composer)return JSON.stringify({healthy:true});return ''})()")
+              .then((raw) => {
+                if (wc.isDestroyed() || !raw) return
+                let st = null
+                try { st = JSON.parse(String(raw)) } catch { st = null }
+                if (st && st.failed) inspectWebBootFailure(st.text)
+                else if (st && st.healthy) markUiPageHealthy()
+              })
               .catch(() => { /* noop */ })
           } catch { /* noop */ }
         }

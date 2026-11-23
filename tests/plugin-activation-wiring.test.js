@@ -229,3 +229,11 @@ test('页面解析提前停住时，单独扫冲突原文仍能归因到 usage-b
   assert.equal(suspects.length, 1)
   assert.equal(suspects[0].npm, '@kenz1117/dsh-ui-usage-billing')
 })
+
+test('真实界面加载后解除过期的“界面未就绪”：页面证据是最终裁决', () => {
+  assert.match(main, /function markUiPageHealthy\(\)/, '要有“页面已健康”的显式标记')
+  assert.match(main, /st && st\.healthy\) markUiPageHealthy\(\)/, '检测到可见聊天输入框时调用')
+  assert.match(main, /server\.uiPageHealthy = false/, '新世代/失败页都要重置或置否')
+  assert.match(main, /degraded: critical\.length > 0 && server\.uiPageHealthy !== true/,
+    '页面健康时 pluginUi.degraded 必须为 false，卡片不能挂着')
+})

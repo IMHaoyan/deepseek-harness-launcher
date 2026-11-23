@@ -80,7 +80,8 @@ test('安全模式：先备份 package.json / cordis.patch.yml，再写 bundle �
 
 test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + 主页面警示卡升级', () => {
   const state = sliceBetween(main, 'function pluginUiState()', '/** 安全模式：保留官方 bundle', 'pluginUiState')
-  assert.match(state, /degraded: critical\.length > 0/, '只有 UI 关键失败才算界面未就绪')
+  assert.match(state, /degraded: critical\.length > 0 && server\.uiPageHealthy !== true/,
+    '真实页面已加载时，过期的 required 证据不能继续挂恢复卡')
   assert.match(state, /criticalCount: critical\.length/, '要告诉界面有多少条是 UI 关键证据')
   assert.match(state, /requiredCount,/, '要告诉界面有多少条是 DSH 标了 required 的')
   assert.match(state, /critical: pluginActivation\.isUiCriticalIssue\(it\)/, '逐条标记是否 UI 关键')
