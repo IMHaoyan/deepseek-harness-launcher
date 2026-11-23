@@ -132,12 +132,14 @@ test('打包清单包含新模块（否则装出来的 exe 缺文件）', () => 
 test('失败页兜底：stderr 没给 required 失败时，从页面原文补证据', () => {
   assert.match(main, /function inspectWebBootFailure\(text\)/, '要有页面原文解析入口')
   assert.match(main, /Failed to load plugins|did not activate/, '只对失败页做检查')
-  assert.match(main, /inspectWebBootFailure\(text\)/, 'did-finish-load 时要把页面文本送进解析')
-  assert.match(main, /setTimeout\(inspect, 2000\)/, 'SPA 延迟挂载时补读一次')
+  assert.match(main, /inspectWebBootFailure\(text\)/, '页面取证结果要送进解析')
+  assert.match(main, /const st = await inspectWebUiPage\(wc, seq\)/, 'did-finish-load 后要把页面取证接进流程')
+  assert.match(main, /if \(st !== 'pending'\) return/, '拿到失败/健康结论就停止轮询')
+  assert.match(main, /Date\.now\(\) - startedAt > 90000/, '慢机器上失败页可能晚于 did-finish-load，必须有界轮询')
   assert.match(main, /kind: 'ui-page'/, '解析不出条目也要留一条合成证据，至少能进安全模式')
   assert.match(main, /document\.querySelector\('textarea,\[contenteditable=true\],input\[type=text\]'\)/,
     '只在没有聊天输入框的失败页采信，避免聊天正文里的报错文本误触发')
-  assert.match(main, /function addActivationIssues\(found\)/, 'stderr 与页面两个来源共用同一份去重/推送/自动打开逻辑')
+  assert.match(main, /function addActivationIssues\(found, opts\)/, 'stderr 与页面/控制台来源共用同一份去重/推送/自动打开逻辑')
 })
 
 test('失败页原文 → 19 条证据 / required 2 / 自动打开恢复页，且重复读页不重复记', () => {
@@ -230,10 +232,189 @@ test('页面解析提前停住时，单独扫冲突原文仍能归因到 usage-b
   assert.equal(suspects[0].npm, '@kenz1117/dsh-ui-usage-billing')
 })
 
+test('失败页没有冲突原文时：留合成证据并记录诊断片段，不瞎猜元凶', () => {
+  const activation = require('../plugin-activation')
+  const server = { activationIssues: [], activationAutoOpened: false, failureSnippetLogged: '' }
+  const logs = []
+  const ctx = {
+    server,
+    pluginActivation: activation,
+    IGNORED_NPM_PLUGINS: new Set(['dsh-computer-use-win']),
+    log: (m) => { logs.push(m) },
+    broadcastState: () => {},
+    consoleIsOpen: () => true,
+    showConsolePage: () => {},
+  }
+  vm.createContext(ctx)
+  const add = main.slice(main.indexOf('function addActivationIssues('), main.indexOf('function noteActivationEvidence('))
+  const inspect = main.slice(main.indexOf('function inspectWebBootFailure('), main.indexOf('function activationIssueOf('))
+  vm.runInContext(add + '\n' + inspect, ctx)
+
+  const text = [
+    'HARNESS',
+    'Failed to load plugins',
+    'web boot: 1 required entry did not activate',
+    '@deepseek-ai/dsh-client-ui-workspace (required): pending (waiting for service: uiWorkspace)',
+  ].join('\n')
+  assert.equal(ctx.inspectWebBootFailure(text), true, '失败页必须留证据，才进得了安全模式')
+  assert.ok(server.activationIssues.length >= 1, '至少保留 required 条目')
+  assert.equal(activation.attributeCulprits(server.activationIssues, []).length, 0, '没有原文就不归因')
+  assert.ok(server.failureSnippetLogged, '要把页面片段记下来，便于对照用户设备')
+  assert.ok(logs.some((m) => m.includes('未找到冲突原文')), '诊断日志要可检索')
+
+  // 同一片段重复读取不重复刷日志
+  const before = logs.length
+  ctx.inspectWebBootFailure(text)
+  assert.equal(logs.filter((m) => m.includes('未找到冲突原文')).length, 1, '同内容只记一次')
+  assert.equal(logs.length, before, '重复读取不新增日志')
+
+  // 只有冲突原文、没有“Failed to load plugins”页头时也必须能归因
+  const conflictOnly = 'Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)'
+  assert.equal(ctx.inspectWebBootFailure(conflictOnly), true, '冲突原文本身就是失败证据')
+  const suspects = activation.attributeCulprits(server.activationIssues, [
+    { npm: '@kenz1117/dsh-ui-usage-billing', name: '用量与计费' },
+  ])
+  assert.equal(suspects.length, 1, '冲突行要归因到用量与计费')
+})
+
 test('真实界面加载后解除过期的“界面未就绪”：页面证据是最终裁决', () => {
   assert.match(main, /function markUiPageHealthy\(\)/, '要有“页面已健康”的显式标记')
-  assert.match(main, /st && st\.healthy\) markUiPageHealthy\(\)/, '检测到可见聊天输入框时调用')
+  assert.match(main, /function classifyUiPageSnapshot\(snap\)/, '页面判定要抽成可回归的纯函数')
+  assert.match(main, /if \(composer\) return 'healthy'/, '检测到可见聊天输入框时判为健康')
+  assert.match(main, /markUiPageHealthy\(\)/, '健康路径要调用 markUiPageHealthy')
+
+  // 失败页取证必须走 frame 树，而不是只看主文档 + 同源 iframe：
+  // 冲突行可能落在跨源 / 嵌套 frame 或开放 shadow root 里。
+  assert.match(main, /async function collectPageSnapshot\(wc\)/, '要有按 frame 树取证的采集函数')
+  assert.match(main, /walk\(wc\.mainFrame\)/, '从 mainFrame 开始遍历')
+  assert.match(main, /f\.frames/, '递归遍历子 frame')
+  assert.match(main, /f\.executeJavaScript/, '每个 frame 单独执行只读取证脚本')
+  assert.match(main, /shadowRoot/, '开放 shadow root 的文本也要纳入')
+  assert.match(main, /new URL\(url\)\.origin === expectedOrigin/, '只信 DSH 同源 frame，第三方嵌入内容不能当启动证据')
+  assert.match(main, /f, i\) => i === 0 \|\| trusted\(f\)/, '主 frame 永远保留，其余按来源过滤')
+
+  assert.match(main, /const st = await inspectWebUiPage\(wc, seq\)/, 'did-finish-load 后要触发 frame 树取证')
+  assert.match(main, /seq !== pageInspectSeq/, '旧导航的延迟取证必须作废，不能污染新页面')
+  assert.match(main, /server\.activationIssues !== issuesRef/, '期间换服务世代时，旧页面证据作废')
+  assert.match(main, /verdict === 'healthy'\) markUiPageHealthy\(\)/,
+    '纯函数判健康时才解除“界面未就绪”，聊天里讨论报错不算失败')
+  assert.match(main, /setTimeout\(\(\) => \{ void tick\(\) \}, 3000\)/, '未定案时按 3 秒间隔继续取证')
   assert.match(main, /server\.uiPageHealthy = false/, '新世代/失败页都要重置或置否')
   assert.match(main, /degraded: critical\.length > 0 && server\.uiPageHealthy !== true/,
     '页面健康时 pluginUi.degraded 必须为 false，卡片不能挂着')
+})
+
+test('浏览器控制台证据：可选插件失败也能点名 usage-billing，但不擅自弹恢复页', () => {
+  const activation = require('../plugin-activation')
+  const server = { activationIssues: [], activationWindow: [], activationAutoOpened: false, uiPageHealthy: false }
+  const state = { pages: [], broadcasts: 0 }
+  const ctx = {
+    server,
+    pluginActivation: activation,
+    IGNORED_NPM_PLUGINS: new Set(['dsh-computer-use-win']),
+    ACTIVATION_WINDOW_LINES: 64,
+    log: () => {},
+    broadcastState: () => { state.broadcasts += 1 },
+    consoleIsOpen: () => false,
+    showConsolePage: (page) => { state.pages.push(page) },
+  }
+  vm.createContext(ctx)
+  const add = main.slice(main.indexOf('function addActivationIssues('), main.indexOf('function noteActivationEvidence('))
+  const note = main.slice(main.indexOf('function noteActivationEvidence('), main.indexOf('function markUiPageHealthy('))
+  vm.runInContext(add + '\n' + note, ctx)
+
+  // DSH 对「可选插件没激活」只 console.warn；失败页只渲染 required 条目，
+  // 冲突行往往只在这里出现 —— 这是 dshl 能点名用量与计费的最后一条证据链。
+  const warn = [
+    'web boot: warning: 1 entry did not activate',
+    '@kenz1117/dsh-ui-usage-billing: failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+  ].join('\n')
+  ctx.noteConsoleEvidence(warn)
+  assert.equal(server.activationIssues.length, 1, '控制台证据要进统一去重表')
+  const suspects = activation.attributeCulprits(server.activationIssues, [
+    { npm: '@kenz1117/dsh-ui-usage-billing', name: '用量与计费' },
+  ])
+  assert.equal(suspects.length, 1, '冲突行要归因到用量与计费')
+  assert.equal(state.pages.length, 0, '控制台证据不自动打开恢复页（界面可能完全正常）')
+  assert.ok(state.broadcasts > 0, '证据变化要立刻推给界面')
+
+  // 真实形态：插件把 register 异常吞掉，用 console.info 打印（本机实测日志原文）。
+  // 冲突行前面没有 warning 头，也不是条目格式 —— 必须单独抠冲突原文。
+  const swallowed = '[usage-billing] swallowed: shortcut-register-failed Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)'
+  ctx.noteConsoleEvidence(swallowed)
+  const swallowedSuspects = activation.attributeCulprits(server.activationIssues, [
+    { npm: '@kenz1117/dsh-ui-usage-billing', name: '用量与计费' },
+  ])
+  assert.equal(swallowedSuspects.length, 1, 'console.info 里吞掉的冲突也要能点名用量与计费')
+
+  // 页面失败证据走默认路径时仍然自动开页：两边的差别只在 opts.autoOpen
+  const pageEvidence = [
+    'HARNESS',
+    'Failed to load plugins',
+    'web boot: 1 required entry did not activate',
+    '@deepseek-ai/dsh-client-ui-workspace (required): failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+  ].join('\n')
+  ctx.noteActivationEvidence(pageEvidence)
+  assert.deepEqual(state.pages, ['recovery'], '真正的失败页证据照旧自动打开恢复页')
+
+  assert.match(main, /wc\.on\('console-message'/, '独立窗口/标签页都要接浏览器控制台')
+  assert.match(main, /noteConsoleEvidence\(text\)/, '控制台证据统一进 activationIssues，但不自动开页')
+  assert.doesNotMatch(main, /level !== 'warning' && level !== 'error'/, '不能过滤 info：插件会把异常吞进 console.info')
+  assert.match(main, /new URL\(src\)\.origin === new URL\(WEB_URL\)\.origin/, '只信 DSH 同源控制台消息')
+})
+
+test('页面判定纯函数：失败页/真实界面/加载中三种边界，以及“只 loading 不归因”', () => {
+  const activation = require('../plugin-activation')
+  const ctx = {}
+  vm.createContext(ctx)
+  const fn = main.slice(main.indexOf('function classifyUiPageSnapshot('), main.indexOf('async function inspectWebUiPage('))
+  vm.runInContext(fn, ctx)
+  const classify = (text, composer) => ctx.classifyUiPageSnapshot({ text, composer })
+
+  const failedPage = [
+    'HARNESS',
+    'Failed to load plugins',
+    'web boot: 1 required entry did not activate',
+    '@deepseek-ai/dsh-client-ui-workspace (required): failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+  ].join('\n')
+  assert.equal(classify(failedPage, false), 'failed', 'HARNESS 失败页必须判失败')
+  assert.equal(classify('', false), 'pending', '空页面不能下结论')
+  assert.equal(classify('HARNESS\nLoading plugins…', false), 'pending', '加载中保持 pending，继续轮询')
+  assert.equal(classify(failedPage, true), 'healthy', '有可见聊天输入框 = 真实界面，正文讨论报错不算失败')
+  assert.equal(classify('web boot: 2 entries did not activate\nfoo: failed', false), 'failed',
+    '没有 HARNESS 页头但有失败签名、且无输入框，同样判失败')
+
+  // 只有 loading / pending 原因时，不能把任何第三方插件说成元凶
+  const pendingOnly = [
+    'HARNESS',
+    'Failed to load plugins',
+    'web boot: 1 required entry did not activate',
+    '@deepseek-ai/dsh-client-ui-workspace (required): pending (waiting for service: uiWorkspace)',
+  ].join('\n')
+  const issues = activation.parseActivationIssues(pendingOnly)
+  assert.ok(issues.length >= 1, 'pending 本身仍是 required 失败证据')
+  const suspects = activation.attributeCulprits(issues, [
+    { npm: '@kenz1117/dsh-ui-usage-billing', name: '用量与计费' },
+  ])
+  assert.equal(suspects.length, 0, '没有冲突原文就不能点名插件')
+})
+
+test('归因候选覆盖 Profile dependencies：市场停用（不在 bundles）的元凶仍能点名', () => {
+  const ctx = {}
+  vm.createContext(ctx)
+  const fn = main.slice(main.indexOf('function profileBundlesOf('), main.indexOf('function writeProfileManifestAtomic('))
+  vm.runInContext(fn, ctx)
+  const manifest = {
+    dependencies: { '@kenz1117/dsh-ui-usage-billing': '^1.8.9', '@deepseek-ai/dsh': '0.2.3-alpha.2' },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh', 'dshmarket'] } },
+  }
+  const declared = ctx.profileDeclaredNpms(manifest)
+  assert.ok(declared.includes('@kenz1117/dsh-ui-usage-billing'),
+    'bundles 里没有、但 dependencies 里还在的插件必须参与归因候选')
+  assert.ok(declared.includes('dshmarket'), 'bundles 仍然保留')
+  assert.equal(new Set(declared).size, declared.length, '并集要去重')
+  assert.deepEqual([...ctx.profileDeclaredNpms(null)], [], 'manifest 缺失时返回空数组')
+
+  // 空/非法 dependencies 不能让状态计算抛错
+  assert.deepEqual([...ctx.profileDeclaredNpms({ dependencies: null, dsh: null })], [])
 })

@@ -1611,7 +1611,20 @@ function renderPluginRecovery(p) {
         lines.push('这些疑似冲突插件已经处于停用状态；如果界面仍未恢复，请重启 DSH，或使用安全模式。');
       }
     } else {
-      lines.push('未能从报错中唯一确定具体插件；可用安全模式先只加载官方插件。');
+      // 报错原文没点名插件（冲突行可能根本没渲染进可达的 DOM）：
+      // 不瞎猜归因，但把「Profile 中声明、且未停用」的第三方插件列为排查范围。
+      // Profile 声明 ≠ 已真正装载，所以这里只说「声明/未停用」，不称「已启用」。
+      const tp = (Array.isArray(ui.thirdPartyEnabled) ? ui.thirdPartyEnabled
+        : (Array.isArray(ui.thirdParty) ? ui.thirdParty : []))
+        .map((npm) => pluginDisplayName(npm)).filter(Boolean);
+      if (tp.length) {
+        const shown = tp.slice(0, 8);
+        lines.push('报错原文没有点名具体插件；Profile 中声明且未停用的第三方插件：'
+          + shown.join('、') + (tp.length > shown.length ? ` 等 ${tp.length} 个` : '')
+          + '。可在插件页逐个禁用排查，或用安全模式先只加载官方插件。');
+      } else {
+        lines.push('未能从报错中唯一确定具体插件；可用安全模式先只加载官方插件。');
+      }
     }
     if (offNames.length) lines.push(`已临时禁用 ${offNames.length} 个：${offNames.join('、')}。`);
     title.textContent = '插件导致界面未就绪';

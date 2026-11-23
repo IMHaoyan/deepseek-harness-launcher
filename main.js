@@ -925,6 +925,7 @@ const server = {
   activationIssues: [], // 本轮启动里解析出的问题条目（去重，随世代清空）
   activationAutoOpened: false, // required 插件失败时是否已自动打开恢复页（每世代只自动一次）
   uiPageHealthy: false, // 页面实际已加载真实 DSH 界面（有可见聊天输入框）→ 覆盖过期的激活证据
+  failureSnippetLogged: '', // 失败页缺冲突原文时已记录过的片段（同内容只记一次，避免刷屏）
   startPromise: null, // 进行中的启动：并发调用共用同一次启动，不再 spawn 第二个 dsh web 抢同一个端口
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
@@ -2314,7 +2315,7 @@ function haltAutoRestart(failure) {
 // ---------- 插件没生效的证据（DSH 只在 stderr 里说，解析见 plugin-activation.js） ----------
 
 /** 把解析出的条目并入本轮证据；返回是否有新增。 */
-function addActivationIssues(found) {
+function addActivationIssues(found, opts) {
   if (!Array.isArray(found) || !found.length) return false
   let changed = false
   for (const issue of found) {
@@ -2329,6 +2330,9 @@ function addActivationIssues(found) {
   broadcastState() // 插件卡片要立刻显示"未生效"，不能等下一次状态推送
   // UI 关键条目失败时 DSH 的界面就是一张 Failed to load plugins 页；只留主页面提示
   // 用户可能根本不知道要点「控制台」。每世代自动打开一次恢复页，把按插件禁用/安全模式摆到眼前。
+  // 浏览器控制台里的证据（可选插件失败只是 console.warn）默认不据此自动开页：
+  // 界面可能完全正常，真正的失败页证据到了再开（那条路径维持默认值）。
+  if (opts && opts.autoOpen === false) return true
   const criticalFailure = server.activationIssues.some((it) => pluginActivation.isUiCriticalIssue(it)
     && !IGNORED_NPM_PLUGINS.has(String((it && it.packageName) || '')))
   if (criticalFailure && !server.activationAutoOpened && !consoleIsOpen()) {
@@ -2339,6 +2343,46 @@ function addActivationIssues(found) {
     } catch { /* 打不开控制台也不影响证据记录，主页面警示卡仍可进入 */ }
   }
   return true
+}
+
+/**
+ * 从任意文本里抠出快捷键冲突原文（页面、stderr、浏览器控制台共用）。
+ * 冲突行可能被换行/截断，按空白归一化后再取，确保归因拿得到 usage-billing 这类元凶。
+ */
+function conflictEvidenceOf(text, kind) {
+  const body = String(text || '')
+  const at = body.indexOf('Conflicting shortcut defaults:')
+  if (at < 0) return null
+  const snippet = body.slice(at, at + 300).replace(/\s+/gu, ' ').trim()
+  if (!snippet) return null
+  return {
+    kind: kind || 'ui-page',
+    packageName: '',
+    entryId: '',
+    detail: 'failed: Error: ' + snippet,
+    services: [],
+    required: false,
+  }
+}
+
+/**
+ * 浏览器控制台证据（DSH 页面的 console.warn/error/info）：
+ * 不与 stderr 共用滑动窗口 —— 控制台消息本身是自包含的整段文本（含 warning 头与条目行），
+ * 直接解析比混进 stderr 窗口更不易串源。
+ *
+ * ★ 必须收 info：第三方插件常把异常「吞掉」后用 console.info 打印（例如用量与计费：
+ *   `[usage-billing] swallowed: shortcut-register-failed Conflicting shortcut defaults: …`）。
+ *   只收 warning/error 会漏掉这条唯一能把冲突归因到具体插件的证据。
+ */
+function noteConsoleEvidence(text) {
+  const body = String(text || '').slice(0, 4000)
+  let found = []
+  try { found = pluginActivation.parseActivationIssues(body) } catch { found = [] }
+  const conflict = conflictEvidenceOf(body, 'console')
+  if (conflict && !found.some((it) => String((it && it.detail) || '').includes(conflict.detail.slice(0, 80)))) {
+    found.push(conflict)
+  }
+  if (found.length) addActivationIssues(found, { autoOpen: false })
 }
 
 /**
@@ -2378,29 +2422,144 @@ function markUiPageHealthy() {
   return true
 }
 
+/**
+ * 读取页面当前文本（含同源/跨源/嵌套 iframe 与开放 shadow root）。
+ * 失败页的 required 列表与冲突行可能不在主 frame 的 innerText 里，必须按 frame 树逐层取证。
+ *
+ * 两段式：先只取每层可见文本（便宜，正常页面到此为止）；只有可见文本里出现失败签名，
+ * 才做第二次深取证（整页 textContent + shadow root，能捞到隐藏容器里的冲突行）。
+ * 这样正常界面的每次加载不会被全 DOM 序列化拖慢。
+ */
+const FRAME_TEXT_SCRIPT = `(function(){
+  var boot=document.querySelector('[data-dsh-boot]');
+  var root=boot||document.body;
+  var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');
+  return JSON.stringify({text:(root&&root.innerText)||'',boot:!!boot,composer:!!(c&&c.getClientRects().length)});
+})()`
+const FRAME_DEEP_SCRIPT = `(function(){
+  var out=[],total=0,limit=20000;
+  function push(s){if(!s||total>=limit)return;s=String(s);if(s.length>limit-total)s=s.slice(0,limit-total);out.push(s);total+=s.length;}
+  var boot=document.querySelector('[data-dsh-boot]');
+  var scope=boot||document.documentElement;
+  if(scope)push(scope.textContent);
+  // DSH 的启动失败页在 [data-dsh-boot] 容器里；容器存在时不再扫全页，
+  // 避免把聊天正文/第三方嵌入内容误当启动证据。
+  var els=boot?boot.querySelectorAll('*'):document.querySelectorAll('*');
+  for(var i=0;i<els.length&&total<limit;i++){var s=els[i].shadowRoot;if(s&&s.textContent)push(s.textContent);}
+  return out.join('\\n');
+})()`
+
+function pageFrames(wc) {
+  const frames = []
+  let expectedOrigin = ''
+  try { expectedOrigin = new URL(WEB_URL).origin } catch { expectedOrigin = '' }
+  // 只信 DSH 自己这一源的页面：第三方嵌入的 iframe 内容不能当作启动失败证据。
+  // about:blank 是 DSH 自己创建的空 frame（后续 document.write 继承来源），保留。
+  const trusted = (f) => {
+    let url = ''
+    try { url = String(f.url || '') } catch { return false }
+    if (!url || url === 'about:blank') return true
+    try { return !expectedOrigin || new URL(url).origin === expectedOrigin } catch { return false }
+  }
+  const walk = (f) => {
+    if (!f) return
+    frames.push(f)
+    let kids = null
+    try { kids = f.frames } catch { kids = null }
+    if (kids && typeof kids[Symbol.iterator] === 'function') for (const c of kids) walk(c)
+  }
+  try { walk(wc.mainFrame) } catch { /* noop */ }
+  return frames.filter((f, i) => i === 0 || trusted(f))
+}
+
+async function collectPageSnapshot(wc) {
+  const frames = pageFrames(wc)
+  let text = ''
+  let composer = false
+  for (const f of frames) {
+    try {
+      const snap = JSON.parse(String(await f.executeJavaScript(FRAME_TEXT_SCRIPT, false) || '{}'))
+      if (snap.text) text += snap.text + '\n'
+      if (snap.composer) composer = true
+      if (text.length > 60000) break
+    } catch { /* frame 已销毁 / 执行失败：跳过这一层 */ }
+  }
+  // 失败签名在可见文本里 → 深取证补齐隐藏容器/影子树里的原文（冲突行常被藏在折叠块里）；
+  // 可见文本几乎没有内容时也深取一次：失败页整个落在 shadow root 里的情况不能漏。
+  if (text.trim().length < 50 || /Failed to load plugins|did not activate|Conflicting shortcut defaults/iu.test(text)) {
+    for (const f of frames) {
+      try {
+        const deep = String(await f.executeJavaScript(FRAME_DEEP_SCRIPT, false) || '')
+        if (deep) text += deep + '\n'
+        if (text.length > 60000) break
+      } catch { /* noop */ }
+    }
+  }
+  return { text, composer }
+}
+
+// 页面取证的世代：每次 did-finish-load 自增，延迟读取若已跨过一次导航就作废，
+// 否则重启/刷新后旧页面的文本会污染新世代的状态。
+let pageInspectSeq = 0
+
+/**
+ * 页面取证快照 → 结论（纯函数，便于回归测试三种界面的判定边界）：
+ *   failed  = 有失败签名且没有可见聊天输入框
+ *   healthy = 有可见聊天输入框（真实界面已加载；哪怕正文正在讨论这些报错）
+ *   pending = 页面还在加载/没有可判定证据（调用方继续有界轮询）
+ */
+function classifyUiPageSnapshot(snap) {
+  const text = String((snap && snap.text) || '')
+  const composer = !!(snap && snap.composer)
+  if (!text) return 'pending'
+  const hit = text.indexOf('Failed to load plugins') >= 0
+    || (text.indexOf('web boot:') >= 0 && text.indexOf('did not activate') >= 0)
+    || text.indexOf('Conflicting shortcut defaults') >= 0
+  // 唯一的判定闸门是「有没有可见聊天输入框」：失败页没有输入框；真实界面有。
+  // 这样用户在聊天里粘贴同样的报错时，绝不会被当成启动失败。
+  if (composer) return 'healthy'
+  if (hit) return 'failed'
+  return 'pending'
+}
+
+/**
+ * @returns {'failed'|'healthy'|'pending'|'stale'} 供调用方决定是否继续轮询
+ */
+async function inspectWebUiPage(wc, seq) {
+  if (!wc || wc.isDestroyed()) return 'stale'
+  if (seq !== undefined && seq !== pageInspectSeq) return 'stale'
+  const issuesRef = server.activationIssues
+  let snap = { text: '', composer: false }
+  try { snap = await collectPageSnapshot(wc) } catch { return 'pending' }
+  if (seq !== undefined && seq !== pageInspectSeq) return 'stale'
+  if (server.activationIssues !== issuesRef) return 'stale' // 期间换了服务世代：证据已作废
+  if (wc.isDestroyed()) return 'stale'
+  const verdict = classifyUiPageSnapshot(snap)
+  if (verdict === 'failed') inspectWebBootFailure(snap.text)
+  else if (verdict === 'healthy') markUiPageHealthy()
+  return verdict
+}
+
 function inspectWebBootFailure(text) {
   const body = String(text || '')
-  if (!body || !/Failed to load plugins|did not activate/iu.test(body)) return false
+  if (!body || !/Failed to load plugins|did not activate|Conflicting shortcut defaults/iu.test(body)) return false
   const wasHealthy = server.uiPageHealthy === true
   server.uiPageHealthy = false
   let found = []
   try { found = pluginActivation.parseActivationIssues(body) } catch { found = [] }
   // 页面可能把 required 列表与冲突行拆在不同块里，或在中间夹了非条目行；
-  // 单独扫一遍冲突原文（按空白归一化，避免长行换行把 usage-billing 截掉），
-  // 确保归因仍能拿到 usage-billing 这类元凶。
-  const conflictAt = body.indexOf('Conflicting shortcut defaults:')
-  if (conflictAt >= 0) {
-    const snippet = body.slice(conflictAt, conflictAt + 300).replace(/\s+/gu, ' ').trim()
-    const covered = !!snippet && found.some((it) => String(it.detail || '').includes(snippet.slice(0, 60)))
-    if (!covered) {
-      found.push({
-        kind: 'ui-page',
-        packageName: '',
-        entryId: '',
-        detail: 'failed: Error: ' + snippet,
-        services: [],
-        required: false,
-      })
+  // 单独扫一遍冲突原文，确保归因仍能拿到 usage-billing 这类元凶。
+  const conflict = conflictEvidenceOf(body, 'ui-page')
+  if (conflict) {
+    const covered = found.some((it) => String(it.detail || '').includes(conflict.detail.slice(0, 80)))
+    if (!covered) found.push(conflict)
+  } else if (/Failed to load plugins/iu.test(body)) {
+    // 诊断用：失败页在场却没有冲突原文，说明冲突信息不在可达的 frame/shadow DOM 里。
+    // 记录一段归一化片段，便于对照用户设备上的真实页面结构。
+    const snip = body.replace(/\s+/gu, ' ').trim().slice(0, 300)
+    if (snip && snip !== server.failureSnippetLogged) {
+      server.failureSnippetLogged = snip
+      log('插件失败页：未找到冲突原文，页面片段=' + snip)
     }
   }
   if (!found.length) {
@@ -2462,6 +2621,7 @@ function resetActivationEvidence() {
   server.activationIssues = []
   server.activationAutoOpened = false
   server.uiPageHealthy = false
+  server.failureSnippetLogged = ''
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
@@ -4091,6 +4251,40 @@ function profileBundlesOf(manifest) {
   return Array.isArray(b) ? b.filter((n) => typeof n === 'string' && n) : []
 }
 
+/**
+ * Profile 声明的第三方包（bundle 列表 ∪ dependencies）。
+ *
+ * 归因候选必须用并集：插件市场停用的插件会从 bundles 里摘掉、但依赖仍在 package.json 里，
+ * 而冲突报错仍可能点名它（它就是没被真正卸载）。只看 bundles 会让这类元凶变成
+ * 「未能从报错中唯一确定具体插件」——2026-11-23 现场日志里的用量与计费就是这个形态。
+ * 安全模式的停用范围仍以 bundles 为准（只有 bundles 能通过改 package.json 停掉）。
+ */
+function profileDeclaredNpms(manifest) {
+  const bundles = profileBundlesOf(manifest)
+  let deps = []
+  try { deps = Object.keys((manifest && manifest.dependencies) || {}) } catch { deps = [] }
+  return Array.from(new Set([...bundles, ...deps].filter((n) => typeof n === 'string' && n)))
+}
+
+/**
+ * Profile 里所有真实存在的包名（dependencies ∪ bundles ∪ cordis.patch.yml 的 insert 行）。
+ * 判据直接复用 dsh-plugin-compat.readProfileTargets —— 与插件页清单、升级预判同一份事实来源。
+ * 按两个文件的 mtime 缓存：pluginUiState 每次状态推送都会被调用，不能每次都重读 YAML。
+ */
+let profileTargetsCache = { key: '', names: [] }
+function profileTargetNamesCached() {
+  const stamp = (f) => { try { return fs.statSync(f).mtimeMs } catch { return 0 } }
+  const key = stamp(DSH_PROFILE_PACKAGE) + '|' + stamp(DSH_PROFILE_PATCH)
+  if (profileTargetsCache.key === key) return profileTargetsCache.names
+  let names = []
+  try {
+    const targets = pluginCompat.readProfileTargets(DSH_PROFILE_DIR) || []
+    names = targets.map((t) => String((t && t.name) || '')).filter(Boolean)
+  } catch { names = [] }
+  profileTargetsCache = { key, names }
+  return names
+}
+
 function writeProfileManifestAtomic(manifest) {
   const tmp = `${DSH_PROFILE_PACKAGE}.tmp-${process.pid}-${Date.now()}`
   fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + '\n')
@@ -4108,8 +4302,15 @@ function pluginUiState() {
   const manifest = readProfileManifestSafe()
   const bundles = profileBundlesOf(manifest)
   const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
+  // 归因/排查范围用「Profile 声明」而不是只看 bundles：市场停用的插件仍留在 dependencies 里，
+  // 冲突报错点名它时必须能说出名字（见 profileDeclaredNpms 的说明）。
+  const declaredThirdParty = Array.from(new Set([
+    ...profileDeclaredNpms(manifest),
+    ...profileTargetNamesCached(),
+  ])).filter((n) => !safeModeKeepsBundle(n))
   const isDisabled = (npm) => { try { return pluginSwitch.isDisabled(npm) === true } catch { return false } }
   const canToggle = (npm) => { try { return pluginSwitch.canToggle(npm) === true } catch { return false } }
+  const thirdPartyEnabled = declaredThirdParty.filter((n) => !isDisabled(n))
   const q = Config.pluginQuarantine
   const removedFromBundles = new Set((q && Array.isArray(q.removedFromBundles)) ? q.removedFromBundles : [])
   const quarantined = new Set([
@@ -4122,7 +4323,7 @@ function pluginUiState() {
   }
   // 候选不排除“已经被隔离/手动停用”的包：冲突报错仍然点名它时，卡片必须能说出
   // “疑似是它，但已经停用了”，而不是因为停用就从清单里消失、变成“未能确定”。
-  const candidateNames = Array.from(new Set([...thirdParty, ...quarantined]))
+  const candidateNames = Array.from(new Set([...thirdParty, ...declaredThirdParty, ...quarantined]))
     .filter((npm) => !IGNORED_NPM_PLUGINS.has(npm))
   const candidates = candidateNames.map((npm) => ({
     npm,
@@ -4161,6 +4362,8 @@ function pluginUiState() {
       critical: pluginActivation.isUiCriticalIssue(it),
     })),
     thirdParty,
+    // “Profile 声明了但当前处于停用状态”的不算启用：界面的排查范围只能列真正在跑的插件
+    thirdPartyEnabled,
     canSafeMode: thirdParty.length > 0,
     suspects,
     canBatchDisable: suspects.some((s) => s.actionable),
@@ -6990,6 +7193,21 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
   const wc = view.webContents
   const markBlank = (b) => { tab.blank = b; webPushState() }
   attachContextMenu(wc) // 页面正文同样需要剪切/复制/粘贴/全选；Electron 没有默认菜单
+  // 浏览器控制台是第三证据源：DSH 对「可选插件没激活」只 console.warn（web boot: warning:），
+  // 第三方插件还会把异常吞掉后用 console.info 打印（用量与计费就是这样暴露冲突的）。
+  // 不限日志级别，只按失败签名过滤；只信 DSH 同源消息，不落用户页面正文，也不触发自动开恢复页。
+  wc.on('console-message', (details, _level, message) => {
+    const text = String((details && details.message) || message || '')
+    if (!text) return
+    const src = String((details && details.sourceId) || '')
+    if (src && src !== 'about:blank') {
+      let sameOrigin = false
+      try { sameOrigin = new URL(src).origin === new URL(WEB_URL).origin } catch { sameOrigin = false }
+      if (!sameOrigin) return
+    }
+    if (!/Conflicting shortcut defaults|did not activate|Failed to load plugins/iu.test(text)) return
+    try { noteConsoleEvidence(text) } catch { /* noop */ }
+  })
   // 外部链接（target=_blank / window.open）→ 统一交给系统默认浏览器打开，避免被 Electron 吞掉
   wc.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) { try { shell.openExternal(url) } catch { /* noop */ } }
@@ -7116,48 +7334,24 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       }
     }
     // 失败页兜底：required 激活失败不一定写 stderr，页面原文是第二证据来源。
-    // 只读页面（含同源 iframe）的文本，不改 DSH 页面；正常页面没有失败签名，不会误判。
+    // 按 frame 树逐层只读取证（含同源/嵌套 iframe 与开放 shadow root），不改 DSH 页面；
+    // 正常页面没有失败签名，不会误判。
+    //
+    // 激活失败可能在 did-finish-load 之后才渲染出来（插件加载慢的机器尤甚），
+    // 所以用有界轮询而不是固定两次延迟：拿到「失败/健康」结论就停，最多 90 秒。
     if (!SELF_TEST) {
       const url = wc.getURL() || ''
       if (url.startsWith(WEB_URL) || url === WEB_URL) {
-        const inspect = () => {
-          if (wc.isDestroyed()) return
-          try {
-            // 只在“失败页”采信：有失败签名且**没有聊天输入框**。
-            // 正常 DSH 页面里用户可能正好在聊天中粘贴这段报错，不能把正文当成启动失败；
-            // 反过来，页面有可见聊天输入框且没有失败签名 = 真实界面已加载，清掉过期的“未就绪”判定。
-            wc.executeJavaScript(`(function(){
-              var b=document.body;if(!b)return '';
-              var texts=[b.innerText||'',(document.documentElement&&document.documentElement.textContent)||''];
-              // 失败页可能被包在同源 iframe（DSH 的 boot 错误页）里；顶层 innerText 会是空的
-              var frames=document.querySelectorAll('iframe');
-              var iframeComposer=false;
-              for(var i=0;i<frames.length;i++){
-                try{var d=frames[i].contentDocument;if(d){texts.push(d.body?d.body.innerText:'');texts.push(d.documentElement?d.documentElement.textContent:'');var fc=d.querySelector&&d.querySelector('textarea,[contenteditable=true],input[type=text]');if(fc&&fc.getClientRects().length)iframeComposer=true;}}catch(e){}
-              }
-              var all=texts.join('\\n');
-              var hit=all.indexOf('Failed to load plugins')>=0||(all.indexOf('web boot:')>=0&&all.indexOf('did not activate')>=0)||all.indexOf('Conflicting shortcut defaults')>=0;
-              var failurePage=/^HARNESS\\s+Failed to load plugins/i.test(all.trim())||all.indexOf('web boot:')>=0;
-              var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');
-              var composer=iframeComposer||!!(c&&c.getClientRects().length);
-              if(failurePage)return JSON.stringify({failed:true,text:all.slice(0,20000)});
-              if(hit&&!composer)return JSON.stringify({failed:true,text:all.slice(0,20000)});
-              if(!hit&&composer)return JSON.stringify({healthy:true});
-              return '';
-            })()`)
-              .then((raw) => {
-                if (wc.isDestroyed() || !raw) return
-                let st = null
-                try { st = JSON.parse(String(raw)) } catch { st = null }
-                if (st && st.failed) inspectWebBootFailure(st.text)
-                else if (st && st.healthy) markUiPageHealthy()
-              })
-              .catch(() => { /* noop */ })
-          } catch { /* noop */ }
+        const seq = ++pageInspectSeq
+        const startedAt = Date.now()
+        const tick = async () => {
+          const st = await inspectWebUiPage(wc, seq)
+          if (st !== 'pending') return
+          if (seq !== pageInspectSeq || wc.isDestroyed()) return
+          if (Date.now() - startedAt > 90000) return
+          setTimeout(() => { void tick() }, 3000)
         }
-        inspect()
-        // SPA 可能 did-finish-load 后才挂载失败页；补一次延迟读取
-        setTimeout(inspect, 2000)
+        void tick()
       }
     }
   })
