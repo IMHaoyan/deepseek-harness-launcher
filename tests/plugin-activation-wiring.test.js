@@ -21,6 +21,12 @@ test('主进程：stderr 逐行增量解析，且随世代清空', () => {
   assert.match(main, /server\.activationIssues = \[\]/, '新世代要清掉上一轮的证据')
   assert.match(main, /server\.activationWindow = \[\]/, '滑动窗口也要随世代清空')
   assert.match(main, /const ACTIVATION_WINDOW_LINES = \d+/, '窗口大小要有名字（warning 头 + 条目行一起看）')
+  assert.match(main, /server\.activationAutoOpened = false/, '自动打开恢复页要按世代记账')
+  assert.match(main, /criticalFailure && !server\.activationAutoOpened && !consoleIsOpen\(\)/,
+    'UI 关键插件失败且控制台没开时，自动把恢复页摆到用户面前')
+  assert.match(main, /pluginActivation\.isUiCriticalIssue\(it\)/,
+    '只有 required / UI 服务 / 快捷键冲突才算界面未就绪')
+  assert.match(main, /showConsolePage\('recovery'\)/, '恢复页是插件冲突的唯一写操作入口')
 })
 
 test('换了一代服务也要清证据：自重启认领 / 外部接管都不能留着上一轮的 ⚠', () => {

@@ -21,10 +21,16 @@
 const STAMP_RE = /^\[[^\]]*\]\s*/u
 /** `dsh: skipping profile bundle "<pkg>": <reason>`（前缀是可执行名，不写死成 dsh）。 */
 const SKIP_RE = /^[^\s:]+:\s*skipping profile bundle "(?<pkg>[^"]+)":\s*(?<reason>.+)$/u
-/** `dsh: warning: 1 entry did not activate` / `2 entries did not activate`。 */
-const WARNING_RE = /^[^\s:]+:\s*warning:\s*\d+\s+entr(?:y|ies) did not activate\s*$/u
-/** 紧随 warning 头之后的一行：`<entry id> (<package>): <detail>`。 */
-const ENTRY_RE = /^(?<id>\S+)\s+\((?<pkg>[^)]+)\):\s*(?<detail>.*)$/u
+/** `dsh: warning: 1 entry did not activate`（旧格式）或 `web boot: 2 required entries did not activate`（0.2.x 格式）。 */
+const WARNING_RE = /^(?:.*?:\s*)?(?:warning:\s*)?\d+\s+(?:required\s+)?entr(?:y|ies) did not activate\s*$/u
+/** `<entry id> (<package>): <detail>`（旧）或 `<package> (required): <detail>` / `<package>: <detail>`（0.2.x）。 */
+const ENTRY_RE = /^(?<first>[^\s:()]+)\s*(?:\((?<paren>[^)]+)\))?\s*:\s*(?<detail>.*)$/u
+/** 括号里是角色而不是包名（0.2.x 的 `(required)`）。 */
+const ENTRY_ROLE_RE = /^(?:required|optional|entry|entries)$/iu
+/** 只有这些原因才认成激活条目，避免把紧跟其后的 `dsh: ready` 之类日志也吞进来。 */
+const ACTIVATION_DETAIL_RE = /^(?:pending\s*\(|failed\b|error\b)/iu
+/** 条目之间可能夹着堆栈（`at Fiber…`）；堆栈行不结束条目块。 */
+const STACK_LINE_RE = /^at\s/u
 /** `pending (waiting for service: sessions)` / `pending (waiting for services: a, b)`。 */
 const PENDING_RE = /pending \(waiting for services?:\s*(?<services>[^)]*)\)/u
 /** `Plugin <pkg>@<ver> is incompatible with dsh <ver>: peerDependencies {…}`。 */
@@ -75,16 +81,28 @@ function parseActivationIssues(text) {
       continue
     }
     if (WARNING_RE.test(line)) { expectEntries = true; continue }
+    // 旧格式的条目后面会跟一段堆栈；堆栈不是新日志块，别让它提前结束解析
+    if (expectEntries && STACK_LINE_RE.test(line)) continue
     const entry = ENTRY_RE.exec(line)
     if (entry && expectEntries) {
       const detail = String(entry.groups.detail || '').trim()
+      // 0.2.x 的条目行没有括号，紧跟着的普通日志也长成 `x: y`；只认真正的激活原因
+      if (!ACTIVATION_DETAIL_RE.test(detail)) { expectEntries = false; continue }
+      const first = String(entry.groups.first || '').trim()
+      const paren = String(entry.groups.paren || '').trim()
+      const parenIsPackage = !!paren && !ENTRY_ROLE_RE.test(paren)
+      // 旧格式：`<entry id> (<package>): …`；0.2.x：`<package> (required): …` / `<package>: …`
+      const packageName = parenIsPackage ? paren : first
+      if (!packageName) { expectEntries = false; continue }
       const pending = PENDING_RE.exec(detail)
       out.push({
         kind: 'inactive',
-        packageName: entry.groups.pkg.trim(),
-        entryId: entry.groups.id.trim(),
+        packageName,
+        entryId: first,
         detail,
         services: pending ? pending.groups.services.split(',').map((s) => s.trim()).filter(Boolean) : [],
+        // 0.2.x 的 `(required)` 是“这条没起来会让界面加载失败”的唯一现成信号
+        required: /^required$/iu.test(paren),
       })
       continue
     }
@@ -297,6 +315,19 @@ function mentionsPackage(detail, npm, opts) {
 }
 
 /**
+ * 这条未激活证据是否会让 DSH 界面加载失败（而不是服务照常跑、只是某个 MCP/插件没起来）。
+ * 判据只认三类硬信号：0.2.x 的 `(required)`、UI 服务依赖、快捷键冲突。
+ * 不能把所有 pending/failed 都算进去 —— mcp-json / 电脑操作这类条目失败时 Web UI 是好的。
+ */
+function isUiCriticalIssue(issue) {
+  if (!issue) return false
+  if (issue.required === true) return true
+  if (/Conflicting shortcut defaults/iu.test(String(issue.detail || ''))) return true
+  return Array.isArray(issue.services)
+    && issue.services.some((s) => /^ui(?:Workspace|Conversation)$/u.test(String(s || '')))
+}
+
+/**
  * 在证据列表里找某个包的条目。
  * @param {Array} issues 证据列表
  * @param {string} packageName 包名
@@ -318,6 +349,7 @@ module.exports = {
   packageAliases,
   attributeCulprits,
   mentionsPackage,
+  isUiCriticalIssue,
   // 纯函数（测试用）
   stripStamp,
   shortDetail,

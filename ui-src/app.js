@@ -412,15 +412,20 @@ function render(state) {
     // 服务起来了 ≠ 插件起来了：DSH 对「bundle 被跳过 / 行没激活」只写 stderr、退出码 0，
     // 所以它既不是启动失败、也不会有任何主动提示 —— 插件就那么静默地没工作。
     // 有 required 插件失败时 DSH 会直接给一张 Failed to load plugins 页：这条必须升级成
-    // "界面未就绪"，并把恢复页的主操作（安全模式）露出来，不能只留一行中性提示。
-    let pluginDegraded = false;
+    // "界面未就绪"，并把恢复页的主操作（按插件禁用 / 安全模式）露出来，不能只留一行中性提示。
+    // ★ 不能只在 notActive.length 里判断：失败的常是 DSH 自带的 @deepseek-ai/* UI 包，
+    //   它们在插件页没有卡片，notActive 会是空的，但 pluginUi.degraded 已经是 true。
+    const pluginDegraded = !!(state.pluginUi && state.pluginUi.degraded);
     // 忽略清单里的包（如电脑操作）即使装着并在插件页显示真实状态，也不拉高主页面的全局警示
     const notActive = (state.plugins || []).filter((p) => p && p.activation && !p.ignored);
-    if (notActive.length) {
-      pluginDegraded = !!(state.pluginUi && state.pluginUi.degraded);
-      const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
-      notes.push(`${pluginDegraded ? 'DSH 界面未就绪：' : ''}${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
-        + `${notActive.length > 3 ? ' 等' : ''} → ${pluginDegraded ? '可在恢复页用安全模式处理' : '可在「插件管理」页查看'}`);
+    if (notActive.length || pluginDegraded) {
+      if (notActive.length) {
+        const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
+        notes.push(`${pluginDegraded ? 'DSH 界面未就绪：' : ''}${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
+          + `${notActive.length > 3 ? ' 等' : ''} → ${pluginDegraded ? '可在恢复页禁用疑似冲突插件或使用安全模式' : '可在「插件管理」页查看'}`);
+      } else {
+        notes.push('DSH 界面未就绪：插件冲突导致页面加载失败 → 可在恢复页禁用疑似冲突插件或使用安全模式');
+      }
     }
     crashEl.classList.toggle('env-warning', alert || pluginDegraded); // 插件冲突也要用警示卡，而不是中性一行
     crashEl.classList.toggle('hidden', notes.length === 0);
@@ -1554,8 +1559,18 @@ function renderPluginRecovery(p) {
   const allQuarantineNames = pluginQuarantineNames(quarantine);
   if (dot) dot.className = 'dot' + (ui.degraded ? ' stopped' : ' running');
   if (ui.degraded) {
-    const names = (ui.issues || []).slice(0, 4).map((x) => x.packageName || x.entryId).filter(Boolean);
-    const lines = [`${ui.count || 0} 个插件未激活${names.length ? '：' + names.join('、') : ''}；继续重启不会改变。`];
+    const allIssues = Array.isArray(ui.issues) ? ui.issues : [];
+    const requiredIssues = allIssues.filter((x) => x && x.required);
+    const criticalIssues = allIssues.filter((x) => x && x.critical);
+    const listed = (requiredIssues.length ? requiredIssues
+      : (criticalIssues.length ? criticalIssues : allIssues)).slice(0, 4);
+    const names = listed.map((x) => x.packageName || x.entryId).filter(Boolean);
+    const requiredCount = Number(ui.requiredCount) || requiredIssues.length;
+    const criticalCount = Number(ui.criticalCount) || criticalIssues.length;
+    const countText = requiredCount
+      ? `${requiredCount} 个界面必需插件未激活`
+      : (criticalCount ? `${criticalCount} 个界面相关插件未激活` : `${ui.count || allIssues.length || 0} 个插件未激活`);
+    const lines = [`${countText}${names.length ? '：' + names.join('、') : ''}；继续重启不会改变。`];
     if (suspects.length) {
       lines.push('根据报错，疑似冲突插件：' + suspects.map(pluginSuspectLine).join('；') + '。');
       lines.push(`将只禁用以上 ${suspects.length} 个疑似冲突插件，其他插件不受影响；会先备份 Profile，之后可整体恢复。`);

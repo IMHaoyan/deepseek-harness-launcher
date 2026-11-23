@@ -923,6 +923,7 @@ const server = {
   // 逐行增量解析：errTail 是 60 行环形缓冲，几秒后就可能把启动期那几行挤掉。
   activationWindow: [], // 最近几行 stderr 的滑动窗口（warning 头 + 紧随的条目行要一起看）
   activationIssues: [], // 本轮启动里解析出的问题条目（去重，随世代清空）
+  activationAutoOpened: false, // required 插件失败时是否已自动打开恢复页（每世代只自动一次）
   startPromise: null, // 进行中的启动：并发调用共用同一次启动，不再 spawn 第二个 dsh web 抢同一个端口
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
@@ -2248,7 +2249,7 @@ let readySince = 0 // 本轮服务就绪时刻（0 = 未就绪）
 // 这里留一份内存副本，用于「通知里写清原因」与「确定性失败判定」。
 const ERR_TAIL_LINES = 60
 // 激活证据的滑动窗口：warning 头 + 紧随的条目行要一起看（条目数与插件数同阶，8 行足够）
-const ACTIVATION_WINDOW_LINES = 8
+const ACTIVATION_WINDOW_LINES = 64
 // 同一签名的失败连续出现几次（{ signature, count }）；见 boot-failure.js
 let lastBootFailure = null
 let lastBootFailureInfo = null // 最近一次失败的分类结果（给界面/通知展示）
@@ -2336,6 +2337,17 @@ function noteActivationEvidence(line) {
   log('插件未生效（服务照常运行，重启不会改变）：'
     + server.activationIssues.map((it) => it.packageName + ' → ' + it.detail).join('；'))
   broadcastState() // 插件卡片要立刻显示"未生效"，不能等下一次状态推送
+  // required 条目失败时 DSH 的界面就是一张 Failed to load plugins 页；只留主页面提示
+  // 用户可能根本不知道要点「控制台」。每世代自动打开一次恢复页，把按插件禁用/安全模式摆到眼前。
+  const criticalFailure = server.activationIssues.some((it) => pluginActivation.isUiCriticalIssue(it)
+    && !IGNORED_NPM_PLUGINS.has(String((it && it.packageName) || '')))
+  if (criticalFailure && !server.activationAutoOpened && !consoleIsOpen()) {
+    try {
+      showConsolePage('recovery')
+      server.activationAutoOpened = true
+      log('插件冲突：自动打开恢复页')
+    } catch { /* 打不开控制台也不影响证据记录，主页面警示卡仍可进入 */ }
+  }
 }
 
 /**
@@ -2369,6 +2381,7 @@ function activationIssueOf(packageName, opts) {
 function resetActivationEvidence() {
   server.activationWindow = []
   server.activationIssues = []
+  server.activationAutoOpened = false
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
@@ -4035,14 +4048,20 @@ function pluginUiState() {
     .filter((s) => s.actionable)
   const q = Config.pluginQuarantine
   const removedFromBundles = new Set((q && Array.isArray(q.removedFromBundles)) ? q.removedFromBundles : [])
+  const critical = issues.filter((it) => pluginActivation.isUiCriticalIssue(it))
+  const requiredCount = issues.filter((it) => it.required === true).length
   return {
-    degraded: issues.length > 0,
+    degraded: critical.length > 0,
     count: issues.length,
+    criticalCount: critical.length,
+    requiredCount,
     issues: issues.slice(0, 8).map((it) => ({
       packageName: it.packageName || '',
       entryId: it.entryId || '',
       detail: it.detail || '',
       services: Array.isArray(it.services) ? it.services : [],
+      required: it.required === true,
+      critical: pluginActivation.isUiCriticalIssue(it),
     })),
     thirdParty,
     canSafeMode: thirdParty.length > 0,

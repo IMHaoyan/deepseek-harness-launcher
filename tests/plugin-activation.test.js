@@ -257,3 +257,69 @@ test('attributeCulprits：两个作用域包短名相同 → 短名点名不归�
   const full = [{ ...short[0], detail: 'failed: @a/foo-bar exploded' }]
   assert.deepEqual(activation.attributeCulprits(full, candidates).map((f) => f.npm), ['@a/foo-bar'])
 })
+
+test('0.2.x 格式：web boot 头 + 包名(required) / 包名无括号', () => {
+  const text = [
+    'web boot: 2 required entries did not activate',
+    '@deepseek-ai/dsh-client-ui-sidebar (required): pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-conversation: pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-workspace: failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+    'dsh-mcp-connector: pending (waiting for service: conversation)',
+    '@deepseek-ai/dsh-client-ui-directory-picker-native: pending (waiting for service: uiWorkspace)',
+    'dsh: ready',
+  ].join('\n')
+  const issues = activation.parseActivationIssues(text)
+  assert.equal(issues.length, 5, '末尾的 dsh: ready 不能被当成激活条目')
+  const by = (p) => issues.find((i) => i.packageName === p)
+  assert.equal(by('@deepseek-ai/dsh-client-ui-sidebar').entryId, '@deepseek-ai/dsh-client-ui-sidebar')
+  assert.deepEqual(by('@deepseek-ai/dsh-client-ui-sidebar').services, ['uiWorkspace'])
+  assert.equal(by('@deepseek-ai/dsh-client-ui-sidebar').required, true, '(required) 要保留')
+  assert.equal(by('@deepseek-ai/dsh-client-ui-workspace').required, false, '没有角色标记的条目不能猜成 required')
+  assert.deepEqual(by('dsh-mcp-connector').services, ['conversation'])
+  assert.match(by('@deepseek-ai/dsh-client-ui-workspace').detail, /Conflicting shortcut defaults/)
+  assert.equal(issues.some((i) => i.packageName === 'dsh'), false)
+})
+
+test('0.2.x 真实报错：能从 Failed to load plugins 原文归因到 usage-billing', () => {
+  const text = [
+    'web boot: 2 required entries did not activate',
+    '@deepseek-ai/dsh-client-ui-sidebar (required): pending (waiting for service: uiWorkspace)',
+    '@deepseek-ai/dsh-client-ui-chat (required): pending (waiting for services: uiWorkspace, uiConversation)',
+    '@deepseek-ai/dsh-client-ui-workspace: failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard (desktop:macos)',
+    'dsh-mcp-connector: pending (waiting for service: conversation)',
+  ].join('\n')
+  const issues = activation.parseActivationIssues(text)
+  const found = activation.attributeCulprits(issues, [
+    { npm: USAGE, name: '用量与计费' },
+    { npm: 'dsh-better-sidebar', name: '侧边栏' },
+  ])
+  assert.equal(found.length, 1)
+  assert.equal(found[0].npm, USAGE)
+})
+
+test('旧格式：条目之间夹堆栈也继续解析，Error: 原因不再被漏掉', () => {
+  const text = [
+    'dsh: warning: 2 entries did not activate',
+    'x (dsh-a): Error: cannot get property "root" without inject',
+    '    at Fiber.<anonymous> (file:///x.js:1:2)',
+    '    at async boot (file:///boot.js:3:4)',
+    'y (dsh-b): failed to import',
+  ].join('\n')
+  const issues = activation.parseActivationIssues(text)
+  assert.deepEqual(issues.map((i) => i.packageName), ['dsh-a', 'dsh-b'])
+  assert.match(issues[0].detail, /^Error: cannot get property/)
+})
+
+test('isUiCriticalIssue：required / UI 服务 / 快捷键冲突才算界面未就绪', () => {
+  assert.equal(activation.isUiCriticalIssue({ required: true }), true)
+  assert.equal(activation.isUiCriticalIssue({
+    detail: 'failed: Error: Conflicting shortcut defaults: session.toggleRead and usage-billing.open-dashboard',
+  }), true)
+  assert.equal(activation.isUiCriticalIssue({ services: ['uiWorkspace'] }), true)
+  assert.equal(activation.isUiCriticalIssue({ services: ['uiConversation'] }), true)
+  assert.equal(activation.isUiCriticalIssue({ services: ['conversation'] }), false)
+  assert.equal(activation.isUiCriticalIssue({
+    detail: 'Error: cannot get property "root" without inject',
+  }), false)
+  assert.equal(activation.isUiCriticalIssue(null), false)
+})
