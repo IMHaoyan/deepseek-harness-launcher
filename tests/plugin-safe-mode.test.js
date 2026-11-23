@@ -117,7 +117,14 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(html, /id="recoverySlotsLatest"/, '最新检查点要常驻可见，不能全部收起')
   assert.match(app, /fillSlots\(\$\('recoverySlotsLatest'\)/, '第一条进常驻区，其余进折叠区')
   assert.match(app, /还有 \$\{rest\.length\} 条/, '折叠标题要说明还有多少条')
-  assert.match(read('ui-src/console.css'), /--console-nav-w: 420px/, '侧栏导航宽度放大到 1.5 倍（280 → 420）')
+  const css = read('ui-src/console.css')
+  assert.match(css, /--console-nav-w: 280px/, '侧栏宽度保持原样')
+  assert.match(css, /\.console-nav-item \{[\s\S]{0,220}min-height: 54px/, '导航行高度放大到 1.5 倍（36 → 54）')
+  assert.match(app, /setRecoveryBusy\(true\)/, '禁用并重启期间要锁住恢复动作')
+  assert.match(app, /for \(const id of RECOVERY_ACTION_IDS\)[\s\S]{0,120}el\.disabled = busy/,
+    '禁用期间旁边的按钮一起置灰')
+  assert.match(app, /recoveryBusy[\s\S]{0,220}btnDisable\.textContent = '正在禁用并重启…'/,
+    '重渲染后也要保持进行中文案')
   assert.match(read('ui-src/browser.css'), /bar-btn\.plugin-recovery\.warn[\s\S]{0,160}background: var\(--danger\)/,
     '标题栏「处理插件冲突」红底白字')
   assert.match(browserJs, /⚠️ 处理插件冲突/, '标题栏按钮文字前带 ⚠️')

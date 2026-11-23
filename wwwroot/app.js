@@ -1573,6 +1573,33 @@ function pluginRecoveryVisible(ui) {
   return !!(u.degraded || u.safeMode);
 }
 
+// 恢复动作进行中：卡片里的所有按钮一起锁住，避免在“禁用并重启”还没结束时就点安全模式/恢复。
+const RECOVERY_ACTION_IDS = [
+  'btnPluginDisableSuspects',
+  'btnPluginSafeMode',
+  'btnPluginQuarantineRestore',
+  'btnPluginSafeModeRestore',
+  'btnPluginOpenList',
+  'btnPluginsQuarantineRestore',
+];
+let recoveryBusy = false;
+function setRecoveryBusy(busy, label) {
+  recoveryBusy = busy;
+  for (const id of RECOVERY_ACTION_IDS) {
+    const el = $(id);
+    if (el) el.disabled = busy;
+  }
+  const main = $('btnPluginDisableSuspects');
+  if (main) {
+    if (busy) main.textContent = label || '正在禁用并重启…';
+    else {
+      const ui = window._pluginUi || {};
+      const actionable = (Array.isArray(ui.suspects) ? ui.suspects : []).filter((s) => s && s.actionable);
+      main.textContent = pluginBatchDisableLabel(actionable);
+    }
+  }
+}
+
 function renderPluginRecovery(p) {
   const card = $('pluginRecoveryCard');
   if (!card) return;
@@ -1702,6 +1729,14 @@ function renderPluginRecovery(p) {
     btnQuarantineRestore.classList.toggle('hidden', !quarantine);
     btnQuarantineRestore.disabled = !quarantine;
   }
+  // 状态推送可能在动作进行中到达：重渲染后仍要保持整组按钮锁定与进行中文案。
+  if (recoveryBusy) {
+    for (const id of RECOVERY_ACTION_IDS) {
+      const el = $(id);
+      if (el) el.disabled = true;
+    }
+    if (btnDisable) btnDisable.textContent = '正在禁用并重启…';
+  }
 }
 
 function renderRecovery(state) {
@@ -1807,19 +1842,25 @@ $('btnPluginDisableSuspects').addEventListener('click', async () => {
     danger: true,
   });
   if (!ok) return;
-  const r = await cmd('pluginDisableSuspects', { npms: suspects.map((s) => s.npm) });
-  const done = ((r && Array.isArray(r.disabled)) ? r.disabled : []).map((d) => d.name || d.npm).filter(Boolean);
-  const extra = (r && Array.isArray(r.warnings) && r.warnings.length) ? '；' + r.warnings.join('；') : '';
-  if (!r || r.ok === false) {
-    const prefix = done.length ? `已禁用 ${done.join('、')}，但` : '';
-    showConsoleToast('✕ ' + prefix + ((r && r.error) || '操作失败，请查看日志') + extra);
-    return;
+  // 禁用 + 重启是一次会改 Profile 的连续动作：整组按钮锁住，直到命令返回。
+  setRecoveryBusy(true);
+  try {
+    const r = await cmd('pluginDisableSuspects', { npms: suspects.map((s) => s.npm) });
+    const done = ((r && Array.isArray(r.disabled)) ? r.disabled : []).map((d) => d.name || d.npm).filter(Boolean);
+    const extra = (r && Array.isArray(r.warnings) && r.warnings.length) ? '；' + r.warnings.join('；') : '';
+    if (!r || r.ok === false) {
+      const prefix = done.length ? `已禁用 ${done.join('、')}，但` : '';
+      showConsoleToast('✕ ' + prefix + ((r && r.error) || '操作失败，请查看日志') + extra);
+      return;
+    }
+    const failed = Array.isArray(r.failed) ? r.failed : [];
+    const base = done.length ? `✓ 已禁用 ${done.join('、')}，正在重启 DSH` : '✓ 正在重启 DSH';
+    showConsoleToast((failed.length
+      ? `${base}；未能停用 ${failed.map((f) => f.npm).join('、')}`
+      : base) + extra);
+  } finally {
+    setRecoveryBusy(false);
   }
-  const failed = Array.isArray(r.failed) ? r.failed : [];
-  const base = done.length ? `✓ 已禁用 ${done.join('、')}，正在重启 DSH` : '✓ 正在重启 DSH';
-  showConsoleToast((failed.length
-    ? `${base}；未能停用 ${failed.map((f) => f.npm).join('、')}`
-    : base) + extra);
 });
 async function restoreQuarantineProfile() {
   const q = (window._pluginUi || {}).quarantine || null;
@@ -1832,9 +1873,14 @@ async function restoreQuarantineProfile() {
     danger: true,
   });
   if (!ok) return;
-  const r = await cmd('pluginQuarantineRestore');
-  if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
-  else showConsoleToast('✓ 已恢复禁用前的 Profile，正在重启 DSH');
+  setRecoveryBusy(true);
+  try {
+    const r = await cmd('pluginQuarantineRestore');
+    if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
+    else showConsoleToast('✓ 已恢复禁用前的 Profile，正在重启 DSH');
+  } finally {
+    setRecoveryBusy(false);
+  }
 }
 $('btnPluginQuarantineRestore').addEventListener('click', restoreQuarantineProfile);
 // 卡片在界面健康后会隐藏；插件页工具栏保留同一个入口，动作与确认文案完全一致。
@@ -1847,10 +1893,15 @@ $('btnPluginSafeMode').addEventListener('click', async () => {
     danger: true,
   });
   if (!ok) return;
-  const r = await cmd('pluginSafeMode');
-  const extra = (r && Array.isArray(r.warnings) && r.warnings.length) ? '；' + r.warnings.join('；') : '';
-  if (!r || r.ok === false) showConsoleToast('✕ 安全模式启动失败：' + ((r && r.error) || '无响应，请查看日志') + extra);
-  else showConsoleToast('✓ 已进入安全模式，正在重启 DSH' + extra);
+  setRecoveryBusy(true);
+  try {
+    const r = await cmd('pluginSafeMode');
+    const extra = (r && Array.isArray(r.warnings) && r.warnings.length) ? '；' + r.warnings.join('；') : '';
+    if (!r || r.ok === false) showConsoleToast('✕ 安全模式启动失败：' + ((r && r.error) || '无响应，请查看日志') + extra);
+    else showConsoleToast('✓ 已进入安全模式，正在重启 DSH' + extra);
+  } finally {
+    setRecoveryBusy(false);
+  }
 });
 $('btnPluginSafeModeRestore').addEventListener('click', async () => {
   const ok = await confirmDialog({
@@ -1860,9 +1911,14 @@ $('btnPluginSafeModeRestore').addEventListener('click', async () => {
     danger: true,
   });
   if (!ok) return;
-  const r = await cmd('pluginSafeModeRestore');
-  if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
-  else showConsoleToast('✓ 已恢复 Profile，正在重启 DSH');
+  setRecoveryBusy(true);
+  try {
+    const r = await cmd('pluginSafeModeRestore');
+    if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
+    else showConsoleToast('✓ 已恢复 Profile，正在重启 DSH');
+  } finally {
+    setRecoveryBusy(false);
+  }
 });
 $('btnPluginOpenList').addEventListener('click', () => showPage('plugins'));
 

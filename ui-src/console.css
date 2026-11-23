@@ -2,7 +2,7 @@
    视觉方向对齐 DSH Web：左侧浅灰侧栏 + 右侧纯白画布；卡片用 1px 发丝线 + 大圆角，
    选中态用中性近黑胶囊，品牌蓝只留给主操作与焦点环。 */
 :root {
-  --console-nav-w: 420px;
+  --console-nav-w: 280px;
   --console-content-max: 1120px;
   --console-gutter: clamp(24px, 4vw, 48px);
   --toast-bg: #353638;
@@ -98,7 +98,7 @@ body.console-surface {
   align-items: center;
   gap: 8px;
   width: calc(100% - 4px);
-  min-height: 36px;
+  min-height: 54px; /* 36px × 1.5：导航行更高，点击目标更宽裕 */
   margin: 0 2px;
   padding: 0 10px;
   border: none;
