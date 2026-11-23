@@ -1734,26 +1734,30 @@ function renderRecovery(state) {
     detailEl.textContent = notes.length ? notes.join('；') : '没有未处理的异常。服务反复启动失败时，可用下面的检查点回退配置。';
   }
 
-  // 健康检查点：紧凑行（最新在上；主进程侧有 5s 缓存）
-  const wrap = $('recoverySlots');
+  // 健康检查点：最新一条常驻可见，其余默认收起（主进程侧有 5s 缓存）
   const slots = Array.isArray(r.checkpoints) ? r.checkpoints : [];
+  const latest = slots.length ? slots[0] : null;
+  const rest = slots.slice(1);
   const slotCount = $('recoverySlotCount');
-  if (slotCount) slotCount.textContent = slots.length ? `（${slots.length}）` : '';
-  if (wrap) {
-    const sig = JSON.stringify(slots);
-    if (wrap.dataset.sig !== sig) {
-      wrap.dataset.sig = sig;
-      wrap.textContent = '';
-      if (!slots.length) {
-        const empty = document.createElement('div');
-        empty.className = 'recovery-hint';
-        empty.textContent = '还没有检查点：服务正常启动一次后会自动记录。';
-        wrap.appendChild(empty);
-      } else {
-        for (const s of slots) wrap.appendChild(recoverySlotEl(s));
-      }
+  if (slotCount) slotCount.textContent = rest.length ? `（还有 ${rest.length} 条）` : '';
+  const fillSlots = (wrap, items, emptyText) => {
+    if (!wrap) return;
+    const sig = JSON.stringify(items);
+    if (wrap.dataset.sig === sig) return;
+    wrap.dataset.sig = sig;
+    wrap.textContent = '';
+    if (!items.length) {
+      if (!emptyText) return;
+      const empty = document.createElement('div');
+      empty.className = 'recovery-hint';
+      empty.textContent = emptyText;
+      wrap.appendChild(empty);
+      return;
     }
-  }
+    for (const s of items) wrap.appendChild(recoverySlotEl(s));
+  };
+  fillSlots($('recoverySlotsLatest'), latest ? [latest] : [], '还没有检查点：服务正常启动一次后会自动记录。');
+  fillSlots($('recoverySlots'), rest, '没有更早的检查点。');
 
   // 服务状态 + 操作按钮
   const phase = (state && state.phase) || (state && state.running ? 'ready' : 'stopped');

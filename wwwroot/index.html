@@ -467,10 +467,11 @@
         <span class="diag-note-text" id="recoveryStatusDetail">没有未处理的异常。</span>
       </div>
 
-      <!-- 健康检查点默认收起：服务正常时它只是次要信息，不能把版面从冲突处理上抢走 -->
+      <!-- 最新检查点常驻一行；更多记录与诊断工具默认收起，不和服务状态抢版面 -->
+      <div id="recoverySlotsLatest" class="recovery-slots"></div>
       <details class="diag-slots" id="diagSlotsDetails">
         <summary>
-          <span class="diag-label" title="服务每次正常启动都会记录一份配置快照；服务反复启动失败时可回退到最近的正常配置。回退会先备份当前配置，不会丢东西。">健康检查点<span id="recoverySlotCount"></span></span>
+          <span class="diag-label" title="服务每次正常启动都会记录一份配置快照；服务反复启动失败时可回退到最近的正常配置。回退会先备份当前配置，不会丢东西。">更多检查点<span id="recoverySlotCount"></span></span>
           <span class="diag-slots-hint">展开查看 / 回退</span>
         </summary>
         <div class="diag-slots-body">

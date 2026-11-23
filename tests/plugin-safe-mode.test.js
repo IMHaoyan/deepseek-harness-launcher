@@ -113,7 +113,10 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(main, /show: !!pu\.degraded/, '标题栏的「插件恢复」按钮只跟未就绪状态走，恢复完就消失')
   assert.match(html, /id="diagSlotsDetails"/, '健康检查点默认收起，不再抢冲突处理的版面')
   assert.match(app, /classList\.toggle\('recovery-alert', !!ui\.degraded\)/, '只有未就绪才给红框强调')
-  assert.match(app, /recoverySlotCount/, '收起时也要显示检查点数量')
+  assert.match(app, /recoverySlotCount/, '收起时也要显示剩余检查点数量')
+  assert.match(html, /id="recoverySlotsLatest"/, '最新检查点要常驻可见，不能全部收起')
+  assert.match(app, /fillSlots\(\$\('recoverySlotsLatest'\)/, '第一条进常驻区，其余进折叠区')
+  assert.match(app, /还有 \$\{rest\.length\} 条/, '折叠标题要说明还有多少条')
   assert.match(read('ui-src/console.css'), /--console-nav-w: 420px/, '侧栏导航宽度放大到 1.5 倍（280 → 420）')
   assert.match(read('ui-src/browser.css'), /bar-btn\.plugin-recovery\.warn[\s\S]{0,160}background: var\(--danger\)/,
     '标题栏「处理插件冲突」红底白字')
