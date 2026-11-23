@@ -7116,7 +7116,7 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
       }
     }
     // 失败页兜底：required 激活失败不一定写 stderr，页面原文是第二证据来源。
-    // 只读 document.body.innerText，不改 DSH 页面；正常页面没有这两个签名，直接返回空串。
+    // 只读页面（含同源 iframe）的文本，不改 DSH 页面；正常页面没有失败签名，不会误判。
     if (!SELF_TEST) {
       const url = wc.getURL() || ''
       if (url.startsWith(WEB_URL) || url === WEB_URL) {
@@ -7126,7 +7126,25 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
             // 只在“失败页”采信：有失败签名且**没有聊天输入框**。
             // 正常 DSH 页面里用户可能正好在聊天中粘贴这段报错，不能把正文当成启动失败；
             // 反过来，页面有可见聊天输入框且没有失败签名 = 真实界面已加载，清掉过期的“未就绪”判定。
-            wc.executeJavaScript("(function(){var b=document.body;if(!b)return '';var t=b.innerText||'';var all=(document.documentElement&&document.documentElement.textContent)||t;var hit=t.indexOf('Failed to load plugins')>=0||(t.indexOf('web boot:')>=0&&t.indexOf('did not activate')>=0)||all.indexOf('Conflicting shortcut defaults')>=0;var failurePage=/^HARNESS\\s+Failed to load plugins/i.test(t.trim())||t.indexOf('web boot:')>=0;var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');var composer=!!(c&&c.getClientRects().length);if(failurePage)return JSON.stringify({failed:true,text:all.slice(0,20000)});if(hit&&!composer)return JSON.stringify({failed:true,text:all.slice(0,20000)});if(!hit&&composer)return JSON.stringify({healthy:true});return ''})()")
+            wc.executeJavaScript(`(function(){
+              var b=document.body;if(!b)return '';
+              var texts=[b.innerText||'',(document.documentElement&&document.documentElement.textContent)||''];
+              // 失败页可能被包在同源 iframe（DSH 的 boot 错误页）里；顶层 innerText 会是空的
+              var frames=document.querySelectorAll('iframe');
+              var iframeComposer=false;
+              for(var i=0;i<frames.length;i++){
+                try{var d=frames[i].contentDocument;if(d){texts.push(d.body?d.body.innerText:'');texts.push(d.documentElement?d.documentElement.textContent:'');var fc=d.querySelector&&d.querySelector('textarea,[contenteditable=true],input[type=text]');if(fc&&fc.getClientRects().length)iframeComposer=true;}}catch(e){}
+              }
+              var all=texts.join('\\n');
+              var hit=all.indexOf('Failed to load plugins')>=0||(all.indexOf('web boot:')>=0&&all.indexOf('did not activate')>=0)||all.indexOf('Conflicting shortcut defaults')>=0;
+              var failurePage=/^HARNESS\\s+Failed to load plugins/i.test(all.trim())||all.indexOf('web boot:')>=0;
+              var c=document.querySelector('textarea,[contenteditable=true],input[type=text]');
+              var composer=iframeComposer||!!(c&&c.getClientRects().length);
+              if(failurePage)return JSON.stringify({failed:true,text:all.slice(0,20000)});
+              if(hit&&!composer)return JSON.stringify({failed:true,text:all.slice(0,20000)});
+              if(!hit&&composer)return JSON.stringify({healthy:true});
+              return '';
+            })()`)
               .then((raw) => {
                 if (wc.isDestroyed() || !raw) return
                 let st = null
