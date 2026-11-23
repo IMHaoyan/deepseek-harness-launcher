@@ -449,7 +449,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   const marketRepo = marketRepoMatch[1]
 
   // 2. 注册表自身的形状契约：id / order 唯一，卡片字段齐全
-  assert.equal(registry.length, 13, '推荐插件（npm 分发）应为 13 个（含手机连接、MCP 连接器与 8 个手动项；MCP Lens 已摘出）')
+  assert.equal(registry.length, 12, '推荐插件（npm 分发）应为 12 个（含手机连接、MCP 连接器与 7 个手动项；MCP Lens/电脑操作已摘出）')
   assert.equal(new Set(registry.map((d) => d.id)).size, registry.length, '插件 id 必须唯一')
   assert.equal(new Set(registry.map((d) => d.order)).size, registry.length, '卡片顺序 order 必须唯一')
   for (const d of registry) {
@@ -546,13 +546,12 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'codex-ui',
     'image-gen',
     'chat-import',
-    'computer-use-win',
     'sidebar-qa',
     'archive-manager',
     'context',
   ], '卡片顺序应为「预装在前、手动在后」，各组内按 order')
   assert.deepEqual(catalog.filter((c) => !c.preset).map((c) => c.id), [
-    'better-sidebar', 'codex-ui', 'image-gen', 'chat-import', 'computer-use-win', 'sidebar-qa', 'archive-manager', 'context',
+    'better-sidebar', 'codex-ui', 'image-gen', 'chat-import', 'sidebar-qa', 'archive-manager', 'context',
   ], 'preset=false 的应恰好是手动安装的那批')
   assert.equal(catalog.findIndex((c) => !c.preset), catalog.filter((c) => c.preset).length,
     '预装卡片必须全部连续排在前面（不与手动项交错）')
@@ -619,7 +618,6 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'rewind',
     'better-sidebar',
     'image-gen',
-    'computer-use-win',
     'archive-manager',
     'context', // 手动安装但已装上 → 排在未安装的三张之前（这就是「已安装优先」要的效果）
     'codex-ui',
@@ -627,7 +625,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
     'sidebar-qa',
   ], '已安装的在前；已安装组内「预装 → 手动」，未安装组内同样')
   const installedCount = mixed.filter((c) => c.installed).length
-  assert.equal(installedCount, 11, '这组夹具里应有 11 个已安装（含 MCP 连接器）')
+  assert.equal(installedCount, 10, '这组夹具里应有 10 个已安装（含 MCP 连接器；电脑操作已移出管理）')
   assert.equal(mixed.findIndex((c) => !c.installed), installedCount,
     '已安装卡片必须全部连续排在未安装之前（不与未安装项交错）')
 
@@ -638,7 +636,7 @@ test('推荐插件注册表：真注册表 → 真卡片目录 + 真默认代装
   assert.deepEqual(tagKeys('usage-billing'), ['preinstall'])
   assert.deepEqual(tagKeys('better-sidebar'), ['official'], '增强侧边栏是手动安装项，只挂官方推荐')
   assert.deepEqual(tagKeys('context'), ['official'], '上下文洞察同上')
-  for (const id of ['codex-ui', 'chat-import', 'sidebar-qa', 'image-gen', 'computer-use-win', 'archive-manager']) {
+  for (const id of ['codex-ui', 'chat-import', 'sidebar-qa', 'image-gen', 'archive-manager']) {
     assert.deepEqual(tagKeys(id), [], id + '：两枚标签都不带（落进「其他」）')
   }
   for (const card of catalog) {
@@ -902,7 +900,7 @@ test('旧设置页/恢复页插件入口已迁出，避免双份维护', () => {
   assert.doesNotMatch(html, /id="btnRemoteConnect"/, '设置页不应再保留远程连接行')
   assert.doesNotMatch(html, /id="btnRecoveryMarket"/, '恢复页不应再保留插件修复行')
 })
-test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装；界面类、会话导入、上下文洞察、图像生成、电脑操作、会话归档保持手动；MCP Lens 已摘出注册表', () => {
+test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器自动装；界面类、会话导入、上下文洞察、图像生成、会话归档保持手动；电脑操作已移出管理；MCP Lens 已摘出注册表', () => {
   assert.match(main, /pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: \{\}/, '配置应有自动安装与退役清理记账字段')
   assert.match(main, /function pluginAutoDeclined\(id\)/, '应有「用户卸载过」记忆查询')
   assert.match(main, /function notePluginAutoDeclined\(id, declined\)/, '应有「用户卸载过」记账写入')
@@ -912,13 +910,14 @@ test('默认代装：用量与计费 / 技能管理 / 对话回退随启动器�
   assert.doesNotMatch(main, /npm: 'dsh-better-sidebar',\n    name: '增强侧边栏',\n    autoInstall: true,/, '增强侧边栏改为手动安装')
   assert.match(main, /npm: '@kenz1117\/dsh-ui-usage-billing',\n    name: '用量与计费',\n    autoInstall: true,/, '用量与计费应默认代装')
   assert.match(main, /npm: '@michengai\/dsh-skills-manager',\n    name: '技能管理',\n    autoInstall: true,/, '技能管理应默认代装')
-  // 会话归档 / 图像生成 / 电脑操作：进注册表但保持手动；MCP Lens 仍退役（页面无卡片，残留自动卸载）
+  // 会话归档 / 图像生成：进注册表但保持手动；电脑操作已移出注册表并列入忽略清单；MCP Lens 仍退役
   const regOnly = main.slice(main.indexOf('const MANAGED_NPM_PLUGINS = ['), main.indexOf('\n]\n', main.indexOf('const MANAGED_NPM_PLUGINS = [')) + 3)
   assert.doesNotMatch(regOnly, /dsh-mcp-lens/, 'MCP Lens 已退役，不应再留在推荐插件注册表里')
+  assert.doesNotMatch(regOnly, /dsh-computer-use-win/, '电脑操作已移出注册表，不再由 DSHL 管理')
+  assert.match(main, /IGNORED_NPM_PLUGINS = new Set\(\['dsh-computer-use-win'\]\)/,
+    '电脑操作要进忽略清单：插件页不展示、未生效提示不计入')
   assert.match(regOnly, /npm: 'dsh-image-gen',\n    name: '图像生成',/, '图像生成应进注册表')
   assert.doesNotMatch(regOnly, /npm: 'dsh-image-gen',\n    name: '图像生成',\n    autoInstall: true,/, '图像生成应保持手动安装')
-  assert.match(regOnly, /npm: 'dsh-computer-use-win',\n    name: '电脑操作',/, '电脑操作应进注册表')
-  assert.doesNotMatch(regOnly, /npm: 'dsh-computer-use-win',\n    name: '电脑操作',\n    autoInstall: true,/, '电脑操作应保持手动安装')
   assert.match(regOnly, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',/, '会话归档应重新进注册表')
   assert.doesNotMatch(regOnly, /npm: '@michengai\/dsh-archive-manager',\n    name: '会话归档',\n    autoInstall: true,/, '会话归档应保持手动安装')
   assert.doesNotMatch(main, /npm: 'dsh-sidebar-qa',\n    name: '划线提问',\n    autoInstall: true,/, '划线提问改为手动安装（依赖增强侧边栏）')

@@ -411,20 +411,23 @@ function render(state) {
     }
     // 服务起来了 ≠ 插件起来了：DSH 对「bundle 被跳过 / 行没激活」只写 stderr、退出码 0，
     // 所以它既不是启动失败、也不会有任何主动提示 —— 插件就那么静默地没工作。
-    // 这里只占一行（非红卡），详情在插件页每张卡片的「未生效」态上；不另发系统通知（按需降噪）。
+    // 有 required 插件失败时 DSH 会直接给一张 Failed to load plugins 页：这条必须升级成
+    // "界面未就绪"，并把恢复页的主操作（安全模式）露出来，不能只留一行中性提示。
+    let pluginDegraded = false;
     const notActive = (state.plugins || []).filter((p) => p && p.activation);
     if (notActive.length) {
+      pluginDegraded = !!(state.pluginUi && state.pluginUi.degraded);
       const names = notActive.slice(0, 3).map((p) => p.name || p.subtitle || p.id);
-      notes.push(`${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
-        + `${notActive.length > 3 ? ' 等' : ''} → 可在「插件管理」页查看`);
+      notes.push(`${pluginDegraded ? 'DSH 界面未就绪：' : ''}${notActive.length} 个插件未生效（重启不会改变）：${names.join('、')}`
+        + `${notActive.length > 3 ? ' 等' : ''} → ${pluginDegraded ? '可在恢复页用安全模式处理' : '可在「插件管理」页查看'}`);
     }
-    crashEl.classList.toggle('env-warning', alert); // 非 alert 用普通卡片样式，不再红色告警
+    crashEl.classList.toggle('env-warning', alert || pluginDegraded); // 插件冲突也要用警示卡，而不是中性一行
     crashEl.classList.toggle('hidden', notes.length === 0);
     if (notes.length) {
       const t = $('crashNoteText');
       if (t) {
-        t.textContent = (alert ? '⚠ ' : '') + notes.join('；');
-        t.classList.toggle('muted', !alert); // 中性：次要色、常规字重
+        t.textContent = ((alert || pluginDegraded) ? '⚠ ' : '') + notes.join('；');
+        t.classList.toggle('muted', !alert && !pluginDegraded); // 中性：次要色、常规字重
       }
     }
     // 按钮主次随分级变化：非 alert 时「知道了」是主按钮，恢复入口降级为「查看恢复页」，
@@ -433,11 +436,11 @@ function render(state) {
     const diagBtn = $('btnCrashNoteDiag');
     const closeBtn = $('btnCrashNoteClose');
     if (recoverBtn) {
-      recoverBtn.textContent = alert ? '打开恢复' : '查看恢复页';
-      recoverBtn.classList.toggle('primary', alert);
+      recoverBtn.textContent = pluginDegraded ? '处理插件冲突' : (alert ? '打开恢复' : '查看恢复页');
+      recoverBtn.classList.toggle('primary', alert || pluginDegraded);
     }
-    if (diagBtn) diagBtn.classList.toggle('hidden', !alert);
-    if (closeBtn) closeBtn.classList.toggle('primary', !alert);
+    if (diagBtn) diagBtn.classList.toggle('hidden', !alert && !pluginDegraded);
+    if (closeBtn) closeBtn.classList.toggle('primary', !alert && !pluginDegraded);
   }
 
   // 启动/重启 合一按钮：运行中 = 重启 DSH（停 → 起 → 刷新独立窗口），未运行 = 启动 DSH。
@@ -483,6 +486,7 @@ function render(state) {
   renderNotifyCategories(state.notifyCategories);
   renderDesktopShell(state.desktopShell);
   renderRecovery(state);
+  renderPluginRecovery(state.pluginUi);
 
   // 缩放微调按钮（拖动/双击输入；值变化时应用）
   zoomWidgets.launcher.setFromState(state.zoom);
@@ -1494,6 +1498,50 @@ async function doRestoreSlot(s) {
   if (st) render(st);
 }
 
+// ---------- 插件冲突恢复：界面未就绪 → 安全模式 / 恢复 Profile ----------
+// 位置：日志与反馈页顶部（与检查点卡片相邻）。主页面只给「处理插件冲突」入口，
+// 真正的写操作集中在这里，和「一个状态一个主操作」的恢复页约定一致。
+function renderPluginRecovery(p) {
+  const card = $('pluginRecoveryCard');
+  if (!card) return;
+  const ui = p || {};
+  const safe = ui.safeMode || null;
+  const show = !!(ui.degraded || safe);
+  card.classList.toggle('hidden', !show);
+  if (!show) return;
+  const title = $('pluginRecoveryTitle');
+  const detail = $('pluginRecoveryDetail');
+  const btnSafe = $('btnPluginSafeMode');
+  const btnRestore = $('btnPluginSafeModeRestore');
+  const dot = $('pluginRecoveryDot');
+  if (dot) dot.className = 'dot' + (ui.degraded ? ' stopped' : ' running');
+  if (ui.degraded) {
+    const names = (ui.issues || []).slice(0, 4).map((x) => x.packageName || x.entryId).filter(Boolean);
+    title.textContent = '插件导致界面未就绪';
+    detail.textContent = `${ui.count || 0} 个插件未激活${names.length ? '：' + names.join('、') : ''}。`
+      + '继续重启不会改变；先用安全模式只加载官方插件，确认界面恢复后再逐个启用第三方插件。'
+      + ((ui.thirdParty || []).length
+        ? `将临时停用：${ui.thirdParty.slice(0, 6).join('、')}${ui.thirdParty.length > 6 ? ' 等' : ''}。`
+        : '');
+    detail.title = (ui.issues || []).map((x) => (x.packageName || x.entryId) + '：' + (x.detail || '')).join('\n');
+  } else {
+    title.textContent = '安全模式已启用';
+    const removed = (safe && Array.isArray(safe.removed)) ? safe.removed : [];
+    detail.textContent = `第三方插件已临时停用${safe && safe.at ? '（' + (fmtLocalTime(safe.at) || safe.at) + '）' : ''}；`
+      + (removed.length ? `本次停用 ${removed.length} 个：${removed.slice(0, 6).join('、')}${removed.length > 6 ? ' 等' : ''}。` : '')
+      + '可在「插件」页逐个重新启用，或恢复到安全模式前的完整 Profile。';
+    detail.title = safe && safe.manifest ? '备份：' + safe.manifest : '';
+  }
+  if (btnSafe) {
+    btnSafe.classList.toggle('hidden', !ui.degraded || !ui.canSafeMode);
+    btnSafe.disabled = !ui.degraded || !ui.canSafeMode;
+  }
+  if (btnRestore) {
+    btnRestore.classList.toggle('hidden', !safe);
+    btnRestore.disabled = !safe;
+  }
+}
+
 function renderRecovery(state) {
   const r = (state && state.recovery) || {};
 
@@ -1575,6 +1623,32 @@ $('btnRecoveryDiag').addEventListener('click', async () => {
   else setRecoveryDiagStatus('✕ 生成失败，请查看日志', 'error');
 });
 $('btnRecoveryDiagDir').addEventListener('click', () => { void cmd('openDiagnosticsDir') });
+// 插件冲突恢复：安全模式 / 恢复 Profile（都会重启服务，确认框说明真实动作与备份）
+$('btnPluginSafeMode').addEventListener('click', async () => {
+  const ok = await confirmDialog({
+    title: '以安全模式重启 DSH？',
+    body: '会先备份当前 Profile，然后只加载官方插件并重启服务。第三方插件不会被卸载，之后可以逐个重新启用或整体恢复。',
+    confirmText: '安全模式重启',
+    danger: true,
+  });
+  if (!ok) return;
+  const r = await cmd('pluginSafeMode');
+  if (!r || r.ok === false) showConsoleToast('✕ 安全模式启动失败：' + ((r && r.error) || '无响应，请查看日志'));
+  else showConsoleToast('✓ 已进入安全模式，正在重启 DSH');
+});
+$('btnPluginSafeModeRestore').addEventListener('click', async () => {
+  const ok = await confirmDialog({
+    title: '恢复安全模式前的 Profile？',
+    body: '会用备份覆盖当前 Profile 并重启 DSH；安全模式期间对插件做的启停会被撤销。',
+    confirmText: '恢复并重启',
+    danger: true,
+  });
+  if (!ok) return;
+  const r = await cmd('pluginSafeModeRestore');
+  if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
+  else showConsoleToast('✓ 已恢复 Profile，正在重启 DSH');
+});
+$('btnPluginOpenList').addEventListener('click', () => showPage('plugins'));
 
 // ---------- 事件绑定 ----------
 

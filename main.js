@@ -137,7 +137,7 @@ const OFFLINE_HTML = path.join(WWWROOT, 'offline.html')
 // ---------- 配置 ----------
 let consoleSurfaceHandle = null
 let updateWindowHandle = null
-const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', dshTargetEngines: null, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
+const Config = { consoleZoom: 100, webZoom: 100, theme: 'light', notify: true, autoRestart: true, tabsEnabled: false, desktopShell: !SELF_TEST, desktopShellAutoEnabledFor: '', port: 0, feedbackWebhook: '', feedbackChunkChars: 0, webWindowWidth: 0, webWindowHeight: 0, webWindowMaximized: false, webWindowX: null, webWindowY: null, harnessRoot: '', nodePath: '', dshVersion: 'latest', pnpmVersion: '11.8.0', dshChannel: 'latest', launcherChannel: 'latest', launcherUpdateSource: 'auto', launcherUpdateMirror: '', launcherUpdateSourceOk: '', nodeMajor: envDetect.DEFAULT_NODE_MAJOR, nodeMajorMigratedTo: '', dshTargetEngines: null, nodeMirror: '', npmRegistry: '', npmGlobalRoot: '', nodeInstallMode: 'msi', dshRegistryOk: '', dshUpdateCheckedAt: 0, dshMigrateRetryAt: 0, defExcludeTryVersion: '', panelHideNotified: false, crashNoticeSeen: '', crashNoticeDismissed: '', crashStreak: 0, lastCrashReportedAt: '', pluginMarketAutoTryVersion: '', pluginMarketDeclined: false, pluginSetupChoice: 'pending', pluginSetupSelectedIds: null, pluginAutoInstallTriedVersion: '', pluginRetiredCleanupVersion: '', pluginAutoDeclined: {}, pluginNotes: {}, pluginSafeModeBackup: null, pluginPendingRestart: { count: 0, names: [], mode: 'restart' }, pluginGateNotice: null, notifyCategories: { service: true, recovery: true, update: true }, notifiedLauncherVersion: '', notifiedDshVersion: '', bridgePayloadMigrated: '', usageStats: false, usageStatsUrl: '', usageStatsAt: 0 }
 // 默认接收端在配置对象之外赋值：Config 这一行会被测试按源码片段求值，不能引用外部常量。
 Config.usageStatsUrl = USAGE_STATS_URL
 let firstRun = false
@@ -673,6 +673,19 @@ function applyConfigJson(cfg) {
   if (cfg.pluginNotes && typeof cfg.pluginNotes === 'object' && !Array.isArray(cfg.pluginNotes)) {
     for (const [key, val] of Object.entries(cfg.pluginNotes)) {
       if (typeof key === 'string' && key && typeof val === 'string' && val) Config.pluginNotes[key] = val.slice(0, 500)
+    }
+  }
+  // 安全模式备份的落点（只认结构合理的记录；路径在恢复时还会再校验存在性）
+  Config.pluginSafeModeBackup = null
+  const safe = cfg.pluginSafeModeBackup
+  if (safe && typeof safe === 'object'
+    && typeof safe.manifest === 'string' && safe.manifest
+    && typeof safe.patch === 'string') {
+    Config.pluginSafeModeBackup = {
+      at: typeof safe.at === 'string' ? safe.at : '',
+      manifest: safe.manifest,
+      patch: safe.patch,
+      removed: Array.isArray(safe.removed) ? safe.removed.filter((x) => typeof x === 'string').slice(0, 64) : [],
     }
   }
   // 旧版「随包 payload」→ npm 版本的一次性迁移：只做一次，避免每次启动都读 profile
@@ -2310,6 +2323,8 @@ function noteActivationEvidence(line) {
 
 /** 某个包本轮启动的未生效证据（没有则 undefined）。 */
 function activationIssueOf(packageName) {
+  // 不再归 DSHL 管理的插件：不展示、不计入"未生效"，避免用户在插件页继续看到它。
+  if (IGNORED_NPM_PLUGINS.has(String(packageName || ''))) return undefined
   return pluginActivation.findActivationIssue(server.activationIssues, packageName)
 }
 
@@ -3646,10 +3661,15 @@ function cleanInstalledVersion(spec) {
 //（见 maybeAutoInstallRecommendedPlugins）；用户手动卸载过就不再自动装回来。
 // 当前默认代装集合：手机连接 / MCP 连接器 / 用量与计费 / 技能管理 / 对话回退（另含插件市场）。
 // 不代装的（卡片不显示预装标签，仍可一键装）：界面类（增强侧边栏、划线提问、Codex 风格界面）、
-// 会话导入、上下文洞察、图像生成、电脑操作、会话归档。
+// 会话导入、上下文洞察、图像生成、会话归档。
 // MCP Lens 已摘出注册表，只留在 RETIRED_NPM_PLUGINS：页面不再有卡片，
 // 老用户机器上残留的实例由 maybeRemoveRetiredPlugins 自动卸载。改集合须同步
 // tests/plugin-page-wiring.test.js 的默认代装断言与 docs/internals.md 的预装清单。
+//
+// 明确不归 DSHL 管理的插件：插件页不展示、未生效提示不计入、兼容预判不参与，
+// 已装的实例原样留给 DSH 自己（2026-11-23：电脑操作插件与新版 DSH 的 ctx.root inject
+// 不兼容，用户要求从插件管理页移除并不再由 DSHL 管理）。
+const IGNORED_NPM_PLUGINS = new Set(['dsh-computer-use-win'])
 const MANAGED_NPM_PLUGINS = [
   {
     id: 'bridge-next',
@@ -3743,17 +3763,6 @@ const MANAGED_NPM_PLUGINS = [
     icon: '🧠',
     category: '技能管理',
     repo: 'https://github.com/MichengAI/dsh-skills-manager',
-  },
-  {
-    id: 'computer-use-win',
-    order: 60,
-    npm: 'dsh-computer-use-win',
-    name: '电脑操作',
-    subtitle: 'dsh-computer-use-win',
-    description: '在 Windows 上读写真实桌面应用：UI Automation 树、截图、输入、OCR 与窗口管理，经 MCP 桥接进 DSH。',
-    icon: '🖱️',
-    category: '桌面自动化',
-    repo: 'https://github.com/Yu-tao-Li/dsh-computer-use-win',
   },
   {
     id: 'sidebar-qa',
@@ -3901,7 +3910,8 @@ function pluginInventoryCards() {
     inventoryCardsCache = { key, cards: [] }
     return []
   }
-  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm).concat([market.PLUGIN_NAME]))
+  const known = new Set(MANAGED_NPM_PLUGINS.map((d) => d.npm)
+    .concat([market.PLUGIN_NAME], Array.from(IGNORED_NPM_PLUGINS)))
   let cards = []
   try {
     cards = pluginInventory.inventoryCards({
@@ -3936,6 +3946,114 @@ function pluginInventoryCards() {
 function invalidatePluginInventory() {
   inventoryCardsCache = { key: '', cards: [] }
 }
+
+// ---------- 插件冲突「安全模式」：只改 profile 的 bundle 列表，可整体恢复 ----------
+// 为什么需要：DSH 的 required 插件没激活时，服务仍然 ready，但界面是一张 Failed to load plugins 页。
+// 根因通常是某个第三方 bundle 改了官方 UI 服务链。逐项禁用要在十几个插件里试，代价高；
+// 安全模式一次性只保留官方 bundle（+ 桌面登录辅助），先让界面起来，再按需恢复。
+// 所有写入前都备份 package.json / cordis.patch.yml，恢复动作就是把备份拷回去。
+const SAFE_MODE_KEEP_PREFIX = '@deepseek-ai/'
+const SAFE_MODE_KEEP_BUNDLES = new Set(['dshl-desktop-signin'])
+
+function safeModeKeepsBundle(name) {
+  const n = String(name || '')
+  return n.startsWith(SAFE_MODE_KEEP_PREFIX) || SAFE_MODE_KEEP_BUNDLES.has(n)
+}
+
+function readProfileManifestSafe() {
+  try {
+    const m = JSON.parse(fs.readFileSync(DSH_PROFILE_PACKAGE, 'utf8'))
+    return m && typeof m === 'object' ? m : null
+  } catch { return null }
+}
+
+function profileBundlesOf(manifest) {
+  const b = manifest && manifest.dsh && manifest.dsh.profile ? manifest.dsh.profile.bundles : null
+  return Array.isArray(b) ? b.filter((n) => typeof n === 'string' && n) : []
+}
+
+function writeProfileManifestAtomic(manifest) {
+  const tmp = `${DSH_PROFILE_PACKAGE}.tmp-${process.pid}-${Date.now()}`
+  fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + '\n')
+  fs.renameSync(tmp, DSH_PROFILE_PACKAGE)
+}
+
+/**
+ * 本轮启动的插件问题（忽略不再归 DSHL 管理的包）+ 安全模式事实。只读，供控制台渲染。
+ * 只要 activationIssues 非空就判"界面未就绪"：DSH 对这些行只写 stderr、HTTP 仍 ready，
+ * 不把它升级成状态，用户就会看到一张失败页而启动器显示绿色运行中。
+ */
+function pluginUiState() {
+  const issues = (server.activationIssues || [])
+    .filter((it) => !IGNORED_NPM_PLUGINS.has(String((it && it.packageName) || '')))
+  const manifest = readProfileManifestSafe()
+  const bundles = profileBundlesOf(manifest)
+  const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
+  return {
+    degraded: issues.length > 0,
+    count: issues.length,
+    issues: issues.slice(0, 8).map((it) => ({
+      packageName: it.packageName || '',
+      entryId: it.entryId || '',
+      detail: it.detail || '',
+      services: Array.isArray(it.services) ? it.services : [],
+    })),
+    thirdParty,
+    canSafeMode: thirdParty.length > 0,
+    safeMode: Config.pluginSafeModeBackup || null,
+  }
+}
+
+/** 安全模式：保留官方 bundle + 桌面登录辅助，其余第三方 bundle 临时停用；先备份再写。 */
+async function enablePluginSafeMode() {
+  const manifest = readProfileManifestSafe()
+  if (!manifest) return { ok: false, error: '读不到当前 Profile 的 package.json' }
+  const bundles = profileBundlesOf(manifest)
+  const thirdParty = bundles.filter((n) => !safeModeKeepsBundle(n))
+  if (!thirdParty.length) return { ok: false, error: '当前 Profile 没有可停用的第三方插件' }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const manifestBak = `${DSH_PROFILE_PACKAGE}.bak-dshl-safe-${stamp}`
+  const patchBak = `${DSH_PROFILE_PATCH}.bak-dshl-safe-${stamp}`
+  try {
+    fs.copyFileSync(DSH_PROFILE_PACKAGE, manifestBak)
+    try { fs.copyFileSync(DSH_PROFILE_PATCH, patchBak) } catch { /* 没有用户补丁层也可以安全模式 */ }
+    const next = JSON.parse(JSON.stringify(manifest))
+    next.dsh.profile.bundles = bundles.filter((n) => safeModeKeepsBundle(n))
+    writeProfileManifestAtomic(next)
+  } catch (error) {
+    return { ok: false, error: '写入安全模式 Profile 失败：' + ((error && error.message) || String(error)) }
+  }
+  Config.pluginSafeModeBackup = { at: new Date().toISOString(), manifest: manifestBak, patch: patchBak, removed: thirdParty }
+  try { saveConfig() } catch { /* noop */ }
+  invalidatePluginInventory()
+  log(`插件安全模式：已临时停用 ${thirdParty.length} 个第三方 bundle（${thirdParty.join('、')}）；备份 ${manifestBak}`)
+  const r = await restartDshForConsole()
+  if (r && r.ok === false) {
+    return { ok: false, error: 'Profile 已切换，但服务重启失败（' + (r.reason || 'unknown') + '）', backup: manifestBak }
+  }
+  return { ok: true, backup: manifestBak, removed: thirdParty }
+}
+
+/** 恢复安全模式前的 Profile（只认本次记录、且备份仍存在）。 */
+async function restorePluginSafeMode() {
+  const bak = Config.pluginSafeModeBackup
+  if (!bak || !bak.manifest) return { ok: false, error: '没有可恢复的安全模式备份' }
+  if (!fs.existsSync(bak.manifest)) return { ok: false, error: '安全模式备份已不存在：' + bak.manifest }
+  try {
+    fs.copyFileSync(bak.manifest, DSH_PROFILE_PACKAGE)
+    if (bak.patch && fs.existsSync(bak.patch)) fs.copyFileSync(bak.patch, DSH_PROFILE_PATCH)
+  } catch (error) {
+    return { ok: false, error: '恢复 Profile 失败：' + ((error && error.message) || String(error)) }
+  }
+  Config.pluginSafeModeBackup = null
+  try { saveConfig() } catch { /* noop */ }
+  invalidatePluginInventory()
+  log('插件安全模式：已恢复安全模式前的 Profile')
+  const r = await restartDshForConsole()
+  if (r && r.ok === false) return { ok: false, error: 'Profile 已恢复，但服务重启失败（' + (r.reason || 'unknown') + '）' }
+  return { ok: true }
+}
+
 
 /** 插件卡片 / 提示条用的人类可读名字。 */
 function pluginDisplayName(id) {
@@ -6157,6 +6275,12 @@ function dshPluginCompat() {
       installModulesDirs: dshInstallModulesDirs(),
       targetVersion,
     })
+    // 不再归 DSHL 管理的插件不参与升级兼容预判（电脑操作等），避免更新提示里继续出现它
+    if (report && typeof report === 'object') {
+      const keep = (list) => (Array.isArray(list) ? list : []).filter((x) => !IGNORED_NPM_PLUGINS.has(String((x && x.name) || '')))
+      report.incompatible = keep(report.incompatible)
+      report.unknown = keep(report.unknown)
+    }
     pluginCompatCache = { key, at: Date.now(), report }
     if (report && report.ok === true && report.incompatible.length) {
       log(`dsh-plugin-compat: 目标 v${targetVersion} 下 ${report.incompatible.length} 个插件会被禁用：` + report.incompatible.map((x) => x.name).join(', '))
@@ -7034,6 +7158,8 @@ function stateJson() {
     },
     pluginMarket: marketState,
     plugins: buildPluginCatalog(marketState, Config.pluginNotes),
+    // 插件冲突的"界面未就绪"事实 + 安全模式入口（主页面警示卡与恢复页共用）
+    pluginUi: pluginUiState(),
     pluginInstallAll: {
       running: pluginInstallAllRunning,
       kind: pluginBatchKind, // 'install' | 'update'：两个按钮据此决定谁显示进度
@@ -8076,6 +8202,9 @@ ipcMain.handle('dsh:cmd', async (event, name, value) => {
         case 'pluginCheckUpdates': return JSON.stringify(await checkManagedPluginUpdates())
         case 'pluginSetNote': return JSON.stringify(setManagedPluginNote(value && value.id, value && value.text))
         case 'pluginsApplyRestart': return JSON.stringify(await withProfileOp('重启生效', () => applyPendingPluginChanges()))
+        // 插件冲突急救：安全模式 / 恢复安全模式前的 Profile。两者都走 profile 写锁。
+        case 'pluginSafeMode': return JSON.stringify(await withProfileOp('插件安全模式', () => enablePluginSafeMode()))
+        case 'pluginSafeModeRestore': return JSON.stringify(await withProfileOp('恢复安全模式前的 Profile', () => restorePluginSafeMode()))
         case 'pluginsInstallAll': {
           if (pluginInstallAllRunning) return JSON.stringify({ ok: false, error: '插件批量操作正在进行中' })
           if (profileOpBusy()) return JSON.stringify(profileBusyError())

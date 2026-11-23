@@ -427,6 +427,22 @@
       <button class="btn sm" id="btnLogClear">清空显示</button>
     </div>
 
+    <!-- 插件冲突导致界面未就绪：独立于崩溃/检查点，给出"安全模式"与"恢复 Profile"两条出路 -->
+    <section class="card diag-card hidden" id="pluginRecoveryCard">
+      <div class="diag-head">
+        <div class="diag-state">
+          <span class="dot stopped" id="pluginRecoveryDot"></span>
+          <span class="diag-state-text" id="pluginRecoveryTitle">插件导致界面未就绪</span>
+        </div>
+        <div class="diag-ops">
+          <button class="btn sm primary" id="btnPluginSafeMode">安全模式启动</button>
+          <button class="btn sm hidden" id="btnPluginSafeModeRestore">恢复安全模式前的 Profile</button>
+          <button class="btn sm" id="btnPluginOpenList">查看插件</button>
+        </div>
+      </div>
+      <div class="diag-note" id="pluginRecoveryDetail"></div>
+    </section>
+
     <!-- 服务状态 + 服务操作 + 健康检查点 + 诊断操作：压成一张紧凑卡片 -->
     <section class="card diag-card" id="recoveryCheckpointsCard">
       <div class="diag-head">

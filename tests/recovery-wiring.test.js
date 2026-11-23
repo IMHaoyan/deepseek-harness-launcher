@@ -473,18 +473,21 @@ test('「未生效」证据接到清单卡片上，且与注册表卡片同源',
   assert.match(inventory, /activation: String\(activationOf\(npm\) \|\| ''\)/, '纯函数侧要真的用上这个探针')
 })
 
-test('控制台主页把「未生效」收敛成一行（不发系统通知：按需降噪）', () => {
-  // 服务起来了 ≠ 插件起来了，而这条既不是启动失败、也没有任何主动提示 —— 必须有个出口。
+test('控制台主页把「未生效」升级为界面未就绪，并给出恢复入口', () => {
+  // 服务起来了 ≠ 插件起来了。普通未生效保持中性一行；有 required 失败（pluginUi.degraded）
+  // 时 DSH 会给一张 Failed to load plugins 页，提示卡必须升级成警示 + 「处理插件冲突」。
   const at = app.indexOf("const notActive = (state.plugins || []).filter")
   assert.ok(at > 0, '控制台主页要有这一行')
-  const block = app.slice(at, at + 600)
+  const block = app.slice(at, at + 900)
   assert.match(block, /个插件未生效（重启不会改变）/, '文案要说清"重启不会改变"')
-  assert.match(block, /可在「插件管理」页查看/, '要给出下一步去哪儿')
+  assert.match(block, /可在恢复页用安全模式处理/, '界面未就绪时给出恢复页的安全模式出口')
+  assert.match(block, /可在「插件管理」页查看/, '普通未生效仍指向插件管理页')
+  assert.match(block, /pluginDegraded/, '要区分"界面未就绪"与普通未生效')
   assert.match(block, /notes\.push/, '走既有的提示卡，不新开模块')
-  // 与"启动失败/崩溃"分开：它不属于 alert 那一档，不能染红
-  const crashAt = app.indexOf('function renderCrashNote')
-  const alertAt = app.indexOf("crashEl.classList.toggle('env-warning', alert)")
-  assert.ok(alertAt > crashAt && alertAt < at + 600, 'alert 样式只看 severity，不受未生效影响')
+  // 插件冲突属于需要处理的异常：警示样式与主按钮要跟着 pluginDegraded 升级。
+  assert.match(app, /crashEl\.classList\.toggle\('env-warning', alert \|\| pluginDegraded\)/,
+    '界面未就绪要用警示卡，而不是中性一行')
+  assert.match(app, /recoverBtn\.textContent = pluginDegraded \? '处理插件冲突'/, '主按钮直达插件恢复')
 })
 
 // ---------- ⑭ 环境不就绪：说明页也必须切到实际状态 ----------
