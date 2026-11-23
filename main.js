@@ -7130,7 +7130,9 @@ function webPushState() {
     pluginRecovery: (() => {
       const pu = pluginUiState()
       return {
-        show: !!(pu.degraded || pu.safeMode || pu.quarantine),
+        // 恢复完成的隔离/安全模式不再占用标题栏：界面已恢复时不给用户「还有冲突」的错觉。
+        // 恢复入口移到控制台的插件页，只有界面仍未就绪（degraded）才需要这个直达按钮。
+        show: !!pu.degraded,
         degraded: !!pu.degraded,
         count: pu.criticalCount || pu.requiredCount || pu.count || 0,
       }

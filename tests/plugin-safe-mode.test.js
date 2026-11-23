@@ -103,11 +103,18 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(state, /quarantine: q \? \{/, '隔离记录要下发，恢复页才能列清楚停了谁')
   assert.match(main, /pluginUi: pluginUiState\(\),/, '状态快照要下发 pluginUi')
 
-  for (const id of ['pluginRecoveryCard', 'pluginRecoveryTitle', 'btnPluginSafeMode', 'btnPluginSafeModeRestore', 'btnPluginDisableSuspects', 'btnPluginQuarantineRestore', 'btnPluginOpenList', 'btnPluginRecoveryJump']) {
+  for (const id of ['pluginRecoveryCard', 'pluginRecoveryTitle', 'btnPluginSafeMode', 'btnPluginSafeModeRestore', 'btnPluginDisableSuspects', 'btnPluginQuarantineRestore', 'btnPluginOpenList', 'btnPluginRecoveryJump', 'btnPluginsQuarantineRestore']) {
     assert.match(html, new RegExp('id="' + id + '"'), `index.html 缺 ${id}`)
   }
+  assert.match(app, /const show = pluginRecoveryVisible\(ui\)/,
+    '按插件隔离成功后（页面已健康）不再占版面；只有未就绪与安全模式才显示恢复卡')
+  assert.match(app, /btnPluginsQuarantineRestore'\)\.addEventListener\('click', restoreQuarantineProfile\)/,
+    '卡片隐藏后，插件页工具栏必须保留恢复入口')
+  assert.match(main, /show: !!pu\.degraded/, '标题栏的「插件恢复」按钮只跟未就绪状态走，恢复完就消失')
   assert.match(app, /pu\.degraded \? '处理插件冲突' : '查看插件恢复状态'/,
     '主页面常驻按钮要随状态换文案')
+  assert.match(app, /const showJump = pluginRecoveryVisible\(pu\)/,
+    '按插件隔离成功且界面健康后，主页面不再常驻「插件恢复」入口')
   assert.match(app, /btnPluginRecoveryJump'\)\.addEventListener\('click', \(\) => showPage\('recovery'\)\)/,
     '主页面按钮要一步跳到恢复卡')
   const render = sliceBetween(app, 'function renderPluginRecovery(p)', 'function renderRecovery(state)', 'renderPluginRecovery')
@@ -234,4 +241,16 @@ test('pluginUiState：运行时没有证据时用默认快捷键兜底，且声�
   assert.deepEqual([...state.suspects].map((s) => s.npm), ['@kenz1117/dsh-ui-usage-billing'])
   assert.equal(state.suspects[0].name, '用量与计费')
   assert.equal(state.canBatchDisable, true, '静态归因同样可以一键禁用')
+})
+
+test('恢复入口可见性：只有未就绪/安全模式占版面，隔离成功不常驻', () => {
+  const ctx = {}
+  vm.createContext(ctx)
+  const fn = app.slice(app.indexOf('function pluginRecoveryVisible('), app.indexOf('function renderPluginRecovery('))
+  vm.runInContext(fn, ctx)
+  assert.equal(ctx.pluginRecoveryVisible({ degraded: true }), true, '界面未就绪要显示')
+  assert.equal(ctx.pluginRecoveryVisible({ safeMode: {} }), true, '安全模式是进行中的状态，保留恢复入口')
+  assert.equal(ctx.pluginRecoveryVisible({ quarantine: { disabled: [{ npm: 'x', disabled: true }] } }), false,
+    '按插件隔离成功、界面健康后，恢复卡/跳转/标题栏都不该再出现')
+  assert.equal(ctx.pluginRecoveryVisible({}), false)
 })

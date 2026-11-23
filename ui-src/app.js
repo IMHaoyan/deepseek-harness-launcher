@@ -511,7 +511,9 @@ function render(state) {
     const jump = $('btnPluginRecoveryJump');
     if (jump) {
       const pu = state.pluginUi || {};
-      const showJump = !!(pu.degraded || pu.safeMode || pu.quarantine);
+      // 恢复完成的隔离记录不再常驻主页面：未就绪或用户主动进入的安全模式才需要入口。
+      // 隔离记录的恢复入口在插件页工具栏，不需要一直占着主页面。
+      const showJump = pluginRecoveryVisible(pu);
       jump.classList.toggle('hidden', !showJump);
       jump.classList.toggle('primary', !!pu.degraded);
       jump.textContent = pu.degraded ? '处理插件冲突' : '查看插件恢复状态';
@@ -1561,6 +1563,16 @@ function pluginQuarantineNames(q) {
   }).filter(Boolean);
 }
 
+/**
+ * 恢复入口（恢复卡 / 主页面跳转）是否占据版面。
+ * 只有「界面未就绪」和「用户主动进入的安全模式」需要；按插件隔离成功、页面已恢复后，
+ * 隔离记录不再出现在通用页/日志页/标题栏，恢复入口收进插件页工具栏。
+ */
+function pluginRecoveryVisible(ui) {
+  const u = ui || {};
+  return !!(u.degraded || u.safeMode);
+}
+
 function renderPluginRecovery(p) {
   const card = $('pluginRecoveryCard');
   if (!card) return;
@@ -1570,8 +1582,19 @@ function renderPluginRecovery(p) {
   const quarantine = ui.quarantine || null;
   const suspects = Array.isArray(ui.suspects) ? ui.suspects : [];
   const actionableSuspects = suspects.filter((s) => s && s.actionable);
-  const show = !!(ui.degraded || safe || quarantine);
+  // 只有“界面还没恢复”(degraded) 与“用户主动进入的安全模式”需要占用版面。
+  // 按插件隔离成功后，页面已健康，这张卡就不该继续挂着：恢复入口移到插件页的工具栏。
+  const show = pluginRecoveryVisible(ui);
   card.classList.toggle('hidden', !show);
+  // 隔离记录的恢复入口：无论卡片是否显示，都放进插件页（低噪音、可找到）。
+  const btnPluginsRestore = $('btnPluginsQuarantineRestore');
+  if (btnPluginsRestore) {
+    const qNames = pluginQuarantineNames(quarantine);
+    btnPluginsRestore.classList.toggle('hidden', !qNames.length);
+    btnPluginsRestore.title = qNames.length
+      ? '恢复禁用前的 Profile（当前禁用：' + qNames.join('、') + '）'
+      : '';
+  }
   if (!show) return;
   const title = $('pluginRecoveryTitle');
   const detail = $('pluginRecoveryDetail');
@@ -1790,7 +1813,7 @@ $('btnPluginDisableSuspects').addEventListener('click', async () => {
     ? `${base}；未能停用 ${failed.map((f) => f.npm).join('、')}`
     : base) + extra);
 });
-$('btnPluginQuarantineRestore').addEventListener('click', async () => {
+async function restoreQuarantineProfile() {
   const q = (window._pluginUi || {}).quarantine || null;
   const names = pluginQuarantineNames(q);
   const ok = await confirmDialog({
@@ -1804,7 +1827,10 @@ $('btnPluginQuarantineRestore').addEventListener('click', async () => {
   const r = await cmd('pluginQuarantineRestore');
   if (!r || r.ok === false) showConsoleToast('✕ 恢复失败：' + ((r && r.error) || '无响应，请查看日志'));
   else showConsoleToast('✓ 已恢复禁用前的 Profile，正在重启 DSH');
-});
+}
+$('btnPluginQuarantineRestore').addEventListener('click', restoreQuarantineProfile);
+// 卡片在界面健康后会隐藏；插件页工具栏保留同一个入口，动作与确认文案完全一致。
+$('btnPluginsQuarantineRestore').addEventListener('click', restoreQuarantineProfile);
 $('btnPluginSafeMode').addEventListener('click', async () => {
   const ok = await confirmDialog({
     title: '以安全模式重启 DSH？',
