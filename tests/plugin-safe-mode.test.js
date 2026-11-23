@@ -88,6 +88,10 @@ test('状态与界面：pluginUi 只读事实 + 恢复页安全模式卡片 + �
   assert.match(state, /thirdParty,/, '要告诉界面哪些第三方 bundle 会被临时停用')
   assert.match(state, /canSafeMode: thirdParty\.length > 0/, '没有第三方插件时不能给安全模式按钮')
   assert.match(state, /pluginActivation\.attributeCulprits\(issues, candidates\)/, '冲突元凶要归因到具体包')
+  assert.match(state, /staticShortcutSuspects\(candidates, candidateNames\)/,
+    '运行时没有证据时，用插件声明的默认快捷键比对兜底')
+  assert.match(state, /suspicionSource = 'shortcut-defaults'/, '要告诉界面这条结论来自默认快捷键比对')
+  assert.match(app, /根据已安装插件声明的默认快捷键比对/, '静态归因必须说明依据，不能冒充报错原文')
   assert.match(state, /\.filter\(\(npm\) => !IGNORED_NPM_PLUGINS\.has\(npm\)\)/, '忽略清单里的插件不参与自动停用')
   assert.match(state, /declaredThirdParty/, '归因候选要覆盖 dependencies（市场停用的插件仍在依赖里）')
   assert.match(state, /profileTargetNamesCached/, '还要覆盖 cordis.patch.yml 里的 insert 行（市场安装的形态）')
@@ -179,4 +183,55 @@ test('DSH 独立窗口：插件冲突时顶栏出现恢复按钮，直达恢复�
   assert.match(main, /pluginRecovery: \(\(\) => \{/, '状态推送要带 pluginRecovery')
   assert.match(main, /case 'browser:pluginRecovery': if \(!SELF_TEST\) showConsolePage\('recovery'\)/,
     '独立窗口按钮直接打开恢复页')
+})
+
+test('pluginUiState：运行时没有证据时用默认快捷键兜底，且声明顺序不能踩 TDZ', () => {
+  const activation = require('../plugin-activation')
+  const manifest = {
+    dependencies: { '@kenz1117/dsh-ui-usage-billing': '^1.8.9' },
+    dsh: { profile: { bundles: ['@kenz1117/dsh-ui-usage-billing'] } },
+  }
+  const server = {
+    activationIssues: [{
+      kind: 'ui-page',
+      packageName: '@deepseek-ai/dsh-client-ui-sidebar',
+      entryId: '',
+      detail: 'pending (waiting for service: uiWorkspace)',
+      required: true,
+    }],
+    uiPageHealthy: false,
+    activationAutoOpened: false,
+  }
+  const ctx = {
+    server,
+    Config: { pluginQuarantine: null, pluginSafeModeBackup: null },
+    IGNORED_NPM_PLUGINS: new Set(),
+    pluginActivation: activation,
+    pluginSwitch: { isDisabled: () => false, canToggle: () => true },
+    readProfileManifestSafe: () => manifest,
+    profileBundlesOf: () => ['@kenz1117/dsh-ui-usage-billing'],
+    profileDeclaredNpms: () => ['@kenz1117/dsh-ui-usage-billing'],
+    profileTargetNamesCached: () => [],
+    safeModeKeepsBundle: (n) => n.startsWith('@deepseek-ai/'),
+    pluginNameForNpm: (n) => (n === '@kenz1117/dsh-ui-usage-billing' ? '用量与计费' : n),
+    staticShortcutSuspects: () => [{
+      npm: '@kenz1117/dsh-ui-usage-billing',
+      name: '用量与计费',
+      reasons: ['声明了与 session.toggleRead（@deepseek-ai/dsh-client-ui-workspace）相同的默认快捷键 desktop:macos'],
+      canToggle: true,
+      inBundles: true,
+      disabled: false,
+      actionable: true,
+      static: true,
+    }],
+  }
+  vm.createContext(ctx)
+  const src = main.slice(main.indexOf('function pluginUiState('), main.indexOf('/** 安全模式：保留官方 bundle'))
+  vm.runInContext(src, ctx)
+  const state = ctx.pluginUiState()
+  assert.equal(state.degraded, true)
+  assert.equal(state.suspicionSource, 'shortcut-defaults')
+  assert.deepEqual([...state.suspects].map((s) => s.npm), ['@kenz1117/dsh-ui-usage-billing'])
+  assert.equal(state.suspects[0].name, '用量与计费')
+  assert.equal(state.canBatchDisable, true, '静态归因同样可以一键禁用')
 })

@@ -1602,7 +1602,10 @@ function renderPluginRecovery(p) {
     const lines = [`${countText}${names.length ? '：' + names.join('、') : ''}；继续重启不会改变。`];
     const actionable = actionableSuspects;
     if (suspects.length) {
-      lines.push('根据报错，疑似冲突插件：' + suspects.map(pluginSuspectLine).join('；') + '。');
+      const basis = ui.suspicionSource === 'shortcut-defaults'
+        ? '根据已安装插件声明的默认快捷键比对，疑似冲突插件：'
+        : '根据报错，疑似冲突插件：';
+      lines.push(basis + suspects.map(pluginSuspectLine).join('；') + '。');
       if (actionable.length === suspects.length) {
         lines.push(`将只禁用以上 ${actionable.length} 个疑似冲突插件，其他插件不受影响；会先备份 Profile，之后可整体恢复。`);
       } else if (actionable.length) {

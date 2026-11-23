@@ -359,8 +359,8 @@ test('浏览器控制台证据：可选插件失败也能点名 usage-billing，
 
   assert.match(main, /wc\.on\('console-message'/, '独立窗口/标签页都要接浏览器控制台')
   assert.match(main, /noteConsoleEvidence\(text\)/, '控制台证据统一进 activationIssues，但不自动开页')
-  assert.doesNotMatch(main, /level !== 'warning' && level !== 'error'/, '不能过滤 info：插件会把异常吞进 console.info')
-  assert.match(main, /new URL\(src\)\.origin === new URL\(WEB_URL\)\.origin/, '只信 DSH 同源控制台消息')
+  assert.match(main, /recordConsoleTrail\(level, text\)/, 'info 级消息也要进控制台尾部（插件会把异常吞进 console.info）')
+  assert.match(main, /u\.origin === new URL\(WEB_URL\)\.origin/, '只信 DSH 同源控制台消息')
 })
 
 test('页面判定纯函数：失败页/真实界面/加载中三种边界，以及“只 loading 不归因”', () => {
@@ -417,4 +417,20 @@ test('归因候选覆盖 Profile dependencies：市场停用（不在 bundles）
 
   // 空/非法 dependencies 不能让状态计算抛错
   assert.deepEqual([...ctx.profileDeclaredNpms({ dependencies: null, dsh: null })], [])
+})
+
+test('控制台来源判定：本机 localhost/127.0.0.1 任意端口都采信，外部来源不采信', () => {
+  const ctx = { WEB_URL: 'http://127.0.0.1:5100', URL }
+  vm.createContext(ctx)
+  const fn = main.slice(main.indexOf('function consoleSourceTrusted('), main.indexOf('function recordConsoleTrail('))
+  vm.runInContext(fn, ctx)
+  assert.equal(ctx.consoleSourceTrusted('http://127.0.0.1:5100/assets/index.js'), true)
+  assert.equal(ctx.consoleSourceTrusted('http://localhost:5100/assets/index.js'), true, 'DSH 可能用 localhost 和 127.0.0.1 混着加载')
+  assert.equal(ctx.consoleSourceTrusted(''), true, '无来源（内联脚本）允许')
+  assert.equal(ctx.consoleSourceTrusted('about:blank'), true)
+  assert.equal(ctx.consoleSourceTrusted('https://example.com/x.js'), false, '外部嵌入内容不能当启动证据')
+  assert.equal(ctx.consoleSourceTrusted('devtools://devtools/bundled/x.js'), false)
+  assert.match(main, /pushConsoleTrail\(\{ level, text: `\(来源被忽略 \$\{src\}\) \$\{text\}` \}\)/,
+    '被来源判定挡下的消息要留在控制台尾部，便于区分“没有证据”和“证据被误杀”')
+  assert.match(main, /插件失败页：控制台尾部=/, '失败页没有冲突原文时，要把控制台尾部记进日志')
 })

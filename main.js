@@ -30,6 +30,7 @@ const pluginSwitch = require('./plugin-switch')
 const pluginInventory = require('./plugin-inventory')
 const pluginRepo = require('./plugin-repo')
 const pluginCompat = require('./dsh-plugin-compat')
+const shortcutConflicts = require('./shortcut-conflicts')
 const stopGuard = require('./service-stop-guard')
 const { probePid, terminateProcess, waitForCompletion } = require('./service-termination')
 const handover = require('./service-handover')
@@ -926,6 +927,7 @@ const server = {
   activationAutoOpened: false, // required 插件失败时是否已自动打开恢复页（每世代只自动一次）
   uiPageHealthy: false, // 页面实际已加载真实 DSH 界面（有可见聊天输入框）→ 覆盖过期的激活证据
   failureSnippetLogged: '', // 失败页缺冲突原文时已记录过的片段（同内容只记一次，避免刷屏）
+  consoleTrail: [], // 本轮启动的浏览器控制台尾部（只收启动诊断相关消息，用于失败页无冲突原文时定位）
   startPromise: null, // 进行中的启动：并发调用共用同一次启动，不再 spawn 第二个 dsh web 抢同一个端口
   expectCrash: false, // 测试/主动 kill 用：这次退出是我们造成的，跳过交接裁决直接走崩溃路径
   owned() { return !!this.child && this.child.exitCode === null && this.child.signalCode === null },
@@ -2386,6 +2388,45 @@ function noteConsoleEvidence(text) {
 }
 
 /**
+ * 控制台来源只信“本机的 DSH 页面”：同源，或 localhost/127.0.0.1 的任意端口
+ * （实测 DSH 的页面与它加载的 bundle 可能分别用 localhost / 127.0.0.1）。
+ * 其它来源（第三方嵌入页、devtools）不采信。
+ */
+function consoleSourceTrusted(src) {
+  const s = String(src || '')
+  if (!s || s === 'about:blank') return true
+  try {
+    const u = new URL(s)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+    const host = u.hostname.toLowerCase()
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') return true
+    return u.origin === new URL(WEB_URL).origin
+  } catch { return false }
+}
+
+/**
+ * 浏览器控制台尾部：失败页只有 pending、没有任何冲突原文时，这里是唯一还能说明
+ * “谁把界面搞挂了”的地方。只留启动诊断相关消息，落盘时每条截断，避免把用户正文写进日志。
+ */
+function recordConsoleTrail(level, text) {
+  if (level !== 'info' && level !== 'warning' && level !== 'error') return
+  const hay = String(text || '')
+  const interesting = level === 'warning' || level === 'error'
+    || /usage-billing|shortcut|Conflicting|did not activate|Failed to load|boot|plugin|fiber/iu.test(hay)
+  if (!interesting) return
+  pushConsoleTrail({ level, text: hay })
+}
+
+function pushConsoleTrail(entry) {
+  const trail = server.consoleTrail
+  trail.push({
+    level: String((entry && entry.level) || ''),
+    text: String((entry && entry.text) || '').replace(/\s+/gu, ' ').trim().slice(0, 240),
+  })
+  if (trail.length > 60) trail.splice(0, trail.length - 60)
+}
+
+/**
  * 逐行喂 stderr：命中「bundle 被跳过 / 行没激活」就记一条证据。
  *
  * 为什么逐行增量而不是就绪时扫 errTail：DSH 那两行出现在启动早期，
@@ -2560,6 +2601,10 @@ function inspectWebBootFailure(text) {
     if (snip && snip !== server.failureSnippetLogged) {
       server.failureSnippetLogged = snip
       log('插件失败页：未找到冲突原文，页面片段=' + snip)
+      const tail = (server.consoleTrail || []).slice(-10)
+      if (tail.length) {
+        log('插件失败页：控制台尾部=' + tail.map((x) => `[${x.level}] ${x.text}`).join(' | ').slice(0, 2000))
+      }
     }
   }
   if (!found.length) {
@@ -2622,6 +2667,7 @@ function resetActivationEvidence() {
   server.activationAutoOpened = false
   server.uiPageHealthy = false
   server.failureSnippetLogged = ''
+  server.consoleTrail = []
 }
 
 // 记录一次服务侧失败：抽取原因 → 按签名累计连续次数 → 供通知/界面/确定性判定使用。
@@ -4292,6 +4338,101 @@ function writeProfileManifestAtomic(manifest) {
 }
 
 /**
+ * 静态快捷键冲突候选：失败页与日志都没有点名插件时的最后一条归因路径。
+ *
+ * 只读插件自己的 client bundle，提取 `defaults:{…}` 默认绑定并两两比对；命中即说明
+ * 这两条命令在 DSH 的快捷键服务里必然互撞（DSH 的判据就是逐 runtime:platform 比较绑定）。
+ * 不执行任何插件代码，解析不到就返回空（宁可少报，不误报）。
+ * 按 profile 的 mtime + DSH 安装树缓存 5 分钟：pluginUiState 会被频繁调用，不能每次扫盘。
+ */
+const SHORTCUT_SCAN_TTL_MS = 5 * 60 * 1000
+let shortcutScanCache = { key: '', at: 0, conflicts: [] }
+
+function pluginClientEntry(pkgDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+    const ex = pkg && pkg.exports && pkg.exports['./client']
+    let rel = ''
+    if (typeof ex === 'string') rel = ex
+    else if (ex && typeof ex === 'object') rel = ex.default || ex.import || ex.require || ''
+    if (!rel) rel = './lib/client.js'
+    return path.join(pkgDir, String(rel).replace(/^\.\//u, ''))
+  } catch { return '' }
+}
+
+function readClientCommands(file) {
+  try {
+    const st = fs.statSync(file)
+    if (!st.isFile() || st.size > 8 * 1024 * 1024) return []
+    return shortcutConflicts.extractShortcutCommands(fs.readFileSync(file, 'utf8'))
+  } catch { return [] }
+}
+
+function staticShortcutConflicts(candidateNpms) {
+  const wanted = new Set(Array.isArray(candidateNpms) ? candidateNpms : [])
+  if (!wanted.size) return []
+  let key = ''
+  try { key = String(fs.statSync(DSH_PROFILE_PACKAGE).mtimeMs) } catch { key = '0' }
+  const dirs = dshInstallModulesDirs()
+  key += '|' + dirs.join(';')
+  const now = Date.now()
+  if (shortcutScanCache.key === key && now - shortcutScanCache.at < SHORTCUT_SCAN_TTL_MS) {
+    return shortcutScanCache.conflicts.filter((c) => wanted.has(c.npm))
+  }
+  const entries = []
+  const seenOfficial = new Set()
+  for (const mod of dirs) {
+    let names = []
+    try { names = fs.readdirSync(path.join(mod, '@deepseek-ai')).filter((n) => n.startsWith('dsh-client-')) } catch { continue }
+    for (const name of names) {
+      if (seenOfficial.has(name)) continue
+      seenOfficial.add(name)
+      const npm = '@deepseek-ai/' + name
+      const commands = readClientCommands(pluginClientEntry(path.join(mod, '@deepseek-ai', name)))
+      if (commands.length) entries.push({ npm, official: true, commands })
+    }
+  }
+  for (const npm of wanted) {
+    const commands = readClientCommands(pluginClientEntry(path.join(DSH_PROFILE_DIR, 'node_modules', npm)))
+    if (commands.length) entries.push({ npm, official: false, commands })
+  }
+  let conflicts = []
+  try { conflicts = shortcutConflicts.findDefaultConflicts(entries) } catch { conflicts = [] }
+  shortcutScanCache = { key, at: now, conflicts }
+  return conflicts.filter((c) => wanted.has(c.npm))
+}
+
+/**
+ * 把静态冲突转成与运行时 suspects 同构的条目，界面/批量停用走同一条路。
+ */
+function staticShortcutSuspects(candidates, candidateNpms) {
+  const conflicts = staticShortcutConflicts(candidateNpms)
+  if (!conflicts.length) return []
+  const byNpm = new Map()
+  for (const c of conflicts) {
+    if (!byNpm.has(c.npm)) byNpm.set(c.npm, [])
+    byNpm.get(c.npm).push(c)
+  }
+  const out = []
+  for (const [npm, list] of byNpm) {
+    const info = (candidates || []).find((x) => x && x.npm === npm) || {}
+    const first = list[0]
+    const reason = `声明了与 ${first.otherId}（${first.otherNpm}）相同的默认快捷键 ${first.combo}`
+    out.push({
+      npm,
+      name: pluginNameForNpm(npm),
+      reasons: [reason],
+      canToggle: info.canToggle === true,
+      inBundles: info.inBundles === true,
+      disabled: info.disabled === true,
+      actionable: info.disabled !== true && (info.canToggle === true || info.inBundles === true),
+      static: true,
+    })
+  }
+  return out
+}
+
+/**
  * 本轮启动的插件问题（忽略不再归 DSHL 管理的包）+ 安全模式事实。只读，供控制台渲染。
  * 只要 activationIssues 非空就判"界面未就绪"：DSH 对这些行只写 stderr、HTTP 仍 ready，
  * 不把它升级成状态，用户就会看到一张失败页而启动器显示绿色运行中。
@@ -4344,9 +4485,20 @@ function pluginUiState() {
         inBundles: info.inBundles === true,
         disabled,
         actionable: !disabled && (info.canToggle === true || info.inBundles === true),
+        static: false,
       }
     })
+  // 没有运行时证据时，退一步看插件自己声明的默认快捷键是否互撞。
+  // 这不是猜：DSH 的失败判据就是逐平台比较默认绑定，绑定相同必然冲突。
   const critical = issues.filter((it) => pluginActivation.isUiCriticalIssue(it))
+  let suspicionSource = 'runtime'
+  if (critical.length > 0 && suspects.length === 0) {
+    const fromDefaults = staticShortcutSuspects(candidates, candidateNames)
+    if (fromDefaults.length) {
+      suspects.push(...fromDefaults)
+      suspicionSource = 'shortcut-defaults'
+    }
+  }
   const requiredCount = issues.filter((it) => it.required === true).length
   return {
     degraded: critical.length > 0 && server.uiPageHealthy !== true,
@@ -4366,6 +4518,7 @@ function pluginUiState() {
     thirdPartyEnabled,
     canSafeMode: thirdParty.length > 0,
     suspects,
+    suspicionSource,
     canBatchDisable: suspects.some((s) => s.actionable),
     safeMode: Config.pluginSafeModeBackup || null,
     quarantine: q ? {
@@ -7199,13 +7352,15 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
   wc.on('console-message', (details, _level, message) => {
     const text = String((details && details.message) || message || '')
     if (!text) return
-    const src = String((details && details.sourceId) || '')
-    if (src && src !== 'about:blank') {
-      let sameOrigin = false
-      try { sameOrigin = new URL(src).origin === new URL(WEB_URL).origin } catch { sameOrigin = false }
-      if (!sameOrigin) return
-    }
+    const level = String((details && details.level) || '')
+    recordConsoleTrail(level, text)
     if (!/Conflicting shortcut defaults|did not activate|Failed to load plugins/iu.test(text)) return
+    const src = String((details && details.sourceId) || '')
+    if (!consoleSourceTrusted(src)) {
+      // 不改采信策略，但把“被忽略的来源”留在控制台尾部：下次排查能直接看到是不是来源判定误杀。
+      pushConsoleTrail({ level, text: `(来源被忽略 ${src}) ${text}` })
+      return
+    }
     try { noteConsoleEvidence(text) } catch { /* noop */ }
   })
   // 外部链接（target=_blank / window.open）→ 统一交给系统默认浏览器打开，避免被 Electron 吞掉
