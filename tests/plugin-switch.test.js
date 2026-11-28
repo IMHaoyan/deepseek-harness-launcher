@@ -219,3 +219,68 @@ test('市场状态文件损坏：fail-closed，拒绝写入且不覆盖原文件
   assert.match(result.error, /状态文件/)
   assert.equal(fs.readFileSync(statePath, 'utf8'), before, '损坏文件不能被"重建小形状"覆盖')
 })
+
+// —— 2026-11-28 真机事故：带 config 的条目被"删两行再追加裸行"留下顶格 config: ——
+// DSH 启动时抛 YAMLParseError: Unexpected scalar at node end，整个服务起不来。
+test('带 config 的条目：禁用只改 disabled 行，绝不留下顶格残块', () => {
+  const { home, profile } = makeHome()
+  pluginSwitch.initPluginSwitch({ home })
+  const patchPath = path.join(profile, 'cordis.patch.yml')
+  fs.writeFileSync(patchPath, [
+    '- id: mine',
+    '  disabled: false',
+    '  config:',
+    '    provider: openai-compat',
+    '    nested:',
+    '      - a',
+    '- id: other',
+    '  disabled: true',
+    '',
+  ].join('\n'))
+  const result = pluginSwitch.setEnabled('pkg', false)
+  assert.equal(result.ok, true, result.error)
+  assert.equal(fs.readFileSync(patchPath, 'utf8'), [
+    '- id: mine',
+    '  disabled: true',
+    '  config:',
+    '    provider: openai-compat',
+    '    nested:',
+    '      - a',
+    '- id: other',
+    '  disabled: true',
+    '',
+  ].join('\n'), 'config 必须原样保留，开关必须就地改值')
+})
+
+test('带 config 的条目：启用只删 disabled 行，条目与 config 都保留', () => {
+  const { home, profile } = makeHome()
+  pluginSwitch.initPluginSwitch({ home })
+  const patchPath = path.join(profile, 'cordis.patch.yml')
+  fs.writeFileSync(patchPath, [
+    '- id: mine',
+    '  disabled: true',
+    '  config:',
+    '    provider: openai-compat',
+    '',
+  ].join('\n'))
+  const result = pluginSwitch.setEnabled('pkg', true)
+  assert.equal(result.ok, true, result.error)
+  assert.equal(fs.readFileSync(patchPath, 'utf8'), [
+    '- id: mine',
+    '  config:',
+    '    provider: openai-compat',
+    '',
+  ].join('\n'))
+})
+
+test('补丁层已是残块结构：写入前 fail-closed，原文件一个字节都不改', () => {
+  const { home, profile } = makeHome()
+  pluginSwitch.initPluginSwitch({ home })
+  const patchPath = path.join(profile, 'cordis.patch.yml')
+  const broken = '- id: mine\nconfig:\n    provider: openai-compat\n'
+  fs.writeFileSync(patchPath, broken)
+  const result = pluginSwitch.setEnabled('pkg', false)
+  assert.equal(result.ok, false)
+  assert.match(result.error, /不在顶层条目内/)
+  assert.equal(fs.readFileSync(patchPath, 'utf8'), broken, '坏文件不能被进一步改写')
+})

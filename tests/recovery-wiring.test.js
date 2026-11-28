@@ -74,12 +74,12 @@ test('reasonForPhase 按恢复判定返回新 reason，且判在通用 failed/of
 test('说明页文案表覆盖新 reason（否则 fallback 成"正在启动…"，与真实动作不符）', () => {
   const bodySrc = loading.slice(loading.indexOf('const TEXTS = {'), loading.indexOf('const triedAuth'))
   const keys = new Set([...bodySrc.matchAll(/^  ([A-Za-z][A-Za-z0-9]*): \{$/gm)].map((m) => m[1]))
-  for (const r of ['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown']) {
+  for (const r of ['pluginFailed', 'settingsInvalid', 'patchInvalid', 'envMissing', 'bootUnknown']) {
     assert.ok(keys.has(r), `说明页缺少 ${r} 的文案`)
   }
   // 需要用户介入的状态必须立刻给按钮，不能等 15 秒
   const busy = loading.slice(loading.indexOf('const BUSY_REVEAL_MS'), loading.indexOf('const revealMs'))
-  for (const r of ['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown']) {
+  for (const r of ['pluginFailed', 'settingsInvalid', 'patchInvalid', 'envMissing', 'bootUnknown']) {
     assert.ok(!busy.includes(r + ':'), `${r} 需要用户介入，不该进 BUSY_REVEAL_MS`)
   }
 })
@@ -115,17 +115,17 @@ test('只有"确实是恢复界面"的那几个 reason 才采纳 plan（进行�
   // 主进程的 loadingParams() 对 plugin / recovery / update 这些"进行中"的页面也会附带 plan
   // （lastBootFailureInfo 还留着上一次的失败）。不加这道闸，"正在应用插件变更…"会被渲染成
   // 上一次失败的标题——正是"文案与真实动作不符"。
-  assert.match(loading, /const PLAN_REASONS = new Set\(\['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'\]\)/,
+  assert.match(loading, /const PLAN_REASONS = new Set\(\['pluginFailed', 'settingsInvalid', 'patchInvalid', 'envMissing', 'bootUnknown'\]\)/,
     '必须显式列出采纳 plan 的 reason')
   assert.match(loading, /if \(PLAN_REASONS\.has\(reason\)\) \{[\s\S]{0,200}?JSON\.parse\(raw\)/,
     'plan 的解析必须在 reason 闸之内')
   const at = loading.indexOf('if (PLAN_REASONS.has(reason))')
   const guard = loading.slice(at, loading.indexOf('const planAction'))
   assert.match(guard, /plan = JSON\.parse\(raw\)/, 'plan 只能在闸内赋值')
-  // 集合本身恰好是这四个：多一个就是把"进行中"的页面也交出去了
+  // 集合本身恰好是这五个失败页：多一个就是把"进行中"的页面也交出去了
   const setLine = loading.slice(loading.indexOf('const PLAN_REASONS'), loading.indexOf('\n', loading.indexOf('const PLAN_REASONS')))
   const listed = [...setLine.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]).sort()
-  assert.deepEqual(listed, ['bootUnknown', 'envMissing', 'pluginFailed', 'settingsInvalid'])
+  assert.deepEqual(listed, ['bootUnknown', 'envMissing', 'patchInvalid', 'pluginFailed', 'settingsInvalid'])
 })
 
 // ---------- ⑤ 确认框 fail-closed ----------
@@ -514,7 +514,7 @@ test('环境不就绪的启动路径要刷新说明页（否则背后那页永�
   assert.match(main, /async function startForConsole\(\) \{[\s\S]{0,300}?env-not-ready[\s\S]{0,200}?\n\}/,
     'startForConsole 早退时不刷新 —— 这就是启动路径必须自己刷的原因')
   // 而 start 不在 PLAN_REASONS 里：plan 即使算出了 envMissing 也不能在 start 页上生效
-  assert.match(loading, /PLAN_REASONS = new Set\(\['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'\]\)/,
+  assert.match(loading, /PLAN_REASONS = new Set\(\['pluginFailed', 'settingsInvalid', 'patchInvalid', 'envMissing', 'bootUnknown'\]\)/,
     'start 必须不在白名单里，否则启动中就会显示失败页')
 })
 
@@ -525,7 +525,7 @@ test('四类失败页的 reason 只有一份定义，页面侧与主进程侧不
   const mainSide = planSrc.match(/const PAGE_REASONS = Object\.freeze\(\[([^\]]*)\]\)/)
   assert.ok(mainSide, 'recovery-plan.js 要有 PAGE_REASONS')
   const names = mainSide[1].split(',').map((s) => s.trim().replace(/^'|'$/gu, '')).filter(Boolean)
-  assert.deepEqual(names, ['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'])
+  assert.deepEqual(names, ['pluginFailed', 'settingsInvalid', 'patchInvalid', 'envMissing', 'bootUnknown'])
   for (const n of names) {
     assert.ok(loading.includes(`'${n}'`), `页面侧缺 ${n}`)
     assert.ok(new RegExp(`PLAN_REASONS = new Set\\(\\[[^\\]]*'${n}'`).test(loading)

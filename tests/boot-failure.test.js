@@ -265,8 +265,7 @@ test('pluginTargets：识别不出就是空数组，且有长度上限（不许�
   assert.equal(bf.pluginTargets(many).length, bf.MAX_TARGETS)
 })
 
-test('classifyBootFailure 带上 targets，但 target 仍是那一个（判定口径不变）', () => {
-  const c = bf.classifyBootFailure(MULTI_PLUGIN)
+test('classifyBootFailure 带上 targets，但 target 仍是那一个（判定口径不变）', () => {  const c = bf.classifyBootFailure(MULTI_PLUGIN)
   assert.equal(c.kind, 'plugin-tree')
   assert.equal(c.target, 'dsh-ui-kit', 'target 仍是"最具体的那一条"，不许被 targets 影响')
   assert.deepEqual(c.targets, ['dsh-ui-kit', 'dsh-charts', 'dsh-theme-pack'])
@@ -275,4 +274,54 @@ test('classifyBootFailure 带上 targets，但 target 仍是那一个（判定�
   // 非插件类失败也带上（可能为空），字段始终存在，消费方不必判 undefined
   assert.deepEqual(bf.classifyBootFailure(EACCES).targets, [])
   assert.ok(Array.isArray(bf.classifyBootFailure('Error: 未知').targets))
+})
+
+// —— 2026-11-28 真机语料：profile 的 cordis.patch.yml 被写坏 ——
+// Node 抛未捕获异常时会先打印出错源码行，旧 looksLikeError 把模板串当成了根因，
+// 界面上于是只显示 `throw new Error(...)`（用户截图里的那一行），真正的 Error 行没露出来。
+const PATCH_INVALID = [
+  'file:///C:/Users/x/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js:11798',
+  '\t\tthrow new Error(`${binName}: failed to parse ${label} ${file}: ${String(error)}`);',
+  '\t\t      ^',
+  '',
+  'Error: dsh: failed to parse overlay C:\\Users\\x\\.dsh\\profiles\\web\\cordis.patch.yml: YAMLParseError: Unexpected scalar at node end at line 509, column 1:',
+  '',
+  '    communityNote: link',
+  'config:',
+  '^^^^^^',
+  '',
+  '    at parsePatchList (file:///C:/x/dsh-app-boot/lib/index.js:11798:9)',
+  'Node.js v26.13.1',
+].join('\n')
+
+test('patch-invalid：识别为确定性失败，target 是补丁文件路径', () => {
+  const c = bf.classifyBootFailure(PATCH_INVALID)
+  assert.equal(c.kind, 'patch-invalid')
+  assert.equal(c.target, 'C:\\Users\\x\\.dsh\\profiles\\web\\cordis.patch.yml')
+  assert.equal(c.eligible, true)
+  assert.match(c.reason, /YAMLParseError/u)
+})
+
+test('firstErrorLine：跳过 Node 打印的源码行，取真正的 Error 行', () => {
+  const line = bf.firstErrorLine(PATCH_INVALID)
+  assert.match(line, /^Error: dsh: failed to parse overlay/u)
+  assert.ok(!line.includes('throw new Error'), '不能把源码模板串当根因')
+})
+
+test('firstErrorLine：没有任何已知规则命中时，也不把源码行当根因', () => {
+  const text = [
+    'file:///C:/x/index.js:1',
+    '    throw new Error(`boom`);',
+    '    ^',
+    'Error: boom happened',
+    '    at file:///C:/x/index.js:1:11',
+  ].join('\n')
+  assert.equal(bf.firstErrorLine(text), 'Error: boom happened')
+})
+
+test('patch-invalid：连续两次同签名 → 确定性失败，不再烧重启额度', () => {
+  const c = bf.classifyBootFailure(PATCH_INVALID)
+  const once = bf.nextFailureStreak(null, c.signature)
+  const twice = bf.nextFailureStreak(once, c.signature)
+  assert.equal(bf.isDeterministic(Object.assign({}, c, { count: twice.count })), true)
 })

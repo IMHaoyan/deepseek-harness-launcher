@@ -42,7 +42,7 @@ test('restoreSwap：旧树探测不出可运行版本时如实报失败（并保
     '换下来的新树要保留在 rejected-* 里供诊断')
 })
 
-test('cleanupStage：未完成事务记着的备份与暂存树必须保留', (t) => {
+test('cleanupStage：未完成事务记着的备份与暂存树必须保留', async (t) => {
   const prefix = tempDir(t)
   const stageRoot = path.join(prefix, '.dshl-stage')
   const installDir = path.join(prefix, 'node_modules', '@deepseek-ai', 'dsh')
@@ -61,7 +61,7 @@ test('cleanupStage：未完成事务记着的备份与暂存树必须保留', (t
 
   const keep = dshUpdater.transactionKeepNames()
   assert.deepEqual(keep.sort(), ['0.3.0', 'old-0.2.0'])
-  const removed = dshUpdater.cleanupStage(stageRoot, '', keep)
+  const removed = await dshUpdater.cleanupStage(stageRoot, '', keep)
   assert.deepEqual(removed.sort(), ['0.4.0', 'rejected-123'])
   assert.ok(fs.existsSync(backupDir), '待回滚的旧树不能被清掉')
   assert.ok(fs.existsSync(path.join(stageRoot, '0.3.0')), '预装树不能被清掉')
@@ -107,4 +107,27 @@ test('事务状态文件损坏：不当成"没有事务"删除，也不自动开
   assert.equal(result.reason, 'no-pending')
   assert.ok(fs.existsSync(statePath), '损坏的事务文件必须留作取证')
   assert.equal(fs.readFileSync(statePath, 'utf8'), '{ not json')
+})
+
+// 2026-11-24 定位：检查更新/后台预装里的整树删除原来是 fs.rmSync —— 同步在 Electron 主线程上删
+// 10 万+ 文件（实测一次 54 秒，日志 12:47:05 → 12:47:59），期间启动器窗口完全不响应（卡死）。
+// 这两条把「必须异步」钉住：接口要返回 Promise，源码里不许再出现递归 rmSync。
+test('cleanupStage 返回 Promise（整树删除不得同步阻塞主线程）', async (t) => {
+  const prefix = tempDir(t)
+  const stageRoot = path.join(prefix, '.dshl-stage')
+  const tree = path.join(stageRoot, '0.4.0', 'node_modules', '@deepseek-ai', 'dsh', 'lib')
+  fs.mkdirSync(tree, { recursive: true })
+  for (let i = 0; i < 50; i++) fs.writeFileSync(path.join(tree, 'f' + i + '.js'), 'x')
+  const pending = dshUpdater.cleanupStage(stageRoot, '')
+  assert.equal(typeof pending.then, 'function', '必须返回 Promise：同步删大目录会把窗口钉死')
+  assert.deepEqual((await pending).sort(), ['0.4.0'])
+  assert.ok(!fs.existsSync(path.join(stageRoot, '0.4.0')), 'Promise 结束时目录必须已经删掉')
+})
+
+test('更新路径里不再有递归 fs.rmSync（同步删整棵树 = 窗口卡死）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'dsh-update.js'), 'utf8')
+  const offenders = src.split('\n')
+    .map((line, i) => line + '  // line ' + (i + 1))
+    .filter((line) => /fs\.rmSync\(/.test(line) && /recursive/u.test(line))
+  assert.deepEqual(offenders, [], '递归删除必须走 fs.promises.rm（异步）')
 })

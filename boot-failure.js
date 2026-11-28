@@ -77,6 +77,17 @@ const RULES = [
     describe: (t, m) => `插件引用了当前 DSH 不再提供的导出 ${m[1]}（插件与新版本 DSH 不兼容）`,
   },
   {
+    kind: 'patch-invalid',
+    lineRank: 0,
+    // 真实语料（2026-11-28，profile 的 cordis.patch.yml 被写坏后）：
+    //   Error: dsh: failed to parse overlay C:\Users\x\.dsh\profiles\web\cordis.patch.yml:
+    //   YAMLParseError: Unexpected scalar at node end at line 509, column 1:
+    // 路径里带盘符冒号，所以以 `YAMLParseError:` 作为右边界，而不是第一个冒号。
+    re: /failed to parse (?:overlay|profile [^:]+) (.+?):\s*([A-Za-z]*ParseError):\s*(.*)$/iu,
+    target: (m) => m[1],
+    describe: (t, m) => `Profile 配置补丁${t ? ' ' + t : ''}解析失败（${m[2]}${m[3] ? '：' + String(m[3]).slice(0, 80) : ''}）`,
+  },
+  {
     kind: 'settings-invalid',
     lineRank: 1,
     // 路径里带盘符冒号（C:\…），所以取"最后一个冒号 + 大写错误码"的贪婪匹配
@@ -103,7 +114,7 @@ const RULES = [
 ]
 
 // 参与确定性判定的种类：这些失败的根因是磁盘上的持久状态，重试不会改变结果
-const DETERMINISTIC_KINDS = new Set(['bundle-missing', 'plugin-tree', 'settings-invalid', 'module-missing', 'dsh-core-mismatch'])
+const DETERMINISTIC_KINDS = new Set(['bundle-missing', 'plugin-tree', 'settings-invalid', 'patch-invalid', 'module-missing', 'dsh-core-mismatch'])
 
 // —— 多插件失败：一次失败里到底有几个插件坏了 ——
 // DSH 侧多插件激活失败是一个 AggregateError，成员**逐条打印**：
@@ -191,11 +202,18 @@ function pluginTargets(text) {
   return out
 }
 
-/** 判定「这行看起来是不是根因」。用于 firstErrorLine 的候选筛选。 */
+/**
+ * 判定「这行看起来是不是根因」。用于 firstErrorLine 的候选筛选。
+ *
+ * 必须**行首锚定**：Node 抛未捕获异常时会先打印出错源码行，例如
+ *   `throw new Error(`${binName}: failed to parse ${label} ${file}: ${String(error)}`);`
+ * 旧实现用 `(^|\s)Error\b` 会把这行源码当成根因，界面上于是只显示一段模板字符串，
+ * 而真正的 `Error: dsh: failed to parse overlay …` 就在下面几行（2026-11-28 实际踩到）。
+ */
 function looksLikeError(line) {
-  return /(^|\s)(Error|TypeError|RangeError|ReferenceError|SyntaxError)\b/u.test(line) ||
+  return /^(?:Uncaught\s+)?[A-Za-z]*(?:Error|Exception)\b/u.test(line) ||
     /ERR_[A-Z_]+/u.test(line) ||
-    /^\s*(error|fatal)\b/iu.test(line) ||
+    /^(?:error|fatal)\b/iu.test(line) ||
     RULES.some((r) => r.re.test(line))
 }
 

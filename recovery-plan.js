@@ -99,6 +99,7 @@ const ACTION_IDS = Object.freeze([
 const PAGE_REASONS = Object.freeze([
   'pluginFailed',
   'settingsInvalid',
+  'patchInvalid',
   'envMissing',
   'bootUnknown',
 ])
@@ -253,7 +254,7 @@ function scopeNote(capabilities, unsupported, alreadyOff) {
  *   }
  * }} input
  * @returns {{
- *   scenario: 'none'|'env'|'plugin'|'settings'|'unknown',
+ *   scenario: 'none'|'env'|'plugin'|'settings'|'patch'|'unknown',
  *   reason: string,
  *   title: string,
  *   sub: string,
@@ -419,6 +420,24 @@ function planRecovery(input) {
       primary,
       entry: null,
       blocked: primary ? '' : '没有可用的健康检查点，无法自动回退这份设置文件。',
+    }
+  }
+
+  // ③' Profile 补丁层解析失败：检查点里同样带 profile 的 cordis.patch.yml（healthExtraFiles），
+  //     所以回退是同一套现成动作。这不是插件问题：插件一个都没坏，坏的是补丁文件本身。
+  if (kind === 'patch-invalid') {
+    const primary = checkpointAction
+    return {
+      scenario: 'patch',
+      reason: 'patchInvalid',
+      title: 'Profile 补丁层解析失败',
+      sub: withRunFacts(hasText(target) ? 'DSH 读取配置补丁 ' + target + ' 时解析失败，服务因此起不来。' : 'Profile 的配置补丁无法解析，服务因此起不来。', failure, capabilities),
+      detail: primary ? '' : (detail || reasonText),
+      primary,
+      entry: null,
+      blocked: primary
+        ? ''
+        : '没有可用的健康检查点，无法自动回退这份补丁文件；请修正该文件，或从同目录的 .bak 备份恢复。',
     }
   }
 

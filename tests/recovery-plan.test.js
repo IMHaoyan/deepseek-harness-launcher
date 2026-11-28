@@ -357,7 +357,7 @@ test('入口是**导航**不是动作：id 不许混进 ACTION_IDS，也不能�
 
 // ---------- ③④ 全局不变量：对每一种输入都成立 ----------
 test('对任意输入：动作只能来自 ACTION_IDS 且只有一个动作位；无动作时 blocked 必非空；插件动作必点名 target', () => {
-  const kinds = ['plugin-tree', 'module-missing', 'bundle-missing', 'settings-invalid', 'bind', 'unknown', '']
+  const kinds = ['plugin-tree', 'module-missing', 'bundle-missing', 'settings-invalid', 'patch-invalid', 'bind', 'unknown', '']
   const caps = [
     { envReady: true },
     { envReady: false },
@@ -396,4 +396,33 @@ test('ACTION_IDS 与实现同源：冻结、无重复、且不含导航类动作
   assert.equal(new Set(plan.ACTION_IDS).size, plan.ACTION_IDS.length)
   assert.deepEqual([...plan.ACTION_IDS].sort(),
     ['disable-plugin', 'restore-checkpoint', 'retry', 'uninstall-plugin'])
+})
+
+// ---------- ③' Profile 补丁层解析失败（2026-11-28 真机） ----------
+test('patch-invalid：有检查点时回退检查点（补丁文件本来就在快照里）', () => {
+  const p = plan.planRecovery({
+    failure: {
+      kind: 'patch-invalid',
+      target: 'C:\\Users\\x\\.dsh\\profiles\\web\\cordis.patch.yml',
+      line: 'Error: dsh: failed to parse overlay C:\\Users\\x\\.dsh\\profiles\\web\\cordis.patch.yml: YAMLParseError: Unexpected scalar at node end at line 509, column 1:',
+      reason: 'Profile 配置补丁解析失败（YAMLParseError）',
+      count: 2,
+    },
+    capabilities: { envReady: true, checkpoint: checkpoint() },
+  })
+  assert.equal(p.scenario, 'patch')
+  assert.equal(p.reason, 'patchInvalid')
+  assert.equal(p.primary.id, 'restore-checkpoint')
+  assert.match(p.sub, /cordis\.patch\.yml/u, '副文案必须点名是哪个文件')
+  assert.equal(p.detail, '', '有动作时原文退到 tooltip，不占版面')
+})
+
+test('patch-invalid：没有检查点时不给按钮，但必须说清怎么自己修', () => {
+  const p = plan.planRecovery({
+    failure: { kind: 'patch-invalid', target: 'C:\\x\\cordis.patch.yml', line: 'YAMLParseError', count: 1 },
+    capabilities: { envReady: true },
+  })
+  assert.equal(p.primary, null)
+  assert.match(p.blocked, /备份|修正/u)
+  assert.match(p.blocked, /\.bak|备份/u)
 })

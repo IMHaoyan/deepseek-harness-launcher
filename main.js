@@ -32,7 +32,7 @@ const pluginRepo = require('./plugin-repo')
 const pluginCompat = require('./dsh-plugin-compat')
 const shortcutConflicts = require('./shortcut-conflicts')
 const stopGuard = require('./service-stop-guard')
-const { probePid, terminateProcess, waitForCompletion } = require('./service-termination')
+const { probePid, terminateProcess, waitPortClosed, waitForCompletion } = require('./service-termination')
 const handover = require('./service-handover')
 const listenerProbe = require('./service-listener')
 const trust = require('./trust')
@@ -1227,8 +1227,11 @@ function probeDsh() {
     sock.once('close', () => {
       if (settled) return
       const text = Buffer.concat(buf).toString('utf8')
-      // 新版 DSH 对裸地址直接回 401 鉴权页（"dsh web authentication required..."），同样计为指纹命中
-      done(/DeepSeek Harness|dsh web authentication required/i.test(text), 'fingerprint')
+      // 命中任一 DSH 特征即算自己人：应用页标题里的 DeepSeek Harness、旧版裸 401 的英文字样、
+      // 以及 0.2.x 匿名登录页（「连接到此 Host / 配对此设备」）里的设计令牌前缀 --dsw-。
+      // 2026-11-26 实测：这份登录页既没有 'DeepSeek Harness' 也没有旧版 401 文案，只认前两条
+      // 会把我们自己的 DSH 当成陌生程序（误报端口被占、拒绝接管/停服）。
+      done(/DeepSeek Harness|dsh web authentication required|--dsw-|id="auth-pair-/i.test(text), 'fingerprint')
     })
   })
 }
@@ -1832,6 +1835,20 @@ function authProbeSession() {
   return null
 }
 
+// 窗口会话此刻能不能自己打开首页：true=401（没有有效凭据，看到的就是 Host 的匿名登录页），
+// false=200/3xx（凭据可用），null=取不到会话或请求失败——null 不改任何状态，避免把网络抖动当成凭据失效。
+// 为什么不再读页面正文：DSH 0.2.x 的登录页是「连接到此 Host / 配对此设备」的完整中英双语文档，
+// 正文远超早先那 300 字的阈值，也不含 'authentication required'/'unauthorized'，按内文识别 100% 漏判。
+async function sessionNeedsAuth(ses) {
+  if (!ses || typeof ses.fetch !== 'function') return null
+  try {
+    const res = await ses.fetch(WEB_URL, { method: 'GET', cache: 'no-store' })
+    try { await res.arrayBuffer() } catch { /* 读干响应，释放连接 */ }
+    if (res.status === 401) return true
+    return res.ok ? false : null
+  } catch { return null }
+}
+
 async function probeClaimedAuth(gen) {
   if (SELF_TEST) { markAuthPending(); return } // 自检保持确定性路径，不依赖会话 cookie
   if (server.gen !== gen || server.authPending || !server.claimed()) return
@@ -1901,6 +1918,8 @@ function markReady(child, ownerVerdict) {
   readySince = Date.now()
   autoRestartStopped = false
   clearServiceFailureTracking() // 起来了 = 上一轮的失败证据作废，连续计数归零
+  // 启动耗时进日志：此前只能靠 lifecycle 的 start/ready 两条事件事后对时间，日志本身看不出这一轮多慢
+  if (server.genStartedAt) log(`本轮服务启动耗时 ${((Date.now() - server.genStartedAt) / 1000).toFixed(1)}s`)
   // 服务起来了 ≠ 插件起来了：DSH 对「bundle 被跳过 / 行没激活」只写 stderr，不崩、退出码也是 0。
   // 这里补一条日志把整句话说完；界面由插件卡片的「未生效」态呈现（重启不会改变它）。
   const activationIssues = server.activationIssues || []
@@ -2151,7 +2170,8 @@ async function stopServerInner({ managedOnly = false, force = false } = {}) {
       await stopPidVerified(pid, null, force)
       // 进程没了 ≠ 端口已经释放：若端口仍有应答，说明中途又出现了同端口实例，
       // 此时报告"已停止"会让更新/重启在残留实例上继续跑。fail-closed，保留责任进程状态等重试。
-      if (await portOpen()) {
+      // 但监听句柄可能被子进程短暂继承：给一个有界宽限期，别把"已经停了"误报成"没停干净"。
+      if (!(await waitPortClosed(portOpen))) {
         throw new Error(`停止后端口 ${PORT} 仍有应答（原 PID ${pid}），无法确认已停止；已保留责任进程状态，请重试`)
       }
       clearClaimed()
@@ -2188,7 +2208,7 @@ async function stopServerInner({ managedOnly = false, force = false } = {}) {
     }
     // 停止后端口仍有应答、监听者却无法核实：不能静默放行（更新/重启可能在残留实例上继续跑）。
     // managedOnly（只停自管服务、不动外部实例）保持旧语义，不在此拦截。
-    if (!managedOnly && launchSig && await portOpen()) {
+    if (!managedOnly && launchSig && !(await waitPortClosed(portOpen))) {
       const lr = await findListener()
       throw new Error(lr.status === 'found'
         ? `停止后端口 ${PORT} 仍被 PID ${lr.pid} 持有，已暂停更新/重启`
@@ -6721,7 +6741,7 @@ let webSeq = 0
 function isPageBlank(wc) {
   try {
     return wc.executeJavaScript(
-      "document.title === '' || !document.body || document.body.innerHTML.length < 10 || (document.body.innerText || '').indexOf('authentication required') >= 0",
+      "document.title === '' || !document.body || document.body.innerHTML.length < 10",
     ).catch(() => true)
   } catch { return Promise.resolve(true) }
 }
@@ -7302,6 +7322,7 @@ function reasonForPhase(phase) {
   const scenario = recoveryPlanNow().scenario
   if (scenario === 'plugin') return 'pluginFailed'
   if (scenario === 'settings') return 'settingsInvalid'
+  if (scenario === 'patch') return 'patchInvalid'
   if (scenario === 'env') return 'envMissing'
   if (scenario === 'unknown') return 'bootUnknown'
   if (phase === 'ready') return 'failed'
@@ -7448,46 +7469,46 @@ function webCreateTab(targetUrl, targetTitle, opts = {}) {
         maybeCaptureHealthy('page-loaded')
       }
     }
-    // 鉴权兜底：新 DSH 的 401 提示页（"dsh web authentication required..."）。
+    // 鉴权兜底：窗口落在 Host 的匿名登录页（「连接到此 Host / 配对此设备」）时，
     // 有 token → 换带 token 地址重载换取 cookie；没有（认领的自重启后继拿不到它的 stdout）
-    // → 标记为需要一次由启动器发起的重启，页面给明确指引，而不是让人对着 401 猜。
+    // → 标记为需要一次由启动器发起的重启，页面给明确指引，而不是让人对着登录页猜。
+    // 判据是**会话 cookie 的真实认证状态**（见 sessionNeedsAuth）：DSH 0.2.x 的登录页是一整份
+    // 双语 HTML 文档，正文既不短于 300 字也不含旧版裸 401 的英文字样，读内文识别必然漏判。
     {
       const url = wc.getURL() || ''
       if ((url.startsWith(WEB_URL) || url === WEB_URL) && !url.includes('token=')) {
-        try {
-          wc.executeJavaScript("(function(){var b=document.body;if(!b)return false;var t=(b.innerText||'').trim();return !!(t.length<300&&(t.indexOf('authentication required')>=0||t.toLowerCase().indexOf('unauthorized')>=0))})()")
-            .then((hit) => {
-              if (wc.isDestroyed()) return
-              if (!hit) {
-                // 页面正常打开（非 401 文本页）= 登录凭据可用：清掉 authPending，避免控制台/说明页继续误导
-                if (server.authPending && (wc.getURL() || '').startsWith(WEB_URL)) {
-                  server.authPending = false
-                  server.tokenPending = false
-                  log('页面已能正常加载：清除 authPending')
-                  broadcastState()
-                }
-                return
+        void sessionNeedsAuth(wc.session)
+          .then((needsAuth) => {
+            if (wc.isDestroyed()) return
+            if (needsAuth !== true) {
+              // 200 = 页面能正常打开：清掉 authPending，避免控制台/说明页继续误导
+              if (needsAuth === false && server.authPending && (wc.getURL() || '').startsWith(WEB_URL)) {
+                server.authPending = false
+                server.tokenPending = false
+                log('页面已能正常加载：清除 authPending')
+                broadcastState()
               }
-              if (server.launchUrl) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } return }
-              if (!server.claimed()) {
-                // 自己拉起的服务：token/cookie 可能还没换好。别把裸 401 文本留给用户，
-                // 先显示“正在完成登录验证”，就绪流程拿到凭据后会自动刷新进真实页面。
-                tab.blank = true
-                webPushState()
-                try { wc.loadURL(loadingUrl('authWait', tab.id, loadingParams())) } catch { /* noop */ }
-                return
-              }
-              if (server.authPending) {
-                // 说明页点过「刷新页面」仍落回 401：确认没有有效凭据 → 换成带「重启服务」动作的说明页
-                tab.blank = true
-                webPushState()
-                try { wc.loadURL(loadingUrl('auth', tab.id, { tried: 1 })) } catch { /* noop */ }
-                return
-              }
-              markAuthPending()
+              return
+            }
+            if (server.launchUrl) { try { wc.loadURL(uiUrl()) } catch { /* noop */ } return }
+            if (!server.claimed()) {
+              // 自己拉起的服务：token/cookie 可能还没换好。别把 Host 的登录页留给用户，
+              // 先显示“正在完成登录验证”，就绪流程拿到凭据后会自动刷新进真实页面。
+              tab.blank = true
+              webPushState()
+              try { wc.loadURL(loadingUrl('authWait', tab.id, loadingParams())) } catch { /* noop */ }
+              return
+            }
+            if (server.authPending) {
+              // 说明页点过「刷新页面」仍落回 401：确认没有有效凭据 → 换成带「重启服务」动作的说明页
+              tab.blank = true
+              webPushState()
+              try { wc.loadURL(loadingUrl('auth', tab.id, { tried: 1 })) } catch { /* noop */ }
+              return
+            }
+            markAuthPending()
             })
             .catch(() => { /* noop */ })
-        } catch { /* noop */ }
       }
     }
     // 失败页兜底：required 激活失败不一定写 stderr，页面原文是第二证据来源。

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
-const { terminateProcess, waitForCompletion } = require('../service-termination')
+const { terminateProcess, waitPortClosed, waitForCompletion } = require('../service-termination')
 const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8')
 const exitCode = source.slice(source.indexOf('let exitPromise = null'), source.indexOf('// ---------- 自检（对齐 C# selftest'))
 function exitHarness(stop, install = async () => false) {
@@ -79,7 +79,7 @@ function stopHarness({ fail = false, external = false, busy = false } = {}) {
     setDesktopShellGate: () => {},
     stopPidVerified: async (pid) => { calls.push(pid); if (fail) throw new Error('still alive') },
     clearClaimed: () => { server.claimedPid = 0; server.claimedAlive = false }, lastServiceError: '', waitForCompletion,
-    PORT: 3080, portOpen: async () => false,
+    PORT: 3080, portOpen: async () => false, waitPortClosed: (open) => waitPortClosed(open, { timeoutMs: 0 }),
     findListener: async () => ({ status: 'absent', pid: 0 }),
   }
   vm.createContext(ctx)

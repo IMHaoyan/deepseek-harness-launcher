@@ -10,7 +10,7 @@
 //  - 全局形态发现新版即后台"预装"一整套可切换的安装树（见"预装与改名切换"节）：
 //    点击更新时只做同卷目录改名（秒级），把 40s 的解包落盘挪到用户无感的检查阶段。
 'use strict'
-const { spawn } = require('child_process')
+const { spawn, execFile } = require('child_process')
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
@@ -202,9 +202,9 @@ async function recoverSwapTransaction(st, nodeBin, ctx) {
     probeVersion: probe.version,
   })
   const stageRoot = stageRootOf(installDir)
-  const finish = (payload, keepExtra = []) => {
+  const finish = async (payload, keepExtra = []) => {
     try { clearUpdateState() } catch { /* noop */ }
-    if (!warming) cleanupStage(stageRoot, '', keepExtra)
+    if (!warming) await cleanupStage(stageRoot, '', keepExtra)
     return payload
   }
   if (decided.action === 'done') {
@@ -662,6 +662,109 @@ function logNpmFailure(args, error, stderr) {
   log(`dsh-update: npm ${args.slice(0, 4).join(' ')} 失败（${error}）：${redact(tail(stderr)) || '(stderr 为空)'}`)
 }
 
+// ---------- 安装目录占用（Windows 文件锁） ----------
+// 停服务只停「我们启动的那一代」。被孤儿化的常驻 helper（典型：dsh-cua-windows 的 --shared-server，
+// 父进程已挂到 explorer）仍会映射旧树里的 exe/dll；Windows 不允许改名被映射文件所在的目录，
+// 于是暂存切换与 npm 重装都会报 EBUSY/EPERM。停服之后必须按「可执行文件路径」再清一遍。
+
+/** 进程清单里挑出可执行文件落在安装目录内的条目（纯函数，供测试）。 */
+function pickInstallDirProcesses(list, installDir) {
+  const raw = String(installDir || '').trim()
+  // 空串必须先挡掉：path.resolve('') 会变成当前目录，等于把整片工作目录当成安装树
+  if (!raw) return []
+  const root = path.resolve(raw).toLowerCase().replace(/[\\/]+$/, '')
+  const out = []
+  for (const item of Array.isArray(list) ? list : []) {
+    const exe = String((item && item.exe) || '').trim()
+    if (!exe) continue
+    const full = path.resolve(exe).toLowerCase()
+    if (full !== root && !full.startsWith(root + path.sep)) continue
+    const pid = Number(item && item.pid)
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) continue
+    out.push({ pid, name: String(item.name || '') || path.basename(exe), exe })
+  }
+  return out
+}
+
+/** 枚举本机进程的 pid/name/exe（Windows，PowerShell）。null = 取不到清单（未知，不等于没有占用）。 */
+function listProcesses() {
+  if (process.platform !== 'win32') return Promise.resolve([])
+  const script = '[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);'
+    + ' Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath }'
+    + ' | Select-Object ProcessId,Name,ExecutablePath | ConvertTo-Json -Compress'
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
+      { windowsHide: true, timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) { log(`dsh-update: 枚举进程失败（${(err && err.message) || err}）`); return resolve(null) }
+        try {
+          const raw = JSON.parse(String(stdout || '').trim() || '[]')
+          const rows = Array.isArray(raw) ? raw : [raw]
+          resolve(rows.map((p) => ({
+            pid: Number(p && p.ProcessId),
+            name: String((p && p.Name) || ''),
+            exe: String((p && p.ExecutablePath) || ''),
+          })))
+        } catch {
+          log('dsh-update: 进程清单不是合法 JSON，跳过占用检查')
+          resolve(null)
+        }
+      })
+  })
+}
+
+function killTree(pid) {
+  return new Promise((resolve) => {
+    execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 15000 },
+      (err) => resolve(!err))
+  })
+}
+
+/**
+ * 结束安装目录内的进程并复核。ok=false 表示清完仍被占用（调用方必须 fail-closed，不能继续改名）。
+ * @returns {Promise<{ok:boolean, killed:Array, remaining:Array, unknown?:boolean}>}
+ */
+async function clearInstallDirHolders(installDir) {
+  const listed = await listProcesses()
+  if (listed === null) return { ok: true, unknown: true, killed: [], remaining: [] }
+  const holders = pickInstallDirProcesses(listed, installDir)
+  if (!holders.length) return { ok: true, killed: [], remaining: [] }
+  log(`dsh-update: 安装目录内仍有 ${holders.length} 个进程占着旧树：`
+    + holders.map((h) => `${h.name}(PID ${h.pid})`).join('、'))
+  for (const h of holders) {
+    log(`dsh-update: 结束占用进程 ${h.name}(PID ${h.pid})：${h.exe}`)
+    await killTree(h.pid)
+  }
+  const deadline = Date.now() + 3000
+  for (;;) {
+    const again = await listProcesses()
+    if (again === null) return { ok: true, unknown: true, killed: holders, remaining: [] }
+    const remaining = pickInstallDirProcesses(again, installDir)
+    if (!remaining.length) {
+      // 进程退出到句柄真正释放之间还有一小段窗口：给 200ms 再交给改名，减少一次无谓失败
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      return { ok: true, killed: holders, remaining: [] }
+    }
+    if (Date.now() >= deadline) return { ok: false, killed: holders, remaining }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+}
+
+/** 失败是否属于「文件被占用」（EBUSY/EPERM）：这类失败换源没有意义（纯函数，供测试）。 */
+function isBusyFailure(result) {
+  if (!result || result.ok !== false) return false
+  const text = String(result.stderr || '') + '\n' + String(result.error || '')
+  return /EBUSY|resource busy or locked|EPERM: operation not permitted|(?:文件|目录).{0,16}(?:正由另一进程使用|被另一进程使用)/i.test(text)
+}
+
+/** 占用失败的说明：带上占用者，界面/日志都能看懂是谁锁着。 */
+function busyHoldersText(holders) {
+  const list = Array.isArray(holders) ? holders : []
+  if (!list.length) return '旧版本安装目录仍被进程占用（无法定位具体进程）'
+  return '旧版本安装目录仍被占用：'
+    + list.slice(0, 4).map((h) => `${(h && h.name) || '进程'}(PID ${h && h.pid})`).join('、')
+}
+
 /** 安装失败是否属于"缺版本号"（npm ETARGET / notarget）。纯函数，供测试。 */
 function isMissingVersionFailure(result) {
   if (!result || result.ok !== false) return false
@@ -796,7 +899,11 @@ async function fetchLatest(nodeBin) {
   const tags = channelTags(channel)
   lastFetchError = ''
   lastFetchBusy = false // 每次重新判定：本轮是不是因为"有安装在跑"而让路
-  for (const registry of registries()) {
+  const order = registries()
+  for (let i = 0; i < order.length; i++) {
+    const registry = order[i]
+    const next = order[i + 1]
+    const nextHint = next !== undefined ? `，改用 ${next || '默认源'} 重试` : ''
     const args = ['view', '@deepseek-ai/dsh', 'dist-tags', '--json']
     if (registry) args.push('--registry', registry)
     const r = await runNpm(args, { nodeBin })
@@ -805,7 +912,7 @@ async function fetchLatest(nodeBin) {
     if (!r.ok) {
       // 404 = 该源上没有这个包，不是网络问题
       lastFetchError = /404/.test(r.error || '') ? `渠道 ${channel} 暂无可用版本` : (r.error || '网络错误')
-      log(`dsh-update: npm view dist-tags 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
+      log(`dsh-update: npm view dist-tags 失败（registry=${registry || '默认'}）：${r.error}${nextHint}`)
       continue
     }
     // 一次调用拿全部 tag（alpha / next / latest），目标版本与"是否已转正"都来自同一份响应：
@@ -826,7 +933,7 @@ async function fetchLatest(nodeBin) {
       return { version: best.version, tag: tagForDisplay(best, distTags.latest || ''), registry, channel }
     }
     lastFetchError = `渠道 ${channel} 暂无可用版本`
-    log(`dsh-update: 渠道 ${channel} 无可用版本（registry=${registry || '默认'}）${registry ? '，回退官方源重试' : ''}`)
+    log(`dsh-update: 渠道 ${channel} 无可用版本（registry=${registry || '默认'}）${nextHint}`)
   }
   return null
 }
@@ -874,13 +981,22 @@ function parseDistTags(stdout) {
 // npm 会在解析阶段报 ETARGET/notarget（2026-10 的 rc.4 / alpha.2 就是这样"显示有更新但装不上"）。
 // 这类缺版本号失败由 runNpm 强制重新校验元数据后重试一次；仍失败则如实上报，交给下一轮检查。
 async function runGlobalUpdate(nodeBin, globalRoot, version) {
-  for (const registry of registries()) {
+  const order = registries()
+  for (let i = 0; i < order.length; i++) {
+    const registry = order[i]
+    const next = order[i + 1]
     const args = ['install', '-g', '--prefix', globalRoot, `@deepseek-ai/dsh@${version}`, '--no-audit', '--no-fund']
     if (registry) args.push('--registry', registry)
     // 用当前环境 npm（用户级/系统均可）并显式指定全局根，确保落在与 npm i -g 相同的目录
     const r = await runNpm(args, { nodeBin, timeoutMs: 25 * 60 * 1000, mutation: true })
     if (r.ok) { noteRegistryOk(registry); return r }
-    log(`dsh-update: npm install -g 失败（registry=${registry || '默认'}）：${r.error}${registry ? '，回退官方源重试' : ''}`)
+    // 文件占用跟 registry 无关：换源只会再撞同一把锁，直接把真实原因交出去
+    if (isBusyFailure(r)) {
+      log(`dsh-update: npm install -g 失败（registry=${registry || '默认'}）：文件被占用，停止换源`)
+      return { ok: false, busy: true, error: '安装目录被占用，无法替换文件（有进程仍在运行旧版本）' }
+    }
+    // 文案按真实顺序生成：order 是「记住的成功源 → 其余源」，没有下一个源时不许说“回退官方源”
+    log(`dsh-update: npm install -g 失败（registry=${registry || '默认'}）：${r.error}${next !== undefined ? `，改用 ${next || '默认源'} 重试` : ''}`)
   }
   return { ok: false, error: '全局更新失败' }
 }
@@ -1076,16 +1192,42 @@ function probeFailureDetail(output) {
   return String(hit || lines[0] || '').slice(0, 200)
 }
 
-/** 清理暂存目录：删掉 keep 之外的版本目录与 old-/rejected- 备份，返回删掉的名字。 */
+/**
+ * 删除整棵安装树（10 万+ 文件 / 1.4 GB）只能异步：fs.rmSync 在 Electron 主线程上同步跑完，
+ * 期间窗口不响应任何点击（Windows 直接标"未响应"）。证据：2026-11-22 12:47:05 拒绝一棵预装树，
+ * 12:47:59 才打出下一条日志 —— 中间 54 秒全耗在同步删除上。
+ * fs.promises.rm 把逐个文件的删除交给线程池与事件循环：一样慢，但界面不卡死。
+ * @returns {Promise<void>} 失败只记日志（清理是尽力而为，删不掉下次再删）
+ */
+function removeTree(target, note) {
+  if (!target) return Promise.resolve()
+  return fs.promises.rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 })
+    .catch((err) => log(`dsh-update: 清理失败（${note || target}）：${(err && err.message) || String(err)}`))
+}
+
+// 清理串行化："已是最新"的顺手清场与后台预装的清场可能同时发生，并发删除会让后一轮把前一轮
+// 刚建好的暂存目录一起删掉 —— 排队执行，顺序确定（预装建目录前也会先等这条链收场）。
+let cleanupChain = Promise.resolve()
+
+/** 清理暂存目录：删掉 keep 之外的版本目录与 old-/rejected- 备份，返回删掉的名字（异步）。 */
 function cleanupStage(stageRoot, keep, keepExtra = []) {
+  const task = cleanupChain.then(() => cleanupStageNow(stageRoot, keep, keepExtra))
+  cleanupChain = task.then(() => {}, () => {})
+  return task
+}
+
+async function cleanupStageNow(stageRoot, keep, keepExtra) {
   if (!stageRoot) return []
   let names = []
-  try { names = fs.readdirSync(stageRoot) } catch { return [] }
+  try { names = await fs.promises.readdir(stageRoot) } catch { return [] }
   const removed = []
   const keepSet = new Set([String(keep || ''), ...(Array.isArray(keepExtra) ? keepExtra : []).map(String)].filter(Boolean))
   for (const name of staleStageEntries(names, '')) {
     if (keepSet.has(name)) continue // 事务/回退凭据不能当过期物删掉
-    try { fs.rmSync(path.join(stageRoot, name), { recursive: true, force: true }); removed.push(name) } catch { /* 删不掉下次再删 */ }
+    try {
+      await fs.promises.rm(path.join(stageRoot, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 150 })
+      removed.push(name)
+    } catch { /* 删不掉下次再删 */ }
   }
   return removed
 }
@@ -1118,12 +1260,14 @@ async function stageLatest(version, nodeBin, kind, installDir) {
   const installed = readPkgAt(installDir)
   if (!installed) return { ok: false, reason: 'installed-pkg-unreadable' }
   try {
-    fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) // 清掉上次的半成品
+    await cleanupChain // 上一轮清场还在跑：先等它收场，别让它把这次要用的目录删掉
+    // 清掉上次的半成品（整棵树，异步删；同步版会把窗口钉住几十秒，见 removeTree）
+    await fs.promises.rm(paths.stagePrefix, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 })
     fs.mkdirSync(paths.stagePrefix, { recursive: true })
   } catch (err) {
     return { ok: false, reason: 'stage-not-writable: ' + ((err && err.message) || String(err)) }
   }
-  cleanupStage(paths.stageRoot, version) // 其他版本的暂存已过期
+  await cleanupStage(paths.stageRoot, version) // 其他版本的暂存已过期
   let last = { ok: false, error: '未执行' }
   for (const registry of registries()) {
     // 同样不加 --prefer-offline（理由见 runGlobalUpdate 上方注释）：预装的就是"刚发布的新版本"，
@@ -1135,7 +1279,7 @@ async function stageLatest(version, nodeBin, kind, installDir) {
     log(`dsh-update: stage install failed (registry=${registry || '默认'}): ${last.error}`)
   }
   if (!last.ok) {
-    try { fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) } catch { /* noop */ }
+    await removeTree(paths.stagePrefix, '预装失败留下的半成品')
     return { ok: false, reason: last.error || 'npm 预装失败' }
   }
   const staged = readPkgAt(paths.stagePkg)
@@ -1162,7 +1306,7 @@ async function stageLatest(version, nodeBin, kind, installDir) {
     log(decided.reason === 'staged-tree-broken'
       ? `dsh-update: staged tree rejected (${decided.reason})：该版本安装树自身无法运行，点击更新将被拦截`
       : `dsh-update: staged tree rejected (${decided.reason})：退回完整安装路径`)
-    try { fs.rmSync(paths.stagePrefix, { recursive: true, force: true }) } catch { /* noop */ }
+    await removeTree(paths.stagePrefix, '被拒绝的预装树')
     return { ok: false, reason: decided.reason }
   }
   stageBlock = null
@@ -1233,10 +1377,13 @@ async function swapStagedInto(input) {
   if (!txOk) return { ok: false, reason: 'tx-state-unwritable' }
   const t0 = Date.now()
   try {
-    fs.rmSync(paths.backupDir, { recursive: true, force: true })
+    await removeTree(paths.backupDir, '上一次切换留下的备份') // 旧备份也是整棵树：异步删
     fs.renameSync(installDir, paths.backupDir) // 旧树让位（同卷改名，O(1)）
   } catch (err) {
-    return { ok: false, reason: 'rename-out-failed: ' + ((err && err.message) || String(err)) }
+    const message = (err && err.message) || String(err)
+    // 占用类失败要单独成类：调用方据此 fail-closed，不再退 npm（同一把锁，白跑一遍）
+    const busy = isBusyFailure({ ok: false, error: message })
+    return { ok: false, reason: (busy ? 'install-dir-busy: ' : 'rename-out-failed: ') + message }
   }
   try {
     fs.renameSync(paths.stagePkg, installDir) // 预装树顶上（同卷改名，O(1)）
@@ -1278,10 +1425,11 @@ async function restoreSwap(state, nodeBin) {
 }
 
 /** 切换成功后的收尾：删掉旧树备份与暂存残留（正在预装的那份不能碰）。 */
-function finalizeSwap(state) {
+async function finalizeSwap(state) {
   if (!state || !state.installDir) return
-  try { fs.rmSync(state.backupDir, { recursive: true, force: true }) } catch { /* 删不掉不影响 */ }
-  if (!warming) cleanupStage(state.stageRoot, '')
+  await removeTree(state.backupDir, '旧树备份') // 旧树也是整棵安装（10 万+ 文件）：异步删
+  // 删备份可能花几分钟，期间新一轮预装可能已经开工：按「当前预装版本」保留，别把它当过期物删掉
+  if (!warming) await cleanupStage(state.stageRoot, staging ? staging.version : '')
 }
 
 // ---------- 后台就绪（发现新版本后执行，纯尽力而为，失败静默） ----------
@@ -1491,7 +1639,7 @@ async function checkOnce(reason, force) {
       setState({ status: 'up-to-date', nodeBlocked: false })
       // 已是最新：暂存目录里剩下的都是过期物（含切换失败留下的 rejected-*），顺手清掉。
       // 正在预装时不动（那份还在写盘，删了只会让本次预装白跑）；未完成事务记着的树必须保留。
-      if (!warming) cleanupStage(stageRootOf(installDir), '', transactionKeepNames())
+      if (!warming) void cleanupStage(stageRootOf(installDir), '', transactionKeepNames())
     }
   } catch (err) {
     if (timedOut) return
@@ -1651,6 +1799,20 @@ async function updateNow(opts = {}) {
       if (markProgress) markProgress('install')
       // 首选：把后台预装好的整棵树改名顶上（实测 0.04s，替掉 40s 的解包落盘）
       const installDir = (report.dsh && report.dsh.dir) || ''
+      // 停服务只管住我们启动的那一代；被孤儿化的常驻 helper 仍锁着整棵旧树（dsh-cua-windows --shared-server 就是）。
+      // 按可执行文件路径清一遍，清不掉就 fail-closed —— 带着占用去改名/重装只会得到一句 EBUSY。
+      const clearHolders = typeof clearInstallDirHolders === 'function' ? clearInstallDirHolders : async () => ({ ok: true, remaining: [] })
+      const held = await clearHolders(installDir)
+      if (!held.ok) {
+        // 失败前把旧版服务拉回来：文件一个都没动过，没理由让用户面对一个停着的服务
+        if (wasRunning) {
+          try { await startService() } catch { /* noop */ }
+          if (reloadWebTabs) reloadWebTabs()
+        }
+        const describe = typeof busyHoldersText === 'function' ? busyHoldersText : () => '旧版本安装目录仍被进程占用'
+        const current = fromVersion ? '当前 v' + fromVersion + ' 未改动' : '当前版本未改动'
+        throw new Error(describe(held.remaining) + '；已取消升级，' + current + '；关闭这些进程后重试')
+      }
       const stagedReady = !!(staging && staging.version === latest)
       setUpdatePhase(2, stagedReady
         ? '正在切换到已预装的安装包（秒级）…'
@@ -1669,6 +1831,14 @@ async function updateNow(opts = {}) {
         throw new Error(`新版本 v${latest} 的安装包在本机无法运行（${sw.detail || '依赖导出缺失'}）：`
           + '可能是该版本发布包有问题，也可能是本次预装不完整；禁用或卸载插件都无效。'
           + '已取消升级，当前版本未改动；可稍后重试检查更新')
+      } else if (String(sw.reason || '').startsWith('install-dir-busy')) {
+        // 已清过一轮仍被占用：多半是拒绝结束的进程（权限不足）或非 exe 持有者。fail-closed，不再白跑 npm。
+        if (wasRunning) {
+          try { await startService() } catch { /* noop */ }
+          if (reloadWebTabs) reloadWebTabs()
+        }
+        throw new Error('旧版本安装目录仍被占用（已完成一轮清理，可能权限不足或存在非可执行文件句柄）；'
+          + '已取消升级，当前版本未改动；关闭占用进程后重试')
       } else {
         // 没有预装树（用户点得太快 / 预装失败 / 被渠道切换作废）→ 退回完整安装，行为与从前一致
         if (sw.reason !== 'no-staged-tree') log('dsh-update: staged swap unavailable (' + sw.reason + ')，改用 npm install -g')
@@ -1868,7 +2038,7 @@ async function updateNow(opts = {}) {
     log(`dsh-update: updated to v${latest}${/凭据已变化/.test(outcome.message) ? ' (page credential changed)' : ''}`)
     clearTargetRequirement() // 目标已装上：保留旧要求只会让环境页继续按目标范围判 Node
     emitLifecycle('update.dsh', { step: 'updated', from: fromVersion, to: latest, kind: plan.kind })
-    finalizeSwap(swapState) // 更新确认成功：删掉旧树备份与暂存残留
+    void finalizeSwap(swapState) // 更新确认成功：删掉旧树备份与暂存残留（异步，不卡收尾）
     try { clearUpdateState() } catch { /* noop */ }
     setState({ status: 'updated', current: latest, nodeBlocked: false, phase: '完成', phaseIndex: UPDATE_PHASES.length, phaseDetail: '' })
   } catch (err) {
@@ -1903,6 +2073,11 @@ module.exports = {
   // 安装失败的"缺版本号"识别与重试依据（纯函数，供测试验证）
   isMissingVersionFailure,
   missingVersionSpec,
+  // 安装目录占用（Windows 文件锁）的识别与清扫：纯判定供测试，清扫供更新流程使用
+  pickInstallDirProcesses,
+  isBusyFailure,
+  busyHoldersText,
+  clearInstallDirHolders,
   // 预装/改名切换（纯函数，供测试直接验证判定逻辑）
   npmPrefixOf,
   stageRootOf,

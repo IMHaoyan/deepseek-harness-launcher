@@ -11,7 +11,7 @@ const pane = q.get('pane') || ''
 //   （plugin / recovery / update …）也会照常附带 plan（那里还留着上一次失败的分类），
 //   若不加这道闸，"正在应用插件变更…"那一屏会被渲染成上一次失败的标题 —— 正是本仓库
 //   反复强调的"文案与真实动作不符"。
-const PLAN_REASONS = new Set(['pluginFailed', 'settingsInvalid', 'envMissing', 'bootUnknown'])
+const PLAN_REASONS = new Set(['pluginFailed', 'settingsInvalid', 'patchInvalid', 'envMissing', 'bootUnknown'])
 let plan = null
 if (PLAN_REASONS.has(reason)) {
   try {
@@ -29,7 +29,7 @@ const planEntry = (plan && plan.entry && typeof plan.entry.page === 'string' && 
 const TEXTS = {
   start: {
     title: '正在启动 DeepSeek Harness 服务…',
-    sub: '首次启动通常需要 8~15 秒，服务就绪后窗口会自动进入。',
+    sub: '首次启动通常需要 10~25 秒（插件越多越久），服务就绪后窗口会自动进入。',
     btn: '重新加载',
   },
   restart: {
@@ -39,8 +39,8 @@ const TEXTS = {
   },
   restartManual: {
     title: '正在重启 DeepSeek Harness…',
-    sub: '已停止旧服务，正在拉起新进程（通常 7~10 秒）。',
-    // 第二行单独成段：句号后断行，避免在“进入。”中间被自动折行（展示口径 7~10 秒）
+    sub: '已停止旧服务，正在拉起新进程（通常 10~25 秒，插件越多越久）。',
+    // 第二行单独成段：句号后断行，避免在“进入。”中间被自动折行（展示口径见 tests/loading-texts.test.js）
     sub2: '就绪后窗口会自动刷新进入。',
     btn: '重新加载',
   },
@@ -104,6 +104,11 @@ const TEXTS = {
   settingsInvalid: {
     title: 'DSH 设置文件解析失败',
     sub: '设置文件无法解析，服务因此起不来。',
+    btn: '重新检测',
+  },
+  patchInvalid: {
+    title: 'Profile 补丁层解析失败',
+    sub: 'Profile 的配置补丁无法解析，服务因此起不来。',
     btn: '重新检测',
   },
   envMissing: {

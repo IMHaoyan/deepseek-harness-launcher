@@ -270,3 +270,56 @@ test('竞态：预装结论尚未产生时点击，切换阶段发现坏树 → 
   assert.equal(h.state.status, 'error')
   assert.match(h.state.error, /禁用或卸载插件都无效/u, h.state.error)
 })
+// 2026-11-28 现场：dsh-cua-windows --shared-server 被孤儿化到 explorer，停服务带不走；
+// 旧树里的 exe/dll 被它映射着 → 改名 EBUSY。清理不掉时必须停在改名之前，并说清是谁占着。
+test('安装目录被孤儿进程占用：停服后清理失败 → 拒绝改名/安装，报出占用者', async () => {
+  const events = []
+  const h = dsh('global', async () => { events.push('stop'); return true }, { running: true }, {
+    envInstall: { resolveGlobalRoot: async () => 'mock', startInstall: () => events.push('install') },
+    clearInstallDirHolders: async () => ({ ok: false, killed: [], remaining: [{ pid: 9516, name: 'dsh-cua-windows.exe' }] }),
+    busyHoldersText: require('../dsh-update').busyHoldersText,
+    swapStagedInto: async () => { events.push('swap'); return { ok: true } },
+    runGlobalUpdate: async () => { events.push('npm'); return { ok: true } },
+    startService: async () => { events.push('start'); return true },
+    reloadWebTabs: () => events.push('reload'),
+    refreshEnv: async () => {},
+  })
+  await h.fn()
+  assert.equal(h.state.status, 'error')
+  assert.match(h.state.error, /PID 9516/u, h.state.error)
+  assert.match(h.state.error, /已取消升级/u, h.state.error)
+  assert.deepEqual(events, ['stop', 'start', 'reload'], '不许改名/跑 npm，但要把旧服务拉回来：' + events.join(','))
+  assert.equal(h.writes[0].phase, 'start', '事务在动手前落盘，恢复逻辑有依据')
+})
+
+test('改名切换撞上占用：不再退 npm 重装，直接 fail-closed 并拉回旧服务', async () => {
+  const events = []
+  const h = dsh('global', async () => { events.push('stop'); return true }, { running: true }, {
+    envInstall: { resolveGlobalRoot: async () => 'mock', startInstall: () => events.push('install') },
+    clearInstallDirHolders: async () => ({ ok: true, killed: [{ pid: 9516 }], remaining: [] }),
+    swapStagedInto: async () => ({ ok: false, reason: 'install-dir-busy: EBUSY: resource busy or locked, rename ...' }),
+    runGlobalUpdate: async () => { events.push('npm'); return { ok: true } },
+    startService: async () => { events.push('start'); return true },
+    reloadWebTabs: () => events.push('reload'),
+    refreshEnv: async () => {},
+  })
+  await h.fn()
+  assert.equal(h.state.status, 'error')
+  assert.match(h.state.error, /仍被占用/u, h.state.error)
+  assert.deepEqual(events, ['stop', 'start', 'reload'], '不许白跑 npm：' + events.join(','))
+})
+
+test('清理成功后才轮到改名：顺序 stop → clear → swap', async () => {
+  const events = []
+  const h = dsh('global', async () => { events.push('stop'); return true }, { running: true }, {
+    envInstall: { resolveGlobalRoot: async () => 'mock', startInstall: () => events.push('install') },
+    clearInstallDirHolders: async () => { events.push('clear'); return { ok: true, killed: [{ pid: 9516 }], remaining: [] } },
+    swapStagedInto: async () => { events.push('swap'); return { ok: false, reason: 'staged-tree-broken', detail: 'x' } },
+    startService: async () => { events.push('start'); return true },
+    reloadWebTabs: () => events.push('reload'),
+    refreshEnv: async () => {},
+  })
+  await h.fn()
+  assert.deepEqual(events.slice(0, 3), ['stop', 'clear', 'swap'])
+})
+

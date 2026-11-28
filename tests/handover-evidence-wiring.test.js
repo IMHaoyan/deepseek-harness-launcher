@@ -62,3 +62,11 @@ test('监听 PID 取证失败必须留证（不能静默吞成 0）', () => {
   const pkg = JSON.parse(read('package.json'))
   assert.ok(pkg.build.files.includes('service-listener.js'), 'service-listener.js 必须在 build.files 里，否则打包后 require 失败')
 })
+
+// 2026-11-26 实测：DSH 0.2.3 对无凭据的根路径返回「连接到此 Host / 配对此设备」登录页，
+// 正文里既没有 'DeepSeek Harness' 也没有旧版裸 401 的英文提示。指纹只剩前两条时，
+// 我们把自己的 DSH 认成陌生程序 —— 误报端口被占、拒绝接管、拒绝停服。
+test('HTTP 指纹必须认得 0.2.x 的匿名登录页（--dsw- 设计令牌）', () => {
+  assert.match(main, /--dsw-/u, 'probeDsh 的指纹要包含匿名登录页里的 --dsw- 设计令牌')
+  assert.match(main, /done\(\/DeepSeek Harness\|dsh web authentication required\|--dsw-/u, '三条特征必须同时留在指纹里')
+})

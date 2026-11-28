@@ -230,10 +230,6 @@ function isDisabled(packageName, explicitProfileDir = '') {
   return rows.some((id) => state.disables.includes(id))
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
-}
-
 /** 原子落盘：同目录临时文件 → rename；失败抛错（调用方决定语义）。 */
 function writeFileAtomicSync(file, text) {
   const dir = path.dirname(file)
@@ -259,6 +255,8 @@ const PATCH_BACKUP_KEEP = 3
  * 这个文件被 DSH 在启动时**抛错式**解析（坏一个字符就整站起不来），改坏必须能退回去。
  */
 function writePatchAtomic(file, text) {
+  // fail-closed：结构校验不过就不写。坏文件一旦落盘，DSH 会在启动时抛 YAMLParseError。
+  assertPatchShape(text)
   if (fs.existsSync(file)) {
     const backup = `${file}.bak-dshl-${new Date().toISOString().replace(/[:.]/gu, '-')}`
     try { fs.copyFileSync(file, backup) } catch { /* 备份失败不阻断写入，但会缺少回滚点 */ }
@@ -272,9 +270,126 @@ function writePatchAtomic(file, text) {
   writeFileAtomicSync(file, text)
 }
 
-/** 该行属于本工具写入的两行形态（`- id: X` 紧接 2 空格缩进），才允许 strip。 */
+/** 本工具新增条目时写的裸行形态（`- id: X` 紧接 2 空格缩进）。 */
 function rowBlock(rowId, disabled) {
   return `- id: ${rowId}\n  disabled: ${disabled ? 'true' : 'false'}\n`
+}
+
+/**
+ * 顶层条目块的边界 [start, end)。
+ * 条目从顶格 `- id: X` 开始；空行、注释、缩进行都属于它；下一个顶格行（`- ` 条目，
+ * 或 `config:` 这类顶格键 —— 后者说明文件结构已经坏了）或文件末尾才是边界。
+ *
+ * 历史教训（2026-11-28 真机）：旧实现只删 `- id:` 紧接的 `disabled:` 两行，遇到带
+ * `config:` 的用户条目会留下 `config:` 残块。DSH 启动时抛 YAMLParseError，整个服务起不来。
+ * 条目内容必须按块处理，不能按固定两行处理。
+ */
+function findEntryBlocks(lines, rowId) {
+  const blocks = []
+  for (let start = 0; start < lines.length; start += 1) {
+    const head = /^- id: ['"]?([A-Za-z0-9_.-]+)['"]?\s*$/u.exec(lines[start])
+    if (head === null || head[1] !== rowId) continue
+    let end = lines.length
+    for (let probe = start + 1; probe < lines.length; probe += 1) {
+      const line = lines[probe]
+      if (line.trim() === '' || /^[ \t]*#/u.test(line)) continue
+      if (/^- /u.test(line) || /^[^\s]/u.test(line)) { end = probe; break }
+    }
+    blocks.push({ start, end })
+    start = end - 1
+  }
+  return blocks
+}
+
+/** 条目内自己的开关行（恰好 2 空格缩进）。config 下的深缩进不会被误认。 */
+function disabledLineIndex(lines, block) {
+  for (let index = block.start + 1; index < block.end; index += 1) {
+    if (/^ {2}disabled:\s*(?:true|false)\s*$/u.test(lines[index])) return index
+  }
+  return -1
+}
+
+/**
+ * 写盘前校验顶层结构：除注释/空行/`[]`/文档标记/缩进行外，每一行都必须从顶格 `- ` 开始。
+ * 缩进行属于上一个条目（config 子键、`insert:` 下的条目），天然合法；
+ * 顶格却不是条目开头的行才是残块（2026-11-28 那次就是顶格的 `config:`）。
+ * 这是 fail-closed 的最后一道闸 —— 万一上面的块逻辑再出错，宁可写失败让用户看到，
+ * 也不要把一个 YAML 都解析不了的文件落盘（DSH 会因此整个起不来）。
+ */
+function assertPatchShape(text) {
+  const lines = text.split(/\r?\n/u)
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() === '' || /^\s*#/u.test(line)) continue
+    if (/^- /u.test(line) || /^[ \t]/u.test(line) || /^(?:\[\s*\]|---)\s*$/u.test(line)) continue
+    throw new Error(`补丁层第 ${index + 1} 行不在顶层条目内，已拒绝写入：${line.trim().slice(0, 60)}`)
+  }
+}
+
+function lineEndingOf(text) {
+  return /\r\n/u.test(text) ? '\r\n' : '\n'
+}
+
+function readPatchLines(patchPath) {
+  let text = ''
+  try { text = fs.readFileSync(patchPath, 'utf8') } catch { return null }
+  return { text, lines: text.split(/\r?\n/u) }
+}
+
+/**
+ * 设置某条目的开关值：**就地改条目自己的 `disabled:` 行**，没有就插在 `- id:` 之后。
+ * 绝不删条目再追加裸行 —— 那会把条目里的 name/config 丢掉或留成残块。
+ */
+function setRowDisabled(patchPath, rowId, disabled) {
+  const read = readPatchLines(patchPath)
+  if (read === null) return appendPatchEntry(patchPath, rowBlock(rowId, disabled))
+  const { text, lines } = read
+  const blocks = findEntryBlocks(lines, rowId)
+  if (!blocks.length) return appendPatchEntry(patchPath, rowBlock(rowId, disabled))
+  const value = `  disabled: ${disabled ? 'true' : 'false'}`
+  // 倒序处理：插入行会改变后面块的下标
+  for (const block of [...blocks].reverse()) {
+    const at = disabledLineIndex(lines, block)
+    if (at >= 0) lines[at] = value
+    else lines.splice(block.start + 1, 0, value)
+  }
+  writePatchAtomic(patchPath, lines.join(lineEndingOf(text)))
+  return { ok: true, error: '' }
+}
+
+/**
+ * 移除条目的开关覆盖（恢复上层默认）。
+ *   - 条目只有本工具写的 `- id:` + `disabled:` 两行 → 整块删除；
+ *   - 条目还有 name/config 等用户内容 → **只删 `disabled:` 行**，其余原样保留。
+ * onlyValue 用于只撤掉某一种覆盖（force 行：disabled: false）。
+ */
+function clearRowDisabled(patchPath, rowId, onlyValue) {
+  const read = readPatchLines(patchPath)
+  if (read === null) return { ok: true, error: '' }
+  const { text, lines } = read
+  const blocks = findEntryBlocks(lines, rowId)
+  if (!blocks.length) return { ok: true, error: '' }
+  const drop = new Set()
+  for (const block of blocks) {
+    const at = disabledLineIndex(lines, block)
+    if (at < 0) continue
+    if (onlyValue && !new RegExp(`^ {2}disabled:\\s*${onlyValue}\\s*$`, 'u').test(lines[at])) continue
+    drop.add(at)
+    // 删掉开关行后只剩 `- id:` 本身 → 这是本工具写的裸行，整块清掉
+    const rest = []
+    for (let index = block.start; index < block.end; index += 1) {
+      if (drop.has(index)) continue
+      if (lines[index].trim() === '' || /^\s*#/u.test(lines[index])) continue
+      rest.push(index)
+    }
+    if (rest.length === 1 && rest[0] === block.start) {
+      for (let index = block.start; index < block.end; index += 1) drop.add(index)
+    }
+  }
+  if (!drop.size) return { ok: true, error: '' }
+  const next = lines.filter((_, index) => !drop.has(index)).join(lineEndingOf(text))
+  writePatchAtomic(patchPath, withPlaceholderRestored(next))
+  return { ok: true, error: '' }
 }
 
 /** Put the empty-list placeholder back when the last toggle row is removed. */
@@ -327,28 +442,19 @@ function appendPatchEntry(patchPath, block) {
 }
 
 function stripRows(patchPath, rowId) {
-  let text = ''
-  try { text = fs.readFileSync(patchPath, 'utf8') } catch { return }
-  const blockRe = new RegExp(`^- id: ['"]?${escapeRegExp(rowId)}['"]?\\s*\\r?\\n[ \\t]+disabled: (?:true|false)\\s*\\r?\\n?`, 'mgu')
-  const next = text.replace(blockRe, '')
-  if (next !== text) writePatchAtomic(patchPath, withPlaceholderRestored(next))
+  const result = clearRowDisabled(patchPath, rowId)
+  return result
 }
 
 function stripForceRows(patchPath, rowId) {
-  let text = ''
-  try { text = fs.readFileSync(patchPath, 'utf8') } catch { return { ok: true, error: '' } }
-  const blockRe = new RegExp(`^- id: ['"]?${escapeRegExp(rowId)}['"]?\\s*\\r?\\n[ \\t]+disabled: false\\s*\\r?\\n?`, 'mgu')
-  const next = text.replace(blockRe, '')
-  if (next !== text) writePatchAtomic(patchPath, withPlaceholderRestored(next))
-  return { ok: true, error: '' }
+  return clearRowDisabled(patchPath, rowId, 'false')
 }
 
 function disableRow(patchPath, rowId) {
   if (!ROW_ID_RE.test(rowId)) return { ok: false, error: `行 id ${rowId} 含特殊字符，无法写入补丁层` }
   const state = readPatchState(patchPath)
   if (state.disables.includes(rowId)) return { ok: true, error: '' }
-  stripRows(patchPath, rowId)
-  const result = appendPatchEntry(patchPath, rowBlock(rowId, true))
+  const result = setRowDisabled(patchPath, rowId, true)
   if (result.ok) log(`disabled ${rowId}`)
   return result
 }
@@ -357,14 +463,10 @@ function enableRow(patchPath, rowId) {
   if (!ROW_ID_RE.test(rowId)) return { ok: false, error: `行 id ${rowId} 含特殊字符，无法写入补丁层` }
   const state = readPatchState(patchPath)
   if (state.disables.includes(rowId)) {
-    stripRows(patchPath, rowId)
-    log(`enabled ${rowId}`)
-    return { ok: true, error: '' }
+    const result = clearRowDisabled(patchPath, rowId)
+    if (result.ok) log(`enabled ${rowId}`)
+    return result
   }
-  if (state.forced.includes(rowId)) return { ok: true, error: '' }
-  // The row is enabled by its bundle. A force row is only needed when the
-  // user patch already has one; adding one unconditionally would turn every
-  // normal on/off cycle into a permanent override.
   return { ok: true, error: '' }
 }
 
@@ -373,8 +475,7 @@ function forceEnableRow(patchPath, rowId) {
   if (!ROW_ID_RE.test(rowId)) return { ok: false, error: `行 id ${rowId} 含特殊字符，无法写入补丁层` }
   const state = readPatchState(patchPath)
   if (state.disables.includes(rowId) || state.forced.includes(rowId)) return { ok: true, error: '' }
-  stripRows(patchPath, rowId)
-  const result = appendPatchEntry(patchPath, rowBlock(rowId, false))
+  const result = setRowDisabled(patchPath, rowId, false)
   if (result.ok) log(`force-enabled ${rowId}`)
   return result
 }

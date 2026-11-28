@@ -46,6 +46,26 @@ async function terminateProcess(pid, options) {
   throw err
 }
 
+/**
+ * 等端口真正关闭：进程退出 ≠ 监听立刻消失（子进程可能短暂继承监听句柄，
+ * 2026-11-28 22:14 实测：stopPidVerified 已确认进程退出，紧接着 connect 仍成功，
+ * 5 秒后看门狗才看到端口消失）。有界轮询，超时仍返回 false，由调用方 fail-closed。
+ * @param {() => Promise<boolean>} portOpen 端口是否有应答
+ * @returns {Promise<boolean>} 在 timeoutMs 内关闭为 true；始终未关闭为 false
+ */
+async function waitPortClosed(portOpen, options = {}) {
+  const { timeoutMs = 2000, stepMs = 250,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = Date.now } = options
+  const deadline = now() + Math.max(0, timeoutMs)
+  for (;;) {
+    let open = true
+    try { open = !!(await portOpen()) } catch { open = true }
+    if (!open) return true
+    if (now() >= deadline) return false
+    await sleep(stepMs)
+  }
+}
+
 async function waitForCompletion(pending, timeoutMs) {
   let timer
   try {
@@ -56,4 +76,4 @@ async function waitForCompletion(pending, timeoutMs) {
   } finally { clearTimeout(timer) }
 }
 
-module.exports = { probePid, terminateProcess, waitForCompletion }
+module.exports = { probePid, terminateProcess, waitPortClosed, waitForCompletion }

@@ -39,3 +39,19 @@ test('refreshWebUiOnReady：force=true 时无条件重载所有标签', () => {
     'force 必须绕过"非空白页不重载"的保守判断')
   assert.match(body, /wc\.loadURL\(uiUrl\(\)\)/, '重载目标必须是带凭据的 UI 地址')
 })
+
+// 2026-11-26：同一件事的第二个入口 —— 服务重启后窗口先落回裸地址（launchUrl 还没到），
+// 页面停在 Host 的「连接到此 Host / 配对此设备」；它非空、不是 loading.html，
+// 旧逻辑只认正文里的裸 401 英文字样（且要求正文 < 300 字），识别不到就再也不会被拉回应用。
+// 这里钉住：did-finish-load 用会话 cookie 探针判 401，并保留三条恢复分支。
+test('did-finish-load 的鉴权兜底用会话探针判定，且有 token 时立刻换成带凭据的地址', () => {
+  const block = sliceBetween(main,
+    'void sessionNeedsAuth(wc.session)',
+    '// 失败页兜底',
+    '鉴权兜底块')
+  assert.match(block, /if \(server\.launchUrl\) \{ try \{ wc\.loadURL\(uiUrl\(\)\) \} catch/, '有 token 必须立刻换成带凭据地址')
+  assert.match(block, /if \(!server\.claimed\(\)\)/, '自管服务还没换到凭据时走说明页')
+  assert.match(block, /loadingUrl\('authWait'/)
+  assert.match(block, /markAuthPending\(\)/, '认领的自重启后继确认 401 才标记需要一次启动器重启')
+  assert.match(block, /needsAuth !== true/, '探针拿不到结论（null）时不许改状态')
+})
